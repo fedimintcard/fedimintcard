@@ -1,0 +1,148 @@
+//! Step 2: generate a key on the card, get a signature, and let `secp256k1` verify it.
+//!
+//! * SoftCard and APDU framing (`CardClient` over an in-memory APDU responder) always run.
+//! * The bridge test runs only when `CARD_BRIDGE_URL` is set.
+//! * `card_from_env` runs against whatever `CARD_BACKEND` selects (soft by default).
+
+use fedimint_card_host_card::*;
+use secp256k1::{Message, SECP256K1, XOnlyPublicKey};
+
+fn roundtrip(card: &mut dyn Card, slot: u8) {
+    let pk = card.get_or_gen(slot).expect("key");
+    assert_eq!(card.get_pub(slot).unwrap(), pk, "GET_PUB is stable");
+    let msg = [0x5Au8; 32];
+    let sig = card.sign(slot, &msg).expect("sign");
+    SECP256K1
+        .verify_schnorr(&sig, &Message::from_digest(msg), &pk)
+        .expect("signature verifies against the card's key");
+    // A different message must not verify under the same signature.
+    assert!(
+        SECP256K1
+            .verify_schnorr(&sig, &Message::from_digest([0x5B; 32]), &pk)
+            .is_err()
+    );
+}
+
+#[test]
+fn soft_card_roundtrip() {
+    roundtrip(&mut SoftCard::new(), 0);
+}
+
+#[test]
+fn soft_card_slot_semantics() {
+    let mut c = SoftCard::new();
+    assert_eq!(status_word(&c.get_pub(0).unwrap_err()), Some(0x6985), "empty slot");
+    let a = c.gen_key(0).unwrap();
+    assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985), "no overwrite");
+    let b = c.gen_key(1).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(status_word(&c.gen_key(4).unwrap_err()), Some(0x6B00), "slot out of range");
+}
+
+/// Applet-shaped APDU responder over a `SoftCard`, to test `CardClient` framing offline.
+struct FakeApplet {
+    card: SoftCard,
+    /// Deliver responses as `61xx` + GET RESPONSE, as T=0 cards do.
+    chain: bool,
+    pending: Option<Vec<u8>>,
+    log: Vec<Vec<u8>>,
+}
+
+impl Transport for FakeApplet {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.log.push(apdu.to_vec());
+        if apdu[1] == 0xC0 {
+            let mut d = self.pending.take().expect("GET RESPONSE without pending data");
+            d.extend_from_slice(&[0x90, 0x00]);
+            return Ok(d);
+        }
+        if apdu[1] == 0xA4 {
+            return Ok(vec![0x90, 0x00]);
+        }
+        assert_eq!(apdu[0], 0xB0, "CLA");
+        assert_eq!(apdu[3], 0, "P2");
+        let slot = apdu[2];
+        let res = match apdu[1] {
+            0x10 => {
+                assert_eq!(apdu.len(), 5, "GEN_KEY: header + Le only");
+                self.card.gen_key(slot).map(|k| k.serialize().to_vec())
+            }
+            0x11 => {
+                assert_eq!(apdu.len(), 5, "GET_PUB: header + Le only");
+                self.card.get_pub(slot).map(|k| k.serialize().to_vec())
+            }
+            0x12 => {
+                assert_eq!(apdu[4], 0x20, "Lc");
+                assert_eq!(apdu.len(), 5 + 32 + 1, "SIGN: header, 32 bytes, Le");
+                let m: [u8; 32] = apdu[5..37].try_into().unwrap();
+                self.card.sign(slot, &m).map(|s| s.serialize().to_vec())
+            }
+            _ => return Ok(vec![0x6D, 0x00]),
+        };
+        match res {
+            Ok(data) if self.chain => {
+                let n = data.len() as u8;
+                self.pending = Some(data);
+                Ok(vec![0x61, n])
+            }
+            Ok(mut data) => {
+                data.extend_from_slice(&[0x90, 0x00]);
+                Ok(data)
+            }
+            Err(e) => Ok(status_word(&e).unwrap().to_be_bytes().to_vec()),
+        }
+    }
+}
+
+fn fake(chain: bool) -> CardClient<FakeApplet> {
+    CardClient::new(FakeApplet { card: SoftCard::new(), chain, pending: None, log: vec![] })
+}
+
+#[test]
+fn client_apdu_framing_roundtrip() {
+    let mut c = fake(false);
+    c.select().unwrap();
+    roundtrip(&mut c, 2);
+    let log = &c.into_transport().log;
+    assert_eq!(log[0], SELECT_APDU);
+    assert!(log.iter().any(|a| a[1] == 0x12), "SIGN was sent");
+}
+
+#[test]
+fn client_follows_get_response() {
+    let mut c = fake(true);
+    roundtrip(&mut c, 1);
+    assert!(c.into_transport().log.iter().any(|a| a[1] == 0xC0));
+}
+
+#[test]
+fn client_surfaces_status_words() {
+    let mut c = fake(false);
+    let e = c.get_pub(0).unwrap_err();
+    assert_eq!(status_word(&e), Some(0x6985));
+    c.gen_key(0).unwrap();
+    assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985));
+}
+
+#[test]
+fn bridge_roundtrip_when_configured() {
+    let Ok(url) = std::env::var("CARD_BRIDGE_URL") else {
+        eprintln!("CARD_BRIDGE_URL not set: skipping bridge test");
+        return;
+    };
+    let t = BridgeTransport::new(&url);
+    t.health().expect("bridge /health");
+    t.reset().expect("bridge /reset");
+    let mut c = CardClient::new(t);
+    c.select().unwrap();
+    let pk: XOnlyPublicKey = c.gen_key(0).unwrap();
+    assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985));
+    roundtrip(&mut c, 0);
+    assert_eq!(c.get_pub(0).unwrap(), pk);
+}
+
+#[test]
+fn card_from_env() {
+    let mut card = open_from_env().expect("backend from CARD_BACKEND");
+    roundtrip(card.as_mut(), 3);
+}

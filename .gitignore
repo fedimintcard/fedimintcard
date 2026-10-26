@@ -2,3 +2,4 @@ target/
 *.cap
 .DS_Store
 .idea/
+host/build.log
