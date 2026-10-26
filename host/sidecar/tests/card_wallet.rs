@@ -504,3 +504,77 @@ async fn topup_rejects_dust_amounts() -> anyhow::Result<()> {
     drop(f.fed);
     Ok(())
 }
+
+fn stored_tx(f: &Fx) -> anyhow::Result<Transaction> {
+    let hex_tx = f.cw.store.state.pending_txs[0].tx_hex.clone().expect("stored bytes");
+    Transaction::consensus_decode_hex(&hex_tx, f.cw.wallet.client.decoders()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn store_tx(f: &mut Fx, tx: &Transaction) -> anyhow::Result<()> {
+    use fedimint_core::encoding::Encodable;
+    f.cw.store.state.pending_txs[0].tx_hex = Some(tx.consensus_encode_to_hex());
+    f.cw.store.save()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_resubmission_does_not_abandon_a_confirmed_original() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // The stored bytes now describe a different transaction (new txid, same input): resubmitting
+    // them is rejected, as an older federation might reject a duplicate. The recorded txid is
+    // the one the federation did accept, and that confirmation wins.
+    let mut tx = stored_tx(&f)?;
+    tx.nonce = [7; 8];
+    store_tx(&mut f, &tx)?;
+    f.cw.store.state.pending_txs[0].accepted = false;
+    f.cw.store.save()?;
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert_eq!(b.recovered.abandoned, 0);
+    assert!(b.unresolved.is_empty(), "{:?}", b.recovered.errors);
+    assert!(b.recovered.notes_live >= 1 && b.recovered.till_received >= 100_000);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_resubmission_with_an_unspent_input_is_abandoned() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    let before = f.cw.store.state.live_total_msat();
+    f.cw.crash_point = Some(CrashPoint::BeforeSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // Claim it was submitted, with the signatures stripped so the federation rejects it. It never
+    // was accepted and the input is unspent, so it must be abandoned (after the 10 s wait).
+    let mut tx = stored_tx(&f)?;
+    tx.signatures = TransactionSignature::NaiveMultisig(vec![]);
+    store_tx(&mut f, &tx)?;
+    f.cw.store.state.pending_txs[0].submitted = true;
+    f.cw.store.save()?;
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert_eq!(b.recovered.abandoned, 1, "{:?}", b.recovered.errors);
+    assert!(f.cw.store.state.pending_txs.is_empty());
+    assert_eq!(f.cw.store.state.live_total_msat(), before);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    let spent_slot = f.cw.store.state.live_notes()[0].slot;
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    restart(&mut f)?;
+    // No `balance` first: the spend itself must recover, mark the old note spent, and plan from
+    // the change only.
+    let r = f.cw.spend(50_000).await?;
+    assert!(r.inputs.iter().all(|(slot, _)| *slot != spent_slot), "{r:?}");
+    assert!(f.cw.store.state.pending_txs.is_empty());
+    drop(f.fed);
+    Ok(())
+}

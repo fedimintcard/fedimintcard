@@ -40,6 +40,9 @@ enum Ecash {
     /// Reissue an ecash string into the wallet.
     Import { notes: String },
     /// Print an ecash string worth exactly `amount_msat`.
+    /// Reissue an ecash string this wallet exported earlier and nobody redeemed. Fails if the
+    /// recipient already did.
+    Reclaim { notes: String },
     Export {
         amount_msat: u64,
         /// Also draw the string as a QR code.
@@ -138,9 +141,20 @@ async fn main() -> Result<()> {
             }
             println!("wallet balance now {}", sats(w.balance_msat().await?));
         }
+        Cmd::Ecash(Ecash::Reclaim { notes }) => {
+            let w = Wallet::open(&cli.data_dir).await?;
+            match w.import(notes).await {
+                Ok(imp) if imp.already => println!("already reissued into this wallet"),
+                Ok(imp) => println!("reclaimed {} (fees {} msat)", sats(imp.face.msats), imp.fee_msat),
+                Err(e) => return Err(e.context("could not reclaim: the recipient probably redeemed it already")),
+            }
+            println!("wallet balance now {}", sats(w.balance_msat().await?));
+        }
         Cmd::Ecash(Ecash::Export { amount_msat, qr: want_qr, round_up, include_invite }) => {
             let w = Wallet::open(&cli.data_dir).await?;
             let (notes, face) = w.export(*amount_msat, *round_up, *include_invite).await?;
+            // The log comes before the screen: this string is the only copy of the value.
+            StateStore::open(state_path(&cli.data_dir))?.append_cashout_log(&notes.to_string())?;
             println!("{notes}");
             eprintln!("exported {}", sats(face.msats));
             if *want_qr {

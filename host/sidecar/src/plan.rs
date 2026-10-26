@@ -196,10 +196,37 @@ pub fn cashout(note_amount: u64, fee: FeeFn, min_denom: u64) -> Option<(Vec<u64>
     if target == 0 {
         return None;
     }
-    if let Some(v) = min_notes(target, MAX_CASHOUT_NOTES, fee, min_denom) {
-        return Some((v, false));
+    for last_resort in [false, true] {
+        let mut best: Option<(Vec<u64>, bool)> = None;
+        for floor in floors(min_denom, last_resort) {
+            if let Some(v) = min_notes(target, MAX_CASHOUT_NOTES, fee, floor) {
+                // Fewer notes means fewer fees for everyone who touches them afterwards.
+                if best.as_ref().is_none_or(|(b, _)| v.len() < b.len()) {
+                    best = Some((v, floor < min_denom));
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
     }
-    min_notes(target, MAX_CASHOUT_NOTES, fee, 1).map(|v| (v, true))
+    None
+}
+
+/// Floors to try, highest first: `min_denom`, halving down to 4 msat (every multiple-of-4 fee
+/// schedule balances there). With `last_resort`, only 1 msat.
+fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
+    if last_resort {
+        return vec![1];
+    }
+    let mut v = vec![];
+    let mut f = min_denom.max(1);
+    while f > 4 {
+        v.push(f);
+        f /= 2;
+    }
+    v.push(f);
+    v
 }
 
 /// Choose inputs, till notes and change notes for a card spend of `price` msat.
@@ -217,14 +244,30 @@ pub fn solve(
     fee: FeeFn,
     min_denom: u64,
 ) -> Result<Plan, PlanError> {
-    match solve_with(notes, price, free_slots, fee, min_denom.max(1)) {
-        Err(PlanError::NoExactPlan { .. }) if min_denom > 1 => {
-            let mut p = solve_with(notes, price, free_slots, fee, 1)?;
-            p.dust = true;
-            Ok(p)
+    // Every floor that balances is a candidate; the fewest output notes wins (each costs a fee),
+    // then fewest change notes, fewest inputs, smallest overpay. A high floor can force dozens of
+    // notes when fees are not multiples of it, so "no dust" is not allowed to beat "few notes".
+    let mut best: Option<Plan> = None;
+    let mut first_err = None;
+    for floor in floors(min_denom, false).into_iter().chain(floors(min_denom, true)) {
+        if floor == 1 && min_denom > 1 && best.is_some() {
+            break; // 1 msat notes only when nothing larger balances
         }
-        other => other,
+        match solve_with(notes, price, free_slots, fee, floor) {
+            Ok(mut p) => {
+                p.dust = floor < min_denom;
+                let key = |p: &Plan| (p.till.len() + p.change.len(), p.change.len(), p.inputs.len(), p.overpay);
+                if best.as_ref().is_none_or(|b| key(&p) < key(b)) {
+                    best = Some(p);
+                }
+            }
+            Err(e @ PlanError::NoExactPlan { .. }) => {
+                first_err.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
+    best.ok_or_else(|| first_err.unwrap_or(PlanError::NoExactPlan { price, free_slots }))
 }
 
 fn solve_with(
@@ -316,7 +359,7 @@ fn solve_with(
     let till = binary(price + overpay);
     let r = gross - in_fees - (price + overpay) - fee_sum(&till, fee);
     let change = min_notes(r, free_slots, fee, min_denom).expect("found during search");
-    Ok(Plan { inputs: idx, till, change, overpay, dust: min_denom == 1 })
+    Ok(Plan { inputs: idx, till, change, overpay, dust: false })
 }
 
 impl Plan {
@@ -414,7 +457,7 @@ mod tests {
         let notes = [1 << 20];
         let price = (1u64 << 20) - 100 - 100 - 1_500;
         let p = check(&notes, price, 4, &base100);
-        assert!(p.change.len() <= 1, "{p:?}");
+        assert!(p.change.len() <= 3 && p.overpay <= MAX_TILL_OVERPAY, "{p:?}");
     }
 
     #[test]
@@ -510,6 +553,8 @@ mod tests {
         let p = solve(&notes, 100_000, 16, &base100, 512).unwrap();
         assert!(p.dust);
         assert!(p.balances(&notes, &base100));
+        // The descending floors stop at 4 msat here: 100 msat fees balance on multiples of 4.
+        assert!(p.till.iter().chain(&p.change).all(|a| *a >= 4), "{p:?}");
         // And the strict search alone finds nothing.
         assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512), Err(PlanError::NoExactPlan { .. })));
     }

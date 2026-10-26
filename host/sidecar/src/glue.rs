@@ -670,6 +670,7 @@ impl CardWallet {
 
     async fn resolve_tx(&mut self, ptx: PendingTx, timeout: Duration, rec: &mut Recovered) -> Result<()> {
         let txid = ptx.txid.clone();
+        let txid_parsed = parse_txid(&txid)?;
         if !ptx.submitted {
             // Signed or not, it never left this machine.
             self.abandon_group(&txid);
@@ -677,30 +678,61 @@ impl CardWallet {
             rec.abandoned += 1;
             return Ok(());
         }
-        if !ptx.accepted {
-            let hex_tx = ptx.tx_hex.as_deref().context("submitted transaction without stored bytes")?;
-            let tx = Transaction::consensus_decode_hex(hex_tx, self.wallet.client.decoders())
-                .map_err(|e| anyhow!("decoding the stored transaction: {e}"))?;
-            match tokio::time::timeout(timeout, self.submit(tx)).await {
-                Err(_) => return Ok(()), // still undecided
-                Ok(Err(e)) => return Err(e),
-                Ok(Ok(Err(e))) => {
-                    // A definite rejection: the outputs never existed.
-                    tracing::warn!("transaction {txid} was rejected: {e}");
-                    self.abandon_group(&txid);
-                    self.store.save()?;
-                    rec.abandoned += 1;
-                    return Ok(());
+        // Resubmit the stored bytes on every pass until the collection is complete: it is
+        // idempotent, and a federation that lost or never fully processed the first submission
+        // gets it again.
+        let hex_tx = ptx.tx_hex.as_deref().context("submitted transaction without stored bytes")?;
+        let tx = Transaction::consensus_decode_hex(hex_tx, self.wallet.client.decoders())
+            .map_err(|e| anyhow!("decoding the stored transaction: {e}"))?;
+        let mut confirmed = ptx.accepted;
+        match tokio::time::timeout(timeout, self.submit(tx)).await {
+            Err(_) if !ptx.accepted => return Ok(()), // still undecided
+            Ok(Err(e)) if !ptx.accepted => return Err(e),
+            Ok(Ok(Err(rejection))) if !ptx.accepted => {
+                // A rejected resubmission does not mean the original failed: an older federation
+                // may refuse a transaction it already included. Ask for the confirmation first.
+                let included = tokio::time::timeout(Duration::from_secs(10), self.wallet.client.api().await_transaction(txid_parsed))
+                    .await
+                    .is_ok();
+                if included {
+                    confirmed = true;
+                } else {
+                    let mut some_unspent = false;
+                    for n in &ptx.inputs {
+                        if !self.is_spent(nonce_from_hex(n)?).await? {
+                            some_unspent = true;
+                        }
+                    }
+                    if some_unspent {
+                        tracing::warn!("transaction {txid} was rejected ({rejection}) and an input is unspent: abandoning");
+                        self.abandon_group(&txid);
+                        self.store.save()?;
+                        rec.abandoned += 1;
+                        return Ok(());
+                    }
+                    // Every input is spent but we cannot show it was by this transaction (the API
+                    // cannot say which one spent a note): do not abandon, keep trying.
+                    bail!("resubmission rejected ({rejection}), inputs are spent but the transaction is not confirmed");
                 }
-                Ok(Ok(Ok(_))) => {}
             }
+            Ok(Ok(Ok(_))) => {}
+            _ => {} // already confirmed earlier; the resubmission result no longer matters
+        }
+        if !confirmed {
+            confirmed = tokio::time::timeout(timeout, self.wallet.client.api().await_transaction(txid_parsed)).await.is_ok();
+        }
+        if !confirmed {
+            return Ok(());
+        }
+        if !ptx.accepted {
             if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == txid) {
                 p.accepted = true;
             }
             self.store.save()?;
-            self.confirm_inputs_spent(parse_txid(&txid)?, &ptx.inputs, timeout).await?;
         }
         if self.collect_group(&txid, timeout, rec).await? {
+            // Make sure the card notes this transaction spent are marked before the record goes.
+            self.confirm_inputs_spent(txid_parsed, &ptx.inputs, RECOVER_TIMEOUT).await?;
             self.store.state.pending_txs.retain(|p| p.txid != txid);
             self.store.save()?;
         }
@@ -831,23 +863,29 @@ impl CardWallet {
             self.store.save()?;
             return Err(e);
         }
+        // 3. Record the signed bytes, then that we are about to send, then send.
+        if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
+            p.tx_hex = Some(tx.consensus_encode_to_hex());
+        }
+        self.store.save()?;
         if self.crash_point == Some(CrashPoint::BeforeSubmit) {
             bail!("simulated crash before submit");
         }
-
-        // 3. Record the signed bytes and that we are about to send, then send.
         if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
-            p.tx_hex = Some(tx.consensus_encode_to_hex());
             p.submitted = true;
         }
         self.store.save()?;
         match self.submit(tx).await {
             Ok(Ok(accepted)) => {
                 ensure!(accepted == txid, "federation returned a different txid");
-                if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
-                    p.accepted = true;
+                // `accepted` is set only once the federation's own confirmation arrives; until
+                // then recovery keeps resubmitting the stored bytes.
+                if tokio::time::timeout(Duration::from_secs(30), self.wallet.client.api().await_transaction(txid)).await.is_ok() {
+                    if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
+                        p.accepted = true;
+                    }
+                    self.store.save()?;
                 }
-                self.store.save()?;
                 if self.crash_point == Some(CrashPoint::AfterSubmit) {
                     bail!("simulated crash after submit");
                 }
@@ -1046,6 +1084,10 @@ impl CardWallet {
         report.gained_msat = gained;
         match self.export_after_cashout(gained).await {
             Ok(Some((text, amount))) => {
+                // The log comes before the screen.
+                if let Err(e) = self.store.append_cashout_log(&text) {
+                    report.warnings.push(format!("could not write cashouts.log: {e:#}"));
+                }
                 report.ecash = Some(text);
                 report.exported_msat = amount;
             }
