@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+fedimint-card-host-card = { path = "../card" }
 fedimint-api-client = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-core = { workspace = true }
@@ -20,3 +21,4 @@ fedimint-testing = { workspace = true }
 tbs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = "1"
