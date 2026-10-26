@@ -1,3 +1,4 @@
 target/
 *.cap
+.DS_Store
 .idea/
