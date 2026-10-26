@@ -35,6 +35,9 @@ use tbs::{BlindedSignatureShare, BlindingKey};
 
 pub use fedimint_card_host_card as card;
 
+/// Upper bound for each network step, so a stalled guardian fails the test instead of hanging CI.
+pub const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A running 4-guardian federation, one test client, and the ids/config the glue needs.
 pub struct Env {
     /// Keep alive: dropping it stops the guardians.
@@ -47,6 +50,16 @@ pub struct Env {
 
 /// Start a federation. `fees = false` uses `FeeConsensus::zero()` for exact-split spends.
 pub async fn setup(fees: bool) -> Env {
+    assert!(
+        std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
+        "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend; unset it"
+    );
+    tokio::time::timeout(STEP_TIMEOUT, setup_inner(fees))
+        .await
+        .expect("federation did not start within 60 s")
+}
+
+async fn setup_inner(fees: bool) -> Env {
     use fedimint_dummy_client::DummyClientInit;
     use fedimint_dummy_server::DummyInit;
     use fedimint_mintv2_client::MintClientInit;
@@ -89,11 +102,9 @@ fn sign_with_key(tx: &mut Transaction, keys: &[Keypair]) {
 }
 
 pub async fn submit(env: &Env, tx: Transaction) -> Result<Result<TransactionId, TransactionError>> {
-    let outcome = env
-        .client
-        .api()
-        .submit_transaction(tx)
+    let outcome = tokio::time::timeout(STEP_TIMEOUT, env.client.api().submit_transaction(tx))
         .await
+        .context("transaction submission timed out after 60 s")?
         .try_into_inner(env.client.decoders())
         .context("decoding submission outcome")?;
     let TransactionSubmissionOutcome(res) = outcome;
@@ -113,7 +124,7 @@ pub async fn fetch_blind_signatures(
     let check = blinded.clone();
     let mod_api = env.client.api().with_module(env.mint_id);
     let shares: BTreeMap<PeerId, Vec<BlindedSignatureShare>> = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        STEP_TIMEOUT,
         mod_api.request_with_strategy_retry(
             FilterMapThreshold::new(
                 move |peer, shares: Vec<BlindedSignatureShare>| {
@@ -247,8 +258,12 @@ pub async fn finalize_outputs(env: &Env, txid: TransactionId, requests: &[NoteIs
 pub async fn redeem(env: &Env, notes: Vec<SpendableNote>) -> Result<()> {
     let mint = env.client.get_first_module::<MintClientModule>()?;
     let ecash = ECash::new(env.client.federation_id(), notes);
-    let op = mint.receive(ecash, serde_json::Value::Null).await?;
-    let state = mint.await_final_receive_operation_state(op).await?;
+    let state = tokio::time::timeout(STEP_TIMEOUT, async {
+        let op = mint.receive(ecash, serde_json::Value::Null).await?;
+        anyhow::Ok(mint.await_final_receive_operation_state(op).await?)
+    })
+    .await
+    .context("redeem timed out after 60 s")??;
     if state != FinalReceiveOperationState::Success {
         bail!("receive ended in {state:?}");
     }

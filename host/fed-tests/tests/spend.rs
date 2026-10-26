@@ -5,7 +5,7 @@
 use fedimint_card_fed_tests::*;
 use fedimint_card_host_card::{Card, open_from_env};
 use fedimint_core::Amount;
-use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::encoding::Decodable;
 use fedimint_core::secp256k1::XOnlyPublicKey;
 use fedimint_core::transaction::{Transaction, TransactionError};
 use fedimint_mintv2_common::{Denomination, Note};
@@ -46,7 +46,7 @@ async fn card_note_is_spent_with_card_signature_fees_on() -> anyhow::Result<()> 
     attach_signatures(&mut draft.tx, vec![sig]);
 
     // Finding for SPIKE.md: the exact bytes the federation receives.
-    let bytes = draft.tx.consensus_encode_to_vec();
+    let bytes = SpendDraft::encoded(&draft.tx);
     println!("SPEND_TX_BYTES {}", bytes.len());
     println!("SPEND_TX_HEX {}", hex(&bytes));
     println!("SPEND_TXID {}", hex(&draft.digest()));
@@ -60,8 +60,11 @@ async fn card_note_is_spent_with_card_signature_fees_on() -> anyhow::Result<()> 
     assert_eq!(notes.len(), 4);
     let before = f.env.client.get_balance_for_btc().await?;
     redeem(&f.env, notes).await?;
-    // Fees on: the client pays input and output fees (100 msat each) to reissue the notes.
-    let after = wait_for_balance(&f.env, Amount::from_msats(1)).await?;
+    // Fees on: 983,040 msat arrive; the client's own reissue pays per-note fees and rounds to
+    // denominations. Measured: it settles at 978,944 msat every run, so require >= 975,000
+    // (0.8% below the total) to catch a lost note while tolerating fee changes.
+    let after = wait_for_balance(&f.env, Amount::from_msats(975_000)).await?;
+    println!("BALANCE_AFTER_FEES_ON {after}");
     assert!(after > before, "new host notes are spendable: {before} -> {after}");
     assert!(after <= Amount::from_msats((1 << 19) + (1 << 18) + (1 << 17) + (1 << 16)));
     Ok(())
@@ -114,6 +117,11 @@ async fn missing_or_extra_signature_is_rejected() -> anyhow::Result<()> {
     attach_signatures(&mut draft.tx, vec![sig, sig]);
     let e = rejected(submit(&f.env, draft.tx.clone()).await);
     assert!(matches!(e, TransactionError::InvalidWitnessLength), "{e}");
+
+    // Control: the same draft with exactly one correct signature is accepted, so the two
+    // failures above were about the signature count and nothing else.
+    attach_signatures(&mut draft.tx, vec![sig]);
+    submit(&f.env, draft.tx).await?.map_err(|e| anyhow::anyhow!("rejected: {e}"))?;
     Ok(())
 }
 
