@@ -11,7 +11,10 @@ use fedimint_api_client::query::FilterMapThreshold;
 use fedimint_core::module::ApiRequestErased;
 use fedimint_core::{Amount, NumPeersExt, OutPoint, PeerId, TransactionId};
 use fedimint_mint_client::output::verify_blind_share;
-use fedimint_mint_common::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
+// Deprecated upstream in favour of the batch endpoint, but the single-output one works against
+// every federation version, which matters for an unknown demo federation.
+#[allow(deprecated)]
+use fedimint_core::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
 use fedimint_mint_common::{Nonce, Note};
 use tbs::{BlindedMessage, BlindedSignature, BlindedSignatureShare, BlindingKey};
 
@@ -35,7 +38,8 @@ pub async fn fetch_blind_signature(
     spec: OutSpec,
     timeout: Duration,
 ) -> Result<BlindedSignature> {
-    let api = w.client.api().with_module(w.mint_id);
+    // `await_output_outcome` is a federation-wide endpoint, not a mint module one.
+    let api = w.client.api();
     let decoder = w.client.decoders().get_expect(w.mint_id).clone();
     let peer_pks = w.mint_cfg.peer_tbs_pks.clone();
     let OutSpec { amount, blinded, out_idx } = spec;
@@ -51,6 +55,7 @@ pub async fn fetch_blind_signature(
                 },
                 api.all_peers().to_num_peers(),
             ),
+            #[allow(deprecated)]
             AWAIT_OUTPUT_OUTCOME_ENDPOINT.to_owned(),
             ApiRequestErased::new(OutPoint { txid, out_idx }),
         ),
