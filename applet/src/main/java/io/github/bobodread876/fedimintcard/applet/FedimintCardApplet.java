@@ -174,6 +174,8 @@ public final class FedimintCardApplet extends Applet {
             short len = gp.getS(tmp, (short) 0);
             // getS may strip leading zeros or add one on silicon: normalise to 32 bytes.
             SchnorrHW.alignScalar(tmp, (short) 0, len);
+            // Re-assert domain parameters first: a tear after clearKey must not leave a parameterless key.
+            setParams(privs[s], null);
             privs[s].setS(tmp, (short) 0, (short) 32);
             short wl = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
             pubs[s].setW(tmp, (short) 0, wl);

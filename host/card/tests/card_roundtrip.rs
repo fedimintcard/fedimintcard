@@ -161,6 +161,31 @@ fn client_gen_key_overwrite_sends_p2_1() {
     assert_eq!(log[2][3], 0, "GET_PUB keeps P2 = 0");
 }
 
+struct Wrong6C {
+    log: Vec<Vec<u8>>,
+}
+
+impl Transport for Wrong6C {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.log.push(apdu.to_vec());
+        Ok(vec![0x6C, 0x20])
+    }
+}
+
+#[test]
+fn overwrite_is_never_resent_on_6c() {
+    let mut c = CardClient::new(Wrong6C { log: vec![] });
+    let e = c.gen_key_overwrite(1).unwrap_err();
+    assert_eq!(status_word(&e), Some(0x6C20));
+    assert_eq!(c.into_transport().log.len(), 1, "no resend");
+    // Other commands still follow 6Cxx.
+    let mut c = CardClient::new(Wrong6C { log: vec![] });
+    let _ = c.gen_key(1);
+    let log = c.into_transport().log;
+    assert!(log.len() > 1, "plain GEN_KEY is resent with the corrected Le");
+    assert_eq!(*log[1].last().unwrap(), 0x20);
+}
+
 #[test]
 fn client_surfaces_status_words() {
     let mut c = fake(false);

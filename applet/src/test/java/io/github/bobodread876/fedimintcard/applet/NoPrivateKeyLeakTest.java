@@ -47,11 +47,18 @@ class NoPrivateKeyLeakTest {
         // Full INS sweep with a small matrix.
         for (int ins = 0; ins < 256; ins++) {
             for (int p1 : new int[] { 0, 16 }) {
+              for (int p2 : new int[] { 0, 1 }) {
                 for (int len : new int[] { 0, 32 }) {
-                    ResponseAPDU r = c.tx(0xB0, ins, p1, 0, new byte[len]);
+                    ResponseAPDU r = c.tx(0xB0, ins, p1, p2, new byte[len]);
+                    if (ins == 0x10 && p2 == 1 && p1 == 0 && r.getSW() == 0x9000) {
+                        BigInteger d = c.scalar(0);
+                        secrets.add(Bip340.bytes32(d));
+                        secrets.add(Bip340.bytes32(Bip340.N.subtract(d)));
+                    }
                     assertFalse(leaks(wire(r), secrets), "INS " + ins + " P1 " + p1 + " len " + len);
                     checked++;
                 }
+              }
             }
         }
         // Full matrix for the three real commands.
@@ -89,8 +96,9 @@ class NoPrivateKeyLeakTest {
         int checked = 0;
         for (int ins = 0; ins < 256; ins++) {
             for (int p1 : new int[] { 0, 1, 16 }) {
+              for (int p2 : new int[] { 0, 1 }) {
                 for (int len : new int[] { 0, 32 }) {
-                    ResponseAPDU r = c.tx(0xB0, ins, p1, 0, new byte[len]);
+                    ResponseAPDU r = c.tx(0xB0, ins, p1, p2, new byte[len]);
                     List<byte[]> secrets = new ArrayList<>();
                     for (int s = 0; s < 16; s++) {
                         try {
@@ -105,6 +113,7 @@ class NoPrivateKeyLeakTest {
                     assertFalse(leaks(wire(r), secrets), "INS " + ins + " P1 " + p1 + " len " + len);
                     checked++;
                 }
+              }
             }
         }
         assertTrue(checked > 1500);

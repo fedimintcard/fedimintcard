@@ -155,6 +155,28 @@ class GenKeyGetPubTest {
             }
         };
         assertSw(0x6F00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null));
+        assertFalse(real.isInitialized(), "old private key must be wiped");
+        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
+    }
+
+    @Test
+    void overwriteWhereGenKeyPairThrowsLeavesSlotEmpty() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        c.genKey(0);
+        javacard.security.ECPrivateKey real = ((javacard.security.ECPrivateKey[]) c.field("privs"))[0];
+        java.lang.reflect.Field f = FedimintCardApplet.class.getDeclaredField("gen");
+        f.setAccessible(true);
+        // KeyPair is final and jCardSim's genKeyPair cannot be made to throw, so break the generator
+        // itself: the failure then happens in the generate path, after the old key was wiped.
+        f.set(c.runtime.appletAt(c.aid), null);
+        boolean refused;
+        try {
+            refused = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null).getSW() != 0x9000;
+        } catch (RuntimeException e) {
+            refused = true;
+        }
+        assertTrue(refused, "genKeyPair must fail");
+        assertFalse(real.isInitialized(), "old private key must be wiped");
         assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
     }
 }

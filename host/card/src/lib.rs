@@ -54,6 +54,13 @@ pub trait Card {
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
     /// Wipe `slot` and generate a fresh key in it (GEN_KEY with P2 = 1). Works on a used or an
     /// empty slot; the old key is gone for good.
+    ///
+    /// Contract: an overwrite destroys the spend key. The caller must first prove that nothing
+    /// is still locked to the slot's current pubkey, and record the pending overwrite together
+    /// with the old pubkey before sending. On any failure (error, timeout, torn connection) call
+    /// `get_pub` to learn the outcome: `6985` means the slot is empty; a different pubkey means
+    /// the new key exists, so adopt it; the old pubkey means the command never ran. Never retry
+    /// a P2 = 1 GEN_KEY blindly.
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
     /// x-only public key of the key in `slot`. Fails with `6985` if the slot is empty.
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
@@ -113,6 +120,10 @@ impl<T: Transport> CardClient<T> {
             match (sw[0], sw[1]) {
                 (0x90, 0x00) => return Ok(data),
                 (0x61, n) => resp = self.transport.transmit(&[0x00, 0xC0, 0x00, 0x00, n])?,
+                (0x6C, _) if apdu.len() >= 4 && apdu[1] == INS_GEN_KEY && apdu[3] == 0x01 => {
+                    // Never resend an overwrite: the first attempt may already have replaced the key.
+                    return Err(StatusWord(0x6C00 | u16::from(sw[1])).into());
+                }
                 (0x6C, n) => {
                     let mut again = apdu.to_vec();
                     *again.last_mut().expect("non-empty APDU") = n;

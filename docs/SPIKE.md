@@ -87,7 +87,7 @@ Overpaying is allowed (core consensus 2.1), the excess is burned.
   key is transient-deselect where the card allows it, otherwise overwritten with a fixed value
   after each signature; `sc` and `work` zeroed after `sign`; `getS` outputs of 1..33 bytes
   normalised by one shared `alignScalar`; compressed `getW` handled and tested.
-- GEN_KEY never overwrites a slot. There is no delete command. Four slots.
+- GEN_KEY never overwrites a slot. There is no delete command. Four slots (state at the spike; superseded on this branch by 16 slots and GEN_KEY P2=1 overwrite).
 - Transient memory is about 610 B (the J3R180 refused 1,030 B for cashucard).
 - Settled on silicon (J3R180, 2026-10-26): the DH output is the 65-byte `04||X||Y` form
   SchnorrHW expects (signatures verify; a 64-byte form would have failed closed with `6F00`);
