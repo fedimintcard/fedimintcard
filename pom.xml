@@ -9,7 +9,7 @@
   <name>fedimint-card</name>
   <modules>
     <module>applet</module>
-    <!--bridge-->
+    <module>bridge</module>
   </modules>
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
