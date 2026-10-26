@@ -7,7 +7,7 @@ till does the rest. Because Fedimint notes are spent with a Schnorr signature fr
 note's own key, this needs no change to the Fedimint protocol and works with existing
 federations.
 
-Status: spike in progress (steps 1-2, Java side done). The first spike is described in [docs/SPIKE-PLAN.md](docs/SPIKE-PLAN.md).
+Status: spike done on the simulator, real card pending. Plan: [docs/SPIKE-PLAN.md](docs/SPIKE-PLAN.md). Results: [docs/SPIKE.md](docs/SPIKE.md).
 
 This is experimental software. Do not put real funds on a card.
 
@@ -16,7 +16,8 @@ This is experimental software. Do not put real funds on a card.
 ```
 applet/   JavaCard applet (GEN_KEY, GET_PUB, SIGN) and jCardSim tests
 bridge/   HTTP bridge that serves the simulated applet on 127.0.0.1
-docs/     spike plan, CAP build notes
+host/     Rust workspace: card transport and federation tests (see host/README.md)
+docs/     spike plan, results, CAP build notes
 ```
 
 ## Build
