@@ -7,7 +7,7 @@ till does the rest. Because Fedimint notes are spent with a Schnorr signature fr
 note's own key, this needs no change to the Fedimint protocol and works with existing
 federations.
 
-Status: spike done on the simulator, real card pending. Plan: [docs/SPIKE-PLAN.md](docs/SPIKE-PLAN.md). Results: [docs/SPIKE.md](docs/SPIKE.md).
+Status: spike done, including on a real J3R180. Plan: [docs/SPIKE-PLAN.md](docs/SPIKE-PLAN.md). Results: [docs/SPIKE.md](docs/SPIKE.md).
 
 This is experimental software. Do not put real funds on a card.
 

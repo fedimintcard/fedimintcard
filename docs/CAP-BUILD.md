@@ -62,7 +62,9 @@ cargo test --locked --workspace --features fedimint-card-host-card/pcsc -- --tes
 ```
 with `CARD_BACKEND=pcsc` (and `CARD_PCSC_READER=ACR122U` if more than one reader is present).
 
-Things only silicon settles: the `ALG_EC_SVDP_DH_PLAIN_XY` output framing (SchnorrHW fails
-closed with `6F00` if it is not 65 bytes `04||X||Y`), whether `TYPE_EC_FP_PRIVATE_TRANSIENT_DESELECT`
-is accepted for the nonce key, whether the heavy constructor installs after the opener, T=0
-behaviour (not relevant over NFC), and signing time.
+Verified on an NXP J3R180 (JCOP4) through an ACS ACR122U on 2026-10-26: the install sequence
+above works with the default GlobalPlatform keys; the applet signs (median 847 ms per BIP340
+signature, GEN_KEY 125 ms, GET_PUB 27 ms); and all 18 Rust tests pass with `CARD_BACKEND=pcsc`.
+A card personalised by the cashucard provisioner has non-default keys and must be reset in that
+app first. Do not retry `gp` with the wrong keys: each failure counts toward the card lock.
+Still unknown from outside: whether the nonce key is transient or the persistent fallback.
