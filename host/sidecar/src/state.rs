@@ -46,6 +46,9 @@ pub struct NoteRec {
     /// Transaction that created the note, hex, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub txid: Option<String>,
+    /// Index of the note's output in that transaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_idx: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,10 +73,34 @@ pub struct HostPending {
     pub secret_key: String,
     /// Blinding key (consensus encoding), hex.
     pub blinding_key: String,
-    /// `till` notes are reissued into the wallet; `cashout` notes are exported.
+    /// `till` notes are reissued into the wallet. `cashout` only exists in state files written
+    /// by an earlier build, which exported such notes as a string.
     pub kind: HostKind,
-    /// Groups the outputs of one operation so a cashout exports them as one string.
+    /// The transaction (hex txid) that creates the output.
     pub group: String,
+    /// Index of the output in that transaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_idx: Option<u64>,
+}
+
+/// A transaction the host built and (maybe) sent: the outputs it creates are tracked in `notes`
+/// and `host_pending` under the same txid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingTx {
+    pub txid: String,
+    /// Consensus encoding of the signed transaction. Resubmitting it is idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_hex: Option<String>,
+    /// Set (and saved) immediately before the first submission. If false after a restart the
+    /// transaction never left this machine and the group is abandoned.
+    #[serde(default)]
+    pub submitted: bool,
+    /// The federation accepted it; only collection of outputs remains.
+    #[serde(default)]
+    pub accepted: bool,
+    /// Nonces (hex) of the card notes it spends.
+    #[serde(default)]
+    pub inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +122,8 @@ pub struct CardState {
     pub pending_overwrites: Vec<PendingOverwrite>,
     #[serde(default)]
     pub host_pending: Vec<HostPending>,
+    #[serde(default)]
+    pub pending_txs: Vec<PendingTx>,
 }
 
 impl CardState {
@@ -199,11 +228,11 @@ impl StateStore {
     /// then fsync the directory so the rename itself is durable.
     pub fn save(&self) -> Result<()> {
         let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(&self.state)?;
         {
-            let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            let mut f = private_options().truncate(true).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
             f.write_all(&json)?;
             f.write_all(b"\n")?;
             f.sync_all()?;
@@ -212,6 +241,43 @@ impl StateStore {
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
+
+    /// Append `line` to `cashouts.log` next to the state file (mode 0600) and fsync it. Used for
+    /// ecash strings that must not be lost; call before deleting the records that produced them.
+    pub fn append_cashout_log(&self, line: &str) -> Result<()> {
+        let path = self.path.with_file_name("cashouts.log");
+        let mut f = private_options().append(true).open(&path).with_context(|| format!("opening {}", path.display()))?;
+        writeln!(f, "{line}")?;
+        f.sync_all()?;
+        Ok(())
+    }
+}
+
+/// `OpenOptions` for a file only the owner can read.
+pub fn private_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Create `dir` (and parents) with mode 0700 where it does not exist yet.
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -230,6 +296,7 @@ mod tests {
             status,
             blinding_key: None,
             txid: None,
+            out_idx: None,
         }
     }
 
@@ -243,6 +310,15 @@ mod tests {
         s.state.notes.push(note(0, 1, NoteStatus::Live));
         s.save().unwrap();
         assert!(!path.with_extension("json.tmp").exists(), "temp file renamed away");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            s.append_cashout_log("ecash-string").unwrap();
+            let log = path.with_file_name("cashouts.log");
+            assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "ecash-string\n");
+        }
         let s2 = StateStore::open(&path).unwrap();
         assert_eq!(s2.state, s.state);
         // Overwrite again: still parses.

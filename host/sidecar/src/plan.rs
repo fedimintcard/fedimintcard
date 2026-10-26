@@ -41,12 +41,17 @@ pub struct Plan {
     pub change: Vec<u64>,
     /// `sum(till) - price`.
     pub overpay: u64,
+    /// True if some output is below the federation's smallest economical denomination, which
+    /// the planner only allows when no dust-free exact balance exists.
+    pub dust: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// Live notes cannot cover the price plus fees.
     Insufficient { have: u64, need: u64 },
+    /// More live notes than a card can hold.
+    TooManyNotes(usize),
     /// Funds exist, but no exact-balance layout fits the free slots and the overpay limit.
     NoExactPlan { price: u64, free_slots: usize },
 }
@@ -57,6 +62,7 @@ impl std::fmt::Display for PlanError {
             PlanError::Insufficient { have, need } => {
                 write!(f, "insufficient funds on the card: have {have} msat, need at least {need} msat")
             }
+            PlanError::TooManyNotes(n) => write!(f, "{n} live notes is more than a card can hold; state file is inconsistent"),
             PlanError::NoExactPlan { price, free_slots } => write!(
                 f,
                 "no exact-balance spend of {price} msat with {free_slots} free slot(s); \
@@ -90,18 +96,24 @@ fn flat_fee(fee: FeeFn) -> Option<u64> {
 
 /// Fewest notes (at most `max_notes`) whose creation cost `sum(a + fee(a))` is exactly `target`.
 /// Returns amounts descending. `Some(vec![])` for `target == 0`.
-pub fn min_notes(target: u64, max_notes: usize, fee: FeeFn) -> Option<Vec<u64>> {
+pub fn min_notes(target: u64, max_notes: usize, fee: FeeFn, min_denom: u64) -> Option<Vec<u64>> {
+    debug_assert!(min_denom.is_power_of_two());
     if target == 0 {
         return Some(vec![]);
     }
     if let Some(c) = flat_fee(fee) {
         for k in 1..=max_notes {
             let Some(total) = target.checked_sub(c.checked_mul(k as u64)?) else { break };
-            if total == 0 || total < k as u64 {
+            if total % min_denom != 0 {
                 continue;
             }
-            if (total.count_ones() as usize) <= k {
-                return Some(split_to(binary(total), k));
+            let units = total / min_denom;
+            if units == 0 || units < k as u64 {
+                continue;
+            }
+            if (units.count_ones() as usize) <= k {
+                let notes = binary(units).into_iter().map(|u| u * min_denom).collect();
+                return Some(split_to(notes, k, min_denom));
             }
         }
         return None;
@@ -112,7 +124,8 @@ pub fn min_notes(target: u64, max_notes: usize, fee: FeeFn) -> Option<Vec<u64>> 
         let mut out = Vec::new();
         let mut nodes = 0u64;
         let top = (63 - target.leading_zeros() as i32).min(MAX_EXP as i32);
-        if dfs(top, k, target, fee, &mut failed, &mut out, &mut nodes) {
+        let floor = min_denom.trailing_zeros() as i32;
+        if dfs(top, floor, k, target, fee, &mut failed, &mut out, &mut nodes) {
             out.sort_unstable_by(|a, b| b.cmp(a));
             return Some(out);
         }
@@ -121,11 +134,11 @@ pub fn min_notes(target: u64, max_notes: usize, fee: FeeFn) -> Option<Vec<u64>> 
 }
 
 /// Split the largest splittable note in half until there are exactly `k` notes.
-fn split_to(mut notes: Vec<u64>, k: usize) -> Vec<u64> {
+fn split_to(mut notes: Vec<u64>, k: usize, min_denom: u64) -> Vec<u64> {
     while notes.len() < k {
         notes.sort_unstable_by(|a, b| b.cmp(a));
         let big = notes[0];
-        debug_assert!(big > 1, "caller guarantees total >= k");
+        debug_assert!(big > min_denom, "caller guarantees units >= k");
         notes[0] = big / 2;
         notes.push(big / 2);
     }
@@ -135,6 +148,7 @@ fn split_to(mut notes: Vec<u64>, k: usize) -> Vec<u64> {
 
 fn dfs(
     e: i32,
+    floor: i32,
     items: usize,
     rem: u64,
     fee: FeeFn,
@@ -145,7 +159,7 @@ fn dfs(
     if items == 0 {
         return rem == 0;
     }
-    if e < 0 {
+    if e < floor {
         return false;
     }
     *nodes += 1;
@@ -153,7 +167,7 @@ fn dfs(
         return false;
     }
     let w_hi = weight(1u64 << e, fee);
-    let w_lo = weight(1, fee);
+    let w_lo = weight(1u64 << floor, fee);
     if rem > items as u64 * w_hi || rem < items as u64 * w_lo {
         failed.insert((e, items, rem));
         return false;
@@ -164,7 +178,7 @@ fn dfs(
         for _ in 0..c {
             out.push(1u64 << e);
         }
-        if dfs(e - 1, items - c, rem - used, fee, failed, out, nodes) {
+        if dfs(e - 1, floor, items - c, rem - used, fee, failed, out, nodes) {
             return true;
         }
         out.truncate(out.len() - c);
@@ -174,42 +188,76 @@ fn dfs(
 }
 
 /// Plan a cashout of one card note: host-owned notes whose creation cost is exactly
-/// `note_amount - fee(note_amount)`. `None` if the note cannot even pay its own fee.
-pub fn cashout(note_amount: u64, fee: FeeFn) -> Option<Vec<u64>> {
+/// `note_amount - fee(note_amount)`, using only tiers of at least `min_denom` when that can be
+/// balanced exactly and otherwise (second element `true`) allowing smaller ones.
+/// `None` if the note cannot even pay its own fee.
+pub fn cashout(note_amount: u64, fee: FeeFn, min_denom: u64) -> Option<(Vec<u64>, bool)> {
     let target = note_amount.checked_sub(fee(note_amount))?;
     if target == 0 {
         return None;
     }
-    min_notes(target, MAX_CASHOUT_NOTES, fee)
+    if let Some(v) = min_notes(target, MAX_CASHOUT_NOTES, fee, min_denom) {
+        return Some((v, false));
+    }
+    min_notes(target, MAX_CASHOUT_NOTES, fee, 1).map(|v| (v, true))
 }
 
 /// Choose inputs, till notes and change notes for a card spend of `price` msat.
 ///
 /// `notes` are the amounts of the card's live notes. `free_slots` bounds the number of change
-/// notes. Objective, in order: fewest change notes, fewest inputs (each costs one card
-/// signature, about a second on silicon), smallest overpay.
-pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn) -> Result<Plan, PlanError> {
+/// notes. Output notes are at least `min_denom` (the federation's smallest economical
+/// denomination) when an exact balance exists that way; since fees are not multiples of
+/// `min_denom` that is rare, and the planner then retries allowing any tier and sets `dust`.
+/// Objective, in order: fewest change notes, fewest inputs (each costs one card signature, about
+/// a second on silicon), smallest overpay.
+pub fn solve(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+) -> Result<Plan, PlanError> {
+    match solve_with(notes, price, free_slots, fee, min_denom.max(1)) {
+        Err(PlanError::NoExactPlan { .. }) if min_denom > 1 => {
+            let mut p = solve_with(notes, price, free_slots, fee, 1)?;
+            p.dust = true;
+            Ok(p)
+        }
+        other => other,
+    }
+}
+
+fn solve_with(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+) -> Result<Plan, PlanError> {
     if price == 0 {
         return Err(PlanError::NoExactPlan { price, free_slots });
     }
+    let n = notes.len();
+    if n > 20 {
+        return Err(PlanError::TooManyNotes(n));
+    }
     let have: u64 = notes.iter().sum();
-    // Cheapest conceivable cost of the price: the price itself paid with one-note-per-bit fees.
     let min_need = price + fee_sum(&binary(price), fee);
     if have < min_need {
         return Err(PlanError::Insufficient { have, need: min_need });
     }
 
-    // Till cost table: for each overpay 0..=MAX, what the till outputs cost in total.
-    let till_cost: Vec<u64> = (0..=MAX_TILL_OVERPAY)
-        .map(|o| {
-            let t = price + o;
-            t + fee_sum(&binary(t), fee)
-        })
+    // Till candidates: totals that are multiples of `min_denom`, price <= t <= price + MAX.
+    let first = price.div_ceil(min_denom) * min_denom;
+    let till_cost: Vec<(u64, u64)> = (0..)
+        .map(|i| first + i * min_denom)
+        .take_while(|t| *t <= price + MAX_TILL_OVERPAY)
+        .map(|t| (t - price, t + fee_sum(&binary(t), fee)))
         .collect();
-    let min_till = till_cost.iter().copied().min().expect("non-empty");
+    let Some(min_till) = till_cost.iter().map(|c| c.1).min() else {
+        return Err(PlanError::NoExactPlan { price, free_slots });
+    };
 
-    let n = notes.len();
-    assert!(n <= 20, "a card has at most 16 slots");
     let flat = flat_fee(fee);
     let mut budget = BUDGET;
     let mut best: Option<(usize, usize, u64, Vec<usize>)> = None; // (change notes, inputs, overpay, indices)
@@ -230,7 +278,7 @@ pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn) -> Result
             let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
             if let Some(avail) = gross.checked_sub(in_fees) {
                 if avail >= min_till {
-                    for (o, tc) in till_cost.iter().enumerate() {
+                    for (o, tc) in &till_cost {
                         let Some(r) = avail.checked_sub(*tc) else { continue };
                         if budget == 0 {
                             break 'sizes;
@@ -240,15 +288,15 @@ pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn) -> Result
                             None => free_slots,
                         };
                         budget = budget.saturating_sub(1 + if flat.is_some() { 0 } else { 64 });
-                        let Some(change) = min_notes(r, cap, fee) else { continue };
-                        let cand = (change.len(), size, o as u64);
+                        let Some(change) = min_notes(r, cap, fee, min_denom) else { continue };
+                        let cand = (change.len(), size, *o);
                         let better = match &best {
                             None => true,
                             Some((cc, ni, ov, _)) => cand < (*cc, *ni, *ov),
                         };
                         if better {
                             first_feasible_size.get_or_insert(size);
-                            best = Some((change.len(), size, o as u64, idx.clone()));
+                            best = Some((change.len(), size, *o, idx.clone()));
                         }
                     }
                 }
@@ -267,8 +315,8 @@ pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn) -> Result
     let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
     let till = binary(price + overpay);
     let r = gross - in_fees - (price + overpay) - fee_sum(&till, fee);
-    let change = min_notes(r, free_slots, fee).expect("found during search");
-    Ok(Plan { inputs: idx, till, change, overpay })
+    let change = min_notes(r, free_slots, fee, min_denom).expect("found during search");
+    Ok(Plan { inputs: idx, till, change, overpay, dust: min_denom == 1 })
 }
 
 impl Plan {
@@ -296,8 +344,13 @@ mod tests {
         100 + a * 1000 / 1_000_000
     }
 
+    /// What `FeeConsensus::min_economical_denomination` returns for these schedules.
+    fn min_econ(fee: FeeFn) -> u64 {
+        (fee(0) * 4).next_power_of_two()
+    }
+
     fn check(notes: &[u64], price: u64, free: usize, fee: FeeFn) -> Plan {
-        let p = solve(notes, price, free, fee).expect("plan");
+        let p = solve(notes, price, free, fee, min_econ(fee)).expect("plan");
         assert!(p.balances(notes, fee), "unbalanced: {p:?}");
         assert!(p.change.len() <= free);
         assert!(p.overpay <= MAX_TILL_OVERPAY);
@@ -347,10 +400,10 @@ mod tests {
         let p = check(&notes, 1 << 19, 1, &zero);
         assert_eq!(p.change.len(), 1);
         // 948_576 msat of change is not one note and the till can absorb at most 2048.
-        let r = solve(&notes, 100_000, 1, &zero);
+        let r = solve(&notes, 100_000, 1, &zero, 1);
         assert!(matches!(r, Err(PlanError::NoExactPlan { .. })), "{r:?}");
         // No slots, no change: only an exact match works.
-        let r = solve(&notes, 100_000, 0, &zero);
+        let r = solve(&notes, 100_000, 0, &zero, 1);
         assert!(matches!(r, Err(PlanError::NoExactPlan { .. })), "{r:?}");
         assert_eq!(check(&[1 << 20], 1 << 20, 0, &zero).change.len(), 0);
     }
@@ -366,10 +419,10 @@ mod tests {
 
     #[test]
     fn insufficient_funds() {
-        let r = solve(&[1024], 5000, 4, &base100);
+        let r = solve(&[1024], 5000, 4, &base100, 512);
         assert!(matches!(r, Err(PlanError::Insufficient { .. })));
         // Enough for the price but not for the fees.
-        let r = solve(&[1024], 1000, 4, &base100);
+        let r = solve(&[1024], 1000, 4, &base100, 512);
         assert!(matches!(r, Err(PlanError::Insufficient { .. })), "{r:?}");
     }
 
@@ -393,26 +446,26 @@ mod tests {
     fn cashout_is_exact_and_minimal() {
         for fee in [&zero as FeeFn, &base100, &ppm1000] {
             for a in [1u64 << 20, 1 << 17, 1 << 9, 1 << 12] {
-                let outs = cashout(a, fee).expect("cashout");
+                let (outs, _dust) = cashout(a, fee, min_econ(fee)).expect("cashout");
                 assert_eq!(a, outs.iter().sum::<u64>() + fee(a) + fee_sum(&outs, fee), "a={a}");
                 assert!(outs.iter().all(|x| x.is_power_of_two()));
             }
         }
         // zero fee: the whole note comes back as one note
-        assert_eq!(cashout(1 << 20, &zero), Some(vec![1 << 20]));
+        assert_eq!(cashout(1 << 20, &zero, 1), Some((vec![1 << 20], false)));
         // a note that cannot pay its fee
-        assert_eq!(cashout(64, &base100), None);
+        assert_eq!(cashout(64, &base100, 512), None);
     }
 
     #[test]
     fn min_notes_edge_cases() {
-        assert_eq!(min_notes(0, 4, &base100), Some(vec![]));
-        assert_eq!(min_notes(100, 4, &base100), None); // one note would be 0 msat
-        assert_eq!(min_notes(101, 4, &base100), Some(vec![1]));
-        assert_eq!(min_notes(7, 3, &zero), Some(vec![4, 2, 1]));
-        assert_eq!(min_notes(7, 2, &zero), None);
+        assert_eq!(min_notes(0, 4, &base100, 1), Some(vec![]));
+        assert_eq!(min_notes(100, 4, &base100, 1), None); // one note would be 0 msat
+        assert_eq!(min_notes(101, 4, &base100, 1), Some(vec![1]));
+        assert_eq!(min_notes(7, 3, &zero, 1), Some(vec![4, 2, 1]));
+        assert_eq!(min_notes(7, 2, &zero, 1), None);
         // splitting: 8 msat in 4 notes
-        assert_eq!(min_notes(8, 4, &zero).map(|v| v.len()), Some(1));
+        assert_eq!(min_notes(8, 4, &zero, 1).map(|v| v.len()), Some(1));
     }
 
     #[test]
@@ -431,10 +484,39 @@ mod tests {
                 let notes: Vec<u64> = (0..n).map(|_| 1u64 << (10 + next() % 12)).collect();
                 let total: u64 = notes.iter().sum();
                 let price = 1 + next() % (total / 2);
-                if let Ok(p) = solve(&notes, price, 16, fee) {
+                if let Ok(p) = solve(&notes, price, 16, fee, min_econ(fee)) {
                     assert!(p.balances(&notes, fee), "{notes:?} {price} {p:?}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn dust_free_plan_when_the_fee_allows_it() {
+        // Zero fees but a 512 msat floor: every output is a multiple of 512, and the overpay
+        // absorbs the 352 msat that the price is short of one.
+        let p = solve(&[1 << 20], 100_000, 16, &zero, 512).unwrap();
+        assert!(!p.dust);
+        assert!(p.till.iter().chain(&p.change).all(|a| *a >= 512), "{p:?}");
+        assert_eq!(p.overpay, 352);
+        assert!(p.balances(&[1 << 20], &zero));
+    }
+
+    #[test]
+    fn base_fee_forces_dust_and_says_so() {
+        // 100 msat per item is never a multiple of 512, so a dust-free exact balance is
+        // arithmetically impossible; the planner falls back to small tiers and flags it.
+        let notes = [1u64 << 20];
+        let p = solve(&notes, 100_000, 16, &base100, 512).unwrap();
+        assert!(p.dust);
+        assert!(p.balances(&notes, &base100));
+        // And the strict search alone finds nothing.
+        assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512), Err(PlanError::NoExactPlan { .. })));
+    }
+
+    #[test]
+    fn too_many_notes_is_an_error_not_a_panic() {
+        let notes = vec![1024u64; 21];
+        assert!(matches!(solve(&notes, 1000, 4, &zero, 1), Err(PlanError::TooManyNotes(21))));
     }
 }

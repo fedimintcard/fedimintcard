@@ -8,9 +8,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use fedimint_card_host_card::open_from_env;
-use fedimint_card_sidecar::glue::{CardWallet, nonce_for, on_card};
+use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, nonce_for, on_card};
 use fedimint_card_sidecar::plan;
-use fedimint_card_sidecar::state::{NoteStatus, StateStore};
+use fedimint_card_sidecar::state::{HostKind, NoteStatus, StateStore};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
@@ -132,8 +132,18 @@ async fn spend_exact(fees: bool) -> anyhow::Result<()> {
     let r = f.cw.spend(price).await?;
     let ins: u64 = r.inputs.iter().map(|(_, a)| a).sum();
     let change: u64 = r.change.iter().map(|(_, a)| a).sum();
-    // Exact balance: inputs == till + change + fees, to the msat. The federation enforces it.
-    assert_eq!(ins, r.till_msat + change + r.fees_msat, "{r:?}");
+    // Exact balance, with the fees recomputed here from the federation's fee consensus, one item
+    // at a time, and not taken from the planner: every input and every output pays its own fee.
+    let fc = &f.cw.wallet.mint_cfg.fee_consensus;
+    let item = |a: u64| fc.fee(Amount::from_msats(a)).msats;
+    let till_notes: Vec<u64> = (0..64).filter(|b| r.till_msat >> b & 1 == 1).map(|b| 1u64 << b).collect();
+    let fees_here: u64 = r.inputs.iter().map(|(_, a)| item(*a)).sum::<u64>()
+        + till_notes.iter().map(|a| item(*a)).sum::<u64>()
+        + r.change.iter().map(|(_, a)| item(*a)).sum::<u64>();
+    let n_items = (r.inputs.len() + till_notes.len() + r.change.len()) as u64;
+    assert_eq!(fees_here, if fees { 100 * n_items } else { 0 });
+    assert_eq!(ins, r.till_msat + change + fees_here, "{r:?}");
+    assert_eq!(r.fees_msat, fees_here);
     assert!(r.overpay_msat <= plan::MAX_TILL_OVERPAY);
     assert_eq!(r.till_msat, price + r.overpay_msat);
     if fees {
@@ -210,35 +220,43 @@ async fn cashout_produces_ecash_the_stock_client_reissues() -> anyhow::Result<()
     let slot = f.cw.store.state.live_notes()[0].slot;
 
     let r = f.cw.cashout(slot).await?;
-    // 2^18 minus the input fee and the output fees, exactly.
-    let fee = |a: u64| f.cw.wallet.fee(a);
-    let oob = OOBNotes::from_str(&r.ecash).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let face = oob.total_amount().msats;
-    let outs: Vec<u64> = oob.notes().iter_items().map(|(a, _)| a.msats).collect();
-    assert_eq!(face, r.face_msat);
-    assert_eq!(1u64 << 18, face + fee(1 << 18) + plan::fee_sum(&outs, &fee));
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!r.collection_pending);
+    let ecash = r.ecash.clone().expect("ecash string");
+    // Nothing is left half-done on the host, and the note is gone from the card.
     assert_eq!(f.cw.store.state.live_total_msat(), 0);
     assert!(f.cw.store.state.host_pending.is_empty());
+    assert!(f.cw.store.state.pending_txs.is_empty());
+
+    // The string is made of exactly-denominated notes worth what the report says.
+    let oob = OOBNotes::from_str(&ecash).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let face = oob.total_amount().msats;
+    assert_eq!(face, r.exported_msat);
+    assert!(face <= r.gained_msat && r.gained_msat - face < 2_000, "{face} of {}", r.gained_msat);
+    assert!(face + 2 * 6_000 > 1 << 18, "most of the note arrives: {face}");
 
     // An independent client with a fresh database reissues the string with the stock code path.
     let other = f.fed.new_client().await;
     let other = Wallet::from_client(other).await?;
     other.mint()?.validate_notes(&oob)?;
-    let got = other.import(&r.ecash).await?;
-    assert_eq!(got.msats, face);
-    // Balance lags Done slightly; it ends within the reissue fees of the face value.
+    let imp = other.import(&ecash).await?;
+    assert_eq!(imp.face.msats, face);
+    // Independent lower bound on that client's own reissue fees: one input fee per note.
+    let fc = &other.mint_cfg.fee_consensus;
+    let input_fees: u64 = oob.notes().iter_items().map(|(a, _)| fc.fee(a).msats).sum();
+    assert!(imp.fee_msat >= input_fees, "{} < {input_fees}", imp.fee_msat);
+    // Its balance is the face value minus the fees the client itself reports, to the msat.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let b = other.balance_msat().await?;
-        // The stock reissue pays an input fee per note and drops dust below the economical size.
-        if b + 8_000 >= face {
+        if b + imp.fee_msat == face {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "balance stuck at {b}");
+        assert!(std::time::Instant::now() < deadline, "balance {b} + fees {} != face {face}", imp.fee_msat);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Replaying the string fails: the notes are spent.
-    assert!(other.import(&r.ecash).await.is_err());
+    // Replaying the string is not an error for the importer's second call but cannot pay twice.
+    assert!(other.import(&ecash).await?.already);
     drop(f.fed);
     Ok(())
 }
@@ -319,6 +337,170 @@ async fn spend_fails_cleanly_when_card_cannot_cover_it() -> anyhow::Result<()> {
     let err = f.cw.spend(1 << 20).await.expect_err("insufficient");
     assert!(err.to_string().contains("insufficient"), "{err}");
     assert_eq!(f.cw.store.state.live_total_msat(), 1 << 16, "nothing was touched");
+    drop(f.fed);
+    Ok(())
+}
+
+/// Simulate a restart: new process, same state file, same card.
+fn restart(f: &mut Fx) -> anyhow::Result<()> {
+    f.cw.store = StateStore::open(f.cw.store.path().to_owned())?;
+    f.cw.crash_point = None;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spend_signed_but_not_submitted_is_abandoned() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    let before = f.cw.store.state.live_total_msat();
+
+    f.cw.crash_point = Some(CrashPoint::BeforeSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // The crash left records for a transaction that never left the host.
+    let st = &f.cw.store.state;
+    assert_eq!(st.pending_txs.len(), 1);
+    assert!(!st.pending_txs[0].submitted);
+    assert!(st.notes.iter().any(|n| n.status == NoteStatus::Pending));
+    assert!(!st.host_pending.is_empty());
+
+    restart(&mut f)?;
+    // A new spend refuses to start on top of it until recovery ran; `balance` does the recovery.
+    let b = f.cw.balance().await?;
+    assert_eq!(b.recovered.abandoned, 1);
+    let st = &f.cw.store.state;
+    assert!(st.pending_txs.is_empty() && st.host_pending.is_empty());
+    assert!(!st.notes.iter().any(|n| n.status == NoteStatus::Pending));
+    assert_eq!(st.live_total_msat(), before, "the input note is untouched");
+    // And the card is usable again.
+    f.cw.spend(100_000).await?;
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spend_accepted_but_not_collected_is_collected_by_out_idx() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    let till_before = f.cw.wallet.balance_msat().await?;
+
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // Every pending output knows its index in the transaction.
+    let st = &f.cw.store.state;
+    assert!(st.pending_txs[0].submitted && st.pending_txs[0].accepted);
+    assert!(st.host_pending.iter().all(|h| h.out_idx.is_some()));
+    assert!(st.notes.iter().filter(|n| n.status == NoteStatus::Pending).all(|n| n.out_idx.is_some() && n.txid.is_some()));
+    assert_eq!(st.pending_txs.len(), 1);
+
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert!(b.unresolved.is_empty(), "{:?} {:?}", b.unresolved, b.recovered.errors);
+    assert!(b.recovered.errors.is_empty(), "{:?}", b.recovered.errors);
+    assert!(b.recovered.notes_live >= 1, "change collected");
+    let st = &f.cw.store.state;
+    assert!(st.pending_txs.is_empty() && st.host_pending.is_empty());
+    assert_eq!(st.notes.iter().filter(|n| n.status == NoteStatus::Spent).count(), 1, "input marked spent");
+    // The till notes reached the wallet: face value less the wallet's reported reissue fees.
+    let after = f.cw.wallet.balance_msat().await?;
+    assert_eq!(after - till_before + b.recovered.till_fee, b.recovered.till_received);
+    assert!(b.recovered.till_received >= 100_000);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undecided_submission_is_resubmitted_idempotently() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // Pretend the answer never arrived: submitted, not known to be accepted.
+    f.cw.store.state.pending_txs[0].accepted = false;
+    f.cw.store.save()?;
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert!(b.unresolved.is_empty(), "{:?}", b.recovered.errors);
+    assert!(b.recovered.notes_live >= 1);
+    assert!(b.recovered.till_received >= 100_000);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cashout_interrupted_after_submit_ends_in_the_wallet() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 18]).await?;
+    let slot = f.cw.store.state.live_notes()[0].slot;
+    let wallet_before = f.cw.wallet.balance_msat().await?;
+
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.cashout(slot).await.is_err());
+    // The secret keys of the host notes are on disk, not lost with the process.
+    assert!(!f.cw.store.state.host_pending.is_empty());
+
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert!(b.unresolved.is_empty(), "{:?}", b.recovered.errors);
+    assert!(b.recovered.cashouts.is_empty(), "no string path any more");
+    // Wallet balance rose by the face value minus its own reissue fees as reported by the client.
+    let after = f.cw.wallet.balance_msat().await?;
+    assert_eq!(after - wallet_before + b.recovered.till_fee, b.recovered.till_received);
+    assert!(b.recovered.till_received > (1 << 18) - 1_500, "{}", b.recovered.till_received);
+    assert_eq!(f.cw.store.state.live_total_msat(), 0);
+    // The wallet can now hand the value out with the stock export.
+    let amount = f.cw.wallet.max_exportable(after - wallet_before).await?;
+    let (notes, face) = f.cw.wallet.export(amount, false, true).await?;
+    assert_eq!(notes.total_amount(), face);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_cashout_records_go_to_the_log_before_they_are_removed() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 20]).await?;
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert!(f.cw.spend(100_000).await.is_err());
+    // Rewrite the host records the way an older build left them.
+    for h in &mut f.cw.store.state.host_pending {
+        h.kind = HostKind::Cashout;
+    }
+    f.cw.store.save()?;
+    restart(&mut f)?;
+    let b = f.cw.balance().await?;
+    assert_eq!(b.recovered.cashouts.len(), 1);
+    assert_eq!(f.cw.recovered_cashouts, b.recovered.cashouts, "the CLI prints these");
+    let log = std::fs::read_to_string(f.cw.store.path().with_file_name("cashouts.log"))?;
+    assert!(log.contains(&b.recovered.cashouts[0]));
+    assert!(f.cw.store.state.host_pending.is_empty());
+    // The logged string is real ecash.
+    let other = Wallet::from_client(f.fed.new_client().await).await?;
+    assert!(other.import(&b.recovered.cashouts[0]).await?.face.msats >= 100_000);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_never_rounds_up_silently() -> anyhow::Result<()> {
+    let f = fx(true, Amount::from_sats(10_000)).await?;
+    let w = &f.cw.wallet;
+    assert_eq!(w.min_denom(), 512);
+    assert!(w.export(1_000, false, true).await.is_err(), "1000 is not a multiple of 512");
+    let (notes, face) = w.export(1_000, true, true).await?;
+    assert_eq!(face.msats, 1_024);
+    assert_eq!(notes.total_amount().msats, 1_024);
+    let (notes, face) = w.export(2_048, false, false).await?;
+    assert_eq!(face.msats, 2_048);
+    assert_eq!(notes.total_amount().msats, 2_048);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn topup_rejects_dust_amounts() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let err = f.cw.topup(&[1000]).await.expect_err("not a multiple of 512");
+    assert!(err.to_string().contains("multiples of 512"), "{err}");
     drop(f.fed);
     Ok(())
 }
