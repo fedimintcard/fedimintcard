@@ -65,7 +65,7 @@ final class CardTestSupport {
 
     private Object applet() { return runtime.appletAt(aid); }
 
-    private Object field(String name) throws Exception {
+    Object field(String name) throws Exception {
         Field f = FedimintCardApplet.class.getDeclaredField(name);
         f.setAccessible(true);
         return f.get(applet());

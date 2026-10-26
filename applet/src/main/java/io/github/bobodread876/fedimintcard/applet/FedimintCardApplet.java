@@ -142,7 +142,9 @@ public final class FedimintCardApplet extends Applet {
     private void sendPub(APDU apdu, byte[] buf, short s) {
         short n = pubs[s].getW(tmp, (short) 0);
         // 65 bytes 04||X||Y, or 33 bytes compressed: X is at offset 1 either way.
-        if (n != 65 && n != 33) {
+        boolean okEnc = (n == 65 && tmp[0] == 0x04)
+            || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03));
+        if (!okEnc) {
             ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
         }
         Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) 0, (short) 32);
@@ -159,14 +161,35 @@ public final class FedimintCardApplet extends Applet {
         }
         gen.genKeyPair();
         ECPrivateKey gp = (ECPrivateKey) gen.getPrivate();
-        short len = gp.getS(tmp, (short) 0);
-        privs[s].setS(tmp, (short) 0, len);
-        len = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
-        pubs[s].setW(tmp, (short) 0, len);
-        gp.clearKey();
-        Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
-        // clearKey drops the domain parameters too; restore them for the next genKeyPair.
-        setParams(gp, null);
+        boolean ok = false;
+        try {
+            short len = gp.getS(tmp, (short) 0);
+            // getS may strip leading zero bytes on silicon: right-align to 32 bytes.
+            if (len < 1 || len > 32) {
+                ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+            }
+            if (len < 32) {
+                short pad = (short) (32 - len);
+                for (short i = (short) (len - 1); i >= 0; i--) {
+                    tmp[(short) (pad + i)] = tmp[i];
+                }
+                Util.arrayFillNonAtomic(tmp, (short) 0, pad, (byte) 0);
+            }
+            privs[s].setS(tmp, (short) 0, (short) 32);
+            len = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
+            pubs[s].setW(tmp, (short) 0, len);
+            ok = true;
+        } finally {
+            // The generated scalar must not outlive this call, even on a throw.
+            gp.clearKey();
+            Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+            // clearKey may drop the domain parameters; restore them for the next genKeyPair.
+            setParams(gp, null);
+            if (!ok) {
+                privs[s].clearKey();
+                setParams(privs[s], null);
+            }
+        }
         used[s] = true;
         sendPub(apdu, buf, s);
     }

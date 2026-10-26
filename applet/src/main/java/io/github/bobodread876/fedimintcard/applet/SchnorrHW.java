@@ -178,8 +178,19 @@ final class SchnorrHW {
         sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
 
         // Temp private key slot for k (reused each sign call)
-        tmpPriv = (ECPrivateKey) KeyBuilder.buildKey(
-            KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        // Nonce key k: prefer a transient (RAM, cleared on deselect) key so k never reaches
+        // EEPROM. Fall back to a persistent key if the platform refuses. SILICON MUST BE
+        // CHECKED at step 7 (does the J3R180 accept TYPE_EC_FP_PRIVATE_TRANSIENT_DESELECT?).
+        // Either way sign() calls clearKey() on it as soon as k has been used.
+        ECPrivateKey tp;
+        try {
+            tp = (ECPrivateKey) KeyBuilder.buildKey(
+                KeyBuilder.TYPE_EC_FP_PRIVATE_TRANSIENT_DESELECT, KeyBuilder.LENGTH_EC_FP_256, false);
+        } catch (CryptoException e) {
+            tp = (ECPrivateKey) KeyBuilder.buildKey(
+                KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        }
+        tmpPriv = tp;
         setECParams(tmpPriv, null);
 
         ecdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
@@ -264,6 +275,20 @@ final class SchnorrHW {
      * @return 64 (signature byte length)
      */
     short sign(ECPrivateKey privKey, ECPublicKey pubKey,
+               byte[] msg, short msgOff,
+               byte[] out, short outOff) {
+        try {
+            return signInner(privKey, pubKey, msg, msgOff, out, outOff);
+        } finally {
+            // d, n-d, k and intermediates must not outlive the call, even on a throw.
+            tmpPriv.clearKey();
+            setECParams(tmpPriv, null);
+            Util.arrayFillNonAtomic(sc, (short) 0, (short) sc.length, (byte) 0);
+            Util.arrayFillNonAtomic(work, (short) 0, (short) work.length, (byte) 0);
+        }
+    }
+
+    private short signInner(ECPrivateKey privKey, ECPublicKey pubKey,
                byte[] msg, short msgOff,
                byte[] out, short outOff) {
 
@@ -366,6 +391,7 @@ final class SchnorrHW {
         // A card that frames it otherwise is found out here, at its first
         // signature, and signs nothing.
         short rLen = ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
+        tmpPriv.clearKey();   // k is done with; do not leave it in the key object
         if (rLen != (short)65 || sc[SC_TMP] != (byte)0x04) {
             ISOException.throwIt(SW_CRYPTO_ERROR);
         }

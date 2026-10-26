@@ -44,6 +44,10 @@ CLA `B0`. Applet AID `F0464D4341524401`. Four key slots (P1 = 0..3), P2 = 0.
 | GET_PUB | `11` | none | 32-byte x-only pubkey; `6985` if empty |
 | SIGN | `12` | 32-byte message | 64-byte BIP340 signature; `6985` if empty |
 
+The applet is meant for contactless (T=1 style) use. GEN_KEY and GET_PUB call
+`setIncomingAndReceive` on commands with no data, which may stall on T=0 contact transports;
+step 7 must re-check this on the real card.
+
 Status words: `9000` ok, `6700` wrong length, `6B00` bad P1/P2, `6985` slot state, `6D00`
 unknown INS, `6E00` wrong CLA, `6F00` crypto failure.
 

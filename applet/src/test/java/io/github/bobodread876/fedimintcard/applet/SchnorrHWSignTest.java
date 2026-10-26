@@ -161,4 +161,91 @@ class SchnorrHWSignTest {
             () -> new SchnorrHW(G, P, A, B, wrong).init());
         assertEquals((short) 0x6F00, e.getReason());
     }
+
+    /** Public key wrapper whose getW returns 02/03 || X. */
+    static final class CompressedPub implements ECPublicKey {
+        final ECPublicKey d;
+        CompressedPub(ECPublicKey d) { this.d = d; }
+        public short getW(byte[] b, short o) {
+            byte[] full = new byte[65];
+            d.getW(full, (short) 0);
+            b[o] = (byte) ((full[64] & 1) == 1 ? 3 : 2);
+            System.arraycopy(full, 1, b, o + 1, 32);
+            return 33;
+        }
+        public void setW(byte[] b, short o, short l) { d.setW(b, o, l); }
+        public void setFieldFP(byte[] b, short o, short l) { d.setFieldFP(b, o, l); }
+        public void setFieldF2M(short e) { d.setFieldF2M(e); }
+        public void setFieldF2M(short e1, short e2, short e3) { d.setFieldF2M(e1, e2, e3); }
+        public void setA(byte[] b, short o, short l) { d.setA(b, o, l); }
+        public void setB(byte[] b, short o, short l) { d.setB(b, o, l); }
+        public void setG(byte[] b, short o, short l) { d.setG(b, o, l); }
+        public void setR(byte[] b, short o, short l) { d.setR(b, o, l); }
+        public void setK(short k) { d.setK(k); }
+        public short getField(byte[] b, short o) { return d.getField(b, o); }
+        public short getA(byte[] b, short o) { return d.getA(b, o); }
+        public short getB(byte[] b, short o) { return d.getB(b, o); }
+        public short getG(byte[] b, short o) { return d.getG(b, o); }
+        public short getR(byte[] b, short o) { return d.getR(b, o); }
+        public short getK() { return d.getK(); }
+        public void copyDomainParametersFrom(javacard.security.ECKey s) { d.copyDomainParametersFrom(s); }
+        public boolean isInitialized() { return d.isInitialized(); }
+        public void clearKey() { d.clearKey(); }
+        public byte getType() { return d.getType(); }
+        public short getSize() { return d.getSize(); }
+    }
+
+    @Test
+    void compressedPublicKeySignsForBothParities() {
+        SchnorrHW h = signer();
+        byte[] msg = new byte[32];
+        Arrays.fill(msg, (byte) 0x33);
+        int odd = 0, even = 0;
+        for (BigInteger d : KEYS) {
+            BigInteger[] pt = Bip340.pubkey(d);
+            if (pt[1].testBit(0)) odd++; else even++;
+            ECPublicKey cp = new CompressedPub(pub(d));
+            assertEquals(33, cp.getW(new byte[65], (short) 0));
+            byte[] sig = new byte[64];
+            h.sign(priv(d), cp, msg, (short) 0, sig, (short) 0);
+            assertTrue(Bip340.verify(Bip340.bytes32(pt[0]), msg, sig), "d=" + d.toString(16));
+        }
+        assertTrue(odd > 0 && even > 0);
+    }
+
+    private static Object get(Object o, String name) throws Exception {
+        java.lang.reflect.Field f = o.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(o);
+    }
+
+    /** k must not stay in the key object and d, n-d, k must not stay in the scratchpad. */
+    @Test
+    void signLeavesNoSecretsBehind() throws Exception {
+        SchnorrHW h = signer();
+        BigInteger d = KEYS[5];   // odd-y: sc briefly holds n-d
+        byte[] sig = new byte[64];
+        h.sign(priv(d), pub(d), new byte[32], (short) 0, sig, (short) 0);
+        ECPrivateKey tmp = (ECPrivateKey) get(h, "tmpPriv");
+        assertFalse(tmp.isInitialized(), "nonce key must be cleared after SIGN");
+        for (String f : new String[] { "sc", "work" }) {
+            for (byte b : (byte[]) get(h, f)) assertEquals(0, b, f + " must be zero after sign");
+        }
+    }
+
+    /** Anti-vacuity: the same probes do see a non-zero scratchpad while the secret is live. */
+    @Test
+    void signCleansUpEvenWhenItThrows() throws Exception {
+        SchnorrHW h = signer();
+        BigInteger d = KEYS[5];
+        LyingKey liar = new LyingKey(priv(d), false, (short) 33);
+        assertThrows(ISOException.class,
+            () -> h.sign(liar, pub(d), new byte[32], (short) 0, new byte[64], (short) 0));
+        for (byte b : (byte[]) get(h, "sc")) assertEquals(0, b);
+        // and the probe can fail: dirty sc by hand and see it non-zero
+        ((byte[]) get(h, "sc"))[7] = 1;
+        boolean dirty = false;
+        for (byte b : (byte[]) get(h, "sc")) dirty |= b != 0;
+        assertTrue(dirty);
+    }
 }

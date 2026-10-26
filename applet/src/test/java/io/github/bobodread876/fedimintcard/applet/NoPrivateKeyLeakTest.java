@@ -32,11 +32,16 @@ class NoPrivateKeyLeakTest {
     void sweepsLeakNothing() throws Exception {
         CardTestSupport c = new CardTestSupport();
         List<byte[]> secrets = new ArrayList<>();
+        List<byte[]> genWire = new ArrayList<>();
         for (int s = 0; s < 4; s++) {
-            c.genKey(s);
+            genWire.add(wire(c.tx(CardTestSupport.GEN_KEY, s, null)));
             BigInteger d = c.scalar(s);
             secrets.add(Bip340.bytes32(d));
             secrets.add(Bip340.bytes32(Bip340.N.subtract(d)));
+        }
+        for (byte[] w : genWire) {
+            assertEquals(34, w.length);
+            assertFalse(leaks(w, secrets), "GEN_KEY response leaked the scalar");
         }
         int checked = 0;
         // Full INS sweep with a small matrix.
@@ -69,6 +74,34 @@ class NoPrivateKeyLeakTest {
             }
         }
         assertTrue(checked > 1200, "sweep size " + checked);
+    }
+
+    /** Same sweep on a fresh card with empty slots; keys that appear mid-sweep are checked as they appear. */
+    @Test
+    void sweepOnFreshCardLeaksNothing() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        int checked = 0;
+        for (int ins = 0; ins < 256; ins++) {
+            for (int p1 : new int[] { 0, 1, 4 }) {
+                for (int len : new int[] { 0, 32 }) {
+                    ResponseAPDU r = c.tx(0xB0, ins, p1, 0, new byte[len]);
+                    List<byte[]> secrets = new ArrayList<>();
+                    for (int s = 0; s < 4; s++) {
+                        try {
+                            BigInteger d = c.scalar(s);
+                            if (d.signum() == 0) continue;
+                            secrets.add(Bip340.bytes32(d));
+                            secrets.add(Bip340.bytes32(Bip340.N.subtract(d)));
+                        } catch (RuntimeException e) {
+                            // slot has no key yet
+                        }
+                    }
+                    assertFalse(leaks(wire(r), secrets), "INS " + ins + " P1 " + p1 + " len " + len);
+                    checked++;
+                }
+            }
+        }
+        assertTrue(checked > 1500);
     }
 
     /** The only INS values the applet answers (with CLA B0) are exactly 0x10, 0x11 and 0x12. */

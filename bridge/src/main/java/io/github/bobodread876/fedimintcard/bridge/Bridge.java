@@ -20,7 +20,7 @@ public final class Bridge {
 
     public Bridge(int port, boolean fixedKeys) throws IOException {
         card = new SimCard(fixedKeys);
-        server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0);
+        server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 0);
         server.setExecutor(Executors.newSingleThreadExecutor());
         server.createContext("/", this::route);
     }
@@ -56,7 +56,12 @@ public final class Bridge {
                     send(ex, 404, Json.error("not found"));
             }
         } catch (RuntimeException e) {
-            send(ex, 500, Json.error("internal error"));
+            try {
+                send(ex, 500, Json.error("internal error"));
+            } catch (IOException | RuntimeException again) {
+                // headers may already have been sent; nothing more to do but drop the exchange
+                ex.close();
+            }
         }
     }
 
