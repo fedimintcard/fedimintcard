@@ -36,7 +36,7 @@ CARD_BACKEND=pcsc [CARD_PCSC_READER=name] cargo test --workspace --features fedi
 ```
 
 Bridge wire format: `POST /apdu` `{"apdu":"<hex>"}` -> `{"response":"<hex data||SW>"}`; `POST /reset`; `GET /health`.
-`bridge_roundtrip_when_configured` runs only if `CARD_BRIDGE_URL` is set. Tests use slots 0 and 1 and create keys on demand (`get_or_gen`), so they work against a persistent card.
+Verified against the Java bridge from spike/applet (`bridge.jar --port N`): the whole workspace passes with `CARD_BACKEND=bridge`, and `card_roundtrip` passed 20/20 loops. `bridge_roundtrip_when_configured` runs only if `CARD_BRIDGE_URL` is set. Tests use slots 0 and 1 and create keys on demand (`get_or_gen`), so they work against a persistent card.
 
 ## Findings (step 5 transaction)
 
