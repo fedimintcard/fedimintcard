@@ -70,8 +70,10 @@ and SchnorrHW's `reduceModN`, `cmp32`, `sub32`):
     P_i = d_i * G
 
 `GET_PUB(i)` returns the x-only `P_i`. Indices are allocated by the card only (`ALLOC(k)`
-returns the next `k` indices from a monotonic counter) and never reused; the counter is the
-proof, and each live note or pool entry carries one state byte. The phone never chooses an index, which closes the nonce
+returns the next `k` indices from a monotonic counter) and never reused. The card keeps the
+outstanding `ALLOC` ranges as a small list of allocated-but-unbound indices; `NOTE_ADD` and
+`POOL_ADD` must take their index from that list and remove it, so a phone cannot bind a new
+note or pool entry to an index that has already been a nonce on the federation. The phone never chooses an index, which closes the nonce
 collision that would make a change note unspendable (the federation's spent set is keyed by
 nonce). The card stores `x(P_i)` with each note so a spend does not need a 125 ms point
 multiplication to check that the input's nonce is its own. Each `SIGN` loads `d_i` into the
@@ -107,18 +109,24 @@ expressed. A pool entry is 2 + 8 + 48 = 58 bytes.
 
     SIGN_BEGIN(amount_msat)                         opens a session; PIN or limits apply
     BALANCE                                         the note list, only inside a session
-    POOL_TAKE(remainder_msat)                       one entry per set bit of the remainder, with a slot number each
+    POOL_TAKE(input indices)                        the card computes remainder = inputs - amount - fee and
+                                                    returns one entry per set bit, with a slot number each
     SIGN_DATA(chunk)...                             the consensus encoding of inputs, outputs, nonce
     SIGN_END(slot hints)                            returns one signature per card input, or refuses
 
-A session that ends without `SIGN_END`, or whose `SIGN_END` refuses, retires every pool entry
-it revealed: the card marks them dead and logs them so the phone replaces them. Revealing an
-entry is therefore as final as spending it. This closes the skimmer who opens a free session,
+`POOL_TAKE` marks each entry it returns as revealed, and logs it, in one atomic write before
+the response leaves the card; the card cannot see a session end, since a field drop is just a
+loss of power. `SIGN_END`'s commit turns the matched entries from revealed to consumed; every
+other revealed entry is dead, and the phone replaces it at sync. Revealing an entry is
+therefore as final as spending it. This closes the skimmer who opens a free session,
 reads the pool, and submits the blinded messages as dust outputs on the federation (v1 would
 then refuse the holder's real change). The failure mode becomes "pool runs dry, card refuses",
 which fails closed, and the phone checks pool liveness at sync anyway. Each opened session
-also counts a fixed step against the cumulative limit, so a skimmer cannot drain the pool by
-opening sessions in a loop. A no-PIN session does expose the note list to whoever opened it;
+also counts a fixed step against the cumulative limit, refunded when the session reaches a
+successful `SIGN_END`, so honest taps cost nothing and a skimmer loop is bounded. Because the
+card computes the remainder from inputs it really holds, a session can reveal at most one
+entry per set bit of a real remainder; a skimmer can still run the pool dry over several
+sessions, which is denial of service until the next sync, not theft. A no-PIN session does expose the note list to whoever opened it;
 that is the privacy cost of no-PIN taps and is stated to the holder.
 
 The till picks the card inputs (one, or several if no single note covers the amount), builds
@@ -269,7 +277,9 @@ must fit the commit buffer.
 - **Lost phone.** Restored from the seed: `m`, every `bk_j` and the owner key come back; the
   change still on the federation is found with the recovery-by-blinded-message endpoints.
 - **Malicious till.** Covered by checks 1-6, the atomic commit, the cumulative limits, and the
-  cancel-by-reissue rule for unsubmitted transactions.
+  cancel-by-reissue rule for unsubmitted transactions. What remains is denial of service: a
+  reader can open sessions and run the pool dry within the step budget, after which the card
+  refuses change until the phone syncs.
 - **Privacy.** `BALANCE` and pool entries are visible only inside a session, and a no-PIN
   session can be opened by any reader within the no-PIN limit; revealed pool entries are
   retired, but the note list is seen. A till learns the notes it spends, as any payee does.
@@ -325,7 +335,7 @@ it can be a module later; the design does not depend on it.
 | # | Milestone | Done when |
 |---|---|---|
 | 1 | Wire spec frozen: APDUs, parse tables for v1 and v2, the atomic write set, limits semantics | written, with differential tests of the Java parser against fedimint's decoder for both modules |
-| 2 | Applet v1: derived keys, note list, pool, session `SIGN` with parse and on-card fees, owner commands (ECDSA), PIN, cumulative limits | jCardSim tests for every check, including a till that tries each cheat in this note; tearing tests; installed, timed and memory-measured on the J3R180 |
+| 2 | Applet v1: derived keys, note list, pool, session `SIGN` with parse and on-card fees, owner commands (ECDSA), PIN, cumulative limits | jCardSim tests for every check, including a till that tries each cheat in this note; tearing tests (including a field drop right after `POOL_TAKE`); installed, timed and memory-measured on the J3R180 |
 | 3 | Phone library: issue, pool, spend build, consolidate, top-up, sync, sweep, both modules | federation tests end to end for v1 and v2: fund card, spend at a till, sync change, spend the change; cancel an unsubmitted transaction; restore phone from seed and sync again |
 | 4 | Till app (laptop and Android) | a card pays a till over NFC against a test federation; every cheat refused |
 | 5 | Sidecar phone app for the Fedi demo | live demo: Fedi balance to card to till and change back |
@@ -344,5 +354,5 @@ was run.
 4. The ppm fee term needs 64-bit multiply and divide on a 16-bit VM; cheap to implement, but
    confirm the cost on silicon.
 5. Is 64 notes and 64 pool entries enough for daily use between syncs? Measure after install.
-6. The session step against the cumulative limit: how large, so that honest retries are not
-   penalised but a skimmer loop is?
+6. The session step against the cumulative limit: how large, given it is refunded on success,
+   so that an NFC drop and retry is cheap but a skimmer loop is bounded?
