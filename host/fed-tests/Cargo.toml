@@ -1,0 +1,22 @@
+[package]
+name = "fedimint-card-fed-tests"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-dummy-client = { workspace = true }
+fedimint-dummy-common = { workspace = true }
+fedimint-dummy-server = { workspace = true }
+fedimint-mintv2-client = { workspace = true }
+fedimint-mintv2-common = { workspace = true }
+fedimint-mintv2-server = { workspace = true }
+fedimint-testing = { workspace = true }
+tbs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
