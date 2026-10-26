@@ -43,9 +43,9 @@ fn soft_card_slot_semantics() {
     assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985), "no overwrite");
     let b = c.gen_key(1).unwrap();
     assert_ne!(a, b);
-    assert_eq!(status_word(&c.gen_key(16).unwrap_err()), Some(0x6B00), "slot out of range");
-    assert_eq!(status_word(&c.gen_key_overwrite(16).unwrap_err()), Some(0x6B00), "overwrite out of range");
-    assert!(c.gen_key(15).is_ok(), "slot 15 exists");
+    assert_eq!(status_word(&c.gen_key(8).unwrap_err()), Some(0x6B00), "slot out of range");
+    assert_eq!(status_word(&c.gen_key_overwrite(8).unwrap_err()), Some(0x6B00), "overwrite out of range");
+    assert!(c.gen_key(7).is_ok(), "slot 7 exists");
 }
 
 #[test]

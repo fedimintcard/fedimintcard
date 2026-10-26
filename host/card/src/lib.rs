@@ -18,7 +18,7 @@ pub mod pcsc_backend;
 pub use bridge::BridgeTransport;
 
 /// Number of key slots on the applet.
-pub const SLOTS: u8 = 16;
+pub const SLOTS: u8 = 8;
 /// Status word the applet answers for an empty slot (or an occupied slot on GEN_KEY).
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 

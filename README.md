@@ -37,7 +37,7 @@ key every time).
 
 ## APDUs
 
-CLA `B0`. Applet AID `F0464D4341524401`. Sixteen key slots (P1 = 0..15). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
+CLA `B0`. Applet AID `F0464D4341524401`. Eight key slots (P1 = 0..7). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
 
 | Command | INS | Data | Response |
 |---|---|---|---|

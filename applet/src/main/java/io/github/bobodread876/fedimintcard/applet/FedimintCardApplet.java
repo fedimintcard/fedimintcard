@@ -29,7 +29,7 @@ public final class FedimintCardApplet extends Applet {
     static final byte INS_GEN_KEY = (byte) 0x10;
     static final byte INS_GET_PUB = (byte) 0x11;
     static final byte INS_SIGN = (byte) 0x12;
-    static final short SLOTS = 16;
+    static final short SLOTS = 8;
 
     private static final byte[] P = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,

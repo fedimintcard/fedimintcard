@@ -21,7 +21,7 @@ class GenKeyGetPubTest {
     @Test
     void pubkeyIsScalarTimesG() throws Exception {
         CardTestSupport c = new CardTestSupport();
-        for (int s = 0; s < 16; s++) {
+        for (int s = 0; s < 8; s++) {
             byte[] pub = c.genKey(s);
             BigInteger d = c.scalar(s);
             assertTrue(d.signum() > 0 && d.compareTo(Bip340.N) < 0);
@@ -34,8 +34,8 @@ class GenKeyGetPubTest {
     void sixteenSlotsGiveSixteenDistinctKeys() {
         CardTestSupport c = new CardTestSupport();
         Set<String> seen = new HashSet<>();
-        for (int s = 0; s < 16; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
-        assertEquals(16, seen.size());
+        for (int s = 0; s < 8; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
+        assertEquals(8, seen.size());
     }
 
     @Test
@@ -49,7 +49,7 @@ class GenKeyGetPubTest {
     @Test
     void getPubOnEmptySlotIsRefused() {
         CardTestSupport c = new CardTestSupport();
-        for (int s = 0; s < 16; s++) assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, s, null));
+        for (int s = 0; s < 8; s++) assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, s, null));
         c.genKey(1);
         assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
     }
@@ -130,9 +130,9 @@ class GenKeyGetPubTest {
     @Test
     void overwriteOnEmptySlotWorks() {
         CardTestSupport c = new CardTestSupport();
-        ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 12, 1, null);
+        ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 6, 1, null);
         assertSw(0x9000, r);
-        assertArrayEquals(r.getData(), c.getPub(12));
+        assertArrayEquals(r.getData(), c.getPub(6));
     }
 
     @Test
