@@ -2295,6 +2295,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fedimint-api-client",
+ "fedimint-card-host-card",
  "fedimint-client",
  "fedimint-core",
  "fedimint-dummy-client",
@@ -2305,6 +2306,7 @@ dependencies = [
  "fedimint-mintv2-server",
  "fedimint-tbs",
  "fedimint-testing",
+ "serde_json",
  "tokio",
  "tracing",
 ]
