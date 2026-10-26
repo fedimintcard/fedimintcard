@@ -1,0 +1,48 @@
+[package]
+name = "fedimint-card-sidecar"
+description = "Card wallet CLI: holds Fedimint mint v1 notes on a JavaCard's spend keys"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[features]
+default = []
+# PC/SC card reader backend (CARD_BACKEND=pcsc).
+pcsc = ["fedimint-card-host-card/pcsc"]
+
+[lib]
+name = "fedimint_card_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "card-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+fedimint-api-client = { workspace = true }
+fedimint-bip39 = { workspace = true }
+fedimint-card-host-card = { path = "../card" }
+fedimint-client = { workspace = true }
+fedimint-connectors = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-mint-common = { workspace = true }
+fedimint-rocksdb = { workspace = true }
+futures = "0.3"
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tbs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+fedimint-dummy-client = { workspace = true }
+fedimint-dummy-server = { workspace = true }
+fedimint-mint-server = { workspace = true }
+fedimint-testing = { workspace = true }
+tempfile = "3"

@@ -2325,6 +2325,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-card-sidecar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fedimint-api-client",
+ "fedimint-bip39",
+ "fedimint-card-host-card",
+ "fedimint-client",
+ "fedimint-connectors",
+ "fedimint-core",
+ "fedimint-dummy-client",
+ "fedimint-dummy-server",
+ "fedimint-mint-client",
+ "fedimint-mint-common",
+ "fedimint-mint-server",
+ "fedimint-rocksdb",
+ "fedimint-tbs",
+ "fedimint-testing",
+ "futures",
+ "hex",
+ "qrcode",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fedimint-client"
 version = "0.13.0-beta.1"
 source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0-beta.1#f9dccb6656cdad6760d6ed4bc33da585ca87a32a"
@@ -3078,6 +3108,30 @@ dependencies = [
  "fedimint-tbs",
  "serde",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-mint-server"
+version = "0.13.0-beta.1"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0-beta.1#f9dccb6656cdad6760d6ed4bc33da585ca87a32a"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-logging",
+ "fedimint-metrics",
+ "fedimint-mint-common",
+ "fedimint-server-core",
+ "fedimint-tbs",
+ "fedimint-threshold-crypto",
+ "futures",
+ "itertools 0.14.0",
+ "rand 0.8.5",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
  "tracing",
 ]
 
