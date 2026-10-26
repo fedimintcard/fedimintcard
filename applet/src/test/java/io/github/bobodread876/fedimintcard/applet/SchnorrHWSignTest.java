@@ -227,7 +227,14 @@ class SchnorrHWSignTest {
         byte[] sig = new byte[64];
         h.sign(priv(d), pub(d), new byte[32], (short) 0, sig, (short) 0);
         ECPrivateKey tmp = (ECPrivateKey) get(h, "tmpPriv");
-        assertFalse(tmp.isInitialized(), "nonce key must be cleared after SIGN");
+        if ((Boolean) get(h, "tmpTransient")) {
+            assertFalse(tmp.isInitialized(), "transient nonce key must be cleared after SIGN");
+        } else {
+            byte[] sBuf = new byte[32];
+            assertEquals(32, tmp.getS(sBuf, (short) 0));
+            assertArrayEquals((byte[]) get(h, "kWipe"), sBuf, "persistent nonce key must hold the non-secret wipe value");
+            assertEquals(1, sBuf[31]);
+        }
         for (String f : new String[] { "sc", "work" }) {
             for (byte b : (byte[]) get(h, f)) assertEquals(0, b, f + " must be zero after sign");
         }
@@ -247,5 +254,54 @@ class SchnorrHWSignTest {
         boolean dirty = false;
         for (byte b : (byte[]) get(h, "sc")) dirty |= b != 0;
         assertTrue(dirty);
+    }
+
+    private static byte[] runAlign(byte[] in, int len) {
+        byte[] b = Arrays.copyOf(in, 40);
+        SchnorrHW.alignScalar(b, (short) 0, (short) len);
+        return Arrays.copyOf(b, 32);
+    }
+
+    @Test
+    void alignScalarLengths() {
+        byte[] v = new byte[40];
+        for (int i = 0; i < 40; i++) v[i] = (byte) (i + 1);
+        for (int len : new int[] { 1, 30, 31, 32 }) {
+            byte[] in = new byte[40];
+            System.arraycopy(v, 0, in, 0, len);
+            byte[] out = runAlign(in, len);
+            byte[] want = new byte[32];
+            System.arraycopy(v, 0, want, 32 - len, len);
+            assertArrayEquals(want, out, "len " + len);
+        }
+        byte[] in33 = new byte[40];
+        System.arraycopy(v, 0, in33, 1, 32);   // 00 || 32 bytes
+        assertArrayEquals(Arrays.copyOf(v, 32), runAlign(in33, 33), "33 with leading 00");
+        byte[] bad33 = Arrays.copyOf(v, 40);   // leading 0x01
+        for (int len : new int[] { 0, 34, 33 }) {
+            byte[] in = len == 33 ? bad33 : v;
+            ISOException e = assertThrows(ISOException.class, () -> runAlign(in, len), "len " + len);
+            assertEquals((short) 0x6F00, e.getReason());
+        }
+    }
+
+    @Test
+    void signAcceptsLeadingZeroThirtyThreeByteScalar() {
+        SchnorrHW h = signer();
+        BigInteger d = KEYS[4];
+        ECPrivateKey real = priv(d);
+        ECPrivateKey padded = new LyingKey(real, false, (short) 33) {
+            @Override public short getS(byte[] b, short o) {
+                byte[] full = new byte[32];
+                real.getS(full, (short) 0);
+                b[o] = 0;
+                System.arraycopy(full, 0, b, o + 1, 32);
+                return 33;
+            }
+        };
+        byte[] msg = new byte[32];
+        byte[] sig = new byte[64];
+        h.sign(padded, pub(d), msg, (short) 0, sig, (short) 0);
+        assertTrue(Bip340.verify(Bip340.bytes32(Bip340.pubkey(d)[0]), msg, sig));
     }
 }

@@ -159,25 +159,16 @@ public final class FedimintCardApplet extends Applet {
         if (used[s]) {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
-        gen.genKeyPair();
         ECPrivateKey gp = (ECPrivateKey) gen.getPrivate();
         boolean ok = false;
         try {
+            gen.genKeyPair();
             short len = gp.getS(tmp, (short) 0);
-            // getS may strip leading zero bytes on silicon: right-align to 32 bytes.
-            if (len < 1 || len > 32) {
-                ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
-            }
-            if (len < 32) {
-                short pad = (short) (32 - len);
-                for (short i = (short) (len - 1); i >= 0; i--) {
-                    tmp[(short) (pad + i)] = tmp[i];
-                }
-                Util.arrayFillNonAtomic(tmp, (short) 0, pad, (byte) 0);
-            }
+            // getS may strip leading zeros or add one on silicon: normalise to 32 bytes.
+            SchnorrHW.alignScalar(tmp, (short) 0, len);
             privs[s].setS(tmp, (short) 0, (short) 32);
-            len = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
-            pubs[s].setW(tmp, (short) 0, len);
+            short wl = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
+            pubs[s].setW(tmp, (short) 0, wl);
             ok = true;
         } finally {
             // The generated scalar must not outlive this call, even on a throw.

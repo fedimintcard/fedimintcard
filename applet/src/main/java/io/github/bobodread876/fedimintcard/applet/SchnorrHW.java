@@ -144,6 +144,8 @@ final class SchnorrHW {
     private final MessageDigest sha256;
     private final KeyAgreement  ecdh;      // ALG_EC_SVDP_DH_PLAIN_XY
     private final ECPrivateKey  tmpPriv;   // reused temp key for k
+    private final boolean       tmpTransient; // true when tmpPriv is a transient-deselect key
+    private final byte[]        kWipe;     // fixed non-secret scalar (0..01) that overwrites k on the persistent path
     private final RandomData    rng;       // BIP-340 auxiliary randomness (step 2)
     // NB: there is deliberately no ECPublicKey for the generator. R = k*G is
     // computed by handing the raw 65-byte G to generateSecret(), so a key object
@@ -183,14 +185,19 @@ final class SchnorrHW {
         // CHECKED at step 7 (does the J3R180 accept TYPE_EC_FP_PRIVATE_TRANSIENT_DESELECT?).
         // Either way sign() calls clearKey() on it as soon as k has been used.
         ECPrivateKey tp;
+        boolean transientKey = true;
         try {
             tp = (ECPrivateKey) KeyBuilder.buildKey(
                 KeyBuilder.TYPE_EC_FP_PRIVATE_TRANSIENT_DESELECT, KeyBuilder.LENGTH_EC_FP_256, false);
         } catch (CryptoException e) {
             tp = (ECPrivateKey) KeyBuilder.buildKey(
                 KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+            transientKey = false;
         }
         tmpPriv = tp;
+        tmpTransient = transientKey;
+        kWipe = new byte[32];
+        kWipe[31] = (byte) 1;
         setECParams(tmpPriv, null);
 
         ecdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
@@ -281,11 +288,53 @@ final class SchnorrHW {
             return signInner(privKey, pubKey, msg, msgOff, out, outOff);
         } finally {
             // d, n-d, k and intermediates must not outlive the call, even on a throw.
-            tmpPriv.clearKey();
-            setECParams(tmpPriv, null);
+            wipeK();
             Util.arrayFillNonAtomic(sc, (short) 0, (short) sc.length, (byte) 0);
             Util.arrayFillNonAtomic(work, (short) 0, (short) work.length, (byte) 0);
         }
+    }
+
+    /**
+     * Transient path: clearKey (RAM only; signInner re-sets the domain parameters on entry).
+     * Persistent path: overwrite S with a fixed non-secret value and keep the parameters, to
+     * avoid rewriting six EEPROM fields on every signature.
+     */
+    private void wipeK() {
+        if (tmpTransient) {
+            tmpPriv.clearKey();
+        } else {
+            tmpPriv.setS(kWipe, (short) 0, (short) 32);
+        }
+    }
+
+    /**
+     * Normalise a scalar that getS wrote at b[off..off+len-1] to exactly 32 big-endian bytes
+     * at b[off..off+31]. Accepts 1..32 bytes (right-aligned, zero-padded) and 33 bytes with a
+     * leading 0x00 (shifted left). Anything else throws SW_CRYPTO_ERROR. b needs room for len
+     * bytes from off.
+     *
+     * @return 32
+     */
+    static short alignScalar(byte[] b, short off, short len) {
+        if (len == (short) 33 && b[off] == (byte) 0) {
+            for (short i = 0; i < 32; i++) {
+                b[(short) (off + i)] = b[(short) (off + i + 1)];
+            }
+            b[(short) (off + 32)] = (byte) 0;
+            return (short) 32;
+        }
+        if (len < (short) 1 || len > (short) 32) {
+            ISOException.throwIt(SW_CRYPTO_ERROR);
+        }
+        if (len < (short) 32) {
+            short pad = (short) (32 - len);
+            // Backwards, byte by byte: overlapping move.
+            for (short i = (short) (len - 1); i >= (short) 0; i--) {
+                b[(short) (off + pad + i)] = b[(short) (off + i)];
+            }
+            Util.arrayFillNonAtomic(b, off, pad, (byte) 0);
+        }
+        return (short) 32;
     }
 
     private short signInner(ECPrivateKey privKey, ECPublicKey pubKey,
@@ -310,22 +359,7 @@ final class SchnorrHW {
         //
         // Right-aligning handles both, and is correct on every spec-legal card.
         short dLen = privKey.getS(sc, SC_D);   // d at sc[SC_D..SC_D+dLen-1]
-        if (dLen < (short)1 || dLen > (short)32) {
-            ISOException.throwIt(SW_CRYPTO_ERROR);
-        }
-        if (dLen < (short)32) {
-            short pad = (short)(32 - dLen);
-            // Backwards, byte by byte: source and destination overlap inside
-            // sc, and the JavaCard spec does not promise arrayCopyNonAtomic
-            // behaves like memmove when they do.
-            for (short i = (short)(dLen - 1); i >= (short)0; i--) {
-                sc[(short)(SC_D + pad + i)] = sc[(short)(SC_D + i)];
-            }
-            // Not a fresh array: sc is long-lived scratch that still holds the
-            // previous signature's bytes, so the pad must be written, not
-            // assumed.
-            Util.arrayFillNonAtomic(sc, SC_D, pad, (byte)0);
-        }
+        alignScalar(sc, SC_D, dLen);
 
         // Get public key point W (uncompressed 65 bytes or compressed 33 bytes)
         short wLen = pubKey.getW(sc, SC_TMP);  // W at sc[96..]
@@ -377,6 +411,9 @@ final class SchnorrHW {
 
         // ── Step 4: R = k·G via ECDH coprocessor ─────────────────────
         // Load k into temp private key, compute [k]G
+        if (tmpTransient) {
+            setECParams(tmpPriv, null);   // a transient key may have lost its parameters at deselect
+        }
         tmpPriv.setS(sc, SC_K, (short)32);
         ecdh.init(tmpPriv);
         // Result = 65-byte uncompressed point at sc[TMP]; we need 65 bytes
@@ -391,7 +428,7 @@ final class SchnorrHW {
         // A card that frames it otherwise is found out here, at its first
         // signature, and signs nothing.
         short rLen = ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
-        tmpPriv.clearKey();   // k is done with; do not leave it in the key object
+        wipeK();   // k is done with; do not leave it in the key object
         if (rLen != (short)65 || sc[SC_TMP] != (byte)0x04) {
             ISOException.throwIt(SW_CRYPTO_ERROR);
         }
