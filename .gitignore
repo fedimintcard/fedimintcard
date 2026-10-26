@@ -3,3 +3,7 @@ target/
 .DS_Store
 .idea/
 host/build.log
+android-relay/build/
+android-relay/app/build/
+android-relay/.gradle/
+android-relay/local.properties
