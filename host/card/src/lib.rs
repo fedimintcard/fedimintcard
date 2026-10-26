@@ -18,7 +18,7 @@ pub mod pcsc_backend;
 pub use bridge::BridgeTransport;
 
 /// Number of key slots on the applet.
-pub const SLOTS: u8 = 4;
+pub const SLOTS: u8 = 16;
 /// Status word the applet answers for an empty slot (or an occupied slot on GEN_KEY).
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 
@@ -52,6 +52,9 @@ pub fn status_word(err: &anyhow::Error) -> Option<u16> {
 pub trait Card {
     /// Generate a key in `slot`. Fails with `6985` if the slot is already used.
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
+    /// Wipe `slot` and generate a fresh key in it (GEN_KEY with P2 = 1). Works on a used or an
+    /// empty slot; the old key is gone for good.
+    fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
     /// x-only public key of the key in `slot`. Fails with `6985` if the slot is empty.
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
     /// BIP340 signature over the raw 32 bytes.
@@ -121,19 +124,23 @@ impl<T: Transport> CardClient<T> {
         bail!("card kept answering 61xx/6Cxx for {MAX_CHAIN} rounds")
     }
 
-    fn pubkey_cmd(&mut self, ins: u8, slot: u8) -> Result<XOnlyPublicKey> {
-        let out = self.exchange(&[CLA, ins, slot, 0x00, 0x00])?;
+    fn pubkey_cmd(&mut self, ins: u8, slot: u8, p2: u8) -> Result<XOnlyPublicKey> {
+        let out = self.exchange(&[CLA, ins, slot, p2, 0x00])?;
         XOnlyPublicKey::from_slice(&out).context("card returned an invalid x-only public key")
     }
 }
 
 impl<T: Transport> Card for CardClient<T> {
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
-        self.pubkey_cmd(INS_GEN_KEY, slot)
+        self.pubkey_cmd(INS_GEN_KEY, slot, 0x00)
+    }
+
+    fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
+        self.pubkey_cmd(INS_GEN_KEY, slot, 0x01)
     }
 
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
-        self.pubkey_cmd(INS_GET_PUB, slot)
+        self.pubkey_cmd(INS_GET_PUB, slot, 0x00)
     }
 
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
@@ -166,6 +173,13 @@ impl Card for SoftCard {
         if self.slot(slot)?.is_some() {
             return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
         }
+        let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        self.slots[slot as usize] = Some(kp);
+        Ok(kp.x_only_public_key().0)
+    }
+
+    fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
+        self.slot(slot)?;
         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
         self.slots[slot as usize] = Some(kp);
         Ok(kp.x_only_public_key().0)

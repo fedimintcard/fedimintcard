@@ -37,11 +37,11 @@ key every time).
 
 ## APDUs
 
-CLA `B0`. Applet AID `F0464D4341524401`. Four key slots (P1 = 0..3), P2 = 0.
+CLA `B0`. Applet AID `F0464D4341524401`. Sixteen key slots (P1 = 0..15). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
 
 | Command | INS | Data | Response |
 |---|---|---|---|
-| GEN_KEY | `10` | none | 32-byte x-only pubkey; `6985` if the slot is used |
+| GEN_KEY | `10` | none | 32-byte x-only pubkey; P2 = 0: `6985` if the slot is used; P2 = 1 (overwrite): wipes the slot and generates a new key, used or not |
 | GET_PUB | `11` | none | 32-byte x-only pubkey; `6985` if empty |
 | SIGN | `12` | 32-byte message | 64-byte BIP340 signature; `6985` if empty |
 

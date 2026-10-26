@@ -33,7 +33,7 @@ class NoPrivateKeyLeakTest {
         CardTestSupport c = new CardTestSupport();
         List<byte[]> secrets = new ArrayList<>();
         List<byte[]> genWire = new ArrayList<>();
-        for (int s = 0; s < 4; s++) {
+        for (int s = 0; s < 16; s++) {
             genWire.add(wire(c.tx(CardTestSupport.GEN_KEY, s, null)));
             BigInteger d = c.scalar(s);
             secrets.add(Bip340.bytes32(d));
@@ -46,7 +46,7 @@ class NoPrivateKeyLeakTest {
         int checked = 0;
         // Full INS sweep with a small matrix.
         for (int ins = 0; ins < 256; ins++) {
-            for (int p1 : new int[] { 0, 4 }) {
+            for (int p1 : new int[] { 0, 16 }) {
                 for (int len : new int[] { 0, 32 }) {
                     ResponseAPDU r = c.tx(0xB0, ins, p1, 0, new byte[len]);
                     assertFalse(leaks(wire(r), secrets), "INS " + ins + " P1 " + p1 + " len " + len);
@@ -56,13 +56,19 @@ class NoPrivateKeyLeakTest {
         }
         // Full matrix for the three real commands.
         for (int ins = 0x10; ins <= 0x12; ins++) {
-            for (int p1 : new int[] { 0, 1, 2, 3, 4, 0xFF }) {
-                for (int p2 : new int[] { 0, 1 }) {
+            for (int p1 : new int[] { 0, 1, 2, 3, 15, 16, 0xFF }) {
+                for (int p2 : new int[] { 0, 1, 2 }) {
                     for (int len : new int[] { 0, 1, 31, 32, 33, 64, 255 }) {
                         byte[] data = new byte[len];
                         for (int i = 0; i < len; i++) data[i] = (byte) (i * 7 + ins);
                         ResponseAPDU r = c.tx(0xB0, ins, p1, p2, data);
                         byte[] w = wire(r);
+                        // P2=1 GEN_KEY replaces a scalar: track the new one too (old ones stay in the list).
+                        if (ins == 0x10 && p2 == 1 && p1 >= 0 && p1 < 16 && r.getSW() == 0x9000) {
+                            BigInteger d = c.scalar(p1);
+                            secrets.add(Bip340.bytes32(d));
+                            secrets.add(Bip340.bytes32(Bip340.N.subtract(d)));
+                        }
                         assertFalse(leaks(w, secrets), "INS " + ins + " P1 " + p1 + " P2 " + p2 + " len " + len);
                         if (ins == 0x12 && r.getSW() == 0x9000) {
                             byte[] s = java.util.Arrays.copyOfRange(r.getData(), 32, 64);
@@ -82,11 +88,11 @@ class NoPrivateKeyLeakTest {
         CardTestSupport c = new CardTestSupport();
         int checked = 0;
         for (int ins = 0; ins < 256; ins++) {
-            for (int p1 : new int[] { 0, 1, 4 }) {
+            for (int p1 : new int[] { 0, 1, 16 }) {
                 for (int len : new int[] { 0, 32 }) {
                     ResponseAPDU r = c.tx(0xB0, ins, p1, 0, new byte[len]);
                     List<byte[]> secrets = new ArrayList<>();
-                    for (int s = 0; s < 4; s++) {
+                    for (int s = 0; s < 16; s++) {
                         try {
                             BigInteger d = c.scalar(s);
                             if (d.signum() == 0) continue;

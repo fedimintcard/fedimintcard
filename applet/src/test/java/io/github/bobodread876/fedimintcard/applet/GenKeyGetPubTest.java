@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.math.BigInteger;
 import java.util.HashSet;
 import java.util.Set;
+import javax.smartcardio.ResponseAPDU;
 import org.junit.jupiter.api.Test;
 
 class GenKeyGetPubTest {
@@ -20,7 +21,7 @@ class GenKeyGetPubTest {
     @Test
     void pubkeyIsScalarTimesG() throws Exception {
         CardTestSupport c = new CardTestSupport();
-        for (int s = 0; s < 4; s++) {
+        for (int s = 0; s < 16; s++) {
             byte[] pub = c.genKey(s);
             BigInteger d = c.scalar(s);
             assertTrue(d.signum() > 0 && d.compareTo(Bip340.N) < 0);
@@ -30,11 +31,11 @@ class GenKeyGetPubTest {
     }
 
     @Test
-    void fourSlotsGiveFourDistinctKeys() {
+    void sixteenSlotsGiveSixteenDistinctKeys() {
         CardTestSupport c = new CardTestSupport();
         Set<String> seen = new HashSet<>();
-        for (int s = 0; s < 4; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
-        assertEquals(4, seen.size());
+        for (int s = 0; s < 16; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
+        assertEquals(16, seen.size());
     }
 
     @Test
@@ -48,7 +49,7 @@ class GenKeyGetPubTest {
     @Test
     void getPubOnEmptySlotIsRefused() {
         CardTestSupport c = new CardTestSupport();
-        for (int s = 0; s < 4; s++) assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, s, null));
+        for (int s = 0; s < 16; s++) assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, s, null));
         c.genKey(1);
         assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
     }
@@ -94,5 +95,66 @@ class GenKeyGetPubTest {
         javacard.security.KeyPair gen = (javacard.security.KeyPair) c.field("gen");
         assertFalse(gen.getPrivate().isInitialized(), "generator private key must be cleared");
         assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));   // slot not marked used
+    }
+
+    @Test
+    void overwriteGivesNewKeyAndOldKeyNoLongerVerifies() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        byte[] oldPub = c.genKey(7);
+        BigInteger oldD = c.scalar(7);
+        ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 7, 1, null);
+        assertSw(0x9000, r);
+        byte[] newPub = r.getData();
+        assertEquals(32, newPub.length);
+        assertFalse(java.util.Arrays.equals(oldPub, newPub));
+        assertArrayEquals(newPub, c.getPub(7));
+        BigInteger newD = c.scalar(7);
+        assertNotEquals(oldD, newD);
+        assertArrayEquals(Bip340.bytes32(Bip340.pubkey(newD)[0]), newPub);
+        byte[] msg = CardTestSupport.fill(32, 9);
+        byte[] sig = c.sign(7, msg);
+        assertTrue(Bip340.verify(newPub, msg, sig));
+        assertFalse(Bip340.verify(oldPub, msg, sig), "old pubkey must not verify");
+        // Neither response carries a scalar, old or new.
+        java.util.List<byte[]> secrets = new java.util.ArrayList<>();
+        for (BigInteger d : new BigInteger[] { oldD, newD }) {
+            secrets.add(Bip340.bytes32(d));
+            secrets.add(Bip340.bytes32(Bip340.N.subtract(d)));
+        }
+        assertFalse(NoPrivateKeyLeakTest.leaks(r.getBytes(), secrets));
+        assertFalse(NoPrivateKeyLeakTest.leaks(sig, secrets));
+        // A plain GEN_KEY is still refused afterwards.
+        assertSw(0x6985, c.tx(CardTestSupport.GEN_KEY, 7, null));
+    }
+
+    @Test
+    void overwriteOnEmptySlotWorks() {
+        CardTestSupport c = new CardTestSupport();
+        ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 12, 1, null);
+        assertSw(0x9000, r);
+        assertArrayEquals(r.getData(), c.getPub(12));
+    }
+
+    @Test
+    void genKeyP2Of2IsRefused() {
+        CardTestSupport c = new CardTestSupport();
+        assertSw(0x6B00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 2, null));
+        c.genKey(0);
+        assertSw(0x6B00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 2, null));
+    }
+
+    @Test
+    void failedOverwriteLeavesSlotEmpty() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        c.genKey(0);
+        javacard.security.ECPrivateKey[] privs = (javacard.security.ECPrivateKey[]) c.field("privs");
+        javacard.security.ECPrivateKey real = privs[0];
+        privs[0] = new SchnorrHWSignTest.LyingKey(real, false, (short) 32) {
+            @Override public void setS(byte[] b, short o, short l) {
+                javacard.framework.ISOException.throwIt((short) 0x6F00);
+            }
+        };
+        assertSw(0x6F00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null));
+        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
     }
 }

@@ -17,7 +17,8 @@ cd applet && ant cap -Djc.sdk=$HOME/.javacard/sdks/jc305u4_kit     # -> applet/t
 ant-javacard is downloaded into `applet/target/` and checked against a pinned SHA-256
 (`14f5e25c...0589`, the same jar cashucard pins). The converter's off-card verifier runs as part
 of the build. First build on 2026-10-26: load file 4,573 bytes (stored components, without the
-1,028-byte Descriptor), 221 past a multiple of 256. That is a quarter of cashucard's size, so
+1,028-byte Descriptor), 221 past a multiple of 256. With 16 slots and GEN_KEY overwrite (P2 = 1):
+load file 4,633 bytes (without the 1,029-byte Descriptor), 25 past a multiple of 256. That is a quarter of cashucard's size, so
 the size window cashucard measured on the J3R180 may not apply; `stripcap.py` and
 `refcheck.py` were not needed.
 

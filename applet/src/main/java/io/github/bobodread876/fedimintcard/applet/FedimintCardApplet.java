@@ -18,7 +18,7 @@ import javacard.security.KeyPair;
  *
  * <pre>
  * CLA B0
- * 10 GEN_KEY  P1=slot  Lc=0         -> 32 bytes x-only pubkey
+ * 10 GEN_KEY  P1=slot  P2=0|1 Lc=0   -> 32 bytes x-only pubkey (P2=1 overwrites a used slot)
  * 11 GET_PUB  P1=slot  Lc=0         -> 32 bytes x-only pubkey
  * 12 SIGN     P1=slot  Lc=32 (msg)  -> 64 bytes R.x || s
  * </pre>
@@ -29,7 +29,7 @@ public final class FedimintCardApplet extends Applet {
     static final byte INS_GEN_KEY = (byte) 0x10;
     static final byte INS_GET_PUB = (byte) 0x11;
     static final byte INS_SIGN = (byte) 0x12;
-    static final short SLOTS = 4;
+    static final short SLOTS = 16;
 
     private static final byte[] P = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
@@ -130,10 +130,11 @@ public final class FedimintCardApplet extends Applet {
         }
     }
 
-    /** Checks P1/P2, returns the slot. */
-    private static short slot(byte[] buf) {
+    /** Checks P1/P2, returns the slot. P2 must be 0, or 1 when {@code allowOverwrite}. */
+    private static short slot(byte[] buf, boolean allowOverwrite) {
         short p1 = buf[ISO7816.OFFSET_P1];
-        if (p1 < 0 || p1 >= SLOTS || buf[ISO7816.OFFSET_P2] != 0) {
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        if (p1 < 0 || p1 >= SLOTS || (p2 != 0 && !(allowOverwrite && p2 == 1))) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
         return p1;
@@ -152,12 +153,19 @@ public final class FedimintCardApplet extends Applet {
     }
 
     private void genKey(APDU apdu, byte[] buf) {
-        short s = slot(buf);
+        short s = slot(buf, true);
+        boolean overwrite = buf[ISO7816.OFFSET_P2] == 1;
         if (apdu.setIncomingAndReceive() != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         if (used[s]) {
-            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            if (!overwrite) {
+                ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            }
+            // The old key is being replaced: wipe it first so a failure below leaves the slot empty.
+            used[s] = false;
+            privs[s].clearKey();
+            setParams(privs[s], null);
         }
         ECPrivateKey gp = (ECPrivateKey) gen.getPrivate();
         boolean ok = false;
@@ -186,7 +194,7 @@ public final class FedimintCardApplet extends Applet {
     }
 
     private void getPub(APDU apdu, byte[] buf) {
-        short s = slot(buf);
+        short s = slot(buf, false);
         if (apdu.setIncomingAndReceive() != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
@@ -197,7 +205,7 @@ public final class FedimintCardApplet extends Applet {
     }
 
     private void sign(APDU apdu, byte[] buf) {
-        short s = slot(buf);
+        short s = slot(buf, false);
         short got = apdu.setIncomingAndReceive();
         if (got != 32 || apdu.getIncomingLength() != 32) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
