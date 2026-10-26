@@ -7,6 +7,13 @@
 use fedimint_card_host_card::*;
 use secp256k1::{Message, SECP256K1, XOnlyPublicKey};
 
+/// Tests that touch the shared bridge card (one resets it, one uses it) must not interleave.
+static BRIDGE_CARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn bridge_lock() -> std::sync::MutexGuard<'static, ()> {
+    BRIDGE_CARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn roundtrip(card: &mut dyn Card, slot: u8) {
     let pk = card.get_or_gen(slot).expect("key");
     assert_eq!(card.get_pub(slot).unwrap(), pk, "GET_PUB is stable");
@@ -126,6 +133,7 @@ fn client_surfaces_status_words() {
 
 #[test]
 fn bridge_roundtrip_when_configured() {
+    let _guard = bridge_lock();
     let Ok(url) = std::env::var("CARD_BRIDGE_URL") else {
         eprintln!("CARD_BRIDGE_URL not set: skipping bridge test");
         return;
@@ -143,6 +151,47 @@ fn bridge_roundtrip_when_configured() {
 
 #[test]
 fn card_from_env() {
+    let _guard = bridge_lock();
     let mut card = open_from_env().expect("backend from CARD_BACKEND");
     roundtrip(card.as_mut(), 3);
+}
+
+/// Scripted transport: returns canned responses (the last one forever) and records what was sent.
+struct Script {
+    replies: std::collections::VecDeque<Vec<u8>>,
+    sent: Vec<Vec<u8>>,
+}
+
+impl Transport for Script {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.sent.push(apdu.to_vec());
+        Ok(if self.replies.len() > 1 { self.replies.pop_front().unwrap() } else { self.replies[0].clone() })
+    }
+}
+
+fn script(replies: Vec<Vec<u8>>) -> CardClient<Script> {
+    CardClient::new(Script { replies: replies.into(), sent: vec![] })
+}
+
+#[test]
+fn client_resends_with_corrected_le_on_6c() {
+    let key = SoftCard::new().gen_key(0).unwrap().serialize();
+    let mut ok = key.to_vec();
+    ok.extend_from_slice(&[0x90, 0x00]);
+    let mut c = script(vec![vec![0x6C, 0x20], ok]);
+    assert_eq!(c.get_pub(0).unwrap().serialize(), key);
+    let sent = c.into_transport().sent;
+    assert_eq!(sent, vec![vec![0xB0, 0x11, 0x00, 0x00, 0x00], vec![0xB0, 0x11, 0x00, 0x00, 0x20]]);
+}
+
+#[test]
+fn client_gives_up_on_endless_61_and_6c() {
+    let mut c = script(vec![vec![0x61, 0x20]]);
+    let e = c.get_pub(0).unwrap_err();
+    assert!(e.to_string().contains("61xx/6Cxx"), "{e}");
+    assert_eq!(c.into_transport().sent.len(), 1 + 16, "first send plus at most 16 follow-ups");
+
+    let mut c = script(vec![vec![0x6C, 0x20]]);
+    assert!(c.get_pub(0).is_err());
+    assert_eq!(c.into_transport().sent.len(), 1 + 16);
 }

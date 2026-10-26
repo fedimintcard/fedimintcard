@@ -22,6 +22,8 @@ pub const SLOTS: u8 = 4;
 /// Status word the applet answers for an empty slot (or an occupied slot on GEN_KEY).
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 
+/// Upper bound on 61xx / 6Cxx follow-ups for one command.
+const MAX_CHAIN: usize = 16;
 const CLA: u8 = 0xB0;
 const INS_GEN_KEY: u8 = 0x10;
 const INS_GET_PUB: u8 = 0x11;
@@ -96,20 +98,27 @@ impl<T: Transport> CardClient<T> {
         self.transport
     }
 
-    /// Send an APDU, follow `61xx` with GET RESPONSE, and split off the status word.
+    /// Send an APDU, follow `61xx` with GET RESPONSE and `6Cxx` by resending with Le = xx
+    /// (every APDU we build ends in its Le byte), and split off the status word.
     fn exchange(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut resp = self.transport.transmit(apdu)?;
-        loop {
+        for _ in 0..MAX_CHAIN {
             ensure!(resp.len() >= 2, "response shorter than a status word");
             let (body, sw) = resp.split_at(resp.len() - 2);
             data.extend_from_slice(body);
             match (sw[0], sw[1]) {
                 (0x90, 0x00) => return Ok(data),
                 (0x61, n) => resp = self.transport.transmit(&[0x00, 0xC0, 0x00, 0x00, n])?,
+                (0x6C, n) => {
+                    let mut again = apdu.to_vec();
+                    *again.last_mut().expect("non-empty APDU") = n;
+                    resp = self.transport.transmit(&again)?;
+                }
                 (a, b) => return Err(StatusWord(u16::from_be_bytes([a, b])).into()),
             }
         }
+        bail!("card kept answering 61xx/6Cxx for {MAX_CHAIN} rounds")
     }
 
     fn pubkey_cmd(&mut self, ins: u8, slot: u8) -> Result<XOnlyPublicKey> {

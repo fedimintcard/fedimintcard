@@ -26,26 +26,37 @@ impl BridgeTransport {
     }
 
     pub fn health(&self) -> Result<()> {
-        self.agent.get(&format!("{}/health", self.base)).call()?;
+        self.agent.get(&format!("{}/health", self.base)).call().map_err(|e| describe("GET /health", e))?;
         Ok(())
     }
 
     /// Ask the bridge for a fresh card (all slots empty).
     pub fn reset(&self) -> Result<()> {
-        self.agent.post(&format!("{}/reset", self.base)).send_string("")?;
+        self.agent.post(&format!("{}/reset", self.base)).send_string("").map_err(|e| describe("POST /reset", e))?;
         Ok(())
+    }
+}
+
+/// Turn a ureq error into an anyhow error that includes the bridge's response body.
+fn describe(what: &str, err: ureq::Error) -> anyhow::Error {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_else(|e| format!("<unreadable body: {e}>"));
+            anyhow::anyhow!("{what}: HTTP {code}: {body}")
+        }
+        other => anyhow::Error::new(other).context(what.to_owned()),
     }
 }
 
 impl Transport for BridgeTransport {
     fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
-        let resp: serde_json::Value = self
+        let resp = self
             .agent
             .post(&format!("{}/apdu", self.base))
             .send_json(serde_json::json!({ "apdu": hex::encode(apdu) }))
-            .context("POST /apdu")?
-            .into_json()?;
-        let hex_resp = resp["response"].as_str().context("bridge reply has no `response`")?;
-        Ok(hex::decode(hex_resp)?)
+            .map_err(|e| describe("POST /apdu", e))?;
+        let json: serde_json::Value = resp.into_json().context("bridge reply is not valid JSON")?;
+        let hex_resp = json["response"].as_str().context("bridge reply has no `response` string")?;
+        hex::decode(hex_resp).with_context(|| format!("bridge `response` is not hex: {hex_resp:?}"))
     }
 }
