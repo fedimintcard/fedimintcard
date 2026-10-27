@@ -135,6 +135,13 @@ federation invite attached, so a new phone can join and receive in one step.
   every live note with the federation and finishes or abandons the pending transaction.
 - Slots marked `to renew`: the next `topup` regenerates them; no funds are at risk.
 - Switch till: change `CARD_BACKEND` and rerun the same command. The wallet state is the same.
+- POS shows a red dot or "Till service unreachable": re-run `adb reverse tcp:9877 tcp:9877`.
+- POS shows "Phone relay unreachable": re-run `adb forward tcp:9876 tcp:9876`.
+- POS shows "Payment pending" or "Outcome unknown": do nothing rash. The app polls the ledger and
+  turns it into a receipt when the federation decides; "Try again" re-sends the same reference and
+  cannot double charge. "Abandon" is the only way to drop it, and it asks first.
+- Power button, Recents or a notification during Signing drops the card; the till answers no_card
+  or undecided and the app handles both.
 
 ## Numbers from the rehearsal (2026-10-27)
 
