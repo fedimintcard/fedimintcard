@@ -4,6 +4,25 @@ Audience: Fedi. Length: about eight minutes live, or a three minute recording.
 Rehearsed end to end on 2026-10-27 against the Island Bitcoin Community federation
 (4 guardians, core consensus 2.1, mint module `mint` v2.0, mint fee 0 msat).
 
+## How this maps to a product
+
+The Fedi app and the sidecar never talk to each other. They share the federation, and value
+moves between them as ordinary ecash strings. The sidecar is a second Fedimint client that does
+what the Fedi app cannot yet: issue notes to keys that live on a card, and have the card sign
+when those notes are spent. It is the reference implementation, not the product.
+
+Where the logic goes next, in order of preference:
+
+1. Inside the Fedi app: the card module joins the app's own client; "Load card" and "Tap to pay"
+   replace the copy and paste. This is the ask.
+2. As a Fedi mod, once the app exposes NFC transceive and note issuance to mods (the bridge hook
+   in `docs/DESIGN-NOTE.md`). Smaller ask, same result for the user.
+3. On the merchant side: the reference point of sale in this repo (the Android app plus the till
+   service) is the shape of a merchant product. Fedi has no point of sale today.
+
+The copy and paste in step 1 of the live run is the seam where integration happens. Everything
+below it, the card, the federation, the till, is finished.
+
 ## What the audience sees
 
 1. Ecash leaves the Fedi app as a normal "send ecash" string.
