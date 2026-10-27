@@ -164,7 +164,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     fun showSales(r: TillResult<SalesList>?) {
         when (r) {
             is TillResult.Ok -> {
-                salesHeader.text = "${r.value.count} sales · ${formatSats(r.value.totalPriceMsat)} sats"
+                salesHeader.text = "${act.resources.getQuantityString(R.plurals.sales_count, r.value.count.toInt(), r.value.count)} · ${formatSats(r.value.totalPriceMsat)} sats"
                 salesAdapter.rows = r.value.sales.reversed()
             }
             is TillResult.Err -> { salesHeader.text = "Could not load sales"; salesAdapter.rows = emptyList() }

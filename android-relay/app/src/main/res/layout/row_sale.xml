@@ -6,15 +6,16 @@
         android:background="@drawable/bg_card">
         <TextView android:id="@+id/row_time" android:layout_width="0dp" android:layout_weight="2"
             android:layout_height="wrap_content" android:textColor="@color/dim" android:textSize="14sp" />
-        <LinearLayout android:layout_width="0dp" android:layout_weight="3" android:layout_height="wrap_content"
+        <LinearLayout android:layout_width="0dp" android:layout_weight="2" android:layout_height="wrap_content"
             android:orientation="vertical">
             <TextView android:id="@+id/row_price" android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:fontFamily="@font/figtree_extrabold" android:textColor="@color/ink" android:textSize="18sp" />
             <TextView android:id="@+id/row_received" android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:textColor="@color/mist" android:textSize="13sp" />
         </LinearLayout>
-        <TextView android:id="@+id/row_txid" android:layout_width="0dp" android:layout_weight="3"
+        <TextView android:id="@+id/row_txid" android:layout_width="0dp" android:layout_weight="4"
             android:layout_height="wrap_content" android:gravity="end" android:fontFamily="monospace"
-            android:textColor="@color/dim" android:textSize="13sp" />
+            android:singleLine="true" android:ellipsize="end"
+            android:textColor="@color/dim" android:textSize="12sp" />
     </LinearLayout>
 </FrameLayout>
