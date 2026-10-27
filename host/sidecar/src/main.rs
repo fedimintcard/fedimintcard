@@ -61,7 +61,12 @@ enum Ecash {
 #[derive(Subcommand)]
 enum CardCmd {
     /// Generate keys in every empty slot and cache the public keys.
-    Setup,
+    Setup {
+        /// New wallet on a card that was used before: replace every key and treat all slots as
+        /// free. Refused while the state file has live or pending notes.
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Move wallet funds onto the card, one note per set bit of each amount.
     Topup {
         #[arg(required = true)]
@@ -192,8 +197,8 @@ fn report_recovered(r: &Recovered) {
 
 async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
     match cmd {
-        CardCmd::Setup => {
-                        for (slot, pk) in cw.card_setup()? {
+        CardCmd::Setup { fresh } => {
+                        for (slot, pk) in cw.card_setup(*fresh)? {
                 println!("slot {slot:2}  {pk}");
             }
         }

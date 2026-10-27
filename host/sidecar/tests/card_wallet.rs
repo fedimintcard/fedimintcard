@@ -67,7 +67,10 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     let card = open_from_env()?;
     let mut cw = CardWallet::new(wallet, store, card);
     on_card(|| ()); // keep the helper exercised on every backend
-    cw.card_setup()?;
+    // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
+    // behaves like a new one.
+    let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
+    cw.card_setup(!soft)?;
     Ok(Fx { fed, cw, _dir: dir })
 }
 
@@ -186,14 +189,14 @@ async fn spend_with_card_signature_is_exact_fees_off() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn change_note_is_spendable() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    f.cw.topup(&[1 << 17]).await?;
     let r1 = f.cw.spend(100_000).await?;
     let change1: u64 = r1.change.iter().map(|(_, a)| a).sum();
     assert!(change1 > 0);
     let live_before: Vec<String> = f.cw.store.state.live_notes().iter().map(|n| n.nonce.clone()).collect();
 
     // Spend again, from change only.
-    let r2 = f.cw.spend(250_000).await?;
+    let r2 = f.cw.spend(10_000).await?;
     assert!(r2.inputs.iter().all(|(slot, _)| r1.change.iter().any(|(s, _)| s == slot)), "{r2:?}");
     let change2: u64 = r2.change.iter().map(|(_, a)| a).sum();
     let ins2: u64 = r2.inputs.iter().map(|(_, a)| a).sum();
@@ -565,16 +568,69 @@ async fn rejected_resubmission_with_an_unspent_input_is_abandoned() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    f.cw.topup(&[1 << 17]).await?;
     let spent_slot = f.cw.store.state.live_notes()[0].slot;
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
     restart(&mut f)?;
     // No `balance` first: the spend itself must recover, mark the old note spent, and plan from
     // the change only.
-    let r = f.cw.spend(50_000).await?;
+    let r = f.cw.spend(10_000).await?;
     assert!(r.inputs.iter().all(|(slot, _)| *slot != spent_slot), "{r:?}");
     assert!(f.cw.store.state.pending_txs.is_empty());
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_limits_follow_the_card_size() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    assert_eq!(fedimint_card_host_card::SLOTS, 8);
+    assert_eq!(f.cw.store.state.free_slots().len(), 8);
+    f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
+    assert_eq!(f.cw.store.state.free_slots().len(), 5);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_setup_rekeys_and_refuses_with_live_notes() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let old: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
+    f.cw.card_setup(true)?;
+    let new: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
+    assert_eq!(new.len(), 8);
+    assert!(old.iter().zip(&new).all(|(a, b)| a != b), "every slot has a new key");
+    assert_eq!(f.cw.store.state.free_slots().len(), 8);
+    f.cw.topup(&[1 << 18]).await?;
+    let err = f.cw.card_setup(true).expect_err("live note");
+    assert!(err.to_string().contains("live or pending"), "{err}");
+    // Nothing was touched.
+    assert_eq!(f.cw.store.state.live_total_msat(), 1 << 18);
+    drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    // A card whose slots all hold keys this state file never saw.
+    let mut card = open_from_env()?;
+    let mut foreign = vec![];
+    for slot in 0..fedimint_card_host_card::SLOTS {
+        foreign.push(on_card(|| card.get_or_gen(slot))?.to_string());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = StateStore::open(dir.path().join("card_state.json"))?;
+    f.cw = CardWallet::new(f.cw.wallet.clone(), store, card);
+    f.cw.card_setup(false)?;
+    assert!(f.cw.store.state.free_slots().is_empty(), "unknown keys are not free");
+    assert_eq!(f.cw.store.state.overwritable_slots().len(), 8);
+
+    f.cw.topup(&[1 << 18]).await?;
+    let used = f.cw.store.state.live_notes()[0].slot;
+    assert_ne!(f.cw.store.state.slot_pubkey(used).unwrap(), foreign[used as usize], "the old key was replaced");
+    assert!(f.cw.store.state.notes.iter().all(|n| !foreign.iter().any(|k| n.nonce.ends_with(k.as_str()))));
     drop(f.fed);
     Ok(())
 }

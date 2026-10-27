@@ -56,6 +56,10 @@ pub struct SlotRec {
     pub slot: u8,
     /// x-only public key, hex.
     pub pubkey: String,
+    /// The card already held this key when we first saw the slot, so we do not know who else
+    /// has seen it or what it was used for. Never used as a nonce; overwritten when needed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unknown: bool,
 }
 
 /// A slot overwrite that was started and may or may not have reached the card.
@@ -131,11 +135,22 @@ impl CardState {
         self.slots.iter().find(|s| s.slot == slot).map(|s| s.pubkey.as_str())
     }
 
+    /// Record a key found on the card that this state file never produced.
+    pub fn set_unknown_slot(&mut self, slot: u8, pubkey: String) {
+        self.set_slot_pubkey(slot, pubkey);
+        if let Some(s) = self.slots.iter_mut().find(|s| s.slot == slot) {
+            s.unknown = true;
+        }
+    }
+
     pub fn set_slot_pubkey(&mut self, slot: u8, pubkey: String) {
         match self.slots.iter_mut().find(|s| s.slot == slot) {
-            Some(s) => s.pubkey = pubkey,
+            Some(s) => {
+                s.pubkey = pubkey;
+                s.unknown = false;
+            }
             None => {
-                self.slots.push(SlotRec { slot, pubkey });
+                self.slots.push(SlotRec { slot, pubkey, unknown: false });
                 self.slots.sort_by_key(|s| s.slot);
             }
         }
@@ -153,6 +168,7 @@ impl CardState {
     pub fn free_slots(&self) -> Vec<u8> {
         self.slots
             .iter()
+            .filter(|s| !s.unknown)
             .filter(|s| !self.notes_on_current_key(s.slot).any(|_| true))
             .filter(|s| !self.pending_overwrites.iter().any(|p| p.slot == s.slot))
             .map(|s| s.slot)
@@ -165,6 +181,9 @@ impl CardState {
         self.slots
             .iter()
             .filter(|s| {
+                if s.unknown {
+                    return true;
+                }
                 let mut any = false;
                 for n in self.notes_on_current_key(s.slot) {
                     any = true;

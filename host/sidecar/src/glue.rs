@@ -195,36 +195,77 @@ impl CardWallet {
 
     // ---------------------------------------------------------------- card setup
 
-    /// GEN_KEY on every slot that is empty and cache all public keys. Keys already on the card
-    /// are kept. Stops at the first slot the applet does not have (a 4-slot applet answers 6B00).
-    pub fn card_setup(&mut self) -> Result<Vec<(u8, XOnlyPublicKey)>> {
+    /// Make sure every slot has a key and cache the public keys.
+    ///
+    /// Plain setup keeps keys already on the card. A slot that has a key but no record in the
+    /// state file is of unknown provenance: it is recorded as such, never used as a note nonce,
+    /// and overwritten lazily when a topup or spend needs the slot.
+    ///
+    /// `fresh` is for a new wallet on a card that was used before: it replaces every key
+    /// (GEN_KEY with P2 = 1) and records all slots as free. It refuses if the state file has any
+    /// live or pending note, or any unresolved transaction, since that would destroy the keys
+    /// those notes depend on.
+    pub fn card_setup(&mut self, fresh: bool) -> Result<Vec<(u8, XOnlyPublicKey)>> {
         self.recover_overwrites()?;
+        if fresh {
+            let st = &self.store.state;
+            ensure!(
+                !st.notes.iter().any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending))
+                    && st.pending_txs.is_empty()
+                    && st.host_pending.is_empty(),
+                "--fresh would destroy the keys of live or pending notes; cash them out first"
+            );
+        }
         let mut out = vec![];
         for slot in 0..SLOTS {
-            let pk = match on_card(|| self.card.get_or_gen(slot)) {
-                Ok(pk) => pk,
+            let existing = match on_card(|| self.card.get_pub(slot)) {
+                Ok(pk) => Some(pk),
+                Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => None,
                 Err(e) if status_word(&e) == Some(0x6B00) => {
                     self.store.save()?;
-                    bail!("the card has only {slot} slot(s) (status 6B00 for slot {slot}); flash the 16-slot applet");
+                    bail!("the card has only {slot} slot(s) (status 6B00 for slot {slot}); flash the {SLOTS}-slot applet");
                 }
                 Err(e) => return Err(e).with_context(|| format!("slot {slot}")),
             };
-            let hexpk = pk.to_string();
-            match self.store.state.slot_pubkey(slot) {
-                Some(old) if old == hexpk => {}
-                Some(old) => {
-                    // The card holds a different key than we recorded. Safe only if the old key
-                    // carried no money we still care about.
-                    let busy = self
-                        .store
-                        .state
-                        .notes_on_current_key(slot)
-                        .any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending));
-                    ensure!(!busy, "slot {slot} holds a different key than recorded ({old}) and has live notes; \
-                                    this is not the card the state file belongs to");
-                    self.store.state.set_slot_pubkey(slot, hexpk);
+            let pk = match (existing, fresh) {
+                (None, _) => on_card(|| self.card.gen_key(slot)).with_context(|| format!("slot {slot}"))?,
+                (Some(old), true) => {
+                    let rec = PendingOverwrite { slot, old_pubkey: old.to_string() };
+                    self.store.state.pending_overwrites.push(rec.clone());
+                    self.store.save()?;
+                    match on_card(|| self.card.gen_key_overwrite(slot)) {
+                        Ok(pk) => {
+                            self.store.state.pending_overwrites.retain(|q| q.slot != slot);
+                            pk
+                        }
+                        Err(e) => {
+                            self.resolve_overwrite(&rec).ok();
+                            return Err(e).with_context(|| format!("re-keying slot {slot}"));
+                        }
+                    }
                 }
-                None => self.store.state.set_slot_pubkey(slot, hexpk),
+                (Some(old), false) => old,
+            };
+            let hexpk = pk.to_string();
+            if fresh || existing.is_none() {
+                // A key this run created: free.
+                self.store.state.set_slot_pubkey(slot, hexpk);
+            } else {
+                match self.store.state.slot_pubkey(slot) {
+                    Some(rec) if rec == hexpk => {}
+                    Some(rec) => {
+                        // The card holds a different key than we recorded.
+                        let busy = self
+                            .store
+                            .state
+                            .notes_on_current_key(slot)
+                            .any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending));
+                        ensure!(!busy, "slot {slot} holds a different key than recorded ({rec}) and has live notes; \
+                                        this is not the card the state file belongs to");
+                        self.store.state.set_unknown_slot(slot, hexpk);
+                    }
+                    None => self.store.state.set_unknown_slot(slot, hexpk),
+                }
             }
             out.push((slot, pk));
         }

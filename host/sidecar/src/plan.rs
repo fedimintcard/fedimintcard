@@ -244,8 +244,8 @@ pub fn solve(
     fee: FeeFn,
     min_denom: u64,
 ) -> Result<Plan, PlanError> {
-    // Every floor that balances is a candidate; the fewest output notes wins (each costs a fee),
-    // then fewest change notes, fewest inputs, smallest overpay. A high floor can force dozens of
+    // Every floor that balances is a candidate. Card slots are scarce (8), so the fewest change
+    // notes wins, then the fewest output notes (each costs a fee), fewest inputs, smallest overpay. A high floor can force dozens of
     // notes when fees are not multiples of it, so "no dust" is not allowed to beat "few notes".
     let mut best: Option<Plan> = None;
     let mut first_err = None;
@@ -256,7 +256,7 @@ pub fn solve(
         match solve_with(notes, price, free_slots, fee, floor) {
             Ok(mut p) => {
                 p.dust = floor < min_denom;
-                let key = |p: &Plan| (p.till.len() + p.change.len(), p.change.len(), p.inputs.len(), p.overpay);
+                let key = |p: &Plan| (p.change.len(), p.till.len() + p.change.len(), p.inputs.len(), p.overpay);
                 if best.as_ref().is_none_or(|b| key(&p) < key(b)) {
                     best = Some(p);
                 }
