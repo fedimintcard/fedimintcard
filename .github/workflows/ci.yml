@@ -13,3 +13,21 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: '${{ matrix.java }}', cache: maven }
       - run: mvn -B -ntp test
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev protobuf-compiler build-essential
+      # host/rust-toolchain.toml pins the compiler (fedimint's dependency tree needs >= 1.91).
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "host -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test
+        working-directory: host
+        run: cargo test --locked --workspace --profile ci -- --test-threads=2
+        env:
+          RUST_BACKTRACE: "1"
