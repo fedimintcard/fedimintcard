@@ -23,10 +23,14 @@ class ProtocolErrorsTest {
     @Test
     void badP1P2Is6B00() {
         CardTestSupport c = new CardTestSupport();
-        assertSw(0x6B00, c.tx(0xB0, 0x10, 4, 0, null));
-        assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 1, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 8, 0, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 8, 1, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 2, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 0xFF, null));
         assertSw(0x6B00, c.tx(0xB0, 0x11, 0xFF, 0, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x11, 0, 1, null));
         assertSw(0x6B00, c.tx(0xB0, 0x12, 0, 1, new byte[32]));
+        assertSw(0x6B00, c.tx(0xB0, 0x12, 0, 2, new byte[32]));
     }
 
     @Test
@@ -49,10 +53,10 @@ class ProtocolErrorsTest {
     @Test
     void keysSurviveCardReset() {
         CardTestSupport c = new CardTestSupport();
-        byte[] pub = c.genKey(3);
+        byte[] pub = c.genKey(7);
         c.sim.reset();
         assertSw(0x9000, c.sim.transmitCommand(new javax.smartcardio.CommandAPDU(
             0x00, 0xA4, 0x04, 0x00, Bip340.hex(CardTestSupport.AID_HEX))));
-        assertArrayEquals(pub, c.getPub(3));
+        assertArrayEquals(pub, c.getPub(7));
     }
 }

@@ -17,7 +17,8 @@ cd applet && ant cap -Djc.sdk=$HOME/.javacard/sdks/jc305u4_kit     # -> applet/t
 ant-javacard is downloaded into `applet/target/` and checked against a pinned SHA-256
 (`14f5e25c...0589`, the same jar cashucard pins). The converter's off-card verifier runs as part
 of the build. First build on 2026-10-26: load file 4,573 bytes (stored components, without the
-1,028-byte Descriptor), 221 past a multiple of 256. That is a quarter of cashucard's size, so
+1,028-byte Descriptor), 221 past a multiple of 256. With 8 slots and GEN_KEY overwrite (P2 = 1):
+load file 4,643 bytes (without the Descriptor), 35 past a multiple of 256. That is a quarter of cashucard's size, so
 the size window cashucard measured on the J3R180 may not apply; `stripcap.py` and
 `refcheck.py` were not needed.
 
@@ -68,3 +69,13 @@ signature, GEN_KEY 125 ms, GET_PUB 27 ms); and all 18 Rust tests pass with `CARD
 A card personalised by the cashucard provisioner has non-default keys and must be reset in that
 app first. Do not retry `gp` with the wrong keys: each failure counts toward the card lock.
 Still unknown from outside: whether the nonce key is transient or the persistent fallback.
+
+## Slot count on the J3R180 (2026-10-26)
+
+A 16-slot build (32 EC key objects built in the constructor) loads but the INSTALL [for install and
+make selectable] fails with `6F00` even with the Opener instantiated first; the constructor is too
+heavy. 8 slots install. The ACR122U also drops the connection (`SCARD_E_NOT_TRANSACTED`) during a
+default-block-size load about half the time and then needs a power cycle; `--bs 64` loads reliably.
+Root cause and fix: writing the curve parameters into every slot's key objects in the constructor is
+what exceeds the install budget; with the parameters written at GEN_KEY instead, 8 slots install
+(load file 4,643 bytes). The 16-slot build was not retried after this fix.

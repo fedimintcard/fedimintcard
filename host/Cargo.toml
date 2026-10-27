@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["card", "fed-tests"]
+members = ["card", "fed-tests", "sidecar"]
 
 [workspace.package]
 edition = "2024"
@@ -19,6 +19,12 @@ fedimint-mintv2-server = { git = "https://github.com/fedimint/fedimint", tag = "
 fedimint-dummy-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-dummy-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-dummy-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-mint-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-mint-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-bip39 = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 tbs = { package = "fedimint-tbs", git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 anyhow = "1"
@@ -42,6 +48,9 @@ rustls = { opt-level = 3 }
 secp256k1 = { opt-level = 3 }
 secp256k1-sys = { opt-level = 3 }
 subtle = { opt-level = 3 }
+
+# The planner searches a few million combinations; keep it fast in debug builds.
+fedimint-card-sidecar = { opt-level = 2 }
 
 [profile.ci]
 debug = "line-tables-only"

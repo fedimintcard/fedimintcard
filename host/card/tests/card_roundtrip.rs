@@ -43,7 +43,26 @@ fn soft_card_slot_semantics() {
     assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985), "no overwrite");
     let b = c.gen_key(1).unwrap();
     assert_ne!(a, b);
-    assert_eq!(status_word(&c.gen_key(4).unwrap_err()), Some(0x6B00), "slot out of range");
+    assert_eq!(status_word(&c.gen_key(8).unwrap_err()), Some(0x6B00), "slot out of range");
+    assert_eq!(status_word(&c.gen_key_overwrite(8).unwrap_err()), Some(0x6B00), "overwrite out of range");
+    assert!(c.gen_key(7).is_ok(), "slot 7 exists");
+}
+
+#[test]
+fn soft_card_overwrite() {
+    let mut c = SoftCard::new();
+    let e = c.gen_key_overwrite(3).unwrap();
+    assert_eq!(c.get_pub(3).unwrap(), e, "overwrite on an empty slot works");
+    let a = c.gen_key(0).unwrap();
+    let b = c.gen_key_overwrite(0).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(c.get_pub(0).unwrap(), b);
+    let msg = [7u8; 32];
+    let sig = c.sign(0, &msg).unwrap();
+    let m = Message::from_digest(msg);
+    assert!(SECP256K1.verify_schnorr(&sig, &m, &b).is_ok());
+    assert!(SECP256K1.verify_schnorr(&sig, &m, &a).is_err(), "old key no longer signs");
+    assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985), "plain GEN_KEY still refuses");
 }
 
 /// Applet-shaped APDU responder over a `SoftCard`, to test `CardClient` framing offline.
@@ -67,12 +86,19 @@ impl Transport for FakeApplet {
             return Ok(vec![0x90, 0x00]);
         }
         assert_eq!(apdu[0], 0xB0, "CLA");
-        assert_eq!(apdu[3], 0, "P2");
         let slot = apdu[2];
+        if apdu[1] != 0x10 {
+            assert_eq!(apdu[3], 0, "P2");
+        }
         let res = match apdu[1] {
             0x10 => {
                 assert_eq!(apdu.len(), 5, "GEN_KEY: header + Le only");
-                self.card.gen_key(slot).map(|k| k.serialize().to_vec())
+                match apdu[3] {
+                    0 => self.card.gen_key(slot),
+                    1 => self.card.gen_key_overwrite(slot),
+                    _ => return Ok(vec![0x6B, 0x00]),
+                }
+                .map(|k| k.serialize().to_vec())
             }
             0x11 => {
                 assert_eq!(apdu.len(), 5, "GET_PUB: header + Le only");
@@ -123,6 +149,44 @@ fn client_follows_get_response() {
 }
 
 #[test]
+fn client_gen_key_overwrite_sends_p2_1() {
+    let mut c = fake(false);
+    let a = c.gen_key(5).unwrap();
+    let b = c.gen_key_overwrite(5).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(c.get_pub(5).unwrap(), b);
+    let log = c.into_transport().log;
+    assert_eq!(log[0], [0xB0, 0x10, 5, 0, 0], "plain GEN_KEY has P2 = 0");
+    assert_eq!(log[1], [0xB0, 0x10, 5, 1, 0], "overwrite has P2 = 1");
+    assert_eq!(log[2][3], 0, "GET_PUB keeps P2 = 0");
+}
+
+struct Wrong6C {
+    log: Vec<Vec<u8>>,
+}
+
+impl Transport for Wrong6C {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.log.push(apdu.to_vec());
+        Ok(vec![0x6C, 0x20])
+    }
+}
+
+#[test]
+fn overwrite_is_never_resent_on_6c() {
+    let mut c = CardClient::new(Wrong6C { log: vec![] });
+    let e = c.gen_key_overwrite(1).unwrap_err();
+    assert_eq!(status_word(&e), Some(0x6C20));
+    assert_eq!(c.into_transport().log.len(), 1, "no resend");
+    // Other commands still follow 6Cxx.
+    let mut c = CardClient::new(Wrong6C { log: vec![] });
+    let _ = c.gen_key(1);
+    let log = c.into_transport().log;
+    assert!(log.len() > 1, "plain GEN_KEY is resent with the corrected Le");
+    assert_eq!(*log[1].last().unwrap(), 0x20);
+}
+
+#[test]
 fn client_surfaces_status_words() {
     let mut c = fake(false);
     let e = c.get_pub(0).unwrap_err();
@@ -143,7 +207,8 @@ fn bridge_roundtrip_when_configured() {
     t.reset().expect("bridge /reset");
     let mut c = CardClient::new(t);
     c.select().unwrap();
-    let pk: XOnlyPublicKey = c.gen_key(0).unwrap();
+    // Overwrite rather than GEN_KEY: a real card behind the relay keeps its keys across /reset.
+    let pk: XOnlyPublicKey = c.gen_key_overwrite(0).unwrap();
     assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985));
     roundtrip(&mut c, 0);
     assert_eq!(c.get_pub(0).unwrap(), pk);
