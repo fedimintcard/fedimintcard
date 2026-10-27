@@ -109,14 +109,15 @@ federation invite attached, so a new phone can join and receive in one step.
 - Slots marked `to renew`: the next `topup` regenerates them; no funds are at risk.
 - Switch till: change `CARD_BACKEND` and rerun the same command. The wallet state is the same.
 
-## Numbers from the rehearsal (2026-10-27, ACR122U)
+## Numbers from the rehearsal (2026-10-27)
 
-| Operation | Wall clock |
-|---|---|
-| ecash import 2,000 sat | under 5 s |
-| topup of 4 notes | under 10 s |
-| spend, 2 inputs, no change | 7 s |
-| spend, 1 input, 5 change notes | 8 s |
-| cashout of one slot to a string | under 10 s |
+| Operation | ACR122U on laptop | Pixel till (USB relay) |
+|---|---|---|
+| ecash import 2,000 sat | under 5 s | n/a (no card involved) |
+| topup of 4 notes | under 10 s | 2 s for one note |
+| spend, 2 inputs, no change | 7 s | |
+| spend, 1 input, 5 change notes | 8 s | 6 s (1 input, 2 change notes) |
+| spend, 7 inputs, no change | | 16 s (7 card signatures) |
+| cashout of one slot to a string | under 10 s | |
 
 Card-side signature: median 847 ms per input on the J3R180 (`docs/SPIKE.md`).
