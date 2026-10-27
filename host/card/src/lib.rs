@@ -15,7 +15,7 @@ pub mod bridge;
 #[cfg(feature = "pcsc")]
 pub mod pcsc_backend;
 
-pub use bridge::BridgeTransport;
+pub use bridge::{BridgeError, BridgeTransport};
 
 /// Number of key slots on the applet.
 pub const SLOTS: u8 = 8;
