@@ -7,26 +7,40 @@
     <LinearLayout android:id="@+id/screen_amount" android:layout_width="match_parent" android:layout_height="match_parent"
         android:orientation="vertical" android:padding="16dp">
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="horizontal" android:gravity="center_vertical">
-            <View android:id="@+id/dot" android:layout_width="12dp" android:layout_height="12dp"
-                android:background="@drawable/bg_dot" />
-            <TextView android:id="@+id/card_chip" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:layout_marginStart="10dp" android:background="@drawable/bg_chip" android:text="Card: none"
-                android:textColor="@color/muted" android:textSize="12sp" android:paddingStart="10dp" android:paddingEnd="10dp"
-                android:paddingTop="3dp" android:paddingBottom="3dp" />
-            <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
-            <Button android:id="@+id/btn_sales" style="@style/GhostButton" android:layout_width="wrap_content"
+            android:orientation="horizontal" android:gravity="top">
+            <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+                android:orientation="vertical">
+                <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:orientation="horizontal" android:gravity="center_vertical">
+                    <ImageView android:layout_width="34dp" android:layout_height="26dp"
+                        android:src="@drawable/ic_mark" android:contentDescription="@null" />
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp" android:fontFamily="@font/figtree_extrabold"
+                        android:letterSpacing="-0.02" android:text="fedimint" android:textColor="@color/ink" android:textSize="20sp" />
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginStart="4dp" android:text="card" android:textColor="@color/mist" android:textSize="20sp" />
+                </LinearLayout>
+                <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp" android:orientation="horizontal" android:gravity="center_vertical">
+                    <View android:id="@+id/dot" android:layout_width="12dp" android:layout_height="12dp"
+                        android:background="@drawable/bg_dot" />
+                    <TextView android:id="@+id/card_chip" style="@style/Pill" android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" android:layout_marginStart="10dp" android:text="Card: none" />
+                </LinearLayout>
+            </LinearLayout>
+            <Button android:id="@+id/btn_sales" style="@style/HeaderButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="@string/sales" />
-            <Button android:id="@+id/btn_gear" style="@style/GhostButton" android:layout_width="wrap_content"
+            <Button android:id="@+id/btn_gear" style="@style/HeaderButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="⚙" android:minWidth="48dp" />
         </LinearLayout>
         <TextView android:id="@+id/federation_name" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:text="@string/app_name" android:textColor="@color/ink"
-            android:textSize="22sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end" />
+            android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="@string/app_name"
+            android:fontFamily="@font/figtree_extrabold" android:letterSpacing="-0.02" android:textColor="@color/ink"
+            android:textSize="22sp" android:singleLine="true" android:ellipsize="end" />
         <TextView android:id="@+id/balance_line" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:gravity="start" android:textSize="14sp" />
         <TextView android:id="@+id/amount_text" style="@style/Heading" android:layout_width="match_parent"
-            android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" />
+            android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" android:gravity="center" />
         <GridLayout android:id="@+id/keypad" android:layout_width="match_parent" android:layout_height="0dp"
             android:layout_weight="3" android:columnCount="3" android:rowCount="4">
         <TextView android:id="@+id/key_1" style="@style/Key" android:text="1" />
@@ -51,8 +65,12 @@
         android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">
         <TextView android:id="@+id/tap_amount" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="32dp" android:textSize="44sp" />
+        <ImageView android:id="@+id/tap_card" android:layout_width="280dp" android:layout_height="wrap_content"
+            android:layout_marginTop="28dp" android:adjustViewBounds="true" android:src="@drawable/card_front"
+            android:contentDescription="@null" android:rotation="-6" android:elevation="12dp"
+            android:background="@drawable/bg_card" android:clipToOutline="true" />
         <FrameLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1">
-            <View android:id="@+id/pulse" android:layout_width="200dp" android:layout_height="200dp"
+            <View android:id="@+id/pulse" android:layout_width="160dp" android:layout_height="160dp"
                 android:layout_gravity="center" android:background="@drawable/bg_pulse" />
         </FrameLayout>
         <TextView android:id="@+id/tap_status" style="@style/Heading" android:layout_width="match_parent"
@@ -65,9 +83,12 @@
     <LinearLayout android:id="@+id/screen_receipt" android:layout_width="match_parent" android:layout_height="match_parent"
         android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">
         <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
-        <TextView android:id="@+id/receipt_check" android:layout_width="120dp" android:layout_height="120dp"
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp"
+            android:background="@drawable/bg_card">
+        <TextView android:id="@+id/receipt_check" android:layout_width="104dp" android:layout_height="104dp"
             android:background="@drawable/bg_check_circle" android:gravity="center" android:text="✓"
-            android:textColor="#FFFFFF" android:textSize="72sp" />
+            android:textColor="@color/ok" android:textSize="64sp" />
         <TextView android:id="@+id/receipt_amount" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="24dp" android:textSize="44sp" />
         <TextView android:id="@+id/receipt_change" style="@style/Body" android:layout_width="match_parent"
@@ -75,7 +96,9 @@
         <TextView android:id="@+id/receipt_overpaid" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="4dp" />
         <TextView android:id="@+id/receipt_txid" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="12dp" android:fontFamily="monospace" />
+            android:layout_height="wrap_content" android:layout_marginTop="12dp" android:fontFamily="monospace"
+            android:textColor="@color/dim" android:textSize="13sp" />
+        </LinearLayout>
         <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
         <Button android:id="@+id/btn_new_sale" style="@style/PrimaryButton" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:text="@string/new_sale" />
@@ -92,12 +115,12 @@
         <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
         <Button android:id="@+id/btn_retry" style="@style/PrimaryButton" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:text="@string/retry" />
-        <Button android:id="@+id/btn_check_sales" style="@style/PrimaryButton" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:text="@string/check_sales" />
- <Button android:id="@+id/btn_abandon" style="@style/GhostButton" android:layout_width="wrap_content"
-            android:layout_height="wrap_content" android:text="Abandon sale" android:textColor="@color/bad" />
-        <Button android:id="@+id/btn_error_back" style="@style/GhostButton" android:layout_width="wrap_content"
-            android:layout_height="wrap_content" android:text="@string/back" />
+        <Button android:id="@+id/btn_check_sales" style="@style/OutlineButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="10dp" android:text="@string/check_sales" />
+        <Button android:id="@+id/btn_abandon" style="@style/DangerButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="10dp" android:text="Abandon sale" />
+        <Button android:id="@+id/btn_error_back" style="@style/OutlineButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="10dp" android:text="@string/back" />
     </LinearLayout>
 
     <!-- sales -->
@@ -108,11 +131,12 @@
             <Button android:id="@+id/btn_sales_back" style="@style/GhostButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="@string/back" />
             <TextView android:id="@+id/sales_header" android:layout_width="0dp" android:layout_weight="1"
-                android:layout_height="wrap_content" android:gravity="end" android:textColor="@color/ink"
-                android:textSize="16sp" android:textStyle="bold" />
+                android:layout_height="wrap_content" android:gravity="end" android:fontFamily="@font/figtree_extrabold"
+                android:textColor="@color/gold_hi" android:textSize="16sp" />
         </LinearLayout>
         <ListView android:id="@+id/sales_list" android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" />
+            android:layout_weight="1" android:divider="@null" android:dividerHeight="0dp"
+            android:clipToPadding="false" android:paddingTop="8dp" />
     </LinearLayout>
 
     <!-- relay (old status screen) -->

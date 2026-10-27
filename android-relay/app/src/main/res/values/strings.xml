@@ -10,4 +10,8 @@
     <string name="check_sales">Check sales</string>
     <string name="new_sale">New sale</string>
     <string name="relay_title">Card relay</string>
+    <plurals name="sales_count">
+        <item quantity="one">%d sale</item>
+        <item quantity="other">%d sales</item>
+    </plurals>
 </resources>

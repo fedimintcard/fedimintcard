@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="bg">#F6F7F9</color>
-    <color name="ink">#111827</color>
-    <color name="muted">#6B7280</color>
-    <color name="accent">#F7931A</color>
-    <color name="ok">#16A34A</color>
-    <color name="bad">#DC2626</color>
-    <color name="key">#FFFFFF</color>
-    <color name="ripple">#33000000</color>
+    <color name="night">#1a3272</color>
+    <color name="navy">#22408a</color>
+    <color name="blue">#2b4ea6</color>
+    <color name="ink">#eef3ff</color>
+    <color name="mist">#b9c8ee</color>
+    <color name="dim">#a9b8e2</color>
+    <color name="line">#38d6e2ff</color>
+    <color name="card_fill">#520a163c</color>
+    <color name="gold">#d2bb6a</color>
+    <color name="gold_hi">#f4e9b0</color>
+    <color name="gold_deep">#a88a3c</color>
+    <color name="ok">#4ade80</color>
+    <color name="bad">#f87171</color>
+    <color name="muted">#a9b8e2</color>
+    <color name="ripple">#33eef3ff</color>
 </resources>

@@ -87,14 +87,15 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     }
 
     fun setConnection(ok: Boolean?) {
-        val c = when (ok) { true -> R.color.ok; false -> R.color.bad; null -> R.color.muted }
+        val c = when (ok) { true -> R.color.ok; false -> R.color.bad; null -> R.color.dim }
         (dot.background.mutate() as GradientDrawable).setColor(act.getColor(c))
     }
 
     /** Card presence chip on the amount screen; independent of the till connectivity dot. */
     fun setCard(present: Boolean) {
         cardChip.text = if (present) "Card: present" else "Card: none"
-        cardChip.setTextColor(act.getColor(if (present) R.color.ok else R.color.muted))
+        cardChip.setTextColor(act.getColor(if (present) R.color.gold_hi else R.color.dim))
+        cardChip.setBackgroundResource(if (present) R.drawable.bg_chip_on else R.drawable.bg_chip)
     }
 
     fun setStatus(s: TillStatus?) {
@@ -163,7 +164,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     fun showSales(r: TillResult<SalesList>?) {
         when (r) {
             is TillResult.Ok -> {
-                salesHeader.text = "${r.value.count} sales · ${formatSats(r.value.totalPriceMsat)} sats"
+                salesHeader.text = "${act.resources.getQuantityString(R.plurals.sales_count, r.value.count.toInt(), r.value.count)} · ${formatSats(r.value.totalPriceMsat)} sats"
                 salesAdapter.rows = r.value.sales.reversed()
             }
             is TillResult.Err -> { salesHeader.text = "Could not load sales"; salesAdapter.rows = emptyList() }
