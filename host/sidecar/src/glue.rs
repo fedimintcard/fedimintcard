@@ -38,13 +38,79 @@ use tbs::BlindingKey;
 
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
-use crate::state::{HostKind, HostPending, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore};
+use crate::state::{HostKind, HostPending, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore, Tombstone};
 use crate::wallet::Wallet;
 
 /// Short wait used when recovering old records, where the answer may simply not exist.
 const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for waiting on a transaction decision.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Outcomes of a spend that callers (the till service) tell apart. The text is exactly what the
+/// CLI has always printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpendFault {
+    /// The federation rejected the transaction: nothing moved.
+    Declined(String),
+    /// Submitted, no decision yet; recovery resubmits it on the next command.
+    Undecided(String),
+    /// An earlier transaction is still unresolved, so nothing new was started.
+    Unresolved(String),
+    /// The card in the field is not the one this wallet was set up with.
+    WrongCard(String),
+}
+
+impl std::fmt::Display for SpendFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpendFault::Declined(m) | SpendFault::Undecided(m) | SpendFault::Unresolved(m) | SpendFault::WrongCard(m) => f.write_str(m),
+        }
+    }
+}
+impl std::error::Error for SpendFault {}
+
+/// A sale that became real (the federation accepted it), found while resolving a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedSale {
+    pub client_ref: String,
+    pub txid: String,
+    pub ts_unix_ms: u64,
+    pub price_msat: u64,
+    pub received_msat: u64,
+    pub overpaid_msat: u64,
+    pub fees_msat: u64,
+    pub inputs: Vec<(u8, u64)>,
+    pub change: Vec<(u8, u64)>,
+    /// The federation accepted it but the till notes are not all in the wallet yet.
+    pub collection_pending: bool,
+}
+
+impl PromotedSale {
+    fn from_ptx(p: &PendingTx, received_msat: u64, collection_pending: bool) -> Option<Self> {
+        Some(Self {
+            client_ref: p.client_ref.clone()?,
+            txid: p.txid.clone(),
+            ts_unix_ms: p.ts_unix_ms,
+            price_msat: p.price_msat,
+            received_msat,
+            overpaid_msat: p.overpay_msat,
+            fees_msat: p.fees_msat,
+            inputs: p.spent.clone(),
+            change: p.change.clone(),
+            collection_pending,
+        })
+    }
+}
+
+/// Called with a sale just before its `PendingTx` is removed. If it fails the record stays.
+pub type PromoteHook = Box<dyn Fn(&PromotedSale) -> Result<()>>;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Run a blocking card call from inside a multi-thread tokio runtime.
 pub fn on_card<R>(f: impl FnOnce() -> R) -> R {
@@ -171,11 +237,13 @@ pub struct CardWallet {
     pub recovered_cashouts: Vec<String>,
     #[doc(hidden)]
     pub crash_point: Option<CrashPoint>,
+    /// See [`PromoteHook`].
+    pub on_promote: Option<PromoteHook>,
 }
 
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
-        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None }
+        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None }
     }
 
     fn fee_fn(&self) -> impl Fn(u64) -> u64 + use<> {
@@ -359,7 +427,10 @@ impl CardWallet {
 
     pub async fn is_spent(&self, nonce: Nonce) -> Result<bool> {
         let api = self.wallet.client.api().with_module(self.wallet.mint_id);
-        Ok(api.check_note_spent(nonce).await?)
+        tokio::time::timeout(Duration::from_secs(10), api.check_note_spent(nonce))
+            .await
+            .context("asking the federation whether a note is spent timed out")?
+            .map_err(Into::into)
     }
 
     async fn submit(&self, tx: Transaction) -> Result<Result<TransactionId, TransactionError>> {
@@ -735,6 +806,12 @@ impl CardWallet {
                 let included = tokio::time::timeout(Duration::from_secs(10), self.wallet.client.api().await_transaction(txid_parsed))
                     .await
                     .is_ok();
+                // Why abandoning below cannot hit a transaction the federation later accepts: the
+                // federation's verdict on a transaction is final and the same on every submission,
+                // so a rejection means it was never (and will never be) included. A transaction
+                // that was in fact included is caught by `included` just above, or has spent its
+                // inputs (the `bail!` below, which keeps the record). Only a rejected
+                // transaction with a still-unspent input reaches the abandon.
                 if included {
                     confirmed = true;
                 } else {
@@ -771,9 +848,31 @@ impl CardWallet {
             }
             self.store.save()?;
         }
+        let received_before = rec.till_received;
         if self.collect_group(&txid, timeout, rec).await? {
             // Make sure the card notes this transaction spent are marked before the record goes.
             self.confirm_inputs_spent(txid_parsed, &ptx.inputs, RECOVER_TIMEOUT).await?;
+            // A record that carries a client_ref is never removed unless its sale is recorded:
+            // either the hook succeeded, or (no hook, e.g. the CLI without a ledger) a tombstone
+            // is written in the same save that removes the record.
+            if let Some(sale) =
+                PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false)
+            {
+                match &self.on_promote {
+                    Some(hook) => hook(&sale).context("recording the sale")?,
+                    None => self.store.state.tombstones.push(Tombstone {
+                        client_ref: sale.client_ref,
+                        txid: sale.txid,
+                        price_msat: sale.price_msat,
+                        accepted: true,
+                        ts_unix_ms: sale.ts_unix_ms,
+                        overpay_msat: sale.overpaid_msat,
+                        fees_msat: sale.fees_msat,
+                        spent: sale.inputs,
+                        change: sale.change,
+                    }),
+                }
+            }
             self.store.state.pending_txs.retain(|p| p.txid != txid);
             self.store.save()?;
         }
@@ -782,6 +881,78 @@ impl CardWallet {
 
     fn unresolved(&self) -> Vec<String> {
         self.store.state.pending_txs.iter().map(|p| p.txid.clone()).collect()
+    }
+
+    /// The unresolved transaction that belongs to `client_ref`, if any.
+    pub fn pending_for_ref(&self, client_ref: &str) -> Option<&PendingTx> {
+        self.store.state.pending_txs.iter().find(|p| p.client_ref.as_deref() == Some(client_ref))
+    }
+
+    /// Sales the federation has accepted whose records are still waiting for their till notes.
+    pub fn accepted_refs(&self) -> Vec<PromotedSale> {
+        self.store
+            .state
+            .pending_txs
+            .iter()
+            .filter(|p| p.accepted)
+            .filter_map(|p| PromotedSale::from_ptx(p, 0, true))
+            .collect()
+    }
+
+    /// Check that the card in the field is the one this wallet was set up with: the public key
+    /// of the first cached slot without an interrupted overwrite must match the cached one (a
+    /// slot mid-overwrite may legitimately hold either key). Skipped when there is no such slot.
+    /// Only an actual mismatch, or an empty slot, is a different card; a transport failure keeps
+    /// its own error.
+    pub fn verify_card(&mut self) -> Result<()> {
+        let st = &self.store.state;
+        let Some(slot) = st.slots.iter().map(|s| s.slot).find(|s| !st.pending_overwrites.iter().any(|p| p.slot == *s))
+        else {
+            return Ok(());
+        };
+        let want = st.slot_pubkey(slot).unwrap_or_default().to_owned();
+        let got = match on_card(|| self.card.get_pub(slot)) {
+            Ok(k) => k,
+            Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => {
+                return Err(SpendFault::WrongCard(format!("different card presented (slot {slot} is empty)")).into());
+            }
+            Err(e) => return Err(e),
+        };
+        if got.to_string() != want {
+            return Err(SpendFault::WrongCard("different card presented".into()).into());
+        }
+        Ok(())
+    }
+
+    /// Sales waiting in tombstones.
+    pub fn tombstoned_sales(&self) -> Vec<(PromotedSale, Tombstone)> {
+        self.store
+            .state
+            .tombstones
+            .iter()
+            .map(|t| {
+                let sale = PromotedSale {
+                    client_ref: t.client_ref.clone(),
+                    txid: t.txid.clone(),
+                    ts_unix_ms: t.ts_unix_ms,
+                    price_msat: t.price_msat,
+                    // Not kept; the price is the best statement of what was received.
+                    received_msat: t.price_msat,
+                    overpaid_msat: t.overpay_msat,
+                    fees_msat: t.fees_msat,
+                    inputs: t.spent.clone(),
+                    change: t.change.clone(),
+                    collection_pending: false,
+                };
+                (sale, t.clone())
+            })
+            .collect()
+    }
+
+    /// Drop a tombstone once its sale is in the ledger.
+    pub fn clear_tombstone(&mut self, txid: &str) -> Result<()> {
+        self.store.state.tombstones.retain(|t| t.txid != txid);
+        self.store.save()
     }
 
     // ---------------------------------------------------------------- balance
@@ -828,7 +999,7 @@ impl CardWallet {
     /// Build, persist, sign and submit a spend of `inputs` (live note records) into `outs`.
     /// Returns the txid once the federation accepted it. Any error before the transaction is
     /// submitted removes the records of its outputs again.
-    async fn sign_and_submit(&mut self, inputs: &[NoteRec], outs: Vec<PlannedOut>) -> Result<TransactionId> {
+    async fn sign_and_submit(&mut self, inputs: &[NoteRec], outs: Vec<PlannedOut>, template: PendingTx) -> Result<TransactionId> {
         let mint_id = self.wallet.mint_id;
         let mut tx_inputs = vec![];
         let mut keys = vec![];
@@ -883,6 +1054,7 @@ impl CardWallet {
             submitted: false,
             accepted: false,
             inputs: input_nonces.clone(),
+            ..template
         });
         self.store.save()?;
 
@@ -937,10 +1109,13 @@ impl CardWallet {
                 // Definitely rejected: the outputs never existed.
                 self.abandon_group(&group);
                 self.store.save()?;
-                Err(anyhow!("federation rejected the spend: {e}"))
+                Err(SpendFault::Declined(format!("federation rejected the spend: {e}")).into())
             }
             // Undecided: the records stay, recovery resubmits the stored bytes.
-            Err(e) => Err(e.context(format!("transaction {group} is undecided and will be retried by the next command"))),
+            Err(e) => Err(SpendFault::Undecided(format!(
+                "transaction {group} is undecided and will be retried by the next command: {e:#}"
+            ))
+            .into()),
         }
     }
 
@@ -975,10 +1150,11 @@ impl CardWallet {
         self.recover_overwrites()?;
         let rec = self.resolve_pending(RECOVER_TIMEOUT).await?;
         if let Some(t) = self.unresolved().first() {
-            bail!(
+            return Err(SpendFault::Unresolved(format!(
                 "transaction {t} from an earlier command is not resolved yet ({}); run `card balance` until it is",
                 rec.errors.first().map(String::as_str).unwrap_or("waiting for the federation")
-            );
+            ))
+            .into());
         }
         Ok(rec)
     }
@@ -987,6 +1163,12 @@ impl CardWallet {
     /// the change returns to free card slots. Once the federation has accepted the transaction
     /// this never returns an error: the report says what is still pending.
     pub async fn spend(&mut self, price_msat: u64) -> Result<SpendReport> {
+        self.spend_ref(price_msat, None).await
+    }
+
+    /// [`spend`](Self::spend) for the till service: `client_ref` is stored on the `PendingTx`, in
+    /// the save that creates it, before anything is signed or submitted.
+    pub async fn spend_ref(&mut self, price_msat: u64, client_ref: Option<&str>) -> Result<SpendReport> {
         self.start_clean().await?;
         let fee = self.fee_fn();
         let min_denom = self.wallet.min_denom();
@@ -1029,7 +1211,18 @@ impl CardWallet {
             })
             .collect();
 
-        let txid = self.sign_and_submit(&inputs, outs).await?;
+        let fees_msat = inputs.iter().map(|n| fee(n.amount_msat)).sum::<u64>() + plan::fee_sum(&amounts, &fee);
+        let template = PendingTx {
+            client_ref: client_ref.map(str::to_owned),
+            price_msat,
+            ts_unix_ms: now_ms(),
+            overpay_msat: plan.overpay,
+            fees_msat,
+            spent: inputs.iter().map(|n| (n.slot, n.amount_msat)).collect(),
+            change: change.clone(),
+            ..Default::default()
+        };
+        let txid = self.sign_and_submit(&inputs, outs, template).await?;
 
         // Accepted. From here on nothing is an error.
         let mut warnings = vec![];
@@ -1048,7 +1241,6 @@ impl CardWallet {
                 vec![]
             }
         };
-        let fees_msat = inputs.iter().map(|n| fee(n.amount_msat)).sum::<u64>() + plan::fee_sum(&amounts, &fee);
         Ok(SpendReport {
             txid,
             inputs: inputs.iter().map(|n| (n.slot, n.amount_msat)).collect(),
@@ -1092,7 +1284,7 @@ impl CardWallet {
         self.require_tiers(&amounts)?;
         let outs = self.build_outs(&amounts, |_| Ok(OwnerKind::Host(HostKind::Till)))?;
         let bal0 = self.wallet.balance_msat().await?;
-        let txid = self.sign_and_submit(std::slice::from_ref(&note), outs).await?;
+        let txid = self.sign_and_submit(std::slice::from_ref(&note), outs, PendingTx::default()).await?;
 
         let mut warnings = vec![];
         let rec = match self.resolve_pending(FETCH_TIMEOUT).await {

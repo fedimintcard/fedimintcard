@@ -38,6 +38,28 @@ CARD_BACKEND=pcsc [CARD_PCSC_READER=name] cargo test --workspace --features fedi
 Bridge wire format: `POST /apdu` `{"apdu":"<hex>"}` -> `{"response":"<hex data||SW>"}`; `POST /reset`; `GET /health`.
 Verified against the Java bridge from spike/applet (`bridge.jar --port N`): the whole workspace passes with `CARD_BACKEND=bridge`, and `card_roundtrip` passed 20/20 loops. `bridge_roundtrip_when_configured` runs only if `CARD_BRIDGE_URL` is set. Tests use slots 0 and 1 and create keys on demand (`get_or_gen`), so they work against a persistent card.
 
+## Till service
+
+`card-sidecar till serve [--listen 127.0.0.1:9877] [--relay http://127.0.0.1:9876]` runs the
+point-of-sale HTTP API described in `docs/TILL-API.md` (charge, card balance, sales, status). The
+relay URL also comes from `CARD_BRIDGE_URL`. It starts without a card; every charge or balance
+call opens the card behind the phone relay afresh.
+
+Wiring over USB (both forwards die when USB reconnects, so re-run them):
+
+```
+adb forward tcp:9876 tcp:9876   # laptop -> phone NFC relay
+adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
+```
+
+* `serve` owns the data directory. Do not run any other `card-sidecar` command (card, ecash,
+  info) against the same `--data-dir` while it runs; they share `card_state.json` and the client
+  database.
+* One charge or balance call at a time; a second gets `409 busy`.
+* `sales.json` in the data dir (mode 0600) is a convenience ledger for the app and for
+  `client_ref` replays. The money truth is the federation and `card_state.json`.
+* No authentication: keep it on loopback (a warning is printed otherwise).
+
 ## Findings (step 5 transaction)
 
 Spend of one 2^20 msat card note into four host notes (2^19, 2^18, 2^17, 2^16), fees on. The card signs the 32-byte `tx_hash()` only; it never sees these bytes.

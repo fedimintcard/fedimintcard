@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
+use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::{NoteStatus, StateStore};
-use fedimint_card_sidecar::wallet::{Wallet, state_path};
+use fedimint_card_sidecar::wallet::{Wallet, sales_path, state_path};
 
 #[derive(Parser)]
 #[command(name = "card-sidecar", about = "Fedimint ecash on a JavaCard")]
@@ -33,6 +34,22 @@ enum Cmd {
     /// Operate on the card.
     #[command(subcommand)]
     Card(CardCmd),
+    /// The point-of-sale HTTP service (see docs/TILL-API.md).
+    #[command(subcommand)]
+    Till(TillCmd),
+}
+
+#[derive(Subcommand)]
+enum TillCmd {
+    /// Serve the till API. Owns the data directory: do not run other commands meanwhile.
+    Serve {
+        /// Address to listen on. Keep it on loopback: the API has no authentication.
+        #[arg(long, default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
+        listen: std::net::SocketAddr,
+        /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
+        #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
+        relay: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,7 +119,11 @@ async fn card_wallet(cli: &Cli) -> Result<CardWallet> {
     let wallet = Wallet::open(&cli.data_dir).await?;
     let store = StateStore::open(state_path(&cli.data_dir))?;
     let card = open_from_env().context("opening the card")?;
-    Ok(CardWallet::new(wallet, store, card))
+    let mut cw = CardWallet::new(wallet, store, card);
+    // Any command that resolves a till sale must record it where the till service looks.
+    let sales = std::sync::Arc::new(std::sync::Mutex::new(SalesStore::open(sales_path(&cli.data_dir))?));
+    fedimint_card_sidecar::till::ensure_hook(&mut cw, &sales);
+    Ok(cw)
 }
 
 #[tokio::main]
@@ -176,6 +197,12 @@ async fn main() -> Result<()> {
             if *want_qr {
                 qr(&notes.to_string())?;
             }
+        }
+        Cmd::Till(TillCmd::Serve { listen, relay }) => {
+            let wallet = Wallet::open(&cli.data_dir).await?;
+            let store = StateStore::open(state_path(&cli.data_dir))?;
+            let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
+            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone()).await?;
         }
         Cmd::Card(c) => {
             let mut cw = card_wallet(&cli).await?;

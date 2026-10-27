@@ -1,0 +1,709 @@
+//! The till service: charge core, error classification, relay failures and the HTTP router.
+//!
+//! The federation fixture is copied from `card_wallet.rs`.
+
+use std::cell::{Cell, RefCell};
+use std::io::{Read, Write};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::Request;
+use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env};
+use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
+use fedimint_card_sidecar::plan::PlanError;
+use fedimint_card_sidecar::sales::SalesStore;
+use fedimint_card_sidecar::state::StateStore;
+use fedimint_card_sidecar::till::{self, Class, balance_job, charge_with, classify, open_relay_card};
+use fedimint_card_sidecar::wallet::Wallet;
+use fedimint_client::ClientHandleArc;
+use fedimint_client::transaction::TransactionBuilder;
+use fedimint_core::core::OperationId;
+use fedimint_core::secp256k1::XOnlyPublicKey;
+use fedimint_core::secp256k1::schnorr::Signature;
+use fedimint_core::Amount;
+use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
+use fedimint_dummy_server::DummyInit;
+use fedimint_mint_client::MintClientInit;
+use fedimint_mint_server::MintInit;
+use fedimint_testing::federation::FederationTest;
+use fedimint_testing::fixtures::Fixtures;
+use serde_json::Value;
+use tower::ServiceExt as _;
+
+struct Fx {
+    /// Keep alive: dropping it stops the guardians.
+    _fed: FederationTest,
+    cw: CardWallet,
+    _dir: tempfile::TempDir,
+}
+
+/// Give `client` ecash out of thin air through the dummy module.
+async fn fund(client: &ClientHandleArc, amount: Amount) -> anyhow::Result<()> {
+    let dummy = client.get_first_module::<DummyClientModule>()?;
+    let op = OperationId::new_random();
+    let range = client
+        .finalize_and_submit_transaction(op, "fund", |_| (), TransactionBuilder::new().with_inputs(dummy.create_input(amount)))
+        .await?;
+    client.await_primary_bitcoin_module_outputs(op, range.into_iter().collect()).await?;
+    Ok(())
+}
+
+async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
+    assert!(
+        std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
+        "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend"
+    );
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let mut builder = fixtures.new_fed_builder(0);
+    if !fees {
+        builder = builder.disable_mint_fees();
+    }
+    let fed = tokio::time::timeout(Duration::from_secs(60), builder.build()).await?;
+    let client = fed.new_client().await;
+    fund(&client, funds).await?;
+    let wallet = Wallet::from_client(client).await?;
+    let dir = tempfile::tempdir()?;
+    let store = StateStore::open(dir.path().join("card_state.json"))?;
+    let card = open_from_env()?;
+    let mut cw = CardWallet::new(wallet, store, card);
+    // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
+    // behaves like a new one.
+    let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
+    cw.card_setup(!soft)?;
+    Ok(Fx { _fed: fed, cw, _dir: dir })
+}
+
+
+fn sales_of(f: &Fx) -> Arc<Mutex<SalesStore>> {
+    Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales.json")).unwrap()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn charge_happy_path_records_a_sale() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let r = charge_with(&mut f.cw, 50_000, Some("ref-1".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    let b = &r.body;
+    assert_eq!(b["ok"], true);
+    assert_eq!(b["sale_id"], 1);
+    assert_eq!(b["price_msat"], 50_000);
+    assert!(b["overpaid_msat"].as_u64().unwrap() <= fedimint_card_sidecar::plan::MAX_TILL_OVERPAY);
+    assert_eq!(b["txid"].as_str().unwrap().len(), 64);
+    assert!(b["fees_msat"].as_u64().unwrap() >= 200);
+    let ins: u64 = b["inputs"].as_array().unwrap().iter().map(|i| i["msat"].as_u64().unwrap()).sum();
+    let chg: u64 = b["change"].as_array().unwrap().iter().map(|i| i["msat"].as_u64().unwrap()).sum();
+    assert_eq!(
+        ins,
+        b["price_msat"].as_u64().unwrap() + b["overpaid_msat"].as_u64().unwrap() + chg + b["fees_msat"].as_u64().unwrap()
+    );
+    assert_eq!(b["collection_pending"], false);
+    assert!(b["received_msat"].as_u64().unwrap() > 0);
+    assert!(b["warnings"].as_array().unwrap().is_empty());
+    assert!(!b.to_string().contains("OOBNotes") && b.get("ecash").is_none());
+
+    let path = f._dir.path().join("sales.json");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    assert_eq!(file["sales"].as_array().unwrap().len(), 1);
+    assert_eq!(file["sales"][0]["client_ref"], "ref-1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_prices_are_rejected_before_the_card_is_touched() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(1000)).await?;
+    let sales = sales_of(&f);
+    for p in [0, (1u64 << 40) + 1] {
+        let r = charge_with(&mut f.cw, p, None, &sales).await;
+        assert_eq!((r.status, r.body["error"].as_str()), (400, Some("bad_request")));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insufficient_leaves_card_state_unchanged() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 14]).await?;
+    let before = std::fs::read(f._dir.path().join("card_state.json"))?;
+    let sales = sales_of(&f);
+    let r = charge_with(&mut f.cw, 5_000_000, None, &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (402, Some("insufficient")), "{:?}", r.body);
+    assert_eq!(r.body["ok"], false);
+    assert!(r.body["detail"].as_str().unwrap().contains("insufficient"));
+    assert_eq!(std::fs::read(f._dir.path().join("card_state.json"))?, before);
+    assert!(sales.lock().unwrap().file.sales.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sales_persist_and_a_repeated_client_ref_does_not_charge_twice() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("same".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let live = f.cw.store.state.live_total_msat();
+
+    let again = charge_with(&mut f.cw, 20_000, Some("same".into()), &sales).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(again.body["sale_id"], first.body["sale_id"]);
+    assert_eq!(again.body["txid"], first.body["txid"]);
+    assert_eq!(f.cw.store.state.live_total_msat(), live, "the card must not be charged again");
+    assert_eq!(sales.lock().unwrap().file.sales.len(), 1);
+
+    // A second, different sale gets the next id; both survive a reopen.
+    let second = charge_with(&mut f.cw, 10_000, Some("other".into()), &sales).await;
+    assert_eq!((second.status, &second.body["sale_id"]), (200, &Value::from(2)), "{:?}", second.body);
+    let reopened = SalesStore::open(f._dir.path().join("sales.json"))?;
+    assert_eq!(reopened.file.sales.len(), 2);
+    assert_eq!(reopened.file.next_id, 3);
+    assert_eq!(reopened.find_ref("same").unwrap().txid, first.body["txid"].as_str().unwrap());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_after_success_returns_the_identical_body() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("r".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let again = charge_with(&mut f.cw, 20_000, Some("r".into()), &sales).await;
+    assert_eq!((again.status, &again.body), (200, &first.body));
+    Ok(())
+}
+
+/// A shared card that counts signatures: the number of times the card was asked to spend.
+struct CountCard(Rc<RefCell<SoftCard>>, Rc<Cell<u32>>);
+impl Card for CountCard {
+    fn gen_key(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key(s)
+    }
+    fn gen_key_overwrite(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key_overwrite(s)
+    }
+    fn get_pub(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().get_pub(s)
+    }
+    fn sign(&mut self, s: u8, m: &[u8; 32]) -> anyhow::Result<Signature> {
+        self.1.set(self.1.get() + 1);
+        self.0.borrow_mut().sign(s, m)
+    }
+}
+
+type Counted = (Fx, Rc<RefCell<SoftCard>>, Rc<Cell<u32>>);
+
+/// A federation, a topped-up card (notes of 2^16 and 2^14 msat) and a signature counter.
+async fn fx_counted() -> anyhow::Result<Counted> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let signs = Rc::new(Cell::new(0));
+    f.cw.card = Box::new(CountCard(card.clone(), signs.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    Ok((f, card, signs))
+}
+
+/// Leave a charge for `client_ref` in flight and undecided: the transaction was signed and
+/// recorded (with its bytes), marked submitted, but its bytes can no longer be resubmitted, so
+/// resolving it can never reach a decision.
+async fn make_undecided(f: &mut Fx, sales: &Arc<Mutex<SalesStore>>, client_ref: &str, price: u64) {
+    f.cw.crash_point = Some(CrashPoint::BeforeSubmit);
+    let r = charge_with(&mut f.cw, price, Some(client_ref.into()), sales).await;
+    assert_eq!(r.status, 500, "{:?}", r.body);
+    f.cw.crash_point = None;
+    let p = f.cw.store.state.pending_txs.iter_mut().find(|p| p.client_ref.as_deref() == Some(client_ref)).unwrap();
+    assert!(p.tx_hex.is_some());
+    assert_eq!(p.price_msat, price);
+    p.submitted = true;
+    p.tx_hex = Some("00".into());
+    f.cw.store.save().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_while_undecided_returns_202_without_a_second_spend() -> anyhow::Result<()> {
+    let (mut f, _card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    make_undecided(&mut f, &sales, "u", 20_000).await;
+    let (live, signed) = (f.cw.store.state.live_total_msat(), signs.get());
+    for _ in 0..2 {
+        let r = charge_with(&mut f.cw, 20_000, Some("u".into()), &sales).await;
+        assert_eq!((r.status, r.body["error"].as_str()), (202, Some("undecided")), "{:?}", r.body);
+    }
+    assert_eq!(signs.get(), signed, "the card must not be asked to sign again");
+    assert_eq!(f.cw.store.state.live_total_msat(), live);
+    assert!(f.cw.pending_for_ref("u").is_some(), "an unknown outcome is never cleared");
+    assert!(sales.lock().unwrap().file.sales.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_after_crash_finds_the_transaction_through_card_state() -> anyhow::Result<()> {
+    let (mut f, card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    let crashed = charge_with(&mut f.cw, 20_000, Some("c".into()), &sales).await;
+    assert_eq!(crashed.status, 500);
+    let txid = f.cw.pending_for_ref("c").expect("linked in card_state").txid.clone();
+    let signed = signs.get();
+    assert!(signed > 0);
+
+    // Restart: everything is read back from disk.
+    drop(sales);
+    let store = StateStore::open(f._dir.path().join("card_state.json"))?;
+    let mut cw2 = CardWallet::new(f.cw.wallet.clone(), store, Box::new(CountCard(card.clone(), signs.clone())));
+    let sales2 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales.json"))?));
+    let r = charge_with(&mut cw2, 20_000, Some("c".into()), &sales2).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["txid"], txid.as_str());
+    assert_eq!(r.body["price_msat"], 20_000);
+    assert_eq!(signs.get(), signed, "exactly one spend");
+    assert_eq!(sales2.lock().unwrap().file.sales.len(), 1);
+    assert!(cw2.pending_for_ref("c").is_none());
+    // The recovered sale is complete: the notes it spent are known.
+    assert!(!r.body["inputs"].as_array().unwrap().is_empty());
+    let again = charge_with(&mut cw2, 20_000, Some("c".into()), &sales2).await;
+    assert_eq!(again.body, r.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_balance_call_promotes_the_sale_and_the_repeat_replays_it() -> anyhow::Result<()> {
+    let (mut f, _card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert_eq!(charge_with(&mut f.cw, 20_000, Some("b".into()), &sales).await.status, 500);
+    f.cw.crash_point = None;
+    let signed = signs.get();
+    // Accepted but not collected: already visible to an app polling /v1/sales.
+    assert!(sales.lock().unwrap().find_ref("b").unwrap().collection_pending);
+
+    let bal = balance_job(&mut f.cw, &sales).await;
+    assert_eq!(bal.status, 200, "{:?}", bal.body);
+    let rec = sales.lock().unwrap().find_ref("b").cloned().expect("promoted by the balance call");
+    assert!(f.cw.pending_for_ref("b").is_none());
+    assert!(!rec.collection_pending && rec.received_msat > 0, "{rec:?}");
+
+    let r = charge_with(&mut f.cw, 20_000, Some("b".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["txid"], rec.txid.as_str());
+    assert_eq!(r.body["sale_id"], rec.id);
+    assert_eq!(signs.get(), signed, "one spend only");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovering_for_another_ref_records_nothing_for_it() -> anyhow::Result<()> {
+    let (mut f, _card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    make_undecided(&mut f, &sales, "a", 20_000).await;
+    let signed = signs.get();
+    let r = charge_with(&mut f.cw, 10_000, Some("b".into()), &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (503, Some("recovering")), "{:?}", r.body);
+    assert!(f.cw.pending_for_ref("b").is_none());
+    assert!(sales.lock().unwrap().find_ref("b").is_none());
+    assert!(sales.lock().unwrap().file.sales.is_empty());
+    assert_eq!(f.cw.pending_for_ref("a").unwrap().client_ref.as_deref(), Some("a"));
+    assert_eq!(signs.get(), signed);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_ledger_write_does_not_cause_a_second_spend() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut f, _card, signs) = fx_counted().await?;
+    let dir = f._dir.path().join("ledger");
+    std::fs::create_dir(&dir)?;
+    let sales = Arc::new(Mutex::new(SalesStore::open(dir.join("sales.json"))?));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))?;
+    let first = charge_with(&mut f.cw, 20_000, Some("w".into()), &sales).await;
+    let second = charge_with(&mut f.cw, 20_000, Some("w".into()), &sales).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    if std::fs::write(dir.join("probe"), "").is_err() {
+        return Ok(()); // running with rights that ignore permissions would make this test moot
+    }
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(first.body["warnings"].to_string().contains("not recorded"), "{:?}", first.body);
+    assert_eq!(second.status, 200, "{:?}", second.body);
+    assert_eq!(second.body["txid"], first.body["txid"]);
+    let used = signs.get();
+    let third = charge_with(&mut f.cw, 20_000, Some("w".into()), &sales).await;
+    assert_eq!(third.body["txid"], first.body["txid"]);
+    assert_eq!(signs.get(), used);
+    assert!(used > 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_with_another_price_is_a_conflict() -> anyhow::Result<()> {
+    let (mut f, _card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("p".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let signed = signs.get();
+    let r = charge_with(&mut f.cw, 30_000, Some("p".into()), &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (409, Some("conflict")), "{:?}", r.body);
+    assert_eq!(signs.get(), signed);
+
+    // The same holds for an undecided one.
+    make_undecided(&mut f, &sales, "q", 10_000).await;
+    let r = charge_with(&mut f.cw, 11_000, Some("q".into()), &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (409, Some("conflict")), "{:?}", r.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_different_card_is_refused_before_anything_moves() -> anyhow::Result<()> {
+    let (mut f, _card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.card = Box::new(SoftCard::new());
+    let before = std::fs::read(f._dir.path().join("card_state.json"))?;
+    let signed = signs.get();
+    let r = charge_with(&mut f.cw, 20_000, Some("x".into()), &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (502, Some("card_error")), "{:?}", r.body);
+    assert!(r.body["detail"].as_str().unwrap().contains("different card presented"));
+    assert_eq!(std::fs::read(f._dir.path().join("card_state.json"))?, before);
+    assert_eq!(signs.get(), signed);
+    let r = balance_job(&mut f.cw, &sales).await;
+    assert_eq!(r.body["error"], "card_error");
+    assert_eq!(std::fs::read(f._dir.path().join("card_state.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_attempt_leaves_nothing_and_the_ref_can_be_retried() -> anyhow::Result<()> {
+    let (mut f, _card, _signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    let r = charge_with(&mut f.cw, 5_000_000, Some("x".into()), &sales).await;
+    assert_eq!(r.body["error"], "insufficient");
+    assert!(f.cw.pending_for_ref("x").is_none());
+    let r = charge_with(&mut f.cw, 5_000, Some("x".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    Ok(())
+}
+/// A card whose first key overwrite takes effect but whose answer is lost, after which the link
+/// stays down (every `get_pub` fails) until the test sets the mode back to 0.
+/// Mode: 0 normal, 1 armed, 2 down.
+struct LostAnswerCard(Rc<RefCell<SoftCard>>, Rc<Cell<u8>>);
+impl Card for LostAnswerCard {
+    fn gen_key(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key(s)
+    }
+    fn gen_key_overwrite(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        let r = self.0.borrow_mut().gen_key_overwrite(s);
+        if self.1.get() == 1 {
+            self.1.set(2);
+            return Err(anyhow::anyhow!("link lost after the card replaced the key"));
+        }
+        r
+    }
+    fn get_pub(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        if self.1.get() == 2 {
+            return Err(anyhow::anyhow!("link is down"));
+        }
+        self.0.borrow_mut().get_pub(s)
+    }
+    fn sign(&mut self, s: u8, m: &[u8; 32]) -> anyhow::Result<Signature> {
+        self.0.borrow_mut().sign(s, m)
+    }
+}
+
+/// A relay that is down: every call fails with the bridge's own error.
+struct DownCard;
+impl Card for DownCard {
+    fn gen_key(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        Err(BridgeError::Unreachable("POST /apdu: refused".into()).into())
+    }
+    fn gen_key_overwrite(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.gen_key(0)
+    }
+    fn get_pub(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.gen_key(0)
+    }
+    fn sign(&mut self, _: u8, _: &[u8; 32]) -> anyhow::Result<Signature> {
+        Err(BridgeError::Unreachable("POST /apdu: refused".into()).into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hookless_cli_balance_cannot_turn_a_sale_into_a_second_charge() -> anyhow::Result<()> {
+    let (mut f, card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert_eq!(charge_with(&mut f.cw, 20_000, Some("t".into()), &sales).await.status, 500);
+    let signed = signs.get();
+    let txid = f.cw.pending_for_ref("t").unwrap().txid.clone();
+
+    // The CLI (no sales hook) resolves the transaction, as `card balance` does.
+    let state_path = f._dir.path().join("card_state.json");
+    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())));
+    cli.balance().await?;
+    assert!(cli.pending_for_ref("t").is_none());
+    assert_eq!(cli.store.state.tombstones.len(), 1, "the sale must not vanish");
+
+    // The service, with a ledger that never heard of it, must not charge again.
+    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())));
+    let sales3 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales3.json"))?));
+    let r = charge_with(&mut cw3, 20_000, Some("t".into()), &sales3).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["txid"], txid.as_str());
+    assert_eq!(signs.get(), signed, "no second spend");
+    assert_eq!(sales3.lock().unwrap().file.sales.len(), 1);
+    assert!(cw3.store.state.tombstones.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let mode = Rc::new(Cell::new(0u8));
+    f.cw.card = Box::new(LostAnswerCard(card.clone(), mode.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    mode.set(1);
+    let first = charge_with(&mut f.cw, 20_000, Some("o1".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(!f.cw.store.state.pending_overwrites.is_empty(), "the lost answer leaves an overwrite pending");
+    mode.set(0);
+    // The card now holds a key the state file has not adopted yet. The next charge must work.
+    let second = charge_with(&mut f.cw, 10_000, Some("o2".into()), &sales).await;
+    assert_eq!(second.status, 200, "{:?}", second.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_failure_while_checking_the_card_keeps_its_own_error() -> anyhow::Result<()> {
+    let (mut f, _card, _signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.card = Box::new(DownCard);
+    let r = charge_with(&mut f.cw, 20_000, None, &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (502, Some("relay_unreachable")), "{:?}", r.body);
+    Ok(())
+}
+
+#[test]
+fn classify_pins_codes_and_statuses() {
+    let c = |e: anyhow::Error| classify(&e);
+    let k = |status, code| Class { status, code };
+    let wrap = |e: anyhow::Error| e.context("outer").context("outermost");
+    assert_eq!(c(wrap(BridgeError::NoCard("POST /apdu: HTTP 503: x".into()).into())), k(409, "no_card"));
+    assert_eq!(c(wrap(BridgeError::Unreachable("POST /apdu: refused".into()).into())), k(502, "relay_unreachable"));
+    assert_eq!(c(wrap(BridgeError::Http(500, "POST /apdu: HTTP 500: x".into()).into())), k(502, "card_error"));
+    assert_eq!(c(wrap(StatusWord(0x6985).into())), k(502, "card_error"));
+    assert_eq!(c(wrap(PlanError::Insufficient { have: 1, need: 2 }.into())), k(402, "insufficient"));
+    assert_eq!(c(wrap(PlanError::NoExactPlan { price: 1, free_slots: 0 }.into())), k(422, "no_exact_plan"));
+    assert_eq!(c(wrap(PlanError::TooManyNotes(9).into())), k(422, "no_exact_plan"));
+    assert_eq!(c(wrap(SpendFault::Declined("d".into()).into())), k(402, "declined"));
+    assert_eq!(c(wrap(SpendFault::Undecided("u".into()).into())), k(202, "undecided"));
+    assert_eq!(c(wrap(SpendFault::Unresolved("r".into()).into())), k(503, "recovering"));
+    assert_eq!(c(anyhow::anyhow!("something else")), k(500, "internal"));
+    // Display text is unchanged from the old anyhow strings.
+    assert_eq!(SpendFault::Declined("federation rejected the spend: e".into()).to_string(), "federation rejected the spend: e");
+}
+
+/// Read one whole HTTP request (headers and body), so closing the socket afterwards cannot
+/// reset the connection before the client has read its answer.
+fn drain_request(s: &mut std::net::TcpStream) {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = s.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let want = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                .unwrap_or(0);
+            if data.len() >= end + 4 + want {
+                return;
+            }
+        }
+    }
+}
+
+/// A relay that answers every request with `status`.
+fn mock_relay(status: &'static str, body: &'static str) -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let mut s = s.unwrap();
+            drain_request(&mut s);
+            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    url
+}
+
+fn closed_port_url() -> String {
+    let p = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    format!("http://127.0.0.1:{p}")
+}
+
+#[test]
+fn relay_failures_map_to_no_card_and_relay_unreachable() {
+    let err = open_relay_card(&mock_relay("503 Service Unavailable", "no card")).err().unwrap();
+    assert_eq!(classify(&err), Class { status: 409, code: "no_card" }, "{err:#}");
+    let err = open_relay_card(&closed_port_url()).err().unwrap();
+    assert_eq!(classify(&err), Class { status: 502, code: "relay_unreachable" }, "{err:#}");
+}
+
+/// A card shared with the test, whose signature takes a while.
+struct SlowCard(Rc<RefCell<SoftCard>>);
+impl Card for SlowCard {
+    fn gen_key(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key(s)
+    }
+    fn gen_key_overwrite(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key_overwrite(s)
+    }
+    fn get_pub(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().get_pub(s)
+    }
+    fn sign(&mut self, s: u8, m: &[u8; 32]) -> anyhow::Result<Signature> {
+        std::thread::sleep(Duration::from_millis(1500));
+        self.0.borrow_mut().sign(s, m)
+    }
+}
+
+async fn call(app: axum::Router, method: &str, uri: &str, body: &str) -> (u16, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    // Replace the card with one shared with the opener below.
+    let shared = Rc::new(RefCell::new(SoftCard::new()));
+    f.cw.card = Box::new(SlowCard(shared.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
+    let opener_card = shared.clone();
+    let dead_relay = closed_port_url();
+    let (handle, actor) = till::new(
+        f.cw,
+        dead_relay,
+        sales,
+        Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>)),
+    )
+    .await;
+    let app = till::router(handle);
+
+    let a = tokio::spawn(call(app.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"a"}"#));
+    let a2 = app.clone();
+    let rest = async move {
+        // Let the first charge get admitted and into the (slow) card call.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let b = tokio::spawn(call(a2.clone(), "POST", "/v1/charge", r#"{"price_msat":10000,"client_ref":"b"}"#)).await.unwrap();
+        let bal = tokio::spawn(call(a2.clone(), "POST", "/v1/card/balance", "")).await.unwrap();
+        let st = tokio::spawn(call(a2.clone(), "GET", "/v1/status", "")).await.unwrap();
+        let first = a.await.unwrap();
+        (b, bal, st, first)
+    };
+    // The actor future is not Send: poll it here, on the test's own task, next to the requests.
+    let rest = tokio::spawn(rest);
+    let mut actor = Box::pin(actor);
+    let (b, bal, st, first) = tokio::select! {
+        r = rest => r.unwrap(),
+        _ = &mut actor => panic!("actor ended early"),
+    };
+    assert_eq!(b.0, 409, "{:?}", b.1);
+    assert_eq!(b.1["error"], "busy");
+    assert_eq!(bal.0, 409);
+    assert_eq!(first.0, 200, "{:?}", first.1);
+
+    // 7: /v1/status with a dead relay.
+    assert_eq!(st.0, 200);
+    assert_eq!(st.1["card_relay_ok"], false);
+    assert_eq!(st.1["busy"], true);
+    assert!(st.1["federation_id"].as_str().unwrap().len() >= 16);
+    assert!(st.1["wallet_balance_msat"].as_u64().is_some());
+    assert!(st.1.get("federation_name").is_some());
+
+    // Validation and malformed bodies.
+    assert_eq!(call(app.clone(), "POST", "/v1/charge", "{}").await.0, 400);
+    assert_eq!(call(app.clone(), "POST", "/v1/charge", "not json").await.0, 400);
+    assert_eq!(call(app.clone(), "GET", "/v1/health", "").await, (200, serde_json::json!({"ok": true})));
+
+    let (code, s) = call(app, "GET", "/v1/sales", "").await;
+    assert_eq!(code, 200);
+    assert_eq!(s["count"], 1);
+    assert_eq!(s["total_price_msat"], 20_000);
+    assert_eq!(s["sales"][0]["client_ref"], "a");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let shared = Rc::new(RefCell::new(SoftCard::new()));
+    f.cw.card = Box::new(SlowCard(shared.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
+    let opener_card = shared.clone();
+    let (handle, actor) = till::new(
+        f.cw,
+        closed_port_url(),
+        sales,
+        Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>)),
+    )
+    .await;
+    let app = till::router(handle);
+    let a = tokio::spawn(call(app.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"same"}"#));
+    let app2 = app.clone();
+    let rest = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let other = call(app2.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"different"}"#).await;
+        // Repeats of the same ref, through the moment the first one finishes: never "busy".
+        let mut seen = vec![];
+        for _ in 0..80 {
+            let r = call(app2.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"same"}"#).await;
+            let done = r.0 == 200;
+            seen.push(r);
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        (seen, other, a.await.unwrap())
+    });
+    let mut actor = Box::pin(actor);
+    let (seen, other, first) = tokio::select! {
+        r = rest => r.unwrap(),
+        _ = &mut actor => panic!("actor ended early"),
+    };
+    assert_eq!((other.0, other.1["error"].as_str()), (409, Some("busy")));
+    assert_eq!(first.0, 200, "{:?}", first.1);
+    assert!(seen.iter().all(|r| r.0 == 202 || r.0 == 200), "{:?}", seen.iter().map(|r| r.0).collect::<Vec<_>>());
+    assert_eq!(seen.first().unwrap().0, 202);
+    let last = seen.last().unwrap();
+    assert_eq!((last.0, &last.1["txid"]), (200, &first.1["txid"]));
+    drop(app); // the actor ends only after the last handle is gone
+    Ok(())
+}

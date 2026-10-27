@@ -2329,6 +2329,7 @@ name = "fedimint-card-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "fedimint-api-client",
  "fedimint-bip39",
@@ -2351,6 +2352,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
 ]
