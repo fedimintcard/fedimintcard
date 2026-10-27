@@ -28,26 +28,29 @@ normally 5–20 s, worst case about 120 s: use a read timeout of at least 120 s.
 `received_msat` is what the wallet has collected so far; when `collection_pending` is true the
 federation has accepted the payment but the wallet has not yet swept it. Show "paid" either way.
 
-`client_ref` is recorded in `sales.json` as a pending record before anything is submitted to the
-federation, so a repeated `client_ref` never starts a second spend while the first may still count:
+`client_ref` is stored with the transaction record in `card_state.json`, in the same save that
+creates it and before anything is signed or submitted. A repeated `client_ref` therefore never
+starts a second spend while the first may still count:
 
 * the earlier attempt was accepted: the same success body is returned again (200, same `sale_id`
-  and `txid`), without touching the card;
-* the earlier attempt is still undecided: `undecided` 202 again; the service resolves it on the
-  next job, then records the sale (an app can also poll `/v1/sales` for its `client_ref`). A sale
-  recovered this way has empty `inputs`/`change` and `fees_msat` 0, because those were not kept;
-* the earlier attempt is still in flight (the service is busy with it): `undecided` 202, never
-  `busy`; the repeat is not queued;
-* the earlier attempt failed before anything was submitted (`insufficient`, `no_card`, `declined`,
-  ...): the repeat is a fresh attempt with the same ref.
+  and `txid`), without touching the card. The sale is in `sales.json` as soon as the federation has
+  accepted it (`collection_pending` true until the till notes are in the wallet), so an app can
+  also poll `/v1/sales` for its `client_ref`;
+* the earlier attempt is still unresolved, or still in flight (the service is busy with it):
+  `undecided` 202, never `busy`, never a second spend. The service resolves it on the next job
+  and records the sale;
+* the earlier attempt is proven to have left nothing behind (`insufficient`, `no_card`,
+  `declined`, a crash before submission, ...): the repeat is a fresh attempt with the same ref;
+* the same `client_ref` with a different `price_msat` is `conflict` 409.
 
 | error | HTTP | meaning | app action |
 |---|---|---|---|
 | `bad_request` | 400 | missing or zero price | fix input |
+| `conflict` | 409 | this `client_ref` was used for a sale of a different price | use a new `client_ref` |
 | `busy` | 409 | another charge or balance call is in flight | wait, retry |
 | `no_card` | 409 | the relay has no card in the field, or the card did not answer | re-seat card, retry |
 | `relay_unreachable` | 502 | the phone relay could not be reached from the laptop | check USB / adb forward |
-| `card_error` | 502 | the card returned an error status | retry; if it persists, card fault |
+| `card_error` | 502 | the card returned an error status, or a different card than the wallet's was presented ("different card presented") | retry; if it persists, card fault |
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |

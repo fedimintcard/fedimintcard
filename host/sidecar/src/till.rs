@@ -27,9 +27,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::glue::{BalanceReport, CardWallet, SpendFault, SpendReport, on_card};
+use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
 use crate::plan::PlanError;
-use crate::sales::{PendingRec, SaleRec, SalesStore, SlotMsat};
+use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
 use crate::wallet::{Wallet, sales_path};
 
@@ -97,6 +97,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 SpendFault::Declined(_) => c(402, "declined"),
                 SpendFault::Undecided(_) => c(202, "undecided"),
                 SpendFault::Unresolved(_) => c(503, "recovering"),
+                SpendFault::WrongCard(_) => c(502, "card_error"),
             };
         }
     }
@@ -191,6 +192,7 @@ async fn actor(
     sales: Arc<Mutex<SalesStore>>,
     opener: CardOpener,
 ) {
+    ensure_hook(&mut cw, &sales);
     while let Some(job) = rx.recv().await {
         let (reply_tx, reply) = match job {
             Job::Charge { price, client_ref, reply } => {
@@ -204,7 +206,9 @@ async fn actor(
                         let settled = match client_ref.as_deref() {
                             Some(c) => {
                                 cw.card = Box::new(NoCard);
-                                settle_pending(&mut cw, c, &sales).await
+                                let r = settle(&mut cw, c, price, &sales).await;
+                                sync_sales(&cw, &sales);
+                                r
                             }
                             None => None,
                         };
@@ -217,24 +221,41 @@ async fn actor(
                 let r = match on_card(|| opener()) {
                     Ok(card) => {
                         cw.card = card;
-                        match cw.balance().await {
-                            Ok(rep) => balance_reply(&rep),
-                            Err(e) => error_reply(&e),
-                        }
+                        balance_job(&mut cw, &sales).await
                     }
                     Err(e) => error_reply(&e),
                 };
-                // Ecash strings are never sent over the API; they are in cashouts.log.
-                cw.recovered_cashouts.clear();
                 (reply, r)
             }
         };
         cw.card = Box::new(NoCard);
-        // Free the service before answering, so a client that retries at once is not told "busy".
-        *inflight.lock().unwrap() = None;
-        busy.store(false, Ordering::SeqCst);
+        // Free the service before answering, so a client that retries at once is not told
+        // "busy". Both are cleared under the lock admission takes, so no request can see "busy"
+        // for a job that is already over.
+        {
+            let mut g = inflight.lock().unwrap();
+            *g = None;
+            busy.store(false, Ordering::SeqCst);
+        }
         let _ = reply_tx.send(reply);
     }
+}
+
+/// `POST /v1/card/balance`: check the card, reconcile, and record sales the reconciliation
+/// found. The card must already be in `cw.card`.
+pub async fn balance_job(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) -> Reply {
+    ensure_hook(cw, sales);
+    let r = match cw.verify_card() {
+        Ok(()) => match cw.balance().await {
+            Ok(rep) => balance_reply(&rep),
+            Err(e) => error_reply(&e),
+        },
+        Err(e) => error_reply(&e),
+    };
+    sync_sales(cw, sales);
+    // Ecash strings are never sent over the API; they are in cashouts.log.
+    cw.recovered_cashouts.clear();
+    r
 }
 
 fn now_ms() -> u64 {
@@ -283,8 +304,20 @@ fn validate_price(price: u64) -> Option<Reply> {
     None
 }
 
-fn replay(sales: &Mutex<SalesStore>, client_ref: Option<&str>) -> Option<Reply> {
+fn conflict_reply(client_ref: &str, had: u64, now: u64) -> Reply {
+    Reply::fail(
+        409,
+        "conflict",
+        format!("client_ref {client_ref:?} was used for a sale of {had} msat, not {now} msat"),
+    )
+}
+
+/// A completed sale for `client_ref`: the same body again, or `conflict` if the price differs.
+fn replay(sales: &Mutex<SalesStore>, client_ref: Option<&str>, price: u64) -> Option<Reply> {
     let rec = sales.lock().unwrap().find_ref(client_ref?)?.clone();
+    if rec.price_msat != price {
+        return Some(conflict_reply(client_ref?, rec.price_msat, price));
+    }
     Some(Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms)))
 }
 
@@ -299,113 +332,140 @@ fn undecided_reply(txid: Option<&str>) -> Reply {
     )
 }
 
-/// What a repeated `client_ref` means. `Some(reply)` is the final answer (the earlier sale, or
-/// still undecided); `None` means the earlier attempt left nothing behind and a fresh attempt
-/// may start. Does not need the card.
-pub async fn settle_pending(
+fn sale_from(p: &PromotedSale) -> SaleRec {
+    SaleRec {
+        id: 0,
+        ts_unix_ms: p.ts_unix_ms,
+        price_msat: p.price_msat,
+        received_msat: p.received_msat,
+        overpaid_msat: p.overpaid_msat,
+        fees_msat: p.fees_msat,
+        txid: p.txid.clone(),
+        inputs: SlotMsat::list(&p.inputs),
+        change: SlotMsat::list(&p.change),
+        collection_pending: p.collection_pending,
+        client_ref: Some(p.client_ref.clone()),
+        duration_ms: 0,
+        warnings: vec![],
+    }
+}
+
+/// Make every resolution of a transaction that carries a `client_ref` write its sale to
+/// `sales.json` before the link in `card_state.json` is removed.
+fn ensure_hook(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) {
+    let sales = sales.clone();
+    cw.on_promote = Some(Box::new(move |p| {
+        sales.lock().unwrap().append(sale_from(p)).map(|_| ())
+    }));
+}
+
+/// After a job: sales the federation accepted whose notes are still being collected show up in
+/// the ledger too, so an app polling `/v1/sales` sees them.
+fn sync_sales(cw: &CardWallet, sales: &Mutex<SalesStore>) {
+    for p in cw.accepted_refs() {
+        if let Err(e) = sales.lock().unwrap().append(sale_from(&p)) {
+            tracing::warn!("recording accepted sale {}: {e:#}", p.txid);
+        }
+    }
+}
+
+/// What a repeated `client_ref` means. `Some(reply)` is the final answer; `None` means the
+/// earlier attempt is proven to have left nothing behind and a fresh attempt may start.
+/// Never needs the card, and never starts a spend.
+pub async fn settle(
     cw: &mut CardWallet,
     client_ref: &str,
-    sales: &Mutex<SalesStore>,
+    price: u64,
+    sales: &Arc<Mutex<SalesStore>>,
 ) -> Option<Reply> {
-    if let Some(r) = replay(sales, Some(client_ref)) {
+    ensure_hook(cw, sales);
+    // A sale recorded while its notes were still being collected is finished first, so the
+    // replay shows the final amounts.
+    let collecting = sales.lock().unwrap().find_ref(client_ref).is_some_and(|r| r.collection_pending)
+        && cw.pending_for_ref(client_ref).is_some();
+    if !collecting {
+        if let Some(r) = replay(sales, Some(client_ref), price) {
+            return Some(r);
+        }
+    }
+    let pending = cw.pending_for_ref(client_ref)?.clone();
+    if pending.price_msat != price {
+        return Some(conflict_reply(client_ref, pending.price_msat, price));
+    }
+    // Resolve it now. If the federation accepted it, the hook has recorded the sale.
+    match cw.resolve_pending(Duration::from_secs(10)).await {
+        Ok(rec) => {
+            for e in &rec.errors {
+                tracing::warn!("resolving before a repeated client_ref: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("resolving before a repeated client_ref: {e:#}"),
+    }
+    cw.recovered_cashouts.clear();
+    if let Some(r) = replay(sales, Some(client_ref), price) {
         return Some(r);
     }
-    let pending = sales.lock().unwrap().find_pending(client_ref).cloned()?;
-    // Finish what the earlier attempt left in flight (same path every command takes first).
-    let rec = match cw.resolve_pending(Duration::from_secs(10)).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("resolving before a repeated client_ref: {e:#}");
-            Default::default()
-        }
-    };
-    cw.recovered_cashouts.clear();
-    let still = cw.in_flight();
-    let in_flight = match &pending.txid {
-        Some(t) => still.contains(t),
-        None => !still.is_empty(),
-    };
-    if in_flight {
-        return Some(undecided_reply(pending.txid.as_deref()));
-    }
-    if let Some(t) = &pending.txid {
-        if cw.tx_accepted(t, Duration::from_secs(5)).await {
-            // Accepted. The per-input detail was not kept; the federation is the record.
-            let sale = SaleRec {
-                id: 0,
-                ts_unix_ms: pending.ts_unix_ms,
-                price_msat: pending.price_msat,
-                received_msat: rec.till_received,
-                overpaid_msat: 0,
-                fees_msat: 0,
-                txid: t.clone(),
-                inputs: vec![],
-                change: vec![],
-                collection_pending: false,
-                client_ref: Some(client_ref.to_owned()),
-                duration_ms: 0,
-                warnings: vec!["recovered after an undecided attempt; fees and slots were not recorded".into()],
+    match cw.pending_for_ref(client_ref).cloned() {
+        // Accepted, the till notes are still being collected: it is a sale.
+        Some(p) if p.accepted => {
+            let sale = PromotedSale {
+                client_ref: client_ref.to_owned(),
+                txid: p.txid.clone(),
+                ts_unix_ms: p.ts_unix_ms,
+                price_msat: p.price_msat,
+                received_msat: 0,
+                overpaid_msat: p.overpay_msat,
+                fees_msat: p.fees_msat,
+                inputs: p.spent.clone(),
+                change: p.change.clone(),
+                collection_pending: true,
             };
-            let mut store = sales.lock().unwrap();
-            return Some(match store.append(sale.clone()) {
-                Ok(saved) => Reply::ok(charge_body(&saved, &saved.warnings, 0)),
-                Err(e) => return Some(Reply::fail(500, "internal", format!("{e:#}"))),
-            });
+            let rec = match sales.lock().unwrap().append(sale_from(&sale)) {
+                Ok(r) => r,
+                Err(_) => sale_from(&sale), // held in memory by the store; replays still work
+            };
+            Some(Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms)))
         }
+        // Still unknown: never a fresh spend.
+        Some(p) => Some(undecided_reply(Some(&p.txid))),
+        // Gone without a sale: proven abandoned.
+        None => None,
     }
-    // Nothing in flight and not accepted: the attempt failed before it mattered.
-    let _ = sales.lock().unwrap().clear_pending(client_ref);
-    None
 }
 
 /// The testable core of `POST /v1/charge`: spend `price` from `cw`'s card and record the sale.
 ///
-/// A `client_ref` is written to `sales.json` as a pending record before anything is submitted.
-/// A repeat never starts a second spend while the first may still count: it returns the earlier
-/// sale, or `undecided`, or (if the first left nothing behind) starts afresh.
+/// A `client_ref` is stored on the transaction record in `card_state.json` in the save that
+/// creates it, before anything is signed or submitted, so a repeat can always find its
+/// transaction. A repeat never starts a second spend while the first may still count.
 pub async fn charge_with(
     cw: &mut CardWallet,
     price: u64,
     client_ref: Option<String>,
-    sales: &Mutex<SalesStore>,
+    sales: &Arc<Mutex<SalesStore>>,
 ) -> ChargeResponse {
     if let Some(bad) = validate_price(price) {
         return bad;
     }
+    ensure_hook(cw, sales);
     if let Some(c) = client_ref.as_deref() {
-        if let Some(r) = settle_pending(cw, c, sales).await {
+        if let Some(r) = settle(cw, c, price, sales).await {
+            sync_sales(cw, sales);
             return r;
         }
-        let pending = PendingRec { client_ref: c.to_owned(), ts_unix_ms: now_ms(), price_msat: price, txid: None };
-        if let Err(e) = sales.lock().unwrap().set_pending(pending) {
-            return Reply::fail(500, "internal", format!("could not record the sale before charging: {e:#}"));
-        }
+    }
+    if let Err(e) = cw.verify_card() {
+        return error_reply(&e);
     }
     let started = Instant::now();
-    let result = cw.spend(price).await;
+    let result = cw.spend_ref(price, client_ref.as_deref()).await;
     // Whatever happened, recovered ecash is never part of an API answer (it is in cashouts.log).
     cw.recovered_cashouts.clear();
     let r: SpendReport = match result {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("charge of {price} msat failed: {e:#}");
-            if let Some(c) = client_ref.as_deref() {
-                let mut store = sales.lock().unwrap();
-                // Something left in flight keeps the pending record, now with its txid.
-                match cw.in_flight().into_iter().next() {
-                    Some(t) => {
-                        let _ = store.set_pending(PendingRec {
-                            client_ref: c.to_owned(),
-                            ts_unix_ms: now_ms(),
-                            price_msat: price,
-                            txid: Some(t),
-                        });
-                    }
-                    None => {
-                        let _ = store.clear_pending(c);
-                    }
-                }
-            }
+            sync_sales(cw, sales);
             return error_reply(&e);
         }
     };
@@ -424,11 +484,13 @@ pub async fn charge_with(
         duration_ms: started.elapsed().as_millis() as u64,
         warnings: r.warnings.clone(),
     };
-    // The money has moved: a ledger failure must not turn a paid sale into an error.
+    // The money has moved: a ledger failure must not turn a paid sale into an error. The store
+    // keeps the sale in memory, so a repeat still replays it.
     match sales.lock().unwrap().append(rec.clone()) {
         Ok(saved) => rec = saved,
         Err(e) => rec.warnings.push(format!("sale not recorded in sales.json: {e:#}")),
     }
+    sync_sales(cw, sales);
     Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms))
 }
 
@@ -472,24 +534,32 @@ struct ChargeReq {
 }
 
 /// Admit a job (or say busy) and wait for the actor's answer. A repeat of the `client_ref` that
-/// is in flight right now is answered `undecided`, never `busy`, and is not queued.
-async fn run_job(h: &TillHandle, client_ref: Option<&str>, make: impl FnOnce(oneshot::Sender<Reply>) -> Job) -> Reply {
+/// is in flight right now is answered `undecided`, never `busy`, and is not queued; one that
+/// finished in the meantime gets its sale.
+async fn run_job(
+    h: &TillHandle,
+    charge: Option<(&str, u64)>,
+    make: impl FnOnce(oneshot::Sender<Reply>) -> Job,
+) -> Reply {
     {
         let mut inflight = h.inflight.lock().unwrap();
         if h.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            if let Some(c) = client_ref {
-                let same = inflight.as_deref() == Some(c) || h.sales.lock().unwrap().find_pending(c).is_some();
-                if same {
+            if let Some((c, price)) = charge {
+                if let Some(r) = replay(&h.sales, Some(c), price) {
+                    return r;
+                }
+                if inflight.as_deref() == Some(c) {
                     return undecided_reply(None);
                 }
             }
             return Reply::fail(409, "busy", "another charge or balance call is in flight");
         }
-        *inflight = client_ref.map(str::to_owned);
+        *inflight = charge.map(|(c, _)| c.to_owned());
     }
     let (tx, rx) = oneshot::channel();
     if h.tx.try_send(make(tx)).is_err() {
-        *h.inflight.lock().unwrap() = None;
+        let mut g = h.inflight.lock().unwrap();
+        *g = None;
         h.busy.store(false, Ordering::SeqCst);
         return Reply::fail(500, "internal", "the till service is shutting down");
     }
@@ -511,11 +581,11 @@ async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
         return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {MAX_CLIENT_REF} bytes"));
     }
     // A repeat of a finished sale needs neither the card nor the busy flag.
-    if let Some(r) = replay(&h.sales, req.client_ref.as_deref()) {
+    if let Some(r) = replay(&h.sales, req.client_ref.as_deref(), price) {
         return r;
     }
     let cref = req.client_ref.clone();
-    run_job(&h, cref.as_deref(), |reply| Job::Charge { price, client_ref: req.client_ref, reply }).await
+    run_job(&h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, reply }).await
 }
 
 async fn card_balance(State(h): State<TillHandle>) -> Reply {

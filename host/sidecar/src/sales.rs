@@ -50,36 +50,26 @@ pub struct SaleRec {
     pub warnings: Vec<String>,
 }
 
-/// A charge with a `client_ref` that was started and has no recorded outcome yet. Written before
-/// anything is submitted to the federation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingRec {
-    pub client_ref: String,
-    pub ts_unix_ms: u64,
-    pub price_msat: u64,
-    /// The transaction left in flight by the attempt, once known.
-    #[serde(default)]
-    pub txid: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SalesFile {
     pub version: u32,
     pub next_id: u64,
     pub sales: Vec<SaleRec>,
-    #[serde(default)]
-    pub pending: Vec<PendingRec>,
 }
 
 impl Default for SalesFile {
     fn default() -> Self {
-        Self { version: SALES_VERSION, next_id: 1, sales: vec![], pending: vec![] }
+        Self { version: SALES_VERSION, next_id: 1, sales: vec![] }
     }
 }
 
 pub struct SalesStore {
     path: PathBuf,
     pub file: SalesFile,
+    /// Sales that could not be written to disk. Replays are served from here, so a failing disk
+    /// cannot turn a repeat into a second charge; the card state link rebuilds them after a
+    /// restart.
+    memo: Vec<SaleRec>,
 }
 
 impl SalesStore {
@@ -98,7 +88,7 @@ impl SalesStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => SalesFile::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Self { path, file })
+        Ok(Self { path, file, memo: vec![] })
     }
 
     pub fn path(&self) -> &Path {
@@ -106,50 +96,57 @@ impl SalesStore {
     }
 
     pub fn find_ref(&self, client_ref: &str) -> Option<&SaleRec> {
-        self.file.sales.iter().find(|s| s.client_ref.as_deref() == Some(client_ref))
+        self.file.sales.iter().chain(&self.memo).find(|s| s.client_ref.as_deref() == Some(client_ref))
     }
 
-    pub fn find_pending(&self, client_ref: &str) -> Option<&PendingRec> {
-        self.file.pending.iter().find(|p| p.client_ref == client_ref)
-    }
-
-    /// Persist a pending record (replacing one with the same ref). Call before submitting.
-    pub fn set_pending(&mut self, rec: PendingRec) -> Result<()> {
-        let old = self.file.pending.clone();
-        self.file.pending.retain(|p| p.client_ref != rec.client_ref);
-        self.file.pending.push(rec);
-        self.save().inspect_err(|_| self.file.pending = old)
-    }
-
-    pub fn clear_pending(&mut self, client_ref: &str) -> Result<()> {
-        if self.find_pending(client_ref).is_none() {
-            return Ok(());
-        }
-        self.file.pending.retain(|p| p.client_ref != client_ref);
-        self.save()
-    }
-
-    /// Record a sale and persist it (dropping the pending record with the same ref). A sale whose `txid` or `client_ref` is already recorded
-    /// returns the existing record and writes nothing. If the write fails the in-memory ledger
-    /// is rolled back.
-    pub fn append(&mut self, mut rec: SaleRec) -> Result<SaleRec> {
-        if let Some(r) = rec.client_ref.as_deref().and_then(|c| self.find_ref(c)) {
-            return Ok(r.clone());
-        }
+    /// Record a sale and persist it. A sale already recorded (same `txid`, same `client_ref`)
+    /// returns the existing record and writes nothing. A `txid` recorded under a different
+    /// `client_ref`, or a `client_ref` under a different `txid`, is an error. If the write fails
+    /// the sale is kept in memory for replays and the error is returned.
+    pub fn append(&mut self, rec: SaleRec) -> Result<SaleRec> {
         if let Some(r) = self.file.sales.iter().find(|s| s.txid == rec.txid) {
+            if r.client_ref != rec.client_ref {
+                bail!("transaction {} is already recorded under another client_ref", rec.txid);
+            }
+            // Recorded while its notes were still being collected: bring the amounts up to date.
+            if r.collection_pending && !rec.collection_pending {
+                let (received, pending) = (rec.received_msat, rec.collection_pending);
+                let r = self.file.sales.iter_mut().find(|s| s.txid == rec.txid).expect("just found");
+                let old = (r.received_msat, r.collection_pending);
+                r.received_msat = received;
+                r.collection_pending = pending;
+                let updated = r.clone();
+                if let Err(e) = self.save() {
+                    let r = self.file.sales.iter_mut().find(|s| s.txid == rec.txid).expect("just found");
+                    (r.received_msat, r.collection_pending) = old;
+                    return Err(e);
+                }
+                return Ok(updated);
+            }
             return Ok(r.clone());
         }
+        // Not on disk yet: a sale held back by an earlier failed write is written now.
+        if let Some(pos) = self.memo.iter().position(|s| s.txid == rec.txid) {
+            if self.memo[pos].client_ref != rec.client_ref {
+                bail!("transaction {} is already recorded under another client_ref", rec.txid);
+            }
+            let held = self.memo.remove(pos);
+            return self.commit(held);
+        }
+        if let Some(r) = rec.client_ref.as_deref().and_then(|c| self.find_ref(c)) {
+            bail!("client_ref {:?} is already recorded for transaction {}", r.client_ref, r.txid);
+        }
+        self.commit(rec)
+    }
+
+    fn commit(&mut self, mut rec: SaleRec) -> Result<SaleRec> {
         rec.id = self.file.next_id;
         self.file.next_id += 1;
         self.file.sales.push(rec.clone());
-        let old_pending = self.file.pending.clone();
-        if let Some(c) = rec.client_ref.as_deref() {
-            self.file.pending.retain(|p| p.client_ref != c);
-        }
         if let Err(e) = self.save() {
             self.file.sales.pop();
             self.file.next_id -= 1;
-            self.file.pending = old_pending;
+            self.memo.push(rec);
             return Err(e);
         }
         Ok(rec)
