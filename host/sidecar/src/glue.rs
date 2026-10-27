@@ -38,7 +38,7 @@ use tbs::BlindingKey;
 
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
-use crate::state::{HostKind, HostPending, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore};
+use crate::state::{HostKind, HostPending, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore, Tombstone};
 use crate::wallet::Wallet;
 
 /// Short wait used when recovering old records, where the answer may simply not exist.
@@ -806,6 +806,12 @@ impl CardWallet {
                 let included = tokio::time::timeout(Duration::from_secs(10), self.wallet.client.api().await_transaction(txid_parsed))
                     .await
                     .is_ok();
+                // Why abandoning below cannot hit a transaction the federation later accepts: the
+                // federation's verdict on a transaction is final and the same on every submission,
+                // so a rejection means it was never (and will never be) included. A transaction
+                // that was in fact included is caught by `included` just above, or has spent its
+                // inputs (the `bail!` below, which keeps the record). Only a rejected
+                // transaction with a still-unspent input reaches the abandon.
                 if included {
                     confirmed = true;
                 } else {
@@ -846,12 +852,26 @@ impl CardWallet {
         if self.collect_group(&txid, timeout, rec).await? {
             // Make sure the card notes this transaction spent are marked before the record goes.
             self.confirm_inputs_spent(txid_parsed, &ptx.inputs, RECOVER_TIMEOUT).await?;
-            // The sale is recorded before the link to it is removed.
-            if let (Some(hook), Some(sale)) = (
-                &self.on_promote,
-                PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false),
-            ) {
-                hook(&sale).context("recording the sale")?;
+            // A record that carries a client_ref is never removed unless its sale is recorded:
+            // either the hook succeeded, or (no hook, e.g. the CLI without a ledger) a tombstone
+            // is written in the same save that removes the record.
+            if let Some(sale) =
+                PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false)
+            {
+                match &self.on_promote {
+                    Some(hook) => hook(&sale).context("recording the sale")?,
+                    None => self.store.state.tombstones.push(Tombstone {
+                        client_ref: sale.client_ref,
+                        txid: sale.txid,
+                        price_msat: sale.price_msat,
+                        accepted: true,
+                        ts_unix_ms: sale.ts_unix_ms,
+                        overpay_msat: sale.overpaid_msat,
+                        fees_msat: sale.fees_msat,
+                        spent: sale.inputs,
+                        change: sale.change,
+                    }),
+                }
             }
             self.store.state.pending_txs.retain(|p| p.txid != txid);
             self.store.save()?;
@@ -879,17 +899,60 @@ impl CardWallet {
             .collect()
     }
 
-    /// Check that the card in the field is the one this wallet was set up with: slot 0's public
-    /// key must match the cached one. Skipped while no slot is cached.
+    /// Check that the card in the field is the one this wallet was set up with: the public key
+    /// of the first cached slot without an interrupted overwrite must match the cached one (a
+    /// slot mid-overwrite may legitimately hold either key). Skipped when there is no such slot.
+    /// Only an actual mismatch, or an empty slot, is a different card; a transport failure keeps
+    /// its own error.
     pub fn verify_card(&mut self) -> Result<()> {
-        let Some(want) = self.store.state.slot_pubkey(0).map(str::to_owned) else { return Ok(()) };
-        let got = on_card(|| self.card.get_pub(0)).map_err(|e| {
-            anyhow::Error::new(SpendFault::WrongCard(format!("different card presented (slot 0: {e:#})")))
-        })?;
+        let st = &self.store.state;
+        let Some(slot) = st.slots.iter().map(|s| s.slot).find(|s| !st.pending_overwrites.iter().any(|p| p.slot == *s))
+        else {
+            return Ok(());
+        };
+        let want = st.slot_pubkey(slot).unwrap_or_default().to_owned();
+        let got = match on_card(|| self.card.get_pub(slot)) {
+            Ok(k) => k,
+            Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => {
+                return Err(SpendFault::WrongCard(format!("different card presented (slot {slot} is empty)")).into());
+            }
+            Err(e) => return Err(e),
+        };
         if got.to_string() != want {
             return Err(SpendFault::WrongCard("different card presented".into()).into());
         }
         Ok(())
+    }
+
+    /// Sales waiting in tombstones.
+    pub fn tombstoned_sales(&self) -> Vec<(PromotedSale, Tombstone)> {
+        self.store
+            .state
+            .tombstones
+            .iter()
+            .map(|t| {
+                let sale = PromotedSale {
+                    client_ref: t.client_ref.clone(),
+                    txid: t.txid.clone(),
+                    ts_unix_ms: t.ts_unix_ms,
+                    price_msat: t.price_msat,
+                    // Not kept; the price is the best statement of what was received.
+                    received_msat: t.price_msat,
+                    overpaid_msat: t.overpay_msat,
+                    fees_msat: t.fees_msat,
+                    inputs: t.spent.clone(),
+                    change: t.change.clone(),
+                    collection_pending: false,
+                };
+                (sale, t.clone())
+            })
+            .collect()
+    }
+
+    /// Drop a tombstone once its sale is in the ledger.
+    pub fn clear_tombstone(&mut self, txid: &str) -> Result<()> {
+        self.store.state.tombstones.retain(|t| t.txid != txid);
+        self.store.save()
     }
 
     // ---------------------------------------------------------------- balance

@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
+use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::{NoteStatus, StateStore};
-use fedimint_card_sidecar::wallet::{Wallet, state_path};
+use fedimint_card_sidecar::wallet::{Wallet, sales_path, state_path};
 
 #[derive(Parser)]
 #[command(name = "card-sidecar", about = "Fedimint ecash on a JavaCard")]
@@ -118,7 +119,11 @@ async fn card_wallet(cli: &Cli) -> Result<CardWallet> {
     let wallet = Wallet::open(&cli.data_dir).await?;
     let store = StateStore::open(state_path(&cli.data_dir))?;
     let card = open_from_env().context("opening the card")?;
-    Ok(CardWallet::new(wallet, store, card))
+    let mut cw = CardWallet::new(wallet, store, card);
+    // Any command that resolves a till sale must record it where the till service looks.
+    let sales = std::sync::Arc::new(std::sync::Mutex::new(SalesStore::open(sales_path(&cli.data_dir))?));
+    fedimint_card_sidecar::till::ensure_hook(&mut cw, &sales);
+    Ok(cw)
 }
 
 #[tokio::main]

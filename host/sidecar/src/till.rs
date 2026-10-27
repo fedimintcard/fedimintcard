@@ -153,6 +153,9 @@ pub struct TillHandle {
     busy: Arc<AtomicBool>,
     /// The `client_ref` of the job that holds the busy flag, if it has one.
     inflight: Arc<Mutex<Option<String>>>,
+    /// `client_ref`s of unresolved transactions in card_state.json, refreshed by the actor after
+    /// every job (a read-only snapshot, so handlers need not touch the wallet).
+    pending_refs: Arc<Mutex<Vec<String>>>,
     wallet: Wallet,
     relay: String,
     sales: Arc<Mutex<SalesStore>>,
@@ -171,17 +174,19 @@ pub async fn new(
     let busy = Arc::new(AtomicBool::new(false));
     let sales = Arc::new(Mutex::new(sales));
     let inflight = Arc::new(Mutex::new(None));
+    let pending_refs = Arc::new(Mutex::new(refs_of(&cw)));
     let federation_name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
     let handle = TillHandle {
         tx,
         busy: busy.clone(),
         inflight: inflight.clone(),
+        pending_refs: pending_refs.clone(),
         wallet: cw.wallet.clone(),
         relay,
         sales: sales.clone(),
         federation_name,
     };
-    (handle, actor(cw, rx, busy, inflight, sales, opener))
+    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener))
 }
 
 async fn actor(
@@ -189,6 +194,7 @@ async fn actor(
     mut rx: mpsc::Receiver<Job>,
     busy: Arc<AtomicBool>,
     inflight: Arc<Mutex<Option<String>>>,
+    pending_refs: Arc<Mutex<Vec<String>>>,
     sales: Arc<Mutex<SalesStore>>,
     opener: CardOpener,
 ) {
@@ -207,7 +213,7 @@ async fn actor(
                             Some(c) => {
                                 cw.card = Box::new(NoCard);
                                 let r = settle(&mut cw, c, price, &sales).await;
-                                sync_sales(&cw, &sales);
+                                sync_sales(&mut cw, &sales);
                                 r
                             }
                             None => None,
@@ -229,6 +235,7 @@ async fn actor(
             }
         };
         cw.card = Box::new(NoCard);
+        *pending_refs.lock().unwrap() = refs_of(&cw);
         // Free the service before answering, so a client that retries at once is not told
         // "busy". Both are cleared under the lock admission takes, so no request can see "busy"
         // for a job that is already over.
@@ -256,6 +263,10 @@ pub async fn balance_job(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) ->
     // Ecash strings are never sent over the API; they are in cashouts.log.
     cw.recovered_cashouts.clear();
     r
+}
+
+fn refs_of(cw: &CardWallet) -> Vec<String> {
+    cw.store.state.pending_txs.iter().filter_map(|p| p.client_ref.clone()).collect()
 }
 
 fn now_ms() -> u64 {
@@ -352,7 +363,7 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
 
 /// Make every resolution of a transaction that carries a `client_ref` write its sale to
 /// `sales.json` before the link in `card_state.json` is removed.
-fn ensure_hook(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) {
+pub fn ensure_hook(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) {
     let sales = sales.clone();
     cw.on_promote = Some(Box::new(move |p| {
         sales.lock().unwrap().append(sale_from(p)).map(|_| ())
@@ -360,11 +371,19 @@ fn ensure_hook(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) {
 }
 
 /// After a job: sales the federation accepted whose notes are still being collected show up in
-/// the ledger too, so an app polling `/v1/sales` sees them.
-fn sync_sales(cw: &CardWallet, sales: &Mutex<SalesStore>) {
+/// the ledger too, so an app polling `/v1/sales` sees them; so do sales left in tombstones by
+/// a process that had no ledger.
+fn sync_sales(cw: &mut CardWallet, sales: &Mutex<SalesStore>) {
     for p in cw.accepted_refs() {
         if let Err(e) = sales.lock().unwrap().append(sale_from(&p)) {
             tracing::warn!("recording accepted sale {}: {e:#}", p.txid);
+        }
+    }
+    for (sale, _) in cw.tombstoned_sales() {
+        let done = sales.lock().unwrap().append(sale_from(&sale));
+        match done.and_then(|_| cw.clear_tombstone(&sale.txid)) {
+            Ok(()) => {}
+            Err(e) => tracing::warn!("recording tombstoned sale {}: {e:#}", sale.txid),
         }
     }
 }
@@ -387,6 +406,20 @@ pub async fn settle(
         if let Some(r) = replay(sales, Some(client_ref), price) {
             return Some(r);
         }
+    }
+    // A sale whose record was removed by a process without a ledger: record it now.
+    if let Some((sale, _)) = cw.tombstoned_sales().into_iter().find(|(s, _)| s.client_ref == client_ref) {
+        if sale.price_msat != price {
+            return Some(conflict_reply(client_ref, sale.price_msat, price));
+        }
+        let rec = match sales.lock().unwrap().append(sale_from(&sale)) {
+            Ok(r) => {
+                let _ = cw.clear_tombstone(&sale.txid);
+                r
+            }
+            Err(_) => sale_from(&sale), // held in memory by the store; the tombstone stays
+        };
+        return Some(Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms)));
     }
     let pending = cw.pending_for_ref(client_ref)?.clone();
     if pending.price_msat != price {
@@ -548,7 +581,7 @@ async fn run_job(
                 if let Some(r) = replay(&h.sales, Some(c), price) {
                     return r;
                 }
-                if inflight.as_deref() == Some(c) {
+                if inflight.as_deref() == Some(c) || h.pending_refs.lock().unwrap().iter().any(|r| r == c) {
                     return undecided_reply(None);
                 }
             }

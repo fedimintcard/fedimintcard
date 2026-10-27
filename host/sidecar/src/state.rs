@@ -146,6 +146,29 @@ pub struct CardState {
     pub host_pending: Vec<HostPending>,
     #[serde(default)]
     pub pending_txs: Vec<PendingTx>,
+    /// Sales whose `PendingTx` was removed by a process that had no sales ledger to record them
+    /// in. The till service turns them into sales (and removes them) on its next sync.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<Tombstone>,
+}
+
+/// What is left of an accepted `PendingTx` that carried a `client_ref`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tombstone {
+    pub client_ref: String,
+    pub txid: String,
+    pub price_msat: u64,
+    pub accepted: bool,
+    #[serde(default)]
+    pub ts_unix_ms: u64,
+    #[serde(default)]
+    pub overpay_msat: u64,
+    #[serde(default)]
+    pub fees_msat: u64,
+    #[serde(default)]
+    pub spent: Vec<(u8, u64)>,
+    #[serde(default)]
+    pub change: Vec<(u8, u64)>,
 }
 
 impl CardState {
