@@ -30,12 +30,13 @@
     </style>
     <style name="Key">
         <item name="android:layout_width">0dp</item>
-        <item name="android:layout_height">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">72dp</item>
         <item name="android:layout_columnWeight">1</item>
         <item name="android:layout_rowWeight">1</item>
         <item name="android:layout_margin">5dp</item>
         <item name="android:gravity">center</item>
-        <item name="android:textSize">28sp</item>
+        <item name="android:textSize">32sp</item>
         <item name="android:textColor">@color/ink</item>
         <item name="android:background">@drawable/bg_key</item>
         <item name="android:clickable">true</item>

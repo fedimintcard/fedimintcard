@@ -25,6 +25,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
 
     private val screens = listOf(R.id.screen_amount, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_relay)
     private val dot: View = v(R.id.dot)
+    private val cardChip: TextView = v(R.id.card_chip)
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
     private val amountText: TextView = v(R.id.amount_text)
@@ -88,6 +89,12 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     fun setConnection(ok: Boolean?) {
         val c = when (ok) { true -> R.color.ok; false -> R.color.bad; null -> R.color.muted }
         (dot.background.mutate() as GradientDrawable).setColor(act.getColor(c))
+    }
+
+    /** Card presence chip on the amount screen; independent of the till connectivity dot. */
+    fun setCard(present: Boolean) {
+        cardChip.text = if (present) "Card: present" else "Card: none"
+        cardChip.setTextColor(act.getColor(if (present) R.color.ok else R.color.muted))
     }
 
     fun setStatus(s: TillStatus?) {

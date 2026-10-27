@@ -45,7 +45,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         ui = PosUi(this, ::dispatch, ::onKey)
         status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
         ui.onSettings { ui.settingsDialog(settings.baseUrl, { settings.baseUrl = it; failures = 0; pollNow() }, { ui.showRelay() }) }
-        cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
+        cardListener = { present -> ui.setCard(present); dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
         ui.setPad(flow.pad)
         ui.render(flow.state)
         nfc = NfcAdapter.getDefaultAdapter(this)
