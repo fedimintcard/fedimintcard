@@ -14,16 +14,17 @@
                 android:layout_marginStart="10dp" android:background="@drawable/bg_chip" android:text="Card: none"
                 android:textColor="@color/muted" android:textSize="12sp" android:paddingStart="10dp" android:paddingEnd="10dp"
                 android:paddingTop="3dp" android:paddingBottom="3dp" />
-            <TextView android:id="@+id/federation_name" android:layout_width="0dp" android:layout_weight="1"
-                android:layout_height="wrap_content" android:layout_marginStart="10dp" android:gravity="end" android:text="@string/app_name"
-                android:textColor="@color/ink" android:textSize="18sp" android:textStyle="bold" android:singleLine="true" />
+            <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
             <Button android:id="@+id/btn_sales" style="@style/GhostButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="@string/sales" />
             <Button android:id="@+id/btn_gear" style="@style/GhostButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="⚙" android:minWidth="48dp" />
         </LinearLayout>
+        <TextView android:id="@+id/federation_name" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="@string/app_name" android:textColor="@color/ink"
+            android:textSize="22sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end" />
         <TextView android:id="@+id/balance_line" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:textSize="14sp" />
+            android:layout_height="wrap_content" android:gravity="start" android:textSize="14sp" />
         <TextView android:id="@+id/amount_text" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" />
         <GridLayout android:id="@+id/keypad" android:layout_width="match_parent" android:layout_height="0dp"
