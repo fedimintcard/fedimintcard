@@ -390,6 +390,108 @@ async fn failed_attempt_leaves_nothing_and_the_ref_can_be_retried() -> anyhow::R
     assert_eq!(r.status, 200, "{:?}", r.body);
     Ok(())
 }
+/// A card whose first key overwrite takes effect but whose answer is lost, after which the link
+/// stays down (every `get_pub` fails) until the test sets the mode back to 0.
+/// Mode: 0 normal, 1 armed, 2 down.
+struct LostAnswerCard(Rc<RefCell<SoftCard>>, Rc<Cell<u8>>);
+impl Card for LostAnswerCard {
+    fn gen_key(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key(s)
+    }
+    fn gen_key_overwrite(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        let r = self.0.borrow_mut().gen_key_overwrite(s);
+        if self.1.get() == 1 {
+            self.1.set(2);
+            return Err(anyhow::anyhow!("link lost after the card replaced the key"));
+        }
+        r
+    }
+    fn get_pub(&mut self, s: u8) -> anyhow::Result<XOnlyPublicKey> {
+        if self.1.get() == 2 {
+            return Err(anyhow::anyhow!("link is down"));
+        }
+        self.0.borrow_mut().get_pub(s)
+    }
+    fn sign(&mut self, s: u8, m: &[u8; 32]) -> anyhow::Result<Signature> {
+        self.0.borrow_mut().sign(s, m)
+    }
+}
+
+/// A relay that is down: every call fails with the bridge's own error.
+struct DownCard;
+impl Card for DownCard {
+    fn gen_key(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        Err(BridgeError::Unreachable("POST /apdu: refused".into()).into())
+    }
+    fn gen_key_overwrite(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.gen_key(0)
+    }
+    fn get_pub(&mut self, _: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.gen_key(0)
+    }
+    fn sign(&mut self, _: u8, _: &[u8; 32]) -> anyhow::Result<Signature> {
+        Err(BridgeError::Unreachable("POST /apdu: refused".into()).into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hookless_cli_balance_cannot_turn_a_sale_into_a_second_charge() -> anyhow::Result<()> {
+    let (mut f, card, signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    assert_eq!(charge_with(&mut f.cw, 20_000, Some("t".into()), &sales).await.status, 500);
+    let signed = signs.get();
+    let txid = f.cw.pending_for_ref("t").unwrap().txid.clone();
+
+    // The CLI (no sales hook) resolves the transaction, as `card balance` does.
+    let state_path = f._dir.path().join("card_state.json");
+    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())));
+    cli.balance().await?;
+    assert!(cli.pending_for_ref("t").is_none());
+    assert_eq!(cli.store.state.tombstones.len(), 1, "the sale must not vanish");
+
+    // The service, with a ledger that never heard of it, must not charge again.
+    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())));
+    let sales3 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales3.json"))?));
+    let r = charge_with(&mut cw3, 20_000, Some("t".into()), &sales3).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["txid"], txid.as_str());
+    assert_eq!(signs.get(), signed, "no second spend");
+    assert_eq!(sales3.lock().unwrap().file.sales.len(), 1);
+    assert!(cw3.store.state.tombstones.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let mode = Rc::new(Cell::new(0u8));
+    f.cw.card = Box::new(LostAnswerCard(card.clone(), mode.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    mode.set(1);
+    let first = charge_with(&mut f.cw, 20_000, Some("o1".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(!f.cw.store.state.pending_overwrites.is_empty(), "the lost answer leaves an overwrite pending");
+    mode.set(0);
+    // The card now holds a key the state file has not adopted yet. The next charge must work.
+    let second = charge_with(&mut f.cw, 10_000, Some("o2".into()), &sales).await;
+    assert_eq!(second.status, 200, "{:?}", second.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_failure_while_checking_the_card_keeps_its_own_error() -> anyhow::Result<()> {
+    let (mut f, _card, _signs) = fx_counted().await?;
+    let sales = sales_of(&f);
+    f.cw.card = Box::new(DownCard);
+    let r = charge_with(&mut f.cw, 20_000, None, &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (502, Some("relay_unreachable")), "{:?}", r.body);
+    Ok(())
+}
+
 #[test]
 fn classify_pins_codes_and_statuses() {
     let c = |e: anyhow::Error| classify(&e);
