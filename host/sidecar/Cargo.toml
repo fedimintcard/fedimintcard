@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 fedimint-api-client = { workspace = true }
 fedimint-bip39 = { workspace = true }
@@ -37,7 +38,7 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tbs = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
@@ -47,3 +48,4 @@ fedimint-dummy-server = { workspace = true }
 fedimint-mint-server = { workspace = true }
 fedimint-testing = { workspace = true }
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

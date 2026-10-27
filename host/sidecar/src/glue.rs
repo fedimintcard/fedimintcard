@@ -46,6 +46,27 @@ const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for waiting on a transaction decision.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Outcomes of a spend that callers (the till service) tell apart. The text is exactly what the
+/// CLI has always printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpendFault {
+    /// The federation rejected the transaction: nothing moved.
+    Declined(String),
+    /// Submitted, no decision yet; recovery resubmits it on the next command.
+    Undecided(String),
+    /// An earlier transaction is still unresolved, so nothing new was started.
+    Unresolved(String),
+}
+
+impl std::fmt::Display for SpendFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpendFault::Declined(m) | SpendFault::Undecided(m) | SpendFault::Unresolved(m) => f.write_str(m),
+        }
+    }
+}
+impl std::error::Error for SpendFault {}
+
 /// Run a blocking card call from inside a multi-thread tokio runtime.
 pub fn on_card<R>(f: impl FnOnce() -> R) -> R {
     tokio::task::block_in_place(f)
@@ -937,10 +958,13 @@ impl CardWallet {
                 // Definitely rejected: the outputs never existed.
                 self.abandon_group(&group);
                 self.store.save()?;
-                Err(anyhow!("federation rejected the spend: {e}"))
+                Err(SpendFault::Declined(format!("federation rejected the spend: {e}")).into())
             }
             // Undecided: the records stay, recovery resubmits the stored bytes.
-            Err(e) => Err(e.context(format!("transaction {group} is undecided and will be retried by the next command"))),
+            Err(e) => Err(SpendFault::Undecided(format!(
+                "transaction {group} is undecided and will be retried by the next command: {e:#}"
+            ))
+            .into()),
         }
     }
 
@@ -975,10 +999,11 @@ impl CardWallet {
         self.recover_overwrites()?;
         let rec = self.resolve_pending(RECOVER_TIMEOUT).await?;
         if let Some(t) = self.unresolved().first() {
-            bail!(
+            return Err(SpendFault::Unresolved(format!(
                 "transaction {t} from an earlier command is not resolved yet ({}); run `card balance` until it is",
                 rec.errors.first().map(String::as_str).unwrap_or("waiting for the federation")
-            );
+            ))
+            .into());
         }
         Ok(rec)
     }
