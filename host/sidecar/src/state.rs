@@ -89,7 +89,7 @@ pub struct HostPending {
 
 /// A transaction the host built and (maybe) sent: the outputs it creates are tracked in `notes`
 /// and `host_pending` under the same txid.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingTx {
     pub txid: String,
     /// Consensus encoding of the signed transaction. Resubmitting it is idempotent.
@@ -105,6 +105,24 @@ pub struct PendingTx {
     /// Nonces (hex) of the card notes it spends.
     #[serde(default)]
     pub inputs: Vec<String>,
+    /// The till service's `client_ref` for this sale. Written in the same save that creates the
+    /// record, so a repeat of the ref can always find its transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
+    /// What the sale looked like when it was built, so a sale recovered later is complete.
+    #[serde(default)]
+    pub price_msat: u64,
+    #[serde(default)]
+    pub ts_unix_ms: u64,
+    #[serde(default)]
+    pub overpay_msat: u64,
+    #[serde(default)]
+    pub fees_msat: u64,
+    /// (slot, msat) of the card notes spent and of the change notes created.
+    #[serde(default)]
+    pub spent: Vec<(u8, u64)>,
+    #[serde(default)]
+    pub change: Vec<(u8, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
