@@ -11,9 +11,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::Request;
 use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env};
-use fedimint_card_sidecar::glue::{CardWallet, SpendFault};
+use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
 use fedimint_card_sidecar::plan::PlanError;
-use fedimint_card_sidecar::sales::SalesStore;
+use fedimint_card_sidecar::sales::{PendingRec, SalesStore};
+use fedimint_card_sidecar::state::PendingTx;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Class, charge_with, classify, open_relay_card};
 use fedimint_card_sidecar::wallet::Wallet;
@@ -34,7 +35,7 @@ use tower::ServiceExt as _;
 
 struct Fx {
     /// Keep alive: dropping it stops the guardians.
-    fed: FederationTest,
+    _fed: FederationTest,
     cw: CardWallet,
     _dir: tempfile::TempDir,
 }
@@ -72,7 +73,7 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     // behaves like a new one.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
     cw.card_setup(!soft)?;
-    Ok(Fx { fed, cw, _dir: dir })
+    Ok(Fx { _fed: fed, cw, _dir: dir })
 }
 
 
@@ -169,6 +170,89 @@ async fn sales_persist_and_a_repeated_client_ref_does_not_charge_twice() -> anyh
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_after_success_returns_the_identical_body() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("r".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(sales.lock().unwrap().file.pending.is_empty());
+    let again = charge_with(&mut f.cw, 20_000, Some("r".into()), &sales).await;
+    assert_eq!((again.status, &again.body), (200, &first.body));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_while_undecided_returns_202_without_a_second_spend() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    // An earlier attempt left a submitted transaction the federation has not decided.
+    let txid = "ab".repeat(32);
+    f.cw.store.state.pending_txs.push(PendingTx {
+        txid: txid.clone(),
+        tx_hex: None,
+        submitted: true,
+        accepted: false,
+        inputs: vec![],
+    });
+    f.cw.store.save()?;
+    sales.lock().unwrap().set_pending(PendingRec {
+        client_ref: "u".into(),
+        ts_unix_ms: 1,
+        price_msat: 20_000,
+        txid: Some(txid.clone()),
+    })?;
+    let live = f.cw.store.state.live_total_msat();
+    for _ in 0..2 {
+        let r = charge_with(&mut f.cw, 20_000, Some("u".into()), &sales).await;
+        assert_eq!((r.status, r.body["error"].as_str()), (202, Some("undecided")), "{:?}", r.body);
+    }
+    assert_eq!(f.cw.store.state.live_total_msat(), live, "no second spend");
+    assert_eq!(f.cw.store.state.pending_txs.len(), 1);
+    assert!(sales.lock().unwrap().file.sales.is_empty());
+    // The pending record is on disk, mode 0600 like the rest.
+    let file: Value = serde_json::from_slice(&std::fs::read(f._dir.path().join("sales.json"))?)?;
+    assert_eq!(file["pending"][0]["client_ref"], "u");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_after_submit_is_promoted_to_a_sale_on_the_repeat() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    f.cw.crash_point = Some(CrashPoint::AfterSubmit);
+    let crashed = charge_with(&mut f.cw, 20_000, Some("c".into()), &sales).await;
+    assert_eq!(crashed.status, 500);
+    let txid = sales.lock().unwrap().find_pending("c").and_then(|p| p.txid.clone()).expect("pending with txid");
+    f.cw.crash_point = None;
+    let r = charge_with(&mut f.cw, 20_000, Some("c".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["txid"], txid.as_str());
+    assert_eq!(r.body["sale_id"], 1);
+    assert!(sales.lock().unwrap().file.pending.is_empty());
+    // Charged once: the card still holds the rest, and a third call replays the same body.
+    let third = charge_with(&mut f.cw, 20_000, Some("c".into()), &sales).await;
+    assert_eq!(third.body, r.body);
+    assert_eq!(sales.lock().unwrap().file.sales.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_attempt_leaves_no_pending_and_the_ref_can_be_retried() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 14]).await?;
+    let sales = sales_of(&f);
+    let r = charge_with(&mut f.cw, 5_000_000, Some("x".into()), &sales).await;
+    assert_eq!(r.body["error"], "insufficient");
+    assert!(sales.lock().unwrap().file.pending.is_empty());
+    let r = charge_with(&mut f.cw, 5_000, Some("x".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    Ok(())
+}
+
 #[test]
 fn classify_pins_codes_and_statuses() {
     let c = |e: anyhow::Error| classify(&e);
@@ -189,6 +273,30 @@ fn classify_pins_codes_and_statuses() {
     assert_eq!(SpendFault::Declined("federation rejected the spend: e".into()).to_string(), "federation rejected the spend: e");
 }
 
+/// Read one whole HTTP request (headers and body), so closing the socket afterwards cannot
+/// reset the connection before the client has read its answer.
+fn drain_request(s: &mut std::net::TcpStream) {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = s.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let want = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                .unwrap_or(0);
+            if data.len() >= end + 4 + want {
+                return;
+            }
+        }
+    }
+}
+
 /// A relay that answers every request with `status`.
 fn mock_relay(status: &'static str, body: &'static str) -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -196,8 +304,7 @@ fn mock_relay(status: &'static str, body: &'static str) -> String {
     std::thread::spawn(move || {
         for s in l.incoming() {
             let mut s = s.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = s.read(&mut buf);
+            drain_request(&mut s);
             let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         }
     });
@@ -309,5 +416,42 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     assert_eq!(s["count"], 1);
     assert_eq!(s["total_price_msat"], 20_000);
     assert_eq!(s["sales"][0]["client_ref"], "a");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let shared = Rc::new(RefCell::new(SoftCard::new()));
+    f.cw.card = Box::new(SlowCard(shared.clone()));
+    f.cw.card_setup(false)?;
+    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
+    let opener_card = shared.clone();
+    let (handle, actor) = till::new(
+        f.cw,
+        closed_port_url(),
+        sales,
+        Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>)),
+    )
+    .await;
+    let app = till::router(handle);
+    let a = tokio::spawn(call(app.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"same"}"#));
+    let app2 = app.clone();
+    let rest = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let dup = call(app2.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"same"}"#).await;
+        let other = call(app2.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"different"}"#).await;
+        (dup, other, a.await.unwrap())
+    });
+    let mut actor = Box::pin(actor);
+    let (dup, other, first) = tokio::select! {
+        r = rest => r.unwrap(),
+        _ = &mut actor => panic!("actor ended early"),
+    };
+    assert_eq!((dup.0, dup.1["error"].as_str()), (202, Some("undecided")), "{:?}", dup.1);
+    assert_eq!((other.0, other.1["error"].as_str()), (409, Some("busy")));
+    assert_eq!(first.0, 200, "{:?}", first.1);
+    drop(app); // the actor ends only after the last handle is gone
     Ok(())
 }

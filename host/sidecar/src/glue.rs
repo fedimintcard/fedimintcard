@@ -805,6 +805,17 @@ impl CardWallet {
         self.store.state.pending_txs.iter().map(|p| p.txid.clone()).collect()
     }
 
+    /// Ids of transactions submitted (or about to be) and not yet resolved.
+    pub fn in_flight(&self) -> Vec<String> {
+        self.unresolved()
+    }
+
+    /// Did the federation accept transaction `txid`? `false` also covers "no answer in `timeout`".
+    pub async fn tx_accepted(&self, txid: &str, timeout: Duration) -> bool {
+        let Ok(t) = parse_txid(txid) else { return false };
+        tokio::time::timeout(timeout, self.wallet.client.api().await_transaction(t)).await.is_ok()
+    }
+
     // ---------------------------------------------------------------- balance
 
     /// Reconcile and report: finish interrupted work, then ask the federation about every live

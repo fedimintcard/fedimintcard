@@ -43,6 +43,23 @@ pub struct SaleRec {
     pub collection_pending: bool,
     #[serde(default)]
     pub client_ref: Option<String>,
+    /// Kept so a replay returns the same body as the first answer.
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// A charge with a `client_ref` that was started and has no recorded outcome yet. Written before
+/// anything is submitted to the federation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRec {
+    pub client_ref: String,
+    pub ts_unix_ms: u64,
+    pub price_msat: u64,
+    /// The transaction left in flight by the attempt, once known.
+    #[serde(default)]
+    pub txid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,11 +67,13 @@ pub struct SalesFile {
     pub version: u32,
     pub next_id: u64,
     pub sales: Vec<SaleRec>,
+    #[serde(default)]
+    pub pending: Vec<PendingRec>,
 }
 
 impl Default for SalesFile {
     fn default() -> Self {
-        Self { version: SALES_VERSION, next_id: 1, sales: vec![] }
+        Self { version: SALES_VERSION, next_id: 1, sales: vec![], pending: vec![] }
     }
 }
 
@@ -90,7 +109,27 @@ impl SalesStore {
         self.file.sales.iter().find(|s| s.client_ref.as_deref() == Some(client_ref))
     }
 
-    /// Record a sale and persist it. A sale whose `txid` or `client_ref` is already recorded
+    pub fn find_pending(&self, client_ref: &str) -> Option<&PendingRec> {
+        self.file.pending.iter().find(|p| p.client_ref == client_ref)
+    }
+
+    /// Persist a pending record (replacing one with the same ref). Call before submitting.
+    pub fn set_pending(&mut self, rec: PendingRec) -> Result<()> {
+        let old = self.file.pending.clone();
+        self.file.pending.retain(|p| p.client_ref != rec.client_ref);
+        self.file.pending.push(rec);
+        self.save().inspect_err(|_| self.file.pending = old)
+    }
+
+    pub fn clear_pending(&mut self, client_ref: &str) -> Result<()> {
+        if self.find_pending(client_ref).is_none() {
+            return Ok(());
+        }
+        self.file.pending.retain(|p| p.client_ref != client_ref);
+        self.save()
+    }
+
+    /// Record a sale and persist it (dropping the pending record with the same ref). A sale whose `txid` or `client_ref` is already recorded
     /// returns the existing record and writes nothing. If the write fails the in-memory ledger
     /// is rolled back.
     pub fn append(&mut self, mut rec: SaleRec) -> Result<SaleRec> {
@@ -103,9 +142,14 @@ impl SalesStore {
         rec.id = self.file.next_id;
         self.file.next_id += 1;
         self.file.sales.push(rec.clone());
+        let old_pending = self.file.pending.clone();
+        if let Some(c) = rec.client_ref.as_deref() {
+            self.file.pending.retain(|p| p.client_ref != c);
+        }
         if let Err(e) = self.save() {
             self.file.sales.pop();
             self.file.next_id -= 1;
+            self.file.pending = old_pending;
             return Err(e);
         }
         Ok(rec)
