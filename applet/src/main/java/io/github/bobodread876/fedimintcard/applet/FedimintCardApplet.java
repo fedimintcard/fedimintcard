@@ -69,7 +69,9 @@ public final class FedimintCardApplet extends Applet {
                 KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
             pubs[i] = (ECPublicKey) KeyBuilder.buildKey(
                 KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
-            setParams(privs[i], pubs[i]);
+            // Domain parameters are written at GEN_KEY, not here: the J3R180 runs the
+            // constructor inside a bounded commit buffer and refuses INSTALL (6F00) when
+            // all slots' parameters are written at once (8 slots failed, 4 passed).
         }
         gen = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         setParams((ECPrivateKey) gen.getPrivate(), (ECPublicKey) gen.getPublic());
@@ -175,7 +177,7 @@ public final class FedimintCardApplet extends Applet {
             // getS may strip leading zeros or add one on silicon: normalise to 32 bytes.
             SchnorrHW.alignScalar(tmp, (short) 0, len);
             // Re-assert domain parameters first: a tear after clearKey must not leave a parameterless key.
-            setParams(privs[s], null);
+            setParams(privs[s], pubs[s]);
             privs[s].setS(tmp, (short) 0, (short) 32);
             short wl = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
             pubs[s].setW(tmp, (short) 0, wl);

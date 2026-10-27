@@ -76,3 +76,6 @@ A 16-slot build (32 EC key objects built in the constructor) loads but the INSTA
 make selectable] fails with `6F00` even with the Opener instantiated first; the constructor is too
 heavy. 8 slots install. The ACR122U also drops the connection (`SCARD_E_NOT_TRANSACTED`) during a
 default-block-size load about half the time and then needs a power cycle; `--bs 64` loads reliably.
+Root cause and fix: writing the curve parameters into every slot's key objects in the constructor is
+what exceeds the install budget; with the parameters written at GEN_KEY instead, 8 slots install
+(load file 4,643 bytes). The 16-slot build was not retried after this fix.
