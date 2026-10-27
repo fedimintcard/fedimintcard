@@ -120,6 +120,17 @@ async fn main() -> Result<()> {
             let w = Wallet::open(&cli.data_dir).await?;
             let st = StateStore::open(state_path(&cli.data_dir))?;
             println!("federation: {}", w.federation_id());
+            let cfg = w.client.config().await;
+            println!(
+                "name: {}; guardians: {}; core consensus: {}.{}",
+                cfg.global.meta.get("federation_name").map_or("?", String::as_str),
+                cfg.global.api_endpoints.len(),
+                cfg.global.consensus_version.major,
+                cfg.global.consensus_version.minor
+            );
+            for (id, m) in &cfg.modules {
+                println!("module {id}: {} v{}.{}", m.kind, m.version.major, m.version.minor);
+            }
             println!("wallet balance: {}", sats(w.balance_msat().await?));
             println!(
                 "mint fee: {} msat for a 1,048,576 msat note (per input and per output)",
