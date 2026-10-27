@@ -1,17 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent" android:layout_height="wrap_content"
-    android:orientation="horizontal" android:padding="16dp" android:gravity="center_vertical">
-    <TextView android:id="@+id/row_time" android:layout_width="0dp" android:layout_weight="2"
-        android:layout_height="wrap_content" android:textColor="@color/muted" android:textSize="14sp" />
-    <LinearLayout android:layout_width="0dp" android:layout_weight="3" android:layout_height="wrap_content"
-        android:orientation="vertical">
-        <TextView android:id="@+id/row_price" android:layout_width="wrap_content" android:layout_height="wrap_content"
-            android:textColor="@color/ink" android:textSize="18sp" android:textStyle="bold" />
-        <TextView android:id="@+id/row_received" android:layout_width="wrap_content" android:layout_height="wrap_content"
-            android:textColor="@color/muted" android:textSize="13sp" />
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:paddingBottom="8dp">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:padding="16dp" android:gravity="center_vertical"
+        android:background="@drawable/bg_card">
+        <TextView android:id="@+id/row_time" android:layout_width="0dp" android:layout_weight="2"
+            android:layout_height="wrap_content" android:textColor="@color/dim" android:textSize="14sp" />
+        <LinearLayout android:layout_width="0dp" android:layout_weight="3" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView android:id="@+id/row_price" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:fontFamily="@font/figtree_extrabold" android:textColor="@color/ink" android:textSize="18sp" />
+            <TextView android:id="@+id/row_received" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:textColor="@color/mist" android:textSize="13sp" />
+        </LinearLayout>
+        <TextView android:id="@+id/row_txid" android:layout_width="0dp" android:layout_weight="3"
+            android:layout_height="wrap_content" android:gravity="end" android:fontFamily="monospace"
+            android:textColor="@color/dim" android:textSize="13sp" />
     </LinearLayout>
-    <TextView android:id="@+id/row_txid" android:layout_width="0dp" android:layout_weight="3"
-        android:layout_height="wrap_content" android:gravity="end" android:fontFamily="monospace"
-        android:textColor="@color/muted" android:textSize="13sp" />
-</LinearLayout>
+</FrameLayout>

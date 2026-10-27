@@ -1,34 +1,97 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">@color/bg</item>
-        <item name="android:statusBarColor">@color/bg</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:colorAccent">@color/accent</item>
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_app</item>
+        <item name="android:statusBarColor">@color/night</item>
+        <item name="android:navigationBarColor">@color/night</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">@color/gold</item>
+        <item name="android:colorControlActivated">@color/gold</item>
+        <item name="android:textColorPrimary">@color/ink</item>
+        <item name="android:textColorSecondary">@color/mist</item>
+        <item name="android:textViewStyle">@style/Fig</item>
+        <item name="android:buttonStyle">@style/FigButton</item>
+        <item name="android:editTextStyle">@style/FigEdit</item>
+        <item name="android:alertDialogTheme">@style/AppDialog</item>
     </style>
-    <style name="Heading">
+    <style name="AppDialog" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorBackground">@color/navy</item>
+        <item name="android:windowBackground">@drawable/bg_dialog</item>
+        <item name="android:textColorPrimary">@color/ink</item>
+        <item name="android:textColorSecondary">@color/mist</item>
+        <item name="android:textColorHint">@color/dim</item>
+        <item name="android:colorAccent">@color/gold_hi</item>
+        <item name="android:colorControlActivated">@color/gold</item>
+        <item name="android:colorControlNormal">@color/dim</item>
+        <item name="android:textViewStyle">@style/Fig</item>
+        <item name="android:buttonStyle">@style/FigButton</item>
+        <item name="android:editTextStyle">@style/FigEdit</item>
+    </style>
+    <style name="Fig" parent="android:Widget.Material.TextView">
+        <item name="android:fontFamily">@font/figtree_regular</item>
+    </style>
+    <style name="FigEdit" parent="android:Widget.Material.EditText">
+        <item name="android:fontFamily">@font/figtree_regular</item>
+    </style>
+    <style name="FigButton" parent="android:Widget.Material.Button">
+        <item name="android:fontFamily">@font/figtree_medium</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+    <style name="Heading" parent="Fig">
+        <item name="android:fontFamily">@font/figtree_extrabold</item>
+        <item name="android:letterSpacing">-0.02</item>
         <item name="android:textColor">@color/ink</item>
         <item name="android:textSize">28sp</item>
-        <item name="android:textStyle">bold</item>
         <item name="android:gravity">center</item>
     </style>
-    <style name="Body">
-        <item name="android:textColor">@color/muted</item>
+    <style name="Body" parent="Fig">
+        <item name="android:textColor">@color/mist</item>
         <item name="android:textSize">16sp</item>
         <item name="android:gravity">center</item>
     </style>
-    <style name="PrimaryButton" parent="android:Widget.Material.Button">
-        <item name="android:textColor">#FFFFFF</item>
-        <item name="android:backgroundTint">@color/btn_tint</item>
+    <style name="Pill" parent="Fig">
+        <item name="android:fontFamily">@font/figtree_medium</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.12</item>
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">@color/dim</item>
+        <item name="android:background">@drawable/bg_chip</item>
+        <item name="android:paddingStart">10dp</item>
+        <item name="android:paddingEnd">10dp</item>
+        <item name="android:paddingTop">4dp</item>
+        <item name="android:paddingBottom">4dp</item>
+    </style>
+    <style name="PrimaryButton" parent="FigButton">
+        <item name="android:fontFamily">@font/figtree_extrabold</item>
+        <item name="android:textColor">@color/night</item>
+        <item name="android:background">@drawable/bg_btn_gold</item>
         <item name="android:textSize">20sp</item>
-        <item name="android:textStyle">bold</item>
         <item name="android:minHeight">64dp</item>
     </style>
+    <style name="OutlineButton" parent="FigButton">
+        <item name="android:textColor">@color/gold_hi</item>
+        <item name="android:background">@drawable/bg_btn_outline</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:minHeight">52dp</item>
+    </style>
+    <style name="DangerButton" parent="OutlineButton">
+        <item name="android:textColor">@color/bad</item>
+        <item name="android:background">@drawable/bg_btn_outline_bad</item>
+    </style>
     <style name="GhostButton" parent="android:Widget.Material.Button.Borderless">
-        <item name="android:textColor">@color/muted</item>
+        <item name="android:fontFamily">@font/figtree_medium</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">@color/gold_hi</item>
         <item name="android:textSize">16sp</item>
     </style>
-    <style name="Key">
+    <style name="HeaderButton" parent="GhostButton">
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.12</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+    <style name="Key" parent="Fig">
+        <item name="android:fontFamily">@font/figtree_medium</item>
         <item name="android:layout_width">0dp</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:minHeight">72dp</item>
