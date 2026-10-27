@@ -207,7 +207,8 @@ fn bridge_roundtrip_when_configured() {
     t.reset().expect("bridge /reset");
     let mut c = CardClient::new(t);
     c.select().unwrap();
-    let pk: XOnlyPublicKey = c.gen_key(0).unwrap();
+    // Overwrite rather than GEN_KEY: a real card behind the relay keeps its keys across /reset.
+    let pk: XOnlyPublicKey = c.gen_key_overwrite(0).unwrap();
     assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985));
     roundtrip(&mut c, 0);
     assert_eq!(c.get_pub(0).unwrap(), pk);
