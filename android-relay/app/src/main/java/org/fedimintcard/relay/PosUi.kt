@@ -37,6 +37,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     private val errDetail: TextView = v(R.id.error_detail)
     private val retry: Button = v(R.id.btn_retry)
     private val checkSales: Button = v(R.id.btn_check_sales)
+    private val errBack: View = v(R.id.btn_error_back)
     private val salesHeader: TextView = v(R.id.sales_header)
     private val salesList: ListView = v(R.id.sales_list)
     private val salesAdapter = SalesAdapter()
@@ -90,6 +91,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         lastPad = pad.display
         amountText.text = "${pad.display} sats"
         charge.isEnabled = pad.isChargeable
+        charge.alpha = if (pad.isChargeable) 1f else 0.4f
         charge.text = if (pad.isChargeable) "Charge ${pad.display} sats" else act.getString(R.string.charge)
     }
 
@@ -97,6 +99,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
 
     fun render(state: PosState) {
         last = state
+        if (state is PosState.Receipt || state is PosState.Error) relayOpen = false
         when (state) {
             is PosState.WaitingForCard -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
             is PosState.Signing -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
@@ -135,7 +138,8 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         val (title, detail) = errorCopy(e.kind, e.detail)
         errTitle.text = title
         errDetail.text = detail
-        retry.visibility = if (e.kind.needsSalesCheck) View.GONE else View.VISIBLE
+        retry.text = act.getString(if (e.kind.needsSalesCheck) R.string.try_again else R.string.retry)
+        errBack.visibility = if (e.kind.needsSalesCheck) View.GONE else View.VISIBLE
         checkSales.visibility = if (e.kind.needsSalesCheck) View.VISIBLE else View.GONE
     }
 
@@ -150,6 +154,9 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         }
     }
 
+    fun closeRelay(): Boolean { if (!relayOpen) return false; relayOpen = false; show(); return true }
+    fun destroy() { pulser.cancel() }
+
     fun showRelay() { relayOpen = true; show() }
 
     private fun show() {
@@ -160,7 +167,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
                 is PosState.WaitingForCard, is PosState.Signing -> R.id.screen_tap
                 is PosState.Receipt -> R.id.screen_receipt
                 is PosState.Error -> R.id.screen_error
-                PosState.Sales -> R.id.screen_sales
+                is PosState.Sales -> R.id.screen_sales
             }
         }
         screens.forEach { v<View>(it).visibility = if (it == target) View.VISIBLE else View.GONE }
@@ -215,8 +222,8 @@ fun errorCopy(kind: ErrorKind, detail: String): Pair<String, String> = when (kin
     ErrorKind.BUSY -> "Till is busy" to "Try again in a moment"
     ErrorKind.RECOVERING -> "Till is recovering" to "Try again in a few seconds"
     ErrorKind.CARD_ERROR -> "Card error" to detail
-    ErrorKind.UNDECIDED -> "Payment pending" to "Check Sales"
-    ErrorKind.TIMEOUT_UNKNOWN -> "Outcome unknown" to "The till did not answer in time. The card may have been charged: check Sales before retrying."
+    ErrorKind.UNDECIDED -> "Payment pending" to "Waiting for the federation. This screen updates when the sale is recorded; Try again re-checks without charging twice."
+    ErrorKind.TIMEOUT_UNKNOWN -> "Outcome unknown" to "The till did not answer. The card may have been charged. This screen updates when the sale is recorded; Try again re-checks without charging twice."
     ErrorKind.TILL_UNREACHABLE -> "Till service unreachable" to "Check adb reverse tcp:9877 tcp:9877"
     ErrorKind.BAD_REQUEST, ErrorKind.INTERNAL, ErrorKind.UNKNOWN -> "Something went wrong" to detail
 }

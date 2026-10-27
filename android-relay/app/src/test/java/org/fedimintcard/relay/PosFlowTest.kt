@@ -100,12 +100,59 @@ class PosFlowTest {
         val second = f.dispatch(PosEvent.CardPresent).single() as PosEffect.StartCharge
         assertEquals(first.clientRef, second.clientRef)
     }
-    @Test fun timeoutOffersSalesCheck() {
-        val f = flow(); f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed)
-        f.dispatch(PosEvent.ChargeDone(f.signingId(), ChargeResult.Failed(TillError.Timeout)))
-        assertTrue((f.state as PosState.Error).kind.needsSalesCheck)
-        f.dispatch(PosEvent.SalesOpened); assertEquals(PosState.Sales, f.state)
-        f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
+    private fun unresolved(r: ChargeResult): Pair<PosFlow, PosEffect.StartCharge> {
+        val f = flow(); f.dispatch(PosEvent.CardPresent)
+        val fx = f.dispatch(PosEvent.ChargePressed).single() as PosEffect.StartCharge
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, r))
+        return f to fx
+    }
+    @Test fun timeoutKeepsRefNoBackAndSalesReturnsToError() {
+        val (f, fx) = unresolved(ChargeResult.Failed(TillError.Timeout))
+        val err = f.state as PosState.Error
+        assertTrue(err.kind.needsSalesCheck); assertEquals(fx.clientRef, f.unresolvedRef)
+        f.dispatch(PosEvent.BackPressed); assertEquals(err, f.state)
+        assertNull(f.systemBack())
+        f.dispatch(PosEvent.SalesOpened); assertEquals(PosState.Sales(err), f.state)
+        assertEquals(fx.clientRef, f.unresolvedRef)
+        f.dispatch(PosEvent.BackPressed); assertEquals(err, f.state)
+    }
+    @Test fun interruptedIsOutcomeUnknown() {
+        val (f, _) = unresolved(ChargeResult.Failed(TillError.Interrupted))
+        assertEquals(ErrorKind.TIMEOUT_UNKNOWN, (f.state as PosState.Error).kind)
+    }
+    @Test fun tryAgainFromUndecidedReusesRef() {
+        val (f, fx) = unresolved(declined(ChargeErrorCode.UNDECIDED))
+        val again = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.StartCharge
+        assertEquals(fx.clientRef, again.clientRef)
+    }
+    @Test fun salesPollResolvesToReceipt() {
+        val (f, fx) = unresolved(declined(ChargeErrorCode.UNDECIDED))
+        f.dispatch(PosEvent.SaleFound(Sale(9, 1, 5000, 5000, 0, 0, "tx", "other")))
+        assertTrue(f.state is PosState.Error)
+        f.dispatch(PosEvent.SaleFound(Sale(9, 1, 5000, 5000, 0, 0, "tx", fx.clientRef)))
+        assertEquals(9L, (f.state as PosState.Receipt).receipt.saleId)
+        assertNull(f.unresolvedRef)
+    }
+    @Test fun salesPollResolvesFromSalesScreen() {
+        val (f, fx) = unresolved(ChargeResult.Failed(TillError.Timeout))
+        f.dispatch(PosEvent.SalesOpened)
+        f.dispatch(PosEvent.SaleFound(Sale(2, 1, 5000, 5000, 0, 0, "tx", fx.clientRef)))
+        assertTrue(f.state is PosState.Receipt)
+    }
+    @Test fun lingeringAfterDeclinedBlocksImmediateResign() {
+        val (f, _) = unresolved(declined(ChargeErrorCode.DECLINED))
+        f.dispatch(PosEvent.BackPressed)
+        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty())
+        assertEquals(PosState.WaitingForCard(5000, true), f.state)
+    }
+    @Test fun systemBackMapping() {
+        val f = flow()
+        assertNull(f.systemBack())
+        f.dispatch(PosEvent.ChargePressed); assertEquals(PosEvent.CancelPressed, f.systemBack())
+        f.dispatch(PosEvent.CardPresent); assertTrue(f.state is PosState.Signing)
+        assertNull(f.systemBack())
+        f.dispatch(PosEvent.BackPressed); assertTrue(f.state is PosState.Signing)
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), ok)); assertEquals(PosEvent.NewSalePressed, f.systemBack())
     }
     @Test fun cancelWorksWhileWaitingNotSigning() {
         val f = flow(); f.dispatch(PosEvent.ChargePressed); f.dispatch(PosEvent.CancelPressed)
@@ -117,6 +164,6 @@ class PosFlowTest {
         val f = flow(); f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed)
         f.dispatch(PosEvent.ChargeDone(f.signingId(), declined(ChargeErrorCode.DECLINED)))
         f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
-        f.dispatch(PosEvent.SalesOpened); assertEquals(PosState.Sales, f.state)
+        f.dispatch(PosEvent.SalesOpened); assertEquals(PosState.Sales(null), f.state)
     }
 }

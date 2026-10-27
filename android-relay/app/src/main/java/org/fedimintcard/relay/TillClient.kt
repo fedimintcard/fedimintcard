@@ -11,6 +11,9 @@ import java.net.URL
 
 data class RawResponse(val status: Int, val body: String)
 
+/** Thrown by a transport for IO failures after the connection was established. */
+class PostConnectException(cause: Throwable) : IOException(cause.message, cause)
+
 fun interface Transport {
     /** Throws SocketTimeoutException on read timeout; any other IOException means unreachable. */
     @Throws(IOException::class)
@@ -20,6 +23,8 @@ fun interface Transport {
 sealed class TillError {
     object Unreachable : TillError()
     object Timeout : TillError()
+    /** Failure after the request was (or may have been) written: outcome unknown. */
+    object Interrupted : TillError()
     data class BadResponse(val detail: String) : TillError()
 }
 
@@ -42,6 +47,8 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
             TillResult.Ok(transport.send(method, url(path), body, CONNECT_MS, readMs))
         } catch (e: SocketTimeoutException) {
             TillResult.Err(TillError.Timeout)
+        } catch (e: PostConnectException) {
+            TillResult.Err(TillError.Interrupted)
         } catch (e: Exception) {
             TillResult.Err(TillError.Unreachable)
         }
@@ -83,6 +90,7 @@ class UrlConnectionTransport : Transport {
             c.setRequestProperty("Accept", "application/json")
             if (body != null) {
                 c.doOutput = true
+                c.setFixedLengthStreamingMode(body.toByteArray(Charsets.UTF_8).size)
                 c.setRequestProperty("Content-Type", "application/json")
             }
             try {
@@ -90,13 +98,17 @@ class UrlConnectionTransport : Transport {
             } catch (e: SocketTimeoutException) {
                 throw ConnectException("connect timed out") // unreachable, not "outcome unknown"
             }
-            if (body != null) {
-                c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            try {
+                if (body != null) c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                val status = c.responseCode
+                val stream = if (status >= 400) c.errorStream else c.inputStream
+                val text = stream?.use { String(it.readBytes(), Charsets.UTF_8) } ?: ""
+                return RawResponse(status, text)
+            } catch (e: SocketTimeoutException) {
+                throw e
+            } catch (e: IOException) {
+                throw PostConnectException(e) // request may have reached the till
             }
-            val status = c.responseCode
-            val stream = if (status >= 400) c.errorStream else c.inputStream
-            val text = stream?.use { String(it.readBytes(), Charsets.UTF_8) } ?: ""
-            return RawResponse(status, text)
         } finally {
             c.disconnect()
         }
@@ -151,9 +163,9 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
         ChargeResult.Success(
             ChargeReceipt(
                 saleId = o.optL("sale_id"),
-                txid = o.reqStr("txid"),
-                priceMsat = o.reqLong("price_msat"),
-                receivedMsat = o.reqLong("received_msat"),
+                txid = o.optString("txid", ""),
+                priceMsat = o.optL("price_msat"),
+                receivedMsat = o.optL("received_msat"),
                 overpaidMsat = o.optL("overpaid_msat"),
                 feesMsat = o.optL("fees_msat"),
                 inputs = notes(o.optJSONArray("inputs")),
@@ -165,7 +177,11 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
         )
     }
 } catch (e: JSONException) {
-    ChargeResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
+    when (httpStatus) {
+        202 -> ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "", httpStatus)
+        in 200..299 -> ChargeResult.Failed(TillError.Interrupted) // accepted but unreadable: outcome unknown
+        else -> ChargeResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
+    }
 }
 
 internal fun parseSales(body: String): TillResult<SalesList> = try {

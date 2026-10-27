@@ -6,7 +6,7 @@ enum class ErrorKind {
     BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NO_EXACT_PLAN,
     DECLINED, UNDECIDED, RECOVERING, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN;
 
-    /** Outcome may already have happened: do not offer a blind Retry. */
+    /** Outcome may already have happened: keep the ref, poll sales, no Back. */
     val needsSalesCheck: Boolean get() = this == UNDECIDED || this == TIMEOUT_UNKNOWN
 
     companion object {
@@ -20,7 +20,8 @@ sealed class PosState {
     data class Signing(val priceMsat: Long, val chargeId: Int, val clientRef: String) : PosState()
     data class Receipt(val receipt: ChargeReceipt) : PosState()
     data class Error(val priceMsat: Long, val kind: ErrorKind, val detail: String, val clientRef: String) : PosState()
-    object Sales : PosState()
+    /** [returnTo] is the unresolved Error to go back to, or null to go back to Entering. */
+    data class Sales(val returnTo: Error? = null) : PosState()
 }
 
 sealed class PosEvent {
@@ -33,6 +34,8 @@ sealed class PosEvent {
     object NewSalePressed : PosEvent()
     object BackPressed : PosEvent()
     object SalesOpened : PosEvent()
+    /** The sales poll found a row carrying the unresolved sale's client_ref. */
+    data class SaleFound(val sale: Sale) : PosEvent()
 }
 
 sealed class PosEffect {
@@ -47,6 +50,24 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
     private var cardPresent = false
     private var lingering = false
     private var nextId = 0
+    private var pendingRef = ""
+
+    /** The client_ref of a sale whose outcome is unknown, while we are waiting to learn it. */
+    val unresolvedRef: String?
+        get() = when (val s = state) {
+            is PosState.Error -> if (s.kind.needsSalesCheck) s.clientRef else null
+            is PosState.Sales -> s.returnTo?.clientRef
+            else -> null
+        }
+
+    /** What the Android back button should do in the current state (null = swallow it). */
+    fun systemBack(): PosEvent? = when (val s = state) {
+        is PosState.WaitingForCard -> PosEvent.CancelPressed
+        is PosState.Receipt -> PosEvent.NewSalePressed
+        is PosState.Error -> if (s.kind.needsSalesCheck) null else PosEvent.BackPressed
+        is PosState.Sales -> PosEvent.BackPressed
+        else -> null
+    }
 
     private fun sign(price: Long, ref: String): List<PosEffect> {
         val id = ++nextId
@@ -55,12 +76,9 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
     }
 
     private fun wait(price: Long, ref: String): List<PosEffect> {
-        // The ref travels in the Waiting state via pendingRef so Retry keeps it.
         pendingRef = ref
         return if (cardPresent) sign(price, ref) else { state = PosState.WaitingForCard(price, false); emptyList() }
     }
-
-    private var pendingRef = ""
 
     fun dispatch(e: PosEvent): List<PosEffect> {
         val s = state
@@ -88,15 +106,16 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             }
             e is PosEvent.CancelPressed && s is PosState.WaitingForCard -> state = PosState.Entering
             e is PosEvent.ChargeDone && s is PosState.Signing && e.chargeId == s.chargeId -> {
+                lingering = true // the card is still on the phone after any outcome
                 when (val r = e.result) {
-                    is ChargeResult.Success -> { lingering = true; state = PosState.Receipt(r.receipt) }
+                    is ChargeResult.Success -> state = PosState.Receipt(r.receipt)
                     is ChargeResult.Declined ->
                         state = PosState.Error(s.priceMsat, ErrorKind.from(r.code), r.detail, s.clientRef)
                     is ChargeResult.Failed -> state = PosState.Error(
                         s.priceMsat,
                         when (r.error) {
                             TillError.Unreachable -> ErrorKind.TILL_UNREACHABLE
-                            TillError.Timeout -> ErrorKind.TIMEOUT_UNKNOWN
+                            TillError.Timeout, TillError.Interrupted -> ErrorKind.TIMEOUT_UNKNOWN
                             is TillError.BadResponse -> ErrorKind.INTERNAL
                         },
                         (r.error as? TillError.BadResponse)?.detail ?: "",
@@ -105,9 +124,21 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                 }
             }
             e is PosEvent.RetryPressed && s is PosState.Error -> return wait(s.priceMsat, s.clientRef)
-            e is PosEvent.BackPressed && (s is PosState.Error || s is PosState.Sales) -> state = PosState.Entering
+            e is PosEvent.BackPressed && s is PosState.Error -> if (!s.kind.needsSalesCheck) state = PosState.Entering
+            e is PosEvent.BackPressed && s is PosState.Sales -> state = s.returnTo ?: PosState.Entering
             e is PosEvent.NewSalePressed && s is PosState.Receipt -> { pad.clear(); state = PosState.Entering }
-            e is PosEvent.SalesOpened && (s is PosState.Entering || s is PosState.Error) -> state = PosState.Sales
+            e is PosEvent.SalesOpened && s is PosState.Entering -> state = PosState.Sales(null)
+            e is PosEvent.SalesOpened && s is PosState.Error -> state = PosState.Sales(s)
+            e is PosEvent.SaleFound -> {
+                val ref = unresolvedRef
+                if (ref != null && e.sale.clientRef == ref) {
+                    val x = e.sale
+                    state = PosState.Receipt(
+                        ChargeReceipt(x.id, x.txid, x.priceMsat, x.receivedMsat, x.overpaidMsat, x.feesMsat,
+                            emptyList(), emptyList(), false, emptyList(), 0)
+                    )
+                }
+            }
         }
         return emptyList()
     }

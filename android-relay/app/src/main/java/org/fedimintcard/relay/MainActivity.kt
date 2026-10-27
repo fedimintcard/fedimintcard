@@ -10,6 +10,7 @@ import android.nfc.tech.IsoDep
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.widget.Toast
 import android.view.WindowManager
 import android.widget.TextView
 import java.util.concurrent.atomic.AtomicReference
@@ -47,12 +48,11 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
         ui.setPad(flow.pad)
         ui.render(flow.state)
-        handler.post(poll)
         nfc = NfcAdapter.getDefaultAdapter(this)
         if (nfc == null) status.text = "no NFC"
         else if (nfc?.isEnabled == false) last.text = "NFC is switched off"
         try {
-            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> CardLink { a -> try { d.transceive(a) } catch (e: TagLostException) { isoDep.compareAndSet(d, null); runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }; throw e } } } }) { ev ->
+            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> CardLink { a -> try { d.transceive(a) } catch (e: TagLostException) { val lost = isoDep.compareAndSet(d, null); runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }; throw e } } } }) { ev ->
                 runOnUiThread { last.text = ev }
             }.also { it.start() }
         } catch (e: Exception) {
@@ -63,6 +63,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
 
     override fun onResume() {
         super.onResume()
+        handler.post(poll)
+        if (flow.unresolvedRef != null) handler.postDelayed(salesPoll, 3000)
         nfc?.enableReaderMode(
             this, this,
             NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
@@ -72,11 +74,13 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     override fun onPause() {
+        handler.removeCallbacks(poll); handler.removeCallbacks(salesPoll)
         nfc?.disableReaderMode(this)
         super.onPause()
     }
 
     override fun onDestroy() {
+        ui.destroy()
         handler.removeCallbacksAndMessages(null)
         cardListener = null
         server?.stop()
@@ -98,14 +102,14 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                         if (!d.isConnected) throw TagLostException()
                         Thread.sleep(300)
                     } catch (e: Exception) {
-                        isoDep.compareAndSet(d, null)
-                        runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }
+                        val lost = isoDep.compareAndSet(d, null)
+                        runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
                     }
                 }
             }.start()
         } catch (e: TagLostException) {
-            isoDep.compareAndSet(d, null)
-            runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }
+            val lost = isoDep.compareAndSet(d, null)
+            runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
         } catch (e: Exception) {
             runOnUiThread { last.text = "connect failed: ${e.message}" }
         }
@@ -128,6 +132,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             handler.removeCallbacks(tick); handler.postDelayed(tick, 1000)
         }
         if (now is PosState.Sales && before !is PosState.Sales) loadSales()
+        if (flow.unresolvedRef != null && before !is PosState.Error && before !is PosState.Sales) {
+            handler.removeCallbacks(salesPoll); handler.postDelayed(salesPoll, 3000)
+        }
         if (now is PosState.Receipt) pollNow()
         for (fx in effects) if (fx is PosEffect.StartCharge) {
             Thread {
@@ -149,6 +156,21 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         override fun run() {
             pollNow()
             handler.postDelayed(this, 5000)
+        }
+    }
+
+    /** While a sale's outcome is unknown, look for its client_ref in the sales ledger every 3 s. */
+    private val salesPoll = object : Runnable {
+        override fun run() {
+            val ref = flow.unresolvedRef ?: return
+            Thread {
+                val r = client.sales()
+                runOnUiThread {
+                    val hit = (r as? TillResult.Ok)?.value?.sales?.firstOrNull { it.clientRef == ref }
+                    if (hit != null && flow.unresolvedRef == ref) dispatch(PosEvent.SaleFound(hit))
+                    else if (flow.unresolvedRef != null) handler.postDelayed(this, 3000)
+                }
+            }.start()
         }
     }
 
@@ -178,10 +200,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        when (flow.state) {
-            is PosState.Error, PosState.Sales -> dispatch(PosEvent.BackPressed)
-            else -> @Suppress("DEPRECATION") super.onBackPressed()
-        }
+        if (ui.closeRelay()) return
+        val ev = flow.systemBack()
+        if (ev != null) dispatch(ev)
+        else if (flow.state == PosState.Entering) Toast.makeText(this, "Use the app controls", Toast.LENGTH_SHORT).show()
     }
 
     @Suppress("DEPRECATION")

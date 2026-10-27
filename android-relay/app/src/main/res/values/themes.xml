@@ -19,7 +19,7 @@
     </style>
     <style name="PrimaryButton" parent="android:Widget.Material.Button">
         <item name="android:textColor">#FFFFFF</item>
-        <item name="android:backgroundTint">@color/accent</item>
+        <item name="android:backgroundTint">@color/btn_tint</item>
         <item name="android:textSize">20sp</item>
         <item name="android:textStyle">bold</item>
         <item name="android:minHeight">64dp</item>

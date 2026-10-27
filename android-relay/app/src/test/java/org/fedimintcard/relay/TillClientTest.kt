@@ -51,6 +51,18 @@ class TillClientTest {
         assertEquals(ChargeErrorCode.UNKNOWN, (parseCharge(500, """{"ok":false,"error":"wat"}""") as ChargeResult.Declined).code)
         assertEquals(ChargeErrorCode.UNKNOWN, ChargeErrorCode.fromWire(""))
     }
+    @Test fun okTrueWithMissingFieldsIsStillSuccess() {
+        val r = parseCharge(200, """{"ok":true}""")
+        assertTrue(r is ChargeResult.Success)
+    }
+    @Test fun unparsable2xxIsOutcomeUnknown() {
+        assertEquals(ChargeResult.Failed(TillError.Interrupted), parseCharge(200, "<html>"))
+        assertEquals(ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "", 202), parseCharge(202, "oops"))
+        assertTrue((parseCharge(502, "<html>") as ChargeResult.Failed).error is TillError.BadResponse)
+    }
+    @Test fun postConnectFailureIsInterrupted() {
+        assertEquals(ChargeResult.Failed(TillError.Interrupted), client(Fake(ex = PostConnectException(IOException("reset")))).charge(1, "r"))
+    }
     @Test fun nonJsonIsBadResponse() {
         val r = client(Fake(raw(502, "<html>"))).charge(1, "r")
         assertTrue((r as ChargeResult.Failed).error is TillError.BadResponse)

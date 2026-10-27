@@ -69,4 +69,10 @@ the header turns red after two failed status polls. The till URL defaults to
 (`usesCleartextTraffic`); keep the till on loopback or an `adb` tunnel, there is no auth.
 
 To try the UI without the Rust service: `MOCK_SCENARIO=success python3 tools/mock_till.py`
-(also `change`, or any error code such as `insufficient`, `undecided`), then `adb reverse` as above.
+(also `change`, `undecided` which records the sale after 8 s, or any error code such as `insufficient`), then `adb reverse` as above.
+
+Keep the app in the foreground while a card is being charged. The power button, Recents and
+pulling down notifications drop the NFC reader mode and with it the card. The till copes: the
+charge ends as `no_card` (nothing moved) or `undecided`/outcome unknown, in which case the app
+keeps the sale's `client_ref`, polls `/v1/sales` and shows the receipt as soon as the sale
+appears. "Try again" re-sends the same `client_ref`, so the card is never charged twice.
