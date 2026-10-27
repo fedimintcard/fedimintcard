@@ -33,6 +33,22 @@ enum Cmd {
     /// Operate on the card.
     #[command(subcommand)]
     Card(CardCmd),
+    /// The point-of-sale HTTP service (see docs/TILL-API.md).
+    #[command(subcommand)]
+    Till(TillCmd),
+}
+
+#[derive(Subcommand)]
+enum TillCmd {
+    /// Serve the till API. Owns the data directory: do not run other commands meanwhile.
+    Serve {
+        /// Address to listen on. Keep it on loopback: the API has no authentication.
+        #[arg(long, default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
+        listen: std::net::SocketAddr,
+        /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
+        #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
+        relay: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,6 +192,12 @@ async fn main() -> Result<()> {
             if *want_qr {
                 qr(&notes.to_string())?;
             }
+        }
+        Cmd::Till(TillCmd::Serve { listen, relay }) => {
+            let wallet = Wallet::open(&cli.data_dir).await?;
+            let store = StateStore::open(state_path(&cli.data_dir))?;
+            let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
+            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone()).await?;
         }
         Cmd::Card(c) => {
             let mut cw = card_wallet(&cli).await?;

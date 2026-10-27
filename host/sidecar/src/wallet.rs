@@ -29,9 +29,14 @@ pub const MNEMONIC_FILE: &str = "mnemonic";
 pub const INVITE_FILE: &str = "invite";
 pub const DB_DIR: &str = "client.db";
 pub const STATE_FILE: &str = "card_state.json";
+pub const SALES_FILE: &str = "sales.json";
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join(STATE_FILE)
+}
+
+pub fn sales_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SALES_FILE)
 }
 
 /// A joined federation client plus what the card glue needs from the mint module.
