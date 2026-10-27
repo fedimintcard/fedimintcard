@@ -28,7 +28,18 @@ normally 5–20 s, worst case about 120 s: use a read timeout of at least 120 s.
 `received_msat` is what the wallet has collected so far; when `collection_pending` is true the
 federation has accepted the payment but the wallet has not yet swept it. Show "paid" either way.
 
-A repeated `client_ref` returns the earlier sale again (200) without charging the card.
+`client_ref` is recorded in `sales.json` as a pending record before anything is submitted to the
+federation, so a repeated `client_ref` never starts a second spend while the first may still count:
+
+* the earlier attempt was accepted: the same success body is returned again (200, same `sale_id`
+  and `txid`), without touching the card;
+* the earlier attempt is still undecided: `undecided` 202 again; the service resolves it on the
+  next job, then records the sale (an app can also poll `/v1/sales` for its `client_ref`). A sale
+  recovered this way has empty `inputs`/`change` and `fees_msat` 0, because those were not kept;
+* the earlier attempt is still in flight (the service is busy with it): `undecided` 202, never
+  `busy`; the repeat is not queued;
+* the earlier attempt failed before anything was submitted (`insufficient`, `no_card`, `declined`,
+  ...): the repeat is a fresh attempt with the same ref.
 
 | error | HTTP | meaning | app action |
 |---|---|---|---|

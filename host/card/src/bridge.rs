@@ -88,6 +88,30 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    /// Read one whole HTTP request (headers and body), so closing the socket afterwards cannot
+    /// reset the connection before the client has read its answer.
+    fn drain_request(s: &mut std::net::TcpStream) {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let want = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                    .unwrap_or(0);
+                if data.len() >= end + 4 + want {
+                    return;
+                }
+            }
+        }
+    }
+
     /// One-shot HTTP server answering every request with `status` and `body`.
     fn serve(status: &'static str, body: &'static str) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -95,8 +119,7 @@ mod tests {
         std::thread::spawn(move || {
             for s in l.incoming() {
                 let mut s = s.unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                drain_request(&mut s);
                 let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
