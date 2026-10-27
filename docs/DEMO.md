@@ -36,8 +36,12 @@ No Fedi code changed. The Fedi app only ever sees ecash strings it already under
 ## Kit
 
 - NXP J3R180 card with the 8-slot `fedimint-card` applet installed (`docs/CAP-BUILD.md`).
-- Till: Pixel with the `android-relay` app (`android-relay/README.md`), on USB with
-  `adb forward tcp:9876 tcp:9876`. Fallback till: ACS ACR122U on the laptop (`CARD_BACKEND=pcsc`).
+- Till: Pixel with the "Fedimint Card POS" app (`android-relay/README.md`) on USB, plus the till
+  service on the laptop (`card-sidecar till serve`, API in `docs/TILL-API.md`). Two adb tunnels,
+  re-run both after any USB reconnect:
+  `adb forward tcp:9876 tcp:9876` (laptop -> phone NFC relay) and
+  `adb reverse tcp:9877 tcp:9877` (phone -> till service).
+  Fallback till: ACS ACR122U on the laptop (`CARD_BACKEND=pcsc`) with the CLI `card spend`.
 - Laptop with the sidecar built: `cd host && cargo build -p fedimint-card-sidecar --features pcsc`.
   Binary: `host/target/debug/card-sidecar`.
 - A Fedi app joined to the federation, holding a few thousand sats.
@@ -81,31 +85,35 @@ $CS --data-dir $D card balance
 Say: four notes now live on the card, each bound to a key that never leaves the chip.
 The federation issued them to the card's keys, not to the laptop.
 
-### 2. Tap to pay, exact (about 15 s)
+### 2. Start the till (not shown, 10 s)
 
-Hold the card to the phone (screen says "card present").
-
-```sh
-$CS --data-dir $D card spend --price 393216
-# submitted, accepted by the federation: <txid>
-# inputs [(2, 262144), (3, 131072)]; till received 393216 msat; change notes []
-```
-
-Say: the card signed the spend itself (about 0.8 s per signature on the chip). The till
-holds the sats now. Seven seconds wall clock, most of it waiting for the federation.
-
-### 3. Tap to pay, with change (about 20 s)
+The till service owns the wallet directory while it runs: stop it before any `card ...` CLI
+command and start it again after.
 
 ```sh
-$CS --data-dir $D card spend --price 300000
-# inputs [(1, 524288)]; till received 301056 msat (overpaid 1056 msat)
-# change notes [(0, 131072), (2, 65536), (3, 16384), (4, 8192), (5, 2048)]
-$CS --data-dir $D card balance
+$CS --data-dir $D till serve        # prints "listening on http://127.0.0.1:9877"
 ```
 
-Say: one 512 sat note went in, five change notes came back onto the card in the same
-federation transaction. The one sat overpay is the planner refusing to create dust;
-on a federation with fees the same rule bounds the overpay to under 2 sats.
+On the Pixel open Fedimint Card POS. The header shows the federation name, a green dot (till and
+relay reachable) and a "Card: none" chip.
+
+### 3. Tap to pay at the point of sale (about 20 s each)
+
+Cashier keys `300`, presses Charge, customer holds the card to the phone. The screen goes
+"Hold card to phone" -> "Card present" -> "Signing… 7s" -> green receipt: 300 sats, change
+returned to card (5 notes), txid. Press New sale.
+
+Repeat with `100`: receipt again, two of the change notes consumed, one new change note.
+
+Then key `900` with 486 sats left on the card: "Card balance too low", nothing moved. Back.
+
+Say: the phone is the till, the Rust service behind it is the merchant's back office and holds the
+merchant wallet. Each sale carries a reference, so a dropped connection or a retry can never
+charge the card twice; the service and the app were both reviewed for exactly that. The Sales
+screen shows the ledger. Show it.
+
+Fallback if the phone misbehaves: the same sale from the laptop reader,
+`CARD_BACKEND=pcsc $CS --data-dir $D card spend --price 300000` (stop `till serve` first).
 
 ### 4. Card back to Fedi app (about 60 s)
 
@@ -135,8 +143,9 @@ federation invite attached, so a new phone can join and receive in one step.
 | ecash import 2,000 sat | under 5 s | n/a (no card involved) |
 | topup of 4 notes | under 10 s | 2 s for one note |
 | spend, 2 inputs, no change | 7 s | |
-| spend, 1 input, 5 change notes | 8 s | 6 s (1 input, 2 change notes) |
+| spend, 1 input, 5 change notes | 8 s | 6 s (1 input, 2 change notes); 8 s from the POS app |
 | spend, 7 inputs, no change | | 16 s (7 card signatures) |
+| POS: insufficient balance refused | | under 3 s |
 | cashout of one slot to a string | under 10 s | |
 
 Card-side signature: median 847 ms per input on the J3R180 (`docs/SPIKE.md`).
