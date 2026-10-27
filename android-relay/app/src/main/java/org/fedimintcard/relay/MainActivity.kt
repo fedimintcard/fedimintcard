@@ -8,9 +8,9 @@ import android.nfc.Tag
 import android.nfc.TagLostException
 import android.nfc.tech.IsoDep
 import android.os.Bundle
-import android.view.Gravity
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowManager
-import android.widget.LinearLayout
 import android.widget.TextView
 import java.util.concurrent.atomic.AtomicReference
 
@@ -22,23 +22,37 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     private lateinit var info: TextView
     private var nfc: NfcAdapter? = null
 
+    /** Called on the UI thread with true when a card is connected, false when it is gone. */
+    @Volatile var cardListener: ((Boolean) -> Unit)? = null
+
+    private lateinit var flow: PosFlow
+    private lateinit var ui: PosUi
+    private lateinit var client: TillClient
+    private lateinit var settings: Settings
+    private val handler = Handler(Looper.getMainLooper())
+    private var elapsed = 0
+    private var failures = 0
+    private var pollInFlight = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        status = TextView(this).apply { textSize = 40f; gravity = Gravity.CENTER; text = "no card" }
-        last = TextView(this).apply { textSize = 18f; gravity = Gravity.CENTER; text = "" }
-        info = TextView(this).apply { textSize = 16f; gravity = Gravity.CENTER }
-        setContentView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(32, 32, 32, 32)
-            addView(status); addView(last); addView(info)
-        })
+        setContentView(R.layout.activity_main)
+        settings = Settings(this)
+        client = TillClient({ settings.baseUrl }, UrlConnectionTransport())
+        flow = PosFlow()
+        ui = PosUi(this, ::dispatch, ::onKey)
+        status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
+        ui.onSettings { ui.settingsDialog(settings.baseUrl, { settings.baseUrl = it; failures = 0; pollNow() }, { ui.showRelay() }) }
+        cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
+        ui.setPad(flow.pad)
+        ui.render(flow.state)
+        handler.post(poll)
         nfc = NfcAdapter.getDefaultAdapter(this)
         if (nfc == null) status.text = "no NFC"
         else if (nfc?.isEnabled == false) last.text = "NFC is switched off"
         try {
-            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> CardLink { a -> try { d.transceive(a) } catch (e: TagLostException) { isoDep.compareAndSet(d, null); runOnUiThread { status.text = "no card" }; throw e } } } }) { ev ->
+            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> CardLink { a -> try { d.transceive(a) } catch (e: TagLostException) { isoDep.compareAndSet(d, null); runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }; throw e } } } }) { ev ->
                 runOnUiThread { last.text = ev }
             }.also { it.start() }
         } catch (e: Exception) {
@@ -63,6 +77,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        cardListener = null
         server?.stop()
         isoDep.getAndSet(null)?.let { try { it.close() } catch (_: Exception) {} }
         super.onDestroy()
@@ -74,7 +90,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             d.connect()
             d.timeout = 5000
             isoDep.getAndSet(d)?.let { try { it.close() } catch (_: Exception) {} }
-            runOnUiThread { status.text = "card present" }
+            runOnUiThread { status.text = "card present"; cardListener?.invoke(true) }
             // Poll for removal so the status returns to "no card".
             Thread {
                 while (isoDep.get() === d) {
@@ -83,15 +99,88 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                         Thread.sleep(300)
                     } catch (e: Exception) {
                         isoDep.compareAndSet(d, null)
-                        runOnUiThread { status.text = "no card" }
+                        runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }
                     }
                 }
             }.start()
         } catch (e: TagLostException) {
             isoDep.compareAndSet(d, null)
-            runOnUiThread { status.text = "no card" }
+            runOnUiThread { status.text = "no card"; cardListener?.invoke(false) }
         } catch (e: Exception) {
             runOnUiThread { last.text = "connect failed: ${e.message}" }
+        }
+    }
+
+    private fun onKey(k: Int?) {
+        if (flow.state != PosState.Entering) return
+        when (k) { null -> flow.pad.backspace(); -1 -> flow.pad.clear(); else -> flow.pad.press(k) }
+        ui.setPad(flow.pad)
+    }
+
+    private fun dispatch(e: PosEvent) {
+        val before = flow.state
+        val effects = flow.dispatch(e)
+        val now = flow.state
+        ui.setPad(flow.pad)
+        ui.render(now)
+        if (now is PosState.Signing && before !is PosState.Signing) {
+            elapsed = 0; ui.resetElapsed()
+            handler.removeCallbacks(tick); handler.postDelayed(tick, 1000)
+        }
+        if (now is PosState.Sales && before !is PosState.Sales) loadSales()
+        if (now is PosState.Receipt) pollNow()
+        for (fx in effects) if (fx is PosEffect.StartCharge) {
+            Thread {
+                val r = client.charge(fx.priceMsat, fx.clientRef)
+                runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
+            }.start()
+        }
+    }
+
+    private val tick = object : Runnable {
+        override fun run() {
+            if (flow.state !is PosState.Signing) return
+            ui.setElapsed(++elapsed)
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    private val poll = object : Runnable {
+        override fun run() {
+            pollNow()
+            handler.postDelayed(this, 5000)
+        }
+    }
+
+    private fun pollNow() {
+        if (flow.state is PosState.Signing || pollInFlight) return
+        pollInFlight = true
+        Thread {
+            val r = client.status()
+            runOnUiThread {
+                pollInFlight = false
+                if (r is TillResult.Ok) {
+                    failures = 0
+                    ui.setStatus(r.value)
+                    ui.setConnection(r.value.cardRelayOk)
+                } else if (++failures >= 2) ui.setConnection(false)
+            }
+        }.start()
+    }
+
+    private fun loadSales() {
+        ui.showSales(null)
+        Thread {
+            val r = client.sales()
+            runOnUiThread { ui.showSales(r) }
+        }.start()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        when (flow.state) {
+            is PosState.Error, PosState.Sales -> dispatch(PosEvent.BackPressed)
+            else -> @Suppress("DEPRECATION") super.onBackPressed()
         }
     }
 

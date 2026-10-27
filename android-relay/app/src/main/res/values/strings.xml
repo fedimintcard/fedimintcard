@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fedimint Card POS</string>
+    <string name="charge">Charge</string>
+    <string name="sales">Sales</string>
+    <string name="cancel">Cancel</string>
+    <string name="retry">Retry</string>
+    <string name="back">Back</string>
+    <string name="check_sales">Check sales</string>
+    <string name="new_sale">New sale</string>
+    <string name="relay_title">Card relay</string>
+</resources>
