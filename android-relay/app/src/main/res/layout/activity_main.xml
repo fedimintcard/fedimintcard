@@ -88,6 +88,8 @@
             android:layout_height="wrap_content" android:text="@string/retry" />
         <Button android:id="@+id/btn_check_sales" style="@style/PrimaryButton" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:text="@string/check_sales" />
+ <Button android:id="@+id/btn_abandon" style="@style/GhostButton" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:text="Abandon sale" android:textColor="@color/bad" />
         <Button android:id="@+id/btn_error_back" style="@style/GhostButton" android:layout_width="wrap_content"
             android:layout_height="wrap_content" android:text="@string/back" />
     </LinearLayout>

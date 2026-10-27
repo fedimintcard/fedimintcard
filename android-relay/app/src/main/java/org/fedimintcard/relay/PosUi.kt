@@ -38,6 +38,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     private val retry: Button = v(R.id.btn_retry)
     private val checkSales: Button = v(R.id.btn_check_sales)
     private val errBack: View = v(R.id.btn_error_back)
+    private val abandon: View = v(R.id.btn_abandon)
     private val salesHeader: TextView = v(R.id.sales_header)
     private val salesList: ListView = v(R.id.sales_list)
     private val salesAdapter = SalesAdapter()
@@ -65,6 +66,13 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         cancel.setOnClickListener { onEvent(PosEvent.CancelPressed) }
         retry.setOnClickListener { onEvent(PosEvent.RetryPressed) }
         v<View>(R.id.btn_error_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
+        abandon.setOnClickListener {
+            AlertDialog.Builder(act)
+                .setMessage("Abandon sale? If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
+                .setPositiveButton("Abandon") { _, _ -> onEvent(PosEvent.AbandonPressed) }
+                .setNegativeButton("Keep", null)
+                .show()
+        }
         checkSales.setOnClickListener { onEvent(PosEvent.SalesOpened) }
         v<View>(R.id.btn_sales).setOnClickListener { onEvent(PosEvent.SalesOpened) }
         v<View>(R.id.btn_sales_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
@@ -138,9 +146,11 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         val (title, detail) = errorCopy(e.kind, e.detail)
         errTitle.text = title
         errDetail.text = detail
-        retry.text = act.getString(if (e.kind.needsSalesCheck) R.string.try_again else R.string.retry)
-        errBack.visibility = if (e.kind.needsSalesCheck) View.GONE else View.VISIBLE
-        checkSales.visibility = if (e.kind.needsSalesCheck) View.VISIBLE else View.GONE
+        val unresolved = e.unresolvedRef != null
+        abandon.visibility = if (unresolved) View.VISIBLE else View.GONE
+        retry.text = act.getString(if (unresolved) R.string.try_again else R.string.retry)
+        errBack.visibility = if (unresolved) View.GONE else View.VISIBLE
+        checkSales.visibility = if (unresolved) View.VISIBLE else View.GONE
     }
 
     fun showSales(r: TillResult<SalesList>?) {

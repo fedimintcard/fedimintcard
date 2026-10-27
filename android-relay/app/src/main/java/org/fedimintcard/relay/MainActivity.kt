@@ -64,7 +64,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     override fun onResume() {
         super.onResume()
         handler.post(poll)
-        if (flow.unresolvedRef != null) handler.postDelayed(salesPoll, 3000)
+        resumed = true
+        if (flow.unresolvedRef != null) scheduleSalesPoll()
         nfc?.enableReaderMode(
             this, this,
             NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
@@ -74,7 +75,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     override fun onPause() {
-        handler.removeCallbacks(poll); handler.removeCallbacks(salesPoll)
+        resumed = false; salesGen.cancel(); handler.removeCallbacks(poll)
         nfc?.disableReaderMode(this)
         super.onPause()
     }
@@ -123,6 +124,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
 
     private fun dispatch(e: PosEvent) {
         val before = flow.state
+        val refBefore = flow.unresolvedRef
         val effects = flow.dispatch(e)
         val now = flow.state
         ui.setPad(flow.pad)
@@ -132,9 +134,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             handler.removeCallbacks(tick); handler.postDelayed(tick, 1000)
         }
         if (now is PosState.Sales && before !is PosState.Sales) loadSales()
-        if (flow.unresolvedRef != null && before !is PosState.Error && before !is PosState.Sales) {
-            handler.removeCallbacks(salesPoll); handler.postDelayed(salesPoll, 3000)
-        }
+        val refNow = flow.unresolvedRef
+        if (refNow == null) salesGen.cancel()
+        else if (refNow != refBefore) scheduleSalesPoll()
         if (now is PosState.Receipt) pollNow()
         for (fx in effects) if (fx is PosEffect.StartCharge) {
             Thread {
@@ -160,18 +162,26 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     /** While a sale's outcome is unknown, look for its client_ref in the sales ledger every 3 s. */
-    private val salesPoll = object : Runnable {
-        override fun run() {
-            val ref = flow.unresolvedRef ?: return
-            Thread {
-                val r = client.sales()
-                runOnUiThread {
-                    val hit = (r as? TillResult.Ok)?.value?.sales?.firstOrNull { it.clientRef == ref }
-                    if (hit != null && flow.unresolvedRef == ref) dispatch(PosEvent.SaleFound(hit))
-                    else if (flow.unresolvedRef != null) handler.postDelayed(this, 3000)
-                }
-            }.start()
-        }
+    private val salesGen = PollGeneration()
+    private var resumed = false
+
+    private fun scheduleSalesPoll() {
+        val gen = salesGen.next() // supersedes any running loop
+        if (resumed) handler.postDelayed({ runSalesPoll(gen) }, 3000)
+    }
+
+    private fun runSalesPoll(gen: Int) {
+        if (!salesGen.isCurrent(gen)) return
+        val ref = flow.unresolvedRef ?: return
+        Thread {
+            val r = client.sales()
+            runOnUiThread {
+                if (!salesGen.isCurrent(gen)) return@runOnUiThread
+                val hit = (r as? TillResult.Ok)?.value?.sales?.firstOrNull { it.clientRef == ref }
+                if (hit != null && flow.unresolvedRef == ref) dispatch(PosEvent.SaleFound(hit))
+                else if (flow.unresolvedRef != null) handler.postDelayed({ runSalesPoll(gen) }, 3000)
+            }
+        }.start()
     }
 
     private fun pollNow() {
