@@ -162,7 +162,7 @@ fn installed_card(f: &mut Fx) {
 #[tokio::test(flavor = "multi_thread")]
 async fn precheck_on_a_blank_card_says_blank_and_safe() -> anyhow::Result<()> {
     let (shared, card) = blank_card();
-    let mut f = fx_with(card, Amount::from_sats(10_000)).await?;
+    let f = fx_with(card, Amount::from_sats(10_000)).await?;
     // A card whose applet is not installed at all: SELECT answers 6A82.
     shared.borrow_mut().visit_blank_applet();
     let (h, actor) = serve(f, shared.clone()).await;
@@ -228,7 +228,7 @@ async fn key_setup_is_idempotent() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn key_setup_refuses_a_foreign_card() -> anyhow::Result<()> {
     let (shared, card) = blank_card();
-    let mut f = fx_with(card, Amount::from_sats(10_000)).await?;
+    let f = fx_with(card, Amount::from_sats(10_000)).await?;
     // Keys this wallet never produced: as if another machine had set the card up.
     shared.borrow_mut().install_foreign_keys();
     let (h, actor) = serve(f, shared.clone()).await;
@@ -294,6 +294,36 @@ async fn issue_refuses_a_card_that_already_holds_notes() -> anyhow::Result<()> {
         body["detail"].as_str().unwrap().contains("double its value"),
         "the refusal must say the risk: {body}"
     );
+    Ok(())
+}
+
+/// A card whose slots are all keyed but which holds no notes has nowhere to put a batch. That is
+/// a refusal the app must read as a plan problem, not a server fault: this answered `500
+/// internal` until `PlanError::NoFreeSlots` existed. Measured on a real J3R180 on 2026-10-28.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_onto_a_full_card_is_no_exact_plan_not_a_server_fault() -> anyhow::Result<()> {
+    let (shared, card) = blank_card();
+    {
+        let mut c = shared.borrow_mut();
+        c.install_foreign_keys();
+    }
+    // No `card_setup`: the wallet has recorded no slots, so `free_slots()` is empty and the batch
+    // has nowhere to go — the state the real card was in.
+    let f = fx_with(card, Amount::from_sats(100_000)).await?;
+    let (h, actor) = serve(f, shared.clone()).await;
+    let mut actor = Box::pin(actor);
+
+    let (code, body) = call_with_actor!(
+        &mut actor,
+        h,
+        "POST",
+        "/v1/cards/issue",
+        r#"{"amounts_msat":[1000],"client_ref":"full-card"}"#
+    );
+    assert_eq!(code, 422, "{body}");
+    assert_eq!(body["error"], "no_exact_plan");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("free slot"), "{detail}");
     Ok(())
 }
 

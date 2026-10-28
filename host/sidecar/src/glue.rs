@@ -472,13 +472,9 @@ impl CardWallet {
             self.renew_spent_slots().await.ok();
             free = self.store.state.free_slots();
         }
-        ensure!(
-            free.len() >= notes.len(),
-            "{} note(s) need {} free slot(s) but only {} are free (run `card setup`, or spend/cash out to free slots)",
-            notes.len(),
-            notes.len(),
-            free.len()
-        );
+        if free.len() < notes.len() {
+            return Err(plan::PlanError::NoFreeSlots { need: notes.len(), free: free.len() }.into());
+        }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
         let bal = self.wallet.balance_msat().await?;
         ensure!(bal >= need, "wallet holds {bal} msat but the topup needs about {need} msat including fees");

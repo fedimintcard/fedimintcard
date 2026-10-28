@@ -54,6 +54,8 @@ pub enum PlanError {
     TooManyNotes(usize),
     /// Funds exist, but no exact-balance layout fits the free slots and the overpay limit.
     NoExactPlan { price: u64, free_slots: usize },
+    /// A topup needs more empty slots than the card has.
+    NoFreeSlots { need: usize, free: usize },
 }
 
 impl std::fmt::Display for PlanError {
@@ -67,6 +69,11 @@ impl std::fmt::Display for PlanError {
                 f,
                 "no exact-balance spend of {price} msat with {free_slots} free slot(s); \
                  top up to get more free slots, or spend a different amount"
+            ),
+            PlanError::NoFreeSlots { need, free } => write!(
+                f,
+                "{need} note(s) need {need} free slot(s) but only {free} are free \
+                 (run `card setup`, or spend/cash out to free slots)"
             ),
         }
     }

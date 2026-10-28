@@ -63,11 +63,19 @@ the applet by 870 bytes. The doc now records both, and says which is current.
 
 Be explicit about this with anyone downstream.
 
-- **No card, phone or reader was touched.** P1b's "done when" line in the plan says *on a
-  J3R180*. That has not happened. The PIN commands are proven under jCardSim only, and
-  the install is proven against a software model of the card manager. Neither is
-  evidence about silicon. Hardware authorisation **was granted 2026-10-28**, and plan § 9
-  now carries an ordered P1b silicon checklist — but none of it has been run.
+- **A J3R180 was read on 2026-10-28, but nothing was written to it.** The card in the
+  reader carries the **keys-only applet**: `SELECT F0464D4341524401` → `9000`,
+  `SIGN` slot 0 → `9000` with 64 bytes and no PIN given, `VERIFY_PIN` under the applet's
+  CLA (`B0`) → `6D00` (INS unsupported). All 8 slots hold keys that match no wallet on
+  this machine (`0E92BC8B…`, `C338D4D6…`, …), so it is the **foreign** case: useful for
+  proving P0's refusals, unusable for proving its writes. The PIN build is in the tree —
+  a rebuilt CAP is byte-identical to the committed load file in all nine loaded
+  components (Header, Directory, Applet, Import, ConstantPool, Class, Method,
+  StaticField, RefLocation) — so the card is simply older than the applet. Loading the
+  PIN CAP means plan § 9, not a casual reload.
+- **P1b's PIN commands are still proven under jCardSim only.** No `SET_PIN` or
+  `VERIFY_PIN` has ever reached silicon; the card that has the PIN applet has not been
+  loaded. Plan § 9's ordered checklist is not run.
 - **CI passed in full on 2026-10-28** — `cardkit`, `java (11)`, `java (17)` and `rust` on
   commit `a1acf88` ([run 40618880405](https://github.com/fedimintcard/fedimintcard/actions/runs/40618880405)). Before that, no run had ever executed: the
   workflow did not parse (§ 6.5), so all 14 earlier runs were 0-second failures with no
@@ -89,12 +97,16 @@ Be explicit about this with anyone downstream.
   purpose — P1c builds the registry and this repo names no host. The app therefore cannot
   sign in today, and says so ("no registry client configured for this build") rather than
   posting credentials at a guessed server. Filling those two strings is the whole wiring.
-- **The three P0 routes exist but have only been exercised against `SoftCard`.** They are
-  served by `till.rs` and documented in `docs/TILL-API.md`; `sidecar/tests/cards.rs` proves
-  the decisions come from card and state. Nothing has crossed a reader: no real applet
-  answered `SELECT`, no real `SET_PIN` was sent, and the binary is not yet run
-  end-to-end through `apps/provisioner` (see § 7). `SoftCard`'s PIN machine is a model of
-  the applet, so "keySetup is idempotent" is proved against the model, not the chip.
+- **The three P0 routes have crossed a reader, read-only.** `till serve` with
+  `CARD_BACKEND=bridge` pointed at a PC/SC relay on `:9876` (the contract the phone relay
+  speaks: `{"apdu":"<hex>"}` → `{"response":"<hex data||SW>"}`) answered against the
+  J3R180 above: `precheck` → 200 `kind:"foreign"`, `foreign_slots:[0..7]`,
+  `keyed_slots:[0..7]`, `free_slots:[]`, `applet_present:true`, `isd_open:false`,
+  `live_msat:0`, `safe_to_replace:false`, nothing written; `keySetup` → 502 `card_error`
+  naming slot 0 (`0e92bc8bacb14f66`); `issue` → 422 `no_exact_plan` (was 500 `internal`
+  before the fix in § 6). **No write has crossed a reader**: no `SET_PIN`, no `GEN_KEY`,
+  no `topup` on silicon. `keySetup` idempotency and the issue replay path remain proved
+  against `SoftCard` only.
 
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
@@ -262,6 +274,19 @@ Worth reading if you touch the same code, because the failure modes repeat.
     `if (!res.ok || json?.ok === false)`.
 16. **`setCardMessage` was exported and never called**, so iOS's NFC sheet never carried
     the session's line. Now called after `requestTechnology`.
+17. **PIN APDUs were sent with ISO CLA `00`.** `FedimintCardApplet.process` checks CLA
+    against `B0` *before* reading the INS, so it answers `6E00` (CLA not supported) — the
+    same word a card with no PIN applet gives. On the J3R180 this hid the applet's
+    identity: the ISO-CLA probe could not tell "keys-only build" from "PIN build, wrong
+    CLA". Fixed: `pin_apdu` sends `CLA` (`B0`); `SoftCard` now refuses any CLA but `B0`
+    for PIN INS and `00` for ISO, so the model cannot accept what the chip rejects.
+    **How it was found:** the hardware reported `6E00`; the applet's source says why.
+    `SELECT` (`00 A4`) and `GET DATA` (`00 CA`) stay ISO CLA.
+18. **A full card reported `500 internal`.** `topup_ref` refused too few free slots with a
+    bare `anyhow!` string, and `classify()` maps typed errors only, so a plan refusal
+    reached the app as a server fault. Now `PlanError::NoFreeSlots { need, free }` →
+    422 `no_exact_plan`. Caught by calling `issue` against the real (full) card; the
+    `SoftCard` fixtures were never full, so no test had reached it.
 
 ## 6a. Dependabot alerts (open, 2026-10-28)
 
@@ -302,13 +327,33 @@ their alerts fire on *other* locked copies, and the older `lru` 0.12/0.13 and
 4. ~~P0 (sidecar endpoints).~~ **Done 2026-10-28**, uncommitted at the time of writing.
    Next: commit and push it, then the device pass below. P1c (hosted registry) can run in
    parallel with a different hand; P3 needs the phone and the cards.
-5. **Run the app against the sidecar on a real reader.** This is the next real work, and none
-   of it has been done. Blocked as of 2026-10-28 on: **no phone attached** (`adb devices` is
-   empty), the **relay APK not built** (`android-relay/app/build/outputs/apk/debug/` does not
-   exist), and **no wallet data dir** anywhere on this machine (`till serve` refuses with
-   `no wallet in <dir>: run 'join <invite>' first`). An APDU CCID reader driver is installed,
-   and the release binary builds (`host/target/release/card-sidecar`), so the gaps are the
-   phone/relay and a federation to join, not the code. Then:
+5. **Run the app against the sidecar on a real reader.** The sidecar has now been driven
+   against silicon (§ 3), read-only. Still blocked for the app: **no phone attached**
+   (`adb devices` is empty) and the **relay APK not built**
+   (`android-relay/app/build/outputs/apk/debug/` does not exist). The other two gaps are
+   closed and the recipe is repeatable:
+
+   - **Federation without a server.** `fedimint-testing`'s `Fixtures` builds a 4-guardian
+     federation in-process; `Fixtures::new_primary(MintClientInit, MintInit)
+     .with_module(DummyClientInit, DummyInit).new_fed_builder(1).disable_mint_fees()
+     .build()` then `invite_code()`. It dies with the process, so run it as a background
+     service, not under a command deadline.
+   - **Funds without a faucet.** The `dummy` module mints. The sidecar's `Wallet::join`
+     registers **only** `MintClientInit`, so a wallet joined through it has no dummy module
+     and `get_first_module::<DummyClientModule>()` fails with *No module of kind dummy*. A
+     client that also registers `DummyClientInit` must do the `preview(..).join(..)` into a
+     **fresh** `client.db` (re-joining an initialised DB fails *The client database is
+     already initialized*). The tests sidestep this with `fed.new_client()`, which
+     registers every module the federation has.
+   - **Reader without a phone.** `till serve`'s card routes go through the *bridge*
+     (`POST /apdu`, `{"apdu":"<hex>"}` → `{"response":"<hex data||SW>"}`), not the CLI's
+     `CARD_BACKEND` — `pcsc` selects the card for the one-shot commands only. A ~60-line
+     PC/SC relay over `Transport::transmit` on `:9876` plus
+     `CARD_BACKEND=bridge CARD_BRIDGE_URL=http://127.0.0.1:9876` puts real silicon behind
+     the HTTP routes. Keep such examples behind `#[cfg(feature = "pcsc")]` or the default
+     `cargo test --workspace` build breaks on them.
+
+   Then:
    - `android-relay/` up (`adb forward tcp:9876 tcp:9876`, per its README — do not modify it);
    - `card-sidecar till serve` on the laptop, data dir the one the batch signs with;
    - `cd apps/provisioner && yarn start`, debug build on the phone.
