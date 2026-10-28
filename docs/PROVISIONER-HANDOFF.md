@@ -43,6 +43,11 @@ Every number here was produced by running the command in this session.
 | Suite on real bytes | With the fixture committed, the install suite runs the real CAP and prints no placeholder warning (still 62/62). |
 | CI | Runs on GitHub, **green in full** on `a1acf88`: `cardkit` (install, typecheck, `format:check`, test), `java (11)`, `java (17)`, `rust` (20 tests). See § 1 and § 6.5 — before the parse fix no job had ever been queued. |
 
+| P2 app (UI) | `cd apps/provisioner && npx tsc --noEmit` → clean (also clean under `--noUnusedLocals --noUnusedParameters`). `npx jest` → **57 tests, 0 failures, 4 suites** (`api`, `api.registry`, `session`, `demo`). `npx eslint .` → 0 errors, 21 warnings (bitwise/number formatting, inline styles). |
+| P2 renders | Mounted the real `<App />` under `react-test-renderer`: it renders SignIn and prints `4411d43e · 5513 bytes` — the load sha traced from `@fedimintcard/cardkit` through `settings.tsx` into the screen. The tree mounts with the registry adapter in it. |
+| P2 card semantics | The demo suite drives a fake card through the real cardkit engine. Verified there: sweep deletes applet then opener then package; reinstall over `hasOld`/`oldVersion` reaches `done`; `foreign` is refused at `installForLoad` (`6985`) with **no LOAD sent**; `wrongKeys` stops at `auth` with no `EXTERNAL AUTHENTICATE`; SCP02 reply is 28+SW with KVN/SCP at 10/11. |
+| P2 registry adapter | `api.registry.test.ts` drives `RegistryStoreApi` against a scripted fetcher: bearer token on every call, `batch_id` from the `{batch:{...}}` envelope threaded into each row, notes summed (1048+524 → 1572), real load sha sent; a call before sign-in is refused rather than posted. |
+
 `docs/CAP-BUILD.md` said 4,643 bytes. That was the pre-PIN build; the PIN commands grew
 the applet by 870 bytes. The doc now records both, and says which is current.
 
@@ -66,6 +71,20 @@ Be explicit about this with anyone downstream.
   them, `cargo test --locked --workspace -- --test-threads=1` runs **84 tests** here, all
   passing (2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar unit + 22 wallet +
   20 till). CI's `rust` job is still the gate for a clean checkout.
+- **The app has never run on a device.** No phone, no Metro bundle on hardware, no NFC
+  session against a real reader. Everything above is Jest against a fake card, a scripted
+  registry and a rendered tree under `react-test-renderer`. Fonts, safe areas, the iOS
+  sheet's real behaviour, Android's 15 s `setTimeout` clamp and the actual NFC `transceive`
+  path are all unexercised.
+- **The registry has no origin.** `REGISTRY_ORIGINS` is `{test: '', production: ''}` on
+  purpose — P1c builds the registry and this repo names no host. The app therefore cannot
+  sign in today, and says so ("no registry client configured for this build") rather than
+  posting credentials at a guessed server. Filling those two strings is the whole wiring.
+- **Three sidecar routes do not exist yet** (plan § 4, P0): `POST /v1/cards/precheck`,
+  `POST /v1/cards/keySetup`, `POST /v1/cards/issue`. `LocalClient` calls them; `till.rs`
+  serves only `/v1/health`, `/v1/status`, `/v1/card/balance`. The loop cannot issue value
+  until those land.
+
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
   upstream's import layout so it stays diffable against cashucard, and is listed in
@@ -144,6 +163,46 @@ Worth reading if you touch the same code, because the failure modes repeat.
    tests where the tree has 79 — and the handoff carried "87 tests" as a result. A green
    count that does not match `grep -c @Test` means stale output; `mvn clean test` is the
    only count worth quoting. Real figure: **85 (79 applet + 6 bridge)**.
+
+7. **`apps/provisioner` cardkit was a source tree, not a package.** No `main`, no
+   `exports`, so Node had no entry and Jest could not load the TypeScript at all. Fixed by
+   giving `tools/cardkit/package.json` a real shape (`main: dist/index.js`,
+   `reactNative: index.ts`, an `exports` map, `prepack: yarn build`) plus
+   `tsconfig.build.json`, and adding `yarn build` to CI's `cardkit` job. Metro consumes
+   `index.ts`; Jest and Node consume `dist/`. A `react-native` export condition that
+   points at source is the reason the build step is not optional.
+8. **The load file lived under `gp/test/fixtures/`.** The shipped app would have imported
+   from a test tree. Moved to `tools/cardkit/gp/load-file.ts`, exported from the package
+   index and re-hashed by `make-assets.py --check`; a vendored second copy is exactly the
+   stale asset the sha check exists to catch.
+9. **The demo's fake card could not delete anything.** `DELETE` carries its AID as an
+   `4F <len> <aid>` TLV (`gp/scp02.ts deleteAid`), and the fake matched the raw data, so
+   every DELETE answered `6A88`, the sweep never ran, and a reinstall always stopped at
+   `installForLoad`. It now parses the TLV.
+10. **The fake tracked "instances" as one boolean.** Deleting the card applet left the
+    opener reported as present (and vice versa), so the package could never be removed.
+    Now per-AID `hasCard`/`hasOpener`.
+11. **The fake's free-memory TLV declared the wrong length** (`FF 21 0A` for five bytes),
+    so `parseFreeMemory` returned null and `freeBefore`/`freeAfter` were always undefined.
+    Correct length is `06`.
+12. **A `foreign` card was programmed end to end** (`ok: true`, 23 LOADs) because the fake
+    answered `9000` to every INSTALL. `INSTALL [for load]` now refuses `6985` and
+    `and-make-selectable` `6A80` for that state, and no LOAD block is ever sent.
+13. **`apps/provisioner` had no way to sign in.** `StoreProvider` takes an `api`, `App.tsx`
+    passed none, and `api.ts` had no registry origin despite a comment promising it did.
+    Added `REGISTRY_ORIGINS`/`registryOrigin` (both empty on purpose until P1c) and
+    `RegistryStoreApi`, which adapts `RegistryClient` to the store's `StoreApi` and holds
+    the bearer token in memory only. With no origin the store refuses with "no registry
+    client configured for this build", which `signInReason` shows verbatim.
+14. **The per-call transport timeout could be raised by the operation's constant.**
+    `call.timeoutMs ?? this.timeoutMs` let `SIGN_IN_TIMEOUT_MS = 30_000` override a
+    caller's narrower budget; now `Math.min(...)`, so a 20 ms cap fires in 20 ms.
+15. **A 2xx that says it failed was treated as success.** The sidecar answers `202` with
+    `{ok:false, code:'undecided'}`; the transport resolved it as a successful issue with an
+    empty txid, which would hand an operator a card with unrecorded value. Now
+    `if (!res.ok || json?.ok === false)`.
+16. **`setCardMessage` was exported and never called**, so iOS's NFC sheet never carried
+    the session's line. Now called after `requestTechnology`.
 
 ## 6a. Dependabot alerts (open, 2026-10-28)
 
