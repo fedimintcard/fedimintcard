@@ -10,7 +10,7 @@ Decided by the operator 2026-10-27: **shape B** (install + issue), **React Nativ
 ported cardkit** as cashucard does, **a hosted registry**, **a mandatory PIN**, and a
 **public listing reached through TestFlight and the Play internal track first**, with a
 **trimmed UI surface** (§ 5) as the one deliberate divergence from cashucard. App
-identity (bundle id, Play application id, display name) remains open. See § 8.
+identity is settled (§ 8.6).
 
 This copy lives in `~/.opencode/plan/provisioner-plan.md`; the working copy the phases
 build against is `docs/PROVISIONER-PLAN.md` in the repo.
@@ -378,8 +378,9 @@ is done when its verification line is true, not when it compiles.
 
 P0, P1a and P1c can run in parallel with different hands. **P1b is the long pole**: it is
 applet code on an already-proven card, and P4, P6 and the public listing all wait on it.
-P3 is the only phase that needs the phone and the pile of cards, and it needs the
-hardware authorisation in § 9 — as does P1b, which needs at least one card.
+P3 is the only phase that needs the phone and the pile of cards. Both P3 and P1b need
+hardware; the authorisation for it was granted 2026-10-28 (§ 9), and the P1b silicon
+checklist there is ready to run but has not been run.
 
 ## 7. Store readiness
 
@@ -456,9 +457,10 @@ leaves the device.
   `Matchfile`), with the App Store Connect key and Play service account in CI secrets.
 - No card data, no keys, no ecash in logs, crash reports or screenshots.
 
-## 8. Decisions and remaining questions
+## 8. Decisions
 
-Settled 2026-10-27 by the operator:
+Every item below is settled: 1–5 on 2026-10-27, 6 on 2026-10-28. A new question opens a
+new numbered item here; it does not reopen one of these.
 
 1. **Shape: B** — install + issue. A newly programmed card comes out keyed and funded
    from the operator wallet, so the laptop is not needed to produce a usable card. The
@@ -489,14 +491,28 @@ Settled 2026-10-27 by the operator:
    adds P1b below and moves ahead of any store build. It deliberately does *not* pull in
    the change pool or `NOTE_ADD`.
 
-Still open:
+6. **App identity — decided 2026-10-28.**
 
-6. **App identity**: bundle id, Play application id, and the display name. Cashu uses
-   `CashuProvisioner` for both; the repo's neutral name so far has been "fedimint-card".
-   A public listing needs the decision before P7, not before P3, but the bundle id is
-   baked into the first TestFlight build, so it is needed before any store upload.
+   | Field | Value |
+   |---|---|
+   | Android `applicationId` and `namespace` | `org.fedimintcard.provisioner` |
+   | iOS `PRODUCT_BUNDLE_IDENTIFIER` | `org.fedimintcard.provisioner` |
+   | RN `name` (and `displayName`) | `FedimintProvisioner` |
 
-## 9. Hardware authorisation (not yet granted)
+   Reverse-domain root `org.fedimintcard` matches what already ships in this repo
+   (`android-relay` is `org.fedimintcard.relay`), and `.provisioner` is a sibling, not a
+   child, so the two apps can be installed side by side and neither can capture the
+   other's intents. Cashu's upstream id is `com.islandbitcoin.provisioner` on both
+   platforms; nothing here collides with it.
+
+   The display name is deliberately the same string on both platforms — a store name
+   that differs between iOS and Android splits reviews and support. Renaming it later is
+   a store listing change, not a bundle-id change.
+
+   These are build-time constants (§ 5): frozen in `src/settings.tsx` as defaults,
+   never editable at runtime.
+
+## 9. Hardware authorisation — granted 2026-10-28
 
 P3–P6, and the applet phase P1b, need these devices and actions, each named before use:
 
@@ -505,8 +521,44 @@ P3–P6, and the applet phase P1b, need these devices and actions, each named be
 - A laptop running the local sidecar for P0–P5.
 - Optional: the ACS ACR122U on the laptop, as the known-good fallback path.
 
-Nothing here is authorised by this document. Each phase's plan names the devices, the
-APDUs and the stop conditions before it starts.
+**The operator granted authorisation for these devices and actions on 2026-10-28.** That
+removes the blocker; it does not make any result measured. Each phase still names the
+devices, the APDUs and the stop conditions before it starts, and no phase's "done when"
+line is satisfied until it has actually been run.
+
+Grants do not extend beyond this list. Anything added — another reader, a different chip,
+a phone the app is not installed on — is a new authorisation.
+
+### P1b silicon checklist (authorised, not yet run)
+
+Run in this order on a J3R180, because two of these steps spend PIN tries and one bricks
+the card when tries run out:
+
+1. Record the card's identity and the blank state before anything is loaded.
+2. Load and instantiate the opener, then the applet (`gp --install`, `gp --create`),
+   per `docs/CAP-BUILD.md`.
+3. `SELECT` the applet → expect `02 00 90 00`.
+4. `SIGN` slot 0 **before** any `VERIFY_PIN` → expect `69 84` (no PIN set). `checkPinReady`
+   runs before the slot and message checks, so this must be `69 84` and *not* `69 85`
+   (empty slot) — if it answers `69 85`, the gate is not ahead of the slot check and the
+   card is leaking which slots hold a key. Record which arrived.
+5. `SET_PIN "1234"` → `90 00`. A second `SET_PIN` → `69 85`.
+6. `SIGN` now, still without `VERIFY_PIN` → `6A 94` (PIN required). This is the pair that
+   proves the gate distinguishes "no PIN configured" from "PIN not entered".
+7. `VERIFY_PIN "1234"` → `90 00`; `SIGN` → 64 bytes, and the signature must verify under
+   the slot-0 pubkey (`BIP340`), not merely return `90 00`.
+8. Reset the card, `SIGN` with no `VERIFY_PIN` → `6A 94`. This is the sticky-check: a
+   session PIN must not survive a reset.
+9. Wrong PIN twice → `63 C1` then `63 C0`. **Do not spend the third try on a card whose
+   key you care about** — the third is `69 83` and the block is permanent.
+10. Repeat 7–8 over the APDU bridge (`bridge/`), not only over `gp`, so the app path is
+    covered too.
+11. Record the measured signature time against `SPIKE.md`'s ~610 B transient budget and
+    the applet-size bound; both numbers go into `docs/CAP-BUILD.md` next to the load-file
+    size.
+
+If any step diverges, stop and record the exact APDU and status word. A divergence is a
+result worth having; a workaround that hides it is not.
 
 ## 10. Risks
 
