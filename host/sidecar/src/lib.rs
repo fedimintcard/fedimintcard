@@ -1,3 +1,4 @@
+pub mod cards;
 pub mod glue;
 pub mod plan;
 pub mod sales;

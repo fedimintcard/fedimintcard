@@ -144,6 +144,9 @@ pub type CardOpener = Box<dyn Fn() -> Result<Box<dyn Card>>>;
 enum Job {
     Charge { price: u64, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
     Balance { reply: oneshot::Sender<Reply> },
+    Precheck { reply: oneshot::Sender<Reply> },
+    KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
+    Issue { amounts: Vec<u64>, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
 }
 
 /// What handlers hold. Cheap to clone, `Send + Sync`.
@@ -233,6 +236,42 @@ async fn actor(
                 };
                 (reply, r)
             }
+            Job::Precheck { reply } => {
+                let r = match on_card(|| opener()) {
+                    Ok(card) => {
+                        cw.card = card;
+                        match crate::cards::precheck(&mut cw) {
+                            Ok(p) => Reply::ok(p.to_json()),
+                            Err(e) => error_reply(&e),
+                        }
+                    }
+                    Err(e) => error_reply(&e),
+                };
+                (reply, r)
+            }
+            Job::KeySetup { pin, reply } => {
+                let r = match on_card(|| opener()) {
+                    Ok(card) => {
+                        cw.card = card;
+                        match crate::cards::key_setup(&mut cw, pin.as_deref()) {
+                            Ok(o) => Reply::ok(o.to_json()),
+                            Err(e) => error_reply(&e),
+                        }
+                    }
+                    Err(e) => error_reply(&e),
+                };
+                (reply, r)
+            }
+            Job::Issue { amounts, client_ref, reply } => {
+                let r = match on_card(|| opener()) {
+                    Ok(card) => {
+                        cw.card = card;
+                        issue_job(&mut cw, &amounts, client_ref).await
+                    }
+                    Err(e) => error_reply(&e),
+                };
+                (reply, r)
+            }
         };
         cw.card = Box::new(NoCard);
         *pending_refs.lock().unwrap() = refs_of(&cw);
@@ -245,6 +284,107 @@ async fn actor(
             busy.store(false, Ordering::SeqCst);
         }
         let _ = reply_tx.send(reply);
+    }
+}
+
+/// `POST /v1/cards/issue`: put the batch's amounts on the card, exactly as `card topup` does.
+///
+/// The card must already be in `cw.card`. A `client_ref` that has finished is answered from
+/// state without touching the card; one whose notes are pending is `undecided`, never a second
+/// issue. A card already holding live notes on the keys this call would write to is refused —
+/// issuing again would double its value with no record of having done so.
+async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<String>) -> Reply {
+    if let Some(cref) = client_ref.as_deref() {
+        if let Some(rec) = cw.store.state.issues.iter().find(|r| r.client_ref == cref).cloned() {
+            if rec.amounts != amounts {
+                return Reply::fail(
+                    409,
+                    "ref_mismatch",
+                    format!(
+                        "client_ref {cref} was issued for amounts {:?}, not {amounts:?}",
+                        rec.amounts
+                    ),
+                );
+            }
+            if rec.txid.is_empty() {
+                return undecided_reply(None);
+            }
+            let live_msat = cw
+                .store
+                .state
+                .notes
+                .iter()
+                .filter(|n| n.status == crate::state::NoteStatus::Live)
+                .map(|n| n.amount_msat)
+                .sum::<u64>()
+                / 1000;
+            return Reply::ok(
+                crate::cards::IssueOutcome {
+                    client_ref: Some(cref.to_owned()),
+                    live_msat,
+                    txid: rec.txid,
+                    notes: rec.notes,
+                    plan: json!({"notes": amounts.iter().flat_map(|a| crate::plan::binary(*a)).collect::<Vec<u64>>()}),
+                    replayed: true,
+                }
+                .to_json(),
+            );
+        }
+    }
+
+    let preview = match crate::cards::issue_plan(cw, amounts).await {
+        Ok(p) => p,
+        Err(e) => return error_reply(&e),
+    };
+    let held = crate::cards::held_notes(cw);
+    if !held.is_empty() {
+        return Reply::fail(
+            409,
+            "card_holds_notes",
+            format!(
+                "this card already holds {} note(s) worth {} msat (slots {:?}); \
+                 issuing again would double its value, and a copied card would hold it twice",
+                held.len(),
+                held.iter().map(|(_, a)| *a).sum::<u64>(),
+                held.iter().map(|(s, _)| *s).collect::<Vec<u8>>()
+            ),
+        );
+    }
+
+    match cw.topup_ref(amounts, client_ref.as_deref()).await {
+        Ok(notes) => {
+            let txid = client_ref
+                .as_deref()
+                .and_then(|c| cw.store.state.issues.iter().find(|r| r.client_ref == c))
+                .map(|r| r.txid.clone())
+                .or_else(|| {
+                    notes
+                        .first()
+                        .and_then(|(slot, _)| cw.store.state.notes_on_current_key(*slot).find_map(|n| n.txid.clone()))
+                })
+                .unwrap_or_default();
+            let live_msat = cw
+                .store
+                .state
+                .notes
+                .iter()
+                .filter(|n| n.status == crate::state::NoteStatus::Live)
+                .map(|n| n.amount_msat)
+                .sum::<u64>()
+                / 1000;
+            Reply::ok(
+                crate::cards::IssueOutcome {
+                    client_ref,
+                    live_msat,
+                    txid,
+                    notes,
+                    plan: preview,
+                    replayed: false,
+                }
+                .to_json(),
+            )
+        }
+        Err(e) => error_reply(&e),
     }
 }
 
@@ -536,6 +676,9 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/charge", post(charge))
         .route("/v1/sales", get(sales_list))
         .route("/v1/card/balance", post(card_balance))
+        .route("/v1/cards/precheck", post(cards_precheck))
+        .route("/v1/cards/keySetup", post(cards_key_setup))
+        .route("/v1/cards/issue", post(cards_issue))
         .with_state(h)
 }
 
@@ -623,6 +766,73 @@ async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
 
 async fn card_balance(State(h): State<TillHandle>) -> Reply {
     run_job(&h, None, |reply| Job::Balance { reply }).await
+}
+
+#[derive(Deserialize)]
+struct KeySetupReq {
+    /// 4 to 8 ASCII digits, per the applet's `PIN_MIN`/`PIN_MAX`. Omitted means "leave the PIN
+    /// alone" — a card can be keyed and issued before it is pinned.
+    pin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrecheckReq {
+    /// Accepted and ignored: precheck asks the card, not the caller. Present so the app can post
+    /// the batch it is about if it later wants the reply annotated.
+    #[serde(default)]
+    #[allow(dead_code)]
+    batch_id: Option<String>,
+}
+
+/// `POST /v1/cards/precheck` — read-only. What is on this card, is the ISD open, does the applet
+/// answer. Nothing is written, so the app can call it on every tap.
+async fn cards_precheck(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    if !body.is_empty() {
+        if let Err(e) = serde_json::from_slice::<PrecheckReq>(&body) {
+            return Reply::fail(400, "bad_request", format!("body must be JSON or empty: {e}"));
+        }
+    }
+    run_job(&h, None, |reply| Job::Precheck { reply }).await
+}
+
+/// `POST /v1/cards/keySetup` — `card setup`, then `SET_PIN`. Idempotent: keys already present are
+/// kept and an existing PIN is reported, not reset.
+async fn cards_key_setup(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    let req: KeySetupReq = if body.is_empty() {
+        KeySetupReq { pin: None }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"pin\":\"1234\"}}: {e}")),
+        }
+    };
+    let pin = match req.pin {
+        None => None,
+        Some(p) => {
+            if !(4..=8).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Reply::fail(400, "bad_request", "pin must be 4 to 8 digits");
+            }
+            Some(p.into_bytes())
+        }
+    };
+    run_job(&h, None, |reply| Job::KeySetup { pin, reply }).await
+}
+
+/// `POST /v1/cards/issue` — the batch's amounts onto the card, replayable by `client_ref`.
+async fn cards_issue(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    let req: crate::cards::IssueReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"amount_msat\":[N]}}: {e}")),
+    };
+    if req.amounts_msat.is_empty() {
+        return Reply::fail(400, "bad_request", "amount_msat must name at least one amount");
+    }
+    if req.client_ref.as_deref().is_some_and(|c| c.is_empty() || c.len() > MAX_CLIENT_REF) {
+        return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {MAX_CLIENT_REF} bytes"));
+    }
+    let cref = req.client_ref.clone();
+    run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue { amounts: req.amounts_msat, client_ref: req.client_ref, reply })
+        .await
 }
 
 async fn sales_list(State(h): State<TillHandle>) -> Reply {

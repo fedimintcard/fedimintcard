@@ -38,7 +38,7 @@ use tbs::BlindingKey;
 
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
-use crate::state::{HostKind, HostPending, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore, Tombstone};
+use crate::state::{HostKind, HostPending, IssueRec, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore, Tombstone};
 use crate::wallet::Wallet;
 
 /// Short wait used when recovering old records, where the answer may simply not exist.
@@ -450,6 +450,14 @@ impl CardWallet {
     /// decomposition (one note per set bit) and must be a multiple of the federation's smallest
     /// economical note. The wallet funds amount plus fees.
     pub async fn topup(&mut self, amounts: &[u64]) -> Result<Vec<(u8, u64)>> {
+        self.topup_ref(amounts, None).await
+    }
+
+    /// [`topup`](Self::topup), recording `client_ref` in the same save that writes the pending
+    /// notes — before anything is signed or submitted — so a repeat of the ref can be answered
+    /// from state even if the process dies mid-call. The transaction id is filled in as soon as
+    /// the wallet has built it.
+    pub async fn topup_ref(&mut self, amounts: &[u64], client_ref: Option<&str>) -> Result<Vec<(u8, u64)>> {
         self.recover_overwrites()?;
         let notes: Vec<u64> = amounts.iter().flat_map(|a| plan::binary(*a)).collect();
         ensure!(!notes.is_empty(), "nothing to top up");
@@ -504,6 +512,18 @@ impl CardWallet {
                 out_idx: Some(i as u64),
             });
         }
+        // The ref lands in this save or not at all: a replay can then never see a note that the
+        // record does not cover, nor a record over notes that were never written.
+        if let Some(cref) = client_ref {
+            self.store.state.issues.retain(|r| r.client_ref != cref);
+            self.store.state.issues.push(IssueRec {
+                client_ref: cref.to_owned(),
+                txid: String::new(),
+                notes: outs.iter().map(|o| (o.slot, o.amount)).collect(),
+                amounts: amounts.to_vec(),
+                ts_unix_ms: now_ms(),
+            });
+        }
         self.store.save()?;
 
         let bundle = ClientOutputBundle::new_no_sm(
@@ -523,9 +543,12 @@ impl CardWallet {
         {
             Ok(r) => r,
             Err(e) => {
-                // Nothing was sent: forget the pending records.
+                // Nothing was sent: forget the pending records and any ref pointing at them.
                 let nonces: Vec<String> = outs.iter().map(|o| nonce_hex(o.nonce)).collect();
                 self.store.state.notes.retain(|n| !(nonces.contains(&n.nonce) && n.status == NoteStatus::Pending));
+                if let Some(cref) = client_ref {
+                    self.store.state.issues.retain(|r| r.client_ref != cref);
+                }
                 self.store.save()?;
                 return Err(anyhow!(e)).context("building the topup transaction");
             }
@@ -534,6 +557,11 @@ impl CardWallet {
         for n in self.store.state.notes.iter_mut().filter(|n| n.status == NoteStatus::Pending && n.txid.is_none()) {
             if outs.iter().any(|o| nonce_hex(o.nonce) == n.nonce) {
                 n.txid = Some(txid.to_string());
+            }
+        }
+        if let Some(cref) = client_ref {
+            if let Some(r) = self.store.state.issues.iter_mut().find(|r| r.client_ref == cref) {
+                r.txid = txid.to_string();
             }
         }
         self.store.save()?;

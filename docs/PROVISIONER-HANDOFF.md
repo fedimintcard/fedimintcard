@@ -54,6 +54,8 @@ Every number here was produced by running the command in this session.
 | P2 card semantics | The demo suite drives a fake card through the real cardkit engine. Verified there: sweep deletes applet then opener then package; reinstall over `hasOld`/`oldVersion` reaches `done`; `foreign` is refused at `installForLoad` (`6985`) with **no LOAD sent**; `wrongKeys` stops at `auth` with no `EXTERNAL AUTHENTICATE`; SCP02 reply is 28+SW with KVN/SCP at 10/11. |
 | P2 registry adapter | `api.registry.test.ts` drives `RegistryStoreApi` against a scripted fetcher: bearer token on every call, `batch_id` from the `{batch:{...}}` envelope threaded into each row, notes summed (1048+524 → 1572), real load sha sent; a call before sign-in is refused rather than posted. |
 
+| P0 sidecar endpoints | `host/sidecar/tests/cards.rs` → **7 tests, 0 failures** (blank/installed/foreign precheck, keySetup idempotent, keySetup refusing a foreign card, issue replay, issue refusing a holding card, body/PIN validation). Full workspace: `cargo test --locked --workspace -- --test-threads=1` → **91 passed, 0 failed** (was 84; +7). Everything runs against `SoftCard`, not silicon. |
+
 `docs/CAP-BUILD.md` said 4,643 bytes. That was the pre-PIN build; the PIN commands grew
 the applet by 870 bytes. The doc now records both, and says which is current.
 
@@ -74,9 +76,10 @@ Be explicit about this with anyone downstream.
 - **Rust builds locally as of 2026-10-28**, once `cmake` and `pkg-config` are installed
   (`brew install cmake pkg-config`); without them `aws-lc-sys-0.41.0` panics with "Required
   build dependency is missing", which is a missing prerequisite, not a code fault. With
-  them, `cargo test --locked --workspace -- --test-threads=1` runs **84 tests** here, all
-  passing (2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar unit + 22 wallet +
-  20 till). CI's `rust` job is still the gate for a clean checkout.
+  them, `cargo test --locked --workspace -- --test-threads=1` runs **91 tests** here, all
+  passing (was 84 before P0: 2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar
+  unit + 22 wallet + 20 till; P0 added 7 in `sidecar/tests/cards.rs`). CI's `rust` job is
+  still the gate for a clean checkout.
 - **The app has never run on a device.** No phone, no Metro bundle on hardware, no NFC
   session against a real reader. Everything above is Jest against a fake card, a scripted
   registry and a rendered tree under `react-test-renderer`. Fonts, safe areas, the iOS
@@ -86,10 +89,12 @@ Be explicit about this with anyone downstream.
   purpose — P1c builds the registry and this repo names no host. The app therefore cannot
   sign in today, and says so ("no registry client configured for this build") rather than
   posting credentials at a guessed server. Filling those two strings is the whole wiring.
-- **Three sidecar routes do not exist yet** (plan § 4, P0): `POST /v1/cards/precheck`,
-  `POST /v1/cards/keySetup`, `POST /v1/cards/issue`. `LocalClient` calls them; `till.rs`
-  serves only `/v1/health`, `/v1/status`, `/v1/card/balance`. The loop cannot issue value
-  until those land.
+- **The three P0 routes exist but have only been exercised against `SoftCard`.** They are
+  served by `till.rs` and documented in `docs/TILL-API.md`; `sidecar/tests/cards.rs` proves
+  the decisions come from card and state. Nothing has crossed a reader: no real applet
+  answered `SELECT`, no real `SET_PIN` was sent, and the binary is not yet run
+  end-to-end through `apps/provisioner` (see § 7). `SoftCard`'s PIN machine is a model of
+  the applet, so "keySetup is idempotent" is proved against the model, not the chip.
 
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
@@ -132,6 +137,54 @@ pins at the top of that script and commit them with the asset.
   blocked, `6984` not set, `6A94` pin needed. `VERIFY_PIN` is not sticky across a reset.
 - **Only the engine was ported.** Upstream's `identity`, `inspect`, `registry`, `reset`,
   `configuration`, `holderCommands` and the tag/hello applets are absent by design.
+
+### P0 — the card endpoints (2026-10-28)
+
+- **`issue` wraps `topup`, never reimplements it.** `topup(amounts)` became a thin caller of
+  `topup_ref(amounts, Option<&str>)`; every body rule (min denom, `require_tiers`, free slots,
+  balance ≥ sum + 2×fee, persist-before-submit) is unchanged. Reimplementing the body would
+  have meant two copies of the money rules.
+- **The ref is saved in the same `save()` as the pending notes**, before submit; on a build
+  failure both are removed together. A replay therefore cannot see a record over notes that
+  were never written, or notes with no record. The ref's `txid` is filled after
+  `range.txid()`.
+- **The replay record is `CardState.issues: Vec<IssueRec>`, not `PendingTx`.** `topup` never
+  creates a `PendingTx` — only `sign_and_submit` (the till's spend path) does — so the till's
+  ref mechanism was not reusable. `STATE_VERSION` stayed 1; the field is `serde(default)` and
+  skipped when empty, so older state files load.
+- **`precheck` writes nothing** and is safe on every tap. It is the app's only pre-write
+  gate, because `replace` gates nothing in cardkit (`probe` checks it; `FEDIMINT_PLAN` has no
+  `guard`). It walks slots with `get_pub`, classifies `6985`/`6A82`/PIN words, marks any slot
+  whose key this state file never produced as **foreign**, probes `GET DATA FF21` and
+  `SELECT`, and reads live notes from state — never from the federation.
+- **`applet_present` is SELECT → `9000`**, not a PIN-word inference. `kind` is derived
+  separately (`AppletState` from the PIN status words) because a card can be selectable while
+  the PIN probes say nothing useful — that is exactly the blank-card case.
+- **`keySetup` never passes `--fresh`.** Re-keying destroys live notes. A card holding keys
+  this wallet did not produce is refused with `SpendFault::WrongCard` (→ `502 card_error`)
+  instead. `generated` is the before/after diff, so a repeat reports `[]`. `SET_PIN` on a
+  pinned card answers `6985` and is reported `pin: "set"`, never re-set — that is what makes
+  a re-run safe. `pin_set` is true only when `VERIFY_PIN` accepted the PIN.
+- **`issue` refuses a card holding *any* live or pending note, whatever slot.** The first
+  version checked only the slots the new plan would use; its test caught the hole: a card with
+  a note in slot 0 and seven free slots took a second batch in slots 1–6 and was worth both.
+  Slots are recycled, so "free" says nothing about whether the card was already issued to.
+  This is the guard the app cannot provide — the card looks blank to the applet, and a copied
+  card looks exactly like an unused one.
+- **PIN bounds are 4..8 bytes** (`FedimintCardApplet.java:63-64`) and are enforced in
+  `pin_apdu` *before* the card sees the APDU, so a malformed PIN cannot spend a try.
+  `GENERATED_PIN_LENGTH = 6` is only the generator's default.
+- **`host/card` had no PIN or SELECT wrappers** when P0 started, despite P1b's done-line
+  naming "host wrappers in `host/card`" — that line was written before the work and was
+  wrong about the tree. `Card` was keys-only. P0 added defaulted methods (`apdu`,
+  `select_applet`, `get_data_ff21`, `set_pin`, `verify_pin`) with an `apdu()` hook that
+  `CardClient` overrides with `exchange` (so `61xx`/`6Cxx` chaining is reused) and
+  `SoftCard` implements as a model of the applet's dispatch. Backends that cannot send raw
+  APDUs get a loud error, not a silent `Ok`.
+- **`SoftCard` now models the applet's PIN machine**: installed vs blank (`blank()` answers
+  `6A82` to SELECT), `SET_PIN` once then `6985`, three tries, `9000` on match, `63 CX` with
+  tries left, `6983` at zero, `6984` before any PIN, `6D00` for anything else. Before this it
+  had no PIN model at all, so any PIN test would have passed vacuously.
 
 ## 6. Bugs found and fixed this session
 
@@ -246,8 +299,18 @@ their alerts fire on *other* locked copies, and the older `lru` 0.12/0.13 and
 3. ~~Get hardware authorisation.~~ **Granted 2026-10-28** (plan § 9). Next: run the P1b
    silicon checklist there, in its printed order — the third wrong PIN is permanent, so
    steps 9 and 7 do not get swapped.
-4. P0 (sidecar endpoints) and P1c (hosted registry) can run in parallel with different
-   hands; P3 needs the phone and the cards.
+4. ~~P0 (sidecar endpoints).~~ **Done 2026-10-28**, uncommitted at the time of writing.
+   Next: commit and push it, then the device pass below. P1c (hosted registry) can run in
+   parallel with a different hand; P3 needs the phone and the cards.
+5. **Run the app against the sidecar on a real reader.** This is the next real work, and no
+   part of it has been done:
+   - `android-relay/` up (`adb forward tcp:9876 tcp:9876`, per its README — do not modify it);
+   - `card-sidecar till serve` on the laptop, data dir the one the batch signs with;
+   - `cd apps/provisioner && yarn start`, debug build on the phone.
+   Walk precheck → install (cardkit) → keySetup → issue, on a **blank** J3R180 first, then a
+   re-tap of the same card for the keySetup-idempotent and issue-replay paths. Record the card
+   state, reader and federation actually used here in § 3, and do not mark P2's or P3's
+   done-lines met beyond what was walked.
 
 `tools/cardkit/README.md` explains the engine; `docs/PROVISIONER-PLAN.md` is authoritative
 for scope and the phase table.

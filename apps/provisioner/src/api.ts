@@ -23,16 +23,19 @@ import {LOAD_FILE_SHA256} from './cardkit';
  *                                wallet_balance_msat, card_relay_ok, busy}
  *   POST /v1/card/balance      till.rs  card_balance(): no body ->
  *                                {ok, live_msat, notes[{slot, msat, status}], free_slots}
- *   POST /v1/cards/precheck    § 4 "new" — not in till.rs yet
- *   POST /v1/cards/keySetup    § 4 "new" — not in till.rs yet
- *   POST /v1/cards/issue       § 4 "new" — not in till.rs yet
+ *   POST /v1/cards/precheck    till.rs  cards_precheck(): no body -> {applet_present,
+ *                                isd_open, keyed_slots[], live_msat, safe_to_replace,
+ *                                kind, applet, empty_slots[], foreign_slots[], free_slots[]}
+ *   POST /v1/cards/keySetup    till.rs  cards_key_setup(): {pin?} -> {keys[{slot,pubkey}],
+ *                                short_id, pin_set, pin, generated[]}
+ *   POST /v1/cards/issue       till.rs  cards_issue(): {amounts_msat[], client_ref} ->
+ *                                {client_ref, txid, notes[{slot,msat}], live_msat}
  *
- * The three "new" routes are P0's to add (`router()` at till.rs:532 is the
- * place). Their bodies and replies follow what the sidecar already computes —
- * `glue.rs` `CardWallet::topup` for the issue plan, `till.rs`
- * `balance_reply()` for the precheck's note list, `classify()` for the error
- * codes — so P0 implements against this file and the screen code is written
- * once. The `:line` numbers are deliberately absent: they move.
+ * The three card routes live in `sidecar/src/cards.rs`, registered by
+ * `till.rs` `router()` and run through the same single actor as a charge, so
+ * one card is held at a time. Error codes come from `classify()`; the ones the
+ * loop acts on are `no_card`, `relay_unreachable`, `busy`, `undecided`,
+ * `card_error`, plus issue's own `ref_mismatch` and `card_holds_notes`.
  *
  * Errors mirror the sidecar's own vocabulary: every failure body is
  * `{"ok": false, "code": "...", "message": "..."}` (`Reply::fail`), where

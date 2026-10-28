@@ -150,6 +150,29 @@ pub struct CardState {
     /// in. The till service turns them into sales (and removes them) on its next sync.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tombstones: Vec<Tombstone>,
+    /// Finished `issue` calls, keyed by the app's `client_ref`. Written in the save that records
+    /// the notes, before the federation is charged, so a repeat of the ref gets the same answer
+    /// even after a crash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<IssueRec>,
+}
+
+/// One `POST /v1/cards/issue`, kept so its `client_ref` can be replayed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRec {
+    pub client_ref: String,
+    /// The transaction that funds the notes. Empty until the wallet has built it.
+    #[serde(default)]
+    pub txid: String,
+    /// `(slot, msat)` created for this ref.
+    #[serde(default)]
+    pub notes: Vec<(u8, u64)>,
+    /// The amounts the caller asked for, so a repeat with a different body can be told apart
+    /// from a genuine replay.
+    #[serde(default)]
+    pub amounts: Vec<u64>,
+    #[serde(default)]
+    pub ts_unix_ms: u64,
 }
 
 /// What is left of an accepted `PendingTx` that carried a `client_ref`.

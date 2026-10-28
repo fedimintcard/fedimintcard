@@ -7,7 +7,7 @@
 //! * [`CardClient`] implements it over any APDU [`Transport`] (bridge or PC/SC).
 //! * [`SoftCard`] implements it in-process with real keys, for tests without a card.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
 
@@ -21,12 +21,27 @@ pub use bridge::{BridgeError, BridgeTransport};
 pub const SLOTS: u8 = 8;
 /// Status word the applet answers for an empty slot (or an occupied slot on GEN_KEY).
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+/// The applet's PIN bounds (`FedimintCardApplet.java:63-64`). A shorter or longer PIN is refused
+/// before the card sees it, so a malformed one cannot spend a try.
+pub const PIN_MIN: usize = 4;
+pub const PIN_MAX: usize = 8;
+/// Blocked after three wrong PINs; terminal.
+pub const SW_PIN_BLOCKED: u16 = 0x6983;
+/// No PIN set on this card yet.
+pub const SW_NO_PIN_SET: u16 = 0x6984;
+/// A PIN is set and this session has not verified it.
+pub const SW_PIN_REQUIRED: u16 = 0x6A94;
 
 /// Upper bound on 61xx / 6Cxx follow-ups for one command.
 const MAX_CHAIN: usize = 16;
-const CLA: u8 = 0xB0;
 const INS_GEN_KEY: u8 = 0x10;
 const INS_GET_PUB: u8 = 0x11;
+/// PIN commands and ISD interrogation use the standard ISO CLA, not the applet's.
+const CLA_ISO: u8 = 0x00;
+const CLA: u8 = 0xB0;
+pub const INS_VERIFY_PIN: u8 = 0x40;
+pub const INS_SET_PIN: u8 = 0x41;
+pub const INS_CHANGE_PIN: u8 = 0x42;
 const INS_SIGN: u8 = 0x12;
 /// `SELECT` by AID `F0 46 4D 43 41 52 44 01`.
 pub const SELECT_APDU: [u8; 14] = [
@@ -83,6 +98,53 @@ pub trait Card {
             Err(e) => Err(e),
         }
     }
+
+    /// One APDU round trip at the ISO level, without the applet's CLA. This is the escape hatch
+    /// the provisioning endpoints need: `SELECT` of an AID, `GET DATA` on the ISD, and the PIN
+    /// commands. Returns the response data; a non-`9000` status word is an error carrying it.
+    ///
+    /// Backends that cannot speak raw APDUs keep this failing loudly rather than pretending.
+    fn apdu(&mut self, _apdu: &[u8]) -> Result<Vec<u8>> {
+        Err(anyhow!("this card backend cannot send raw APDUs"))
+    }
+
+    /// Select the applet by AID. `Ok(())` means `9000`.
+    fn select_applet(&mut self) -> Result<()> {
+        self.apdu(&SELECT_APDU).map(|_| ())
+    }
+
+    /// `GET DATA` on `FF21` (the card manager's free-memory template). Any answer — data or a
+    /// status word — proves the ISD is there; only a transport error means it is not.
+    fn get_data_ff21(&mut self) -> Result<Vec<u8>> {
+        self.apdu(&[CLA_ISO, 0xCA, 0xFF, 0x21, 0x00])
+    }
+
+    /// `SET_PIN` (once per card). `6985` when a PIN is already set, `6983` when blocked.
+    fn set_pin(&mut self, pin: &[u8]) -> Result<()> {
+        self.apdu(&pin_apdu(INS_SET_PIN, pin)?).map(|_| ())
+    }
+
+    /// `VERIFY_PIN` for this session. `6A94` when no PIN is set, `63 CX` with X tries left,
+    /// `6983` when blocked.
+    fn verify_pin(&mut self, pin: &[u8]) -> Result<()> {
+        self.apdu(&pin_apdu(INS_VERIFY_PIN, pin)?).map(|_| ())
+    }
+}
+
+/// `SET_PIN`/`VERIFY_PIN` APDU: ISO CLA, P1 = P2 = 0, the PIN as Lc bytes, Le = 0.
+///
+/// The bounds are the applet's (`PIN_MIN`..`PIN_MAX`), not a preference: an out-of-range length is
+/// refused here so the card is never asked and cannot burn a try.
+pub fn pin_apdu(ins: u8, pin: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        (PIN_MIN..=PIN_MAX).contains(&pin.len()),
+        "PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}",
+        pin.len()
+    );
+    let mut apdu = vec![CLA_ISO, ins, 0x00, 0x00, pin.len() as u8];
+    apdu.extend_from_slice(pin);
+    apdu.push(0x00);
+    Ok(apdu)
 }
 
 /// Sends one APDU and returns `data || SW1 SW2`.
@@ -154,6 +216,10 @@ impl<T: Transport> Card for CardClient<T> {
         self.pubkey_cmd(INS_GET_PUB, slot, 0x00)
     }
 
+    fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        self.exchange(apdu)
+    }
+
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
         let mut apdu = vec![CLA, INS_SIGN, slot, 0x00, 0x20];
         apdu.extend_from_slice(msg32);
@@ -163,15 +229,51 @@ impl<T: Transport> Card for CardClient<T> {
     }
 }
 
-/// In-process stand-in for the applet, with the same slot semantics (including `6985`).
+/// In-process stand-in for the applet, with the same slot semantics (including `6985`) and the
+/// same PIN state machine: `SET_PIN` once, three tries, `6984` before a PIN exists, `6983` after
+/// it is out of tries.
 #[derive(Default)]
 pub struct SoftCard {
     slots: [Option<Keypair>; SLOTS as usize],
+    pin: Option<Vec<u8>>,
+    tries_left: u8,
+    /// Whether the applet is installed. A blank card answers `6A82` to SELECT.
+    installed: bool,
 }
 
 impl SoftCard {
     pub fn new() -> Self {
-        Self::default()
+        Self { tries_left: 3, installed: true, ..Default::default() }
+    }
+
+    /// A card with no applet on it: SELECT answers `6A82`, and every slot is empty.
+    pub fn blank() -> Self {
+        Self { tries_left: 3, installed: false, ..Default::default() }
+    }
+
+    /// A card whose applet is there but has never been pinned.
+    pub fn pinned_with(&mut self, pin: &[u8]) {
+        self.pin = Some(pin.to_vec());
+        self.tries_left = 3;
+    }
+
+    pub fn is_installed(&self) -> bool {
+        self.installed
+    }
+
+    /// Make SELECT answer `6A82`: the applet is not on this card.
+    pub fn visit_blank_applet(&mut self) {
+        self.installed = false;
+    }
+
+    /// Key every slot with keys no wallet recorded — another machine's card. The slots are full,
+    /// so `card setup` would find nothing to generate and `keySetup` must refuse.
+    pub fn install_foreign_keys(&mut self) {
+        for slot in 0..SLOTS {
+            if self.slots[slot as usize].is_none() {
+                self.slots[slot as usize] = Some(Keypair::new(SECP256K1, &mut rand::thread_rng()));
+            }
+        }
     }
 
     fn slot(&self, slot: u8) -> Result<&Option<Keypair>> {
@@ -209,6 +311,69 @@ impl Card for SoftCard {
             None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
         }
     }
+
+    /// The APDU layer, modelled on the applet's dispatch: SELECT by AID, `GET DATA FF21`, and the
+    /// three PIN commands. Unknown instructions answer `6D00`, like the applet.
+    fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        ensure!(apdu.len() >= 4, "APDU shorter than its header");
+        let (cla, ins) = (apdu[0], apdu[1]);
+        match (cla, ins) {
+            (CLA_ISO, 0xA4) => {
+                let lc = apdu[4] as usize;
+                ensure!(apdu.len() >= 5 + lc, "SELECT too short for its Lc");
+                if !self.installed || &apdu[5..5 + lc] != SELECT_APDU_HEAD {
+                    return Err(StatusWord(0x6A82).into());
+                }
+                Ok(vec![])
+            }
+            (CLA_ISO, 0xCA) if apdu[2] == 0xFF && apdu[3] == 0x21 => {
+                // TLV: 81 applications, 82 non-volatile, 83 volatile. One free slot's worth.
+                Ok(vec![0xFF, 0x21, 0x09, 0x81, 0x01, 0x01, 0x82, 0x02, 0x10, 0x00, 0x83, 0x00])
+            }
+            (CLA_ISO, INS_SET_PIN) => {
+                let pin = apdu_data(apdu)?;
+                ensure!(
+                    (PIN_MIN..=PIN_MAX).contains(&pin.len()),
+                    "PIN must be {PIN_MIN} to {PIN_MAX} bytes"
+                );
+                if self.tries_left == 0 {
+                    return Err(StatusWord(SW_PIN_BLOCKED).into());
+                }
+                if self.pin.is_some() {
+                    return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+                }
+                self.pin = Some(pin.to_vec());
+                self.tries_left = 3;
+                Ok(vec![])
+            }
+            (CLA_ISO, INS_VERIFY_PIN) => {
+                let pin = apdu_data(apdu)?;
+                if self.tries_left == 0 {
+                    return Err(StatusWord(SW_PIN_BLOCKED).into());
+                }
+                let Some(want) = &self.pin else {
+                    return Err(StatusWord(SW_NO_PIN_SET).into());
+                };
+                if want.as_slice() == pin {
+                    self.tries_left = 3;
+                    return Ok(vec![]);
+                }
+                self.tries_left -= 1;
+                Err(StatusWord(0x6300 | u16::from(self.tries_left)).into())
+            }
+            _ => Err(StatusWord(0x6D00).into()),
+        }
+    }
+}
+
+/// The AID bytes `SELECT` names, without the header/Lc that precede them.
+const SELECT_APDU_HEAD: &[u8] = &[0xF0, 0x46, 0x4D, 0x43, 0x41, 0x52, 0x44, 0x01];
+
+/// The data field of a short APDU: `Lc` at byte 4, data from byte 5.
+fn apdu_data(apdu: &[u8]) -> Result<&[u8]> {
+    let lc = apdu[4] as usize;
+    ensure!(apdu.len() >= 5 + lc, "APDU shorter than its Lc");
+    Ok(&apdu[5..5 + lc])
 }
 
 /// Pick a backend from the environment.

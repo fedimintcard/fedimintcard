@@ -148,9 +148,9 @@ the operator's machine, which also drives the card through the phone's relay.
 | `GET /v1/health`, `GET /v1/status` | local | exists | federation name/id, relay reachability |
 | `POST /v1/card/balance` | local | exists | reconcile |
 | `POST /v1/charge`, `GET /v1/sales` | local | exists | merchant (till) |
-| `POST /v1/cards/precheck` | local | **new** | read-only: what is on this card, is the ISD open, does the applet answer |
-| `POST /v1/cards/keySetup` | local | **new** | `card setup`, then `SET_PIN`; returns keys + short id + PIN state |
-| `POST /v1/cards/issue` | local | **new** | body: amounts; previewed plan + `client_ref`; returns notes/txid |
+| `POST /v1/cards/precheck` | local | **delivered (P0)** | read-only: what is on this card, is the ISD open, does the applet answer |
+| `POST /v1/cards/keySetup` | local | **delivered (P0)** | `card setup`, then `SET_PIN`; returns keys + short id + PIN state |
+| `POST /v1/cards/issue` | local | **delivered (P0)** | body: amounts; previewed plan + `client_ref`; returns notes/txid |
 | `POST /auth/operator/session` | hosted | **new** | operator token |
 | `POST /registry/cards`, `GET /registry/cards?batch_id=` | hosted | **new** | idempotent card rows |
 | `POST /registry/batches` | hosted | **new** | batch record (federation id, PIN policy, count, load sha) |
@@ -160,10 +160,21 @@ sidecar for everything about the card. That split keeps the disclosure small: th
 never leaves the operator's machine, and the registry never holds anything that could be
 spent.
 
-`issue` reuses `CardWallet::topup` (`host/sidecar/src/glue.rs:452`) — it already plans
-exact amounts, submits a hand-built transaction, and records a `PendingTx` before
-signing. The endpoint must therefore obey the same rules: write state first, one job at
-a time, `client_ref` replay returns the same result.
+`issue` reuses `CardWallet::topup` (`host/sidecar/src/glue.rs`) — it already plans
+exact amounts, submits a hand-built transaction, and writes its notes before submitting. The
+endpoint obeys the same rules: write state first, one job at a time, `client_ref` replay returns
+the same result. It wraps `topup` as `topup_ref(amounts, client_ref)` rather than reimplementing
+it; the ref is recorded in the *same* `save()` that writes the pending notes, before the
+federation hears of the transaction, so a replay can never see one without the other. The
+replay record lives in `CardState.issues` (a `Vec<IssueRec>`), not in `PendingTx` — `topup` never
+creates a `PendingTx`; only `sign_and_submit` does.
+
+The three endpoints live in `host/sidecar/src/cards.rs`, registered by `till.rs` `router()` and
+admitted through the same single-job actor as a charge, so one card is touched at a time.
+`precheck` writes nothing at all; `keySetup` never passes `--fresh` (re-keying destroys live
+notes) and refuses a card holding keys this wallet did not produce; `issue` refuses any card the
+wallet already holds a live or pending note on, whatever slot — not just the slots the new plan
+would use, which is the case that actually doubles a copied card's value.
 
 ## 5. The app
 
@@ -365,9 +376,9 @@ is done when its verification line is true, not when it compiles.
 
 | # | Phase | Deliverable | Done when |
 |---|---|---|---|
-| P0 | Card-side and local service surface | sidecar `precheck`, `keySetup`, `issue` endpoints + tests | `cargo test -p fedimint-card-sidecar` covers: precheck on blank / installed / foreign card; keySetup idempotent; issue `client_ref` replay; issue refuses a known holding card |
+| P0 | Card-side and local service surface | sidecar `precheck`, `keySetup`, `issue` endpoints + tests | **delivered** — `host/sidecar/tests/cards.rs`, 7 tests, all four named cases plus body validation: precheck on blank / installed / foreign card; keySetup idempotent; issue `client_ref` replay; issue refuses a known holding card. **Proved against `SoftCard`, which now models the applet's PIN machine** (`SET_PIN` once, three tries, `63 CX`, `6984`, `6983`); nothing here has run on a J3R180 — the PIN state machine on silicon is P1b's done-line, and the reader/relay path is P3's |
 | P1a | cardkit port | `tools/cardkit/gp/` ported to `apps/provisioner/tools/`, AIDs and `FEDIMINT_PLAN` | engine's unit tests run unchanged; plan's `checks` include SELECT → `9000` with empty body and `GET_PUB 0` = `6985`; the fake card answers Fedimint framing, not Cashu's; NOTICE/credit added |
-| P1b | **applet PIN** | `SET_PIN`, `VERIFY_PIN` and a PIN-gated `SIGN` in `FedimintCardApplet.java`; new CAP and load sha; host wrappers in `host/card`; a PIN section in `docs/DESIGN-NOTE.md` matching what is built | on a J3R180: `SIGN` before `VERIFY_PIN` → `6A 94`; after `VERIFY_PIN` → signature verifies under the slot key; three wrong PINs → `69 83` and no `SIGN`; `SET_PIN`/`VERIFY_PIN` over the APDU bridge; CAP under the applet-size bound and within the transient budget (`SPIKE.md`: ~610 B).<br><br>**Test surface, measured before the work:** baseline is 44 green jCardSim tests (`mvn -B -f applet/pom.xml test`: 6 classes, 0 failures). Four things break or are unguarded, and P1b must handle each:<br>• `NoPrivateKeyLeakTest.onlyThreeCommandsExist` hard-asserts the INS set is exactly `0x10,0x11,0x12`; it **will fail** when PIN commands land and must be updated to include `0x40,0x41,0x42`.<br>• Every `CardTestSupport.sign(...)` call site — `SignTest`, `GenKeyGetPubTest`, `NoPrivateKeyLeakTest` — asserts `9000` and **will fail** once `SIGN` requires a PIN. `CardTestSupport` needs a `verifyPin(...)` helper.<br>• The `NoPrivateKeyLeakTest` 256-INS sweeps will send bogus PINs and can exhaust the retry counter; each sweep must either reinstall the card or use a PIN-exempt clause.<br>• There is **no** mechanical no-allocation test here (`noAllocationOutsideInstallTime` / `INSTALL_TIME_METHODS` do not exist); the no-`new`-outside-constructor rule is javadoc only, so PIN code is unguarded against allocation. P1b adds such a test or states the gap explicitly in `DESIGN-NOTE.md`.<br><br>There is no `OwnerPIN`, no `SW_PIN_*` constant, no session state and no transaction anywhere in the applet today. Three status words (`6983`, `6984`, `6A94`) are new and must be defined in the applet. |
+| P1b | **applet PIN** | `SET_PIN`, `VERIFY_PIN` and a PIN-gated `SIGN` in `FedimintCardApplet.java`; new CAP and load sha; host wrappers in `host/card`; a PIN section in `docs/DESIGN-NOTE.md` matching what is built | on a J3R180: `SIGN` before `VERIFY_PIN` → `6A 94`; after `VERIFY_PIN` → signature verifies under the slot key; three wrong PINs → `69 83` and no `SIGN`; `SET_PIN`/`VERIFY_PIN` over the APDU bridge; CAP under the applet-size bound and within the transient budget (`SPIKE.md`: ~610 B).<br><br>**Status note (P0, 2026-10-28):** the applet side of P1b is still open, and the "host wrappers in `host/card`" half of this line was not in the tree when P0 started — `Card` was keys-only (`gen_key`/`get_pub`/`sign`), with no way to send `SET_PIN`, `VERIFY_PIN` or `SELECT`. P0 added them as defaulted `Card` methods (`select_applet`, `get_data_ff21`, `set_pin`, `verify_pin`, backed by an `apdu()` hook) so the sidecar could be built and tested; the trait's shape is now whatever P1b builds against. `SoftCard` models the applet's PIN state machine so these paths are testable before silicon, which is the only place they have run.<br><br>**Test surface, measured before the work:** baseline is 44 green jCardSim tests (`mvn -B -f applet/pom.xml test`: 6 classes, 0 failures). Four things break or are unguarded, and P1b must handle each:<br>• `NoPrivateKeyLeakTest.onlyThreeCommandsExist` hard-asserts the INS set is exactly `0x10,0x11,0x12`; it **will fail** when PIN commands land and must be updated to include `0x40,0x41,0x42`.<br>• Every `CardTestSupport.sign(...)` call site — `SignTest`, `GenKeyGetPubTest`, `NoPrivateKeyLeakTest` — asserts `9000` and **will fail** once `SIGN` requires a PIN. `CardTestSupport` needs a `verifyPin(...)` helper.<br>• The `NoPrivateKeyLeakTest` 256-INS sweeps will send bogus PINs and can exhaust the retry counter; each sweep must either reinstall the card or use a PIN-exempt clause.<br>• There is **no** mechanical no-allocation test here (`noAllocationOutsideInstallTime` / `INSTALL_TIME_METHODS` do not exist); the no-`new`-outside-constructor rule is javadoc only, so PIN code is unguarded against allocation. P1b adds such a test or states the gap explicitly in `DESIGN-NOTE.md`.<br><br>There is no `OwnerPIN`, no `SW_PIN_*` constant, no session state and no transaction anywhere in the applet today. Three status words (`6983`, `6984`, `6A94`) are new and must be defined in the applet. |
 | P1c | **hosted registry** | Worker + Durable Object, operator session, `/registry/batches`, `/registry/cards` idempotent upsert with the two new card fields (PIN state, PIN policy) | identical body → 200 with the stored row; changed body → 409; unauthenticated → 401; a row survives a Worker restart; tested against `wrangler dev` |
 | P2 | app skeleton, demo mode | five screens (§ 5, trimmed), `settings.tsx`, store, demo fake card, scripted stops | demo mode walks every screen and every stop on both phones with no card; `demo.test.ts` green, so each demo state still maps to the stop it must produce; settings persist across a relaunch; no per-batch field outside federation, count, PIN policy and the plan preview |
 | P3 | real install | probe → ISD → auth → sweep → load → install (opener, applet) → verify over NFC | 10 consecutive blank J3R180s installed from one phone; loop counter correct; a mid-run pull recovers on the next tap |

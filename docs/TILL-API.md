@@ -69,3 +69,56 @@ Empty body. Reconciles the card's notes with the federation (shares the busy fla
 
 `200 {"ok":true,"live_msat":N,"notes":[{"slot":0,"msat":N,"status":"live"}],"free_slots":[...]}`
 Same error table as `/v1/charge` where applicable.
+
+## POST /v1/cards/precheck
+Empty body (or `{"batch_id":"<string>"}`, ignored). **Read-only**: nothing is written to
+`card_state.json`, so the app may call it on every tap. Answers what is on the card, in the order
+the provisioning loop needs it — must the sweep ask first, is the applet ours, can the ISD take an
+INSTALL.
+
+`200 {"ok":true,"applet_present":B,"isd_open":B,"keyed_slots":[...],"live_msat":N,"safe_to_replace":B,"kind":"blank|installed|foreign","applet":"unknown|not_set|set|blocked","empty_slots":[...],"foreign_slots":[...],"free_slots":[...],"live_notes":[{"slot":S,"msat":N}],"slots":8}`
+
+* `applet_present` — `SELECT` of our AID answered `9000`; `false` on `6A82`.
+* `isd_open` — `GET DATA FF21` got an answer. A status word counts; only a transport error does not.
+* `safe_to_replace` — `true` only for `kind:"blank"`. Any key on the card means the app must ask
+  before it sweeps (`keyed_slots` is what would be destroyed).
+* `kind:"foreign"` — a slot holds a key this wallet never produced. `keySetup` and `issue` both
+  refuse it; the sweep cannot see it (the applet is not selected before `DELETE`, so `6A88` looks
+  the same as on a blank card) and it is caught at `INSTALL [for load]` (`6985`).
+* `live_msat` is in satoshi, `live_notes[].msat` in millisatoshis, as everywhere else here.
+
+## POST /v1/cards/keySetup
+`{"pin":"<4-8 digits>"}` — `pin` is optional; without it the card is keyed and left unpinned.
+Runs `card setup` (never `--fresh`: re-keying destroys live notes) then `SET_PIN`, then
+`VERIFY_PIN`. Shares the single job slot with charges.
+
+`200 {"ok":true,"keys":[{"slot":0,"pubkey":"<hex>"}],"short_id":"<8 hex>","pin_set":B,"pin":"set|set_now|not_set|blocked","generated":[...]}`
+
+Idempotent: keys already present are kept, an existing PIN answers `6985` and is reported `"set"`
+(not reset), and `generated` is empty on a repeat. `short_id` is 8 hex chars hashed over the whole
+key set; it is stable for a given card. `pin_set` is `true` only when `VERIFY_PIN` accepted the PIN
+on this call — a `set_now` that failed to verify reports `pin_set:false`, which the registry
+records as `pinNotSet` and refuses to hand out.
+Errors: `400 bad_request` for a PIN outside 4-8 digits (refused before the card sees it, so a
+malformed PIN cannot spend a try); `502 card_error` with `detail` naming the slot on a foreign card.
+
+## POST /v1/cards/issue
+`{"amounts_msat":[N,...],"client_ref":"<1-128 bytes>"}` — each amount becomes one note per set bit,
+as `card topup` does. Shares the single job slot with charges; the reply waits for the federation
+to accept the transaction.
+
+`200 {"ok":true,"client_ref":"...","txid":"<hex>","notes":[{"slot":0,"msat":N}],"live_msat":N,"replayed":B,"plan":{...}}`
+
+`client_ref` is the idempotency key. The record is written to `card_state.json` in the same save
+that writes the pending notes, before the federation hears of it; a repeat therefore returns the
+same `txid` and `notes` without touching the card or the wallet. A repeat with a *different*
+`amounts_msat` is `409 ref_mismatch`.
+
+`409 card_holds_notes` when the wallet has any live or pending note on this card, whatever slot it
+sits in — issuing again would double the card's value. This is the guard the app cannot provide:
+the card looks blank to the applet, and a copied card looks exactly like an unused one.
+
+`202 undecided` when this `client_ref` is still in flight — a concurrent tap of the same batch
+item answers "ask again" rather than `busy`, and nothing was issued twice.
+Other errors are `/v1/charge`'s table plus `402 insufficient` and `422 no_exact_plan` from the
+planner.
