@@ -36,7 +36,7 @@ pub const SW_PIN_REQUIRED: u16 = 0x6A94;
 const MAX_CHAIN: usize = 16;
 const INS_GEN_KEY: u8 = 0x10;
 const INS_GET_PUB: u8 = 0x11;
-/// PIN commands and ISD interrogation use the standard ISO CLA, not the applet's.
+/// `SELECT` and `GET DATA` are ISO interindustry commands: CLA `00`.
 const CLA_ISO: u8 = 0x00;
 const CLA: u8 = 0xB0;
 pub const INS_VERIFY_PIN: u8 = 0x40;
@@ -131,7 +131,12 @@ pub trait Card {
     }
 }
 
-/// `SET_PIN`/`VERIFY_PIN` APDU: ISO CLA, P1 = P2 = 0, the PIN as Lc bytes, Le = 0.
+/// `SET_PIN`/`VERIFY_PIN` APDU: the applet's CLA `B0` (not ISO `00`), P1 = P2 = 0, the PIN as Lc
+/// bytes, Le = 0.
+///
+/// The CLA is load-bearing: `FedimintCardApplet.process` refuses anything but `B0` before it looks
+/// at the INS, so an ISO-CLA PIN command gets `6E00` on a card that has the PIN applet installed —
+/// indistinguishable from a card that does not. Measured on a J3R180 on 2026-10-28.
 ///
 /// The bounds are the applet's (`PIN_MIN`..`PIN_MAX`), not a preference: an out-of-range length is
 /// refused here so the card is never asked and cannot burn a try.
@@ -141,7 +146,7 @@ pub fn pin_apdu(ins: u8, pin: &[u8]) -> Result<Vec<u8>> {
         "PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}",
         pin.len()
     );
-    let mut apdu = vec![CLA_ISO, ins, 0x00, 0x00, pin.len() as u8];
+    let mut apdu = vec![CLA, ins, 0x00, 0x00, pin.len() as u8];
     apdu.extend_from_slice(pin);
     apdu.push(0x00);
     Ok(apdu)
@@ -318,6 +323,8 @@ impl Card for SoftCard {
         ensure!(apdu.len() >= 4, "APDU shorter than its header");
         let (cla, ins) = (apdu[0], apdu[1]);
         match (cla, ins) {
+            // The applet refuses any CLA but its own before looking at the INS.
+            (c, _) if c != CLA && c != CLA_ISO => Err(StatusWord(0x6E00).into()),
             (CLA_ISO, 0xA4) => {
                 let lc = apdu[4] as usize;
                 ensure!(apdu.len() >= 5 + lc, "SELECT too short for its Lc");
@@ -330,7 +337,7 @@ impl Card for SoftCard {
                 // TLV: 81 applications, 82 non-volatile, 83 volatile. One free slot's worth.
                 Ok(vec![0xFF, 0x21, 0x09, 0x81, 0x01, 0x01, 0x82, 0x02, 0x10, 0x00, 0x83, 0x00])
             }
-            (CLA_ISO, INS_SET_PIN) => {
+            (CLA, INS_SET_PIN) => {
                 let pin = apdu_data(apdu)?;
                 ensure!(
                     (PIN_MIN..=PIN_MAX).contains(&pin.len()),
@@ -346,7 +353,7 @@ impl Card for SoftCard {
                 self.tries_left = 3;
                 Ok(vec![])
             }
-            (CLA_ISO, INS_VERIFY_PIN) => {
+            (CLA, INS_VERIFY_PIN) => {
                 let pin = apdu_data(apdu)?;
                 if self.tries_left == 0 {
                     return Err(StatusWord(SW_PIN_BLOCKED).into());
