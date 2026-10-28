@@ -29,6 +29,9 @@ jobs:
       - run: yarn install --frozen-lockfile
       - run: yarn typecheck
       - run: yarn format:check
+      # The app consumes this package through its Node entry (dist/), so a
+      # package that typechecks but does not emit is a broken dependency.
+      - run: yarn build
       # These tests run the install against a model of the J3R180, so they say
       # nothing about a card in a reader. Without applet/target/fedimint-card-0.1.cap
       # the install suites fall back to a placeholder load file and skip the CAP

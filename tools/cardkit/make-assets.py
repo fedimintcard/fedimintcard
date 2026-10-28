@@ -35,7 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 CAP = 'applet/target/fedimint-card-0.1.cap'
 # Relative to HERE, not ROOT: the asset sits in this package, and a path relative
 # to ROOT writes it to <repo>/gp/ where no test looks.
-ASSET = os.path.join(HERE, 'gp/test/fixtures/load-file.ts')
+ASSET = os.path.join(HERE, 'gp/load-file.ts')
 
 # The pins. None means "not pinned yet": the first run fills them in from the
 # CAP and refuses --check. They are never a guess -- run the script on a real

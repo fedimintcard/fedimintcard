@@ -19,3 +19,5 @@ export {
 } from './gp/des';
 export * from './gp/scp02';
 export * from './gp/provision';
+export {FEDIMINT_LOAD_FILE} from './gp/load-file';
+export type {LoadFileAsset} from './gp/provision';

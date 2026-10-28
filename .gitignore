@@ -8,3 +8,4 @@ android-relay/app/build/
 android-relay/.gradle/
 android-relay/local.properties
 node_modules/
+tools/cardkit/dist/

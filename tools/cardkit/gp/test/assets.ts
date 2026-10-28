@@ -2,7 +2,7 @@
  * The load file the install tests run on.
  *
  * It is normally the real one, generated from the CAP by make-assets.py into
- * fixtures/load-file.ts and committed. When that file is absent -- a machine
+ * gp/load-file.ts and committed. When that file is absent -- a machine
  * where `ant cap` has never run -- this falls back to a placeholder so that the
  * suites which have nothing to do with a load file (the fake card, SCP02, DES)
  * still run. The fallback is loud: it prints, and it is NOT a valid CAP, so any
@@ -97,14 +97,14 @@ export function fedimintLoadFile(): LoadFileAsset {
   let real: LoadFileAsset | undefined;
   try {
     // Loaded lazily: an absent file must be a runtime fallback, not a compile error.
-    real = require('./fixtures/load-file').FEDIMINT_LOAD_FILE as
+    real = require('../load-file').FEDIMINT_LOAD_FILE as
       LoadFileAsset | undefined;
   } catch {
     real = undefined;
   }
   if (!real) {
     console.log(
-      'cardkit: no gp/test/fixtures/load-file.ts: run  python3 tools/cardkit/make-assets.py\n' +
+      'cardkit: no gp/load-file.ts: run  python3 tools/cardkit/make-assets.py\n' +
         '         (needs applet/target/fedimint-card-0.1.cap; the install tests run on a placeholder)',
     );
     return placeholder();

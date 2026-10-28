@@ -4,11 +4,13 @@
   "private": true,
   "description": "GlobalPlatform over an injected transceiver: SCP02, the card-manager commands and a recovering install, for the Fedimint card provisioner.",
   "license": "MIT",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "node --import tsx --test 'gp/test/**/*.test.ts'",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "yarn build"
   },
   "dependencies": {
     "@noble/hashes": "1.8.0"
@@ -21,5 +23,23 @@
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "types": "dist/index.d.ts",
+  "reactNative": "index.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "react-native": "./index.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "index.ts",
+    "gp/*.ts",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }
