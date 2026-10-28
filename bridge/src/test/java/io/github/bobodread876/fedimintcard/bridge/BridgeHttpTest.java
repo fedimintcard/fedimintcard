@@ -53,15 +53,21 @@ class BridgeHttpTest {
     }
 
     @Test
-    void selectGenKeySignVerifiesOverHttp() throws Exception {
-        assertEquals("9000", apdu("00a4040008f0464d4341524401"));
+    void selectGenKeySetPinVerifySignVerifiesOverHttp() throws Exception {
+        assertEquals("02009000", apdu("00a4040008f0464d4341524401"));
         String gen = apdu("b0100000");
         assertEquals(68, gen.length());
         assertTrue(gen.endsWith("9000"));
         byte[] pub = Bip340.hex(gen.substring(0, 64));
         byte[] msg = new byte[32];
         for (int i = 0; i < 32; i++) msg[i] = (byte) (i * 5);
-        String sig = apdu("b0120000" + "20" + Bip340.hex(msg));
+        String sign = "b0120000" + "20" + Bip340.hex(msg);
+        // The applet gates SIGN on a same-session VERIFY_PIN: no PIN set is 6984, set but unverified 6A94.
+        assertEquals("6984", apdu(sign));
+        assertEquals("9000", apdu("b04100000431323334"));
+        assertEquals("6a94", apdu(sign));
+        assertEquals("9000", apdu("b04000000431323334"));
+        String sig = apdu(sign);
         assertEquals(64 * 2 + 4, sig.length());
         assertTrue(sig.endsWith("9000"));
         assertTrue(Bip340.verify(pub, msg, Bip340.hex(sig.substring(0, 128))));

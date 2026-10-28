@@ -250,10 +250,69 @@ reuse nonces.
 | `NOTE_ADD`, `POOL_ADD`, `POOL_CONSUME`, `NOTE_SWEEP`, `NOTE_RESTORE` | owner-signed | write notes and pool entries; mark entries used; drop notes the phone has swept; bring a logged input back for an owner-mode reissue |
 | `PERSONALISE`, `SET_LIMITS`, `SET_PIN`, `UNBLOCK_PIN`, `WIPE` | owner-signed or PUK | as cashucard; `WIPE` refuses while notes remain unless the command says so twice |
 
-The PIN is entered on the till, an untrusted device. The no-PIN limit is therefore the
-skimmer's reach, and the PIN protects only what is above it; a holder who enters the PIN on a
-hostile till exposes the cumulative limit, nothing more. This is cashucard's model and is
-stated to the holder.
+The PIN is entered on the till, an untrusted device. In v1 a no-PIN allowance bounds a
+skimmer's reach and the PIN protects only what is above it; a holder who enters the PIN on a
+hostile till exposes the cumulative limit, nothing more. That is cashucard's model and is
+stated to the holder. **The applet built today has no allowance**: see "The PIN as built" below.
+
+## The PIN as built (P1b)
+
+The applet on the branch is the three-command spike (`GEN_KEY`, `GET_PUB`, `SIGN`) plus a PIN.
+The v1 table above is the target; this is what exists, and `applet/src/test/.../PinTest.java`
+pins every line of it.
+
+| Command | CLA B0 | P1 P2 | Lc | Answers |
+|---|---|---|---|---|
+| `VERIFY_PIN` | `40` | `00 00` | 4..8 | `9000` and this session may `SIGN`; `63 CX` wrong, X tries left; `6983` blocked; `6984` no PIN set |
+| `SET_PIN` | `41` | `00 00` | 4..8 | `9000` first and only time; `6985` when a PIN is already set; never opens a session |
+| `CHANGE_PIN` | `42` | `00 00` | 8..16 (old ‖ new, equal halves) | `9000`; needs a `VERIFY_PIN` first; ends the session |
+| `SIGN` | `12` | slot, `00` | 32 | `6A94` unless this session verified the PIN; `6984` if no PIN was ever set; `6983` if blocked |
+
+- **No no-PIN allowance.** Cashucard's PIN arms a spending limit; here there is nothing behind
+  it (the applet holds no notes), so `SIGN` simply refuses without a `VERIFY_PIN` in the same
+  session. Anything weaker would be a claim the card does not keep.
+- **Session = selection.** The verified flag is a `CLEAR_ON_DESELECT` transient byte, so a card
+  reset or a SELECT of another AID ends the session. One `VERIFY_PIN` covers every `SIGN` until
+  then, which is what a multi-note spend needs; `CHANGE_PIN` ends the session itself.
+- **The gate is checked first.** A `SIGN` without the PIN answers `6A94` before the slot and
+  length are looked at, so a reader without the PIN cannot learn which slots are keyed.
+  `GEN_KEY` and `GET_PUB` are not gated: provisioning keys a fresh card before it has a PIN.
+  Past the gate, a verified session's `SIGN` still refuses a message that is not 32 bytes, an
+  empty one included, with `6700`.
+- **Blocked outranks not-set, and not-set outranks the frame.** A blocked card answers `6983` to
+  every PIN command whatever the frame, so a terminal is told the card is dead rather than that
+  no PIN exists. On a card with no PIN, `VERIFY_PIN` and `CHANGE_PIN` answer `6984` before P1/P2
+  (the terminal needs to know there is nothing to verify against), while `SET_PIN` checks P1/P2
+  first (`6B00`) because the frame it was sent can be refused without touching the state. On a
+  card with a PIN, all three check the frame first. `SET_PIN` on a card that already has one is
+  `6985`, and the blocked and not-set checks come before it.
+- **Tries.** `javacard.framework.OwnerPIN` holds the PIN and the counter: 3 tries, 4..8 bytes,
+  never reset by a card reset. `check()` spends a try even when it succeeds and puts it back, so
+  `63CX` always reports what is left, and a correct PIN can never lock the card. The third
+  miss locks the card: `6983` from then on for `SIGN`, `VERIFY_PIN`, `CHANGE_PIN` and `SET_PIN`.
+  A wrong length answers `6700` and spends no try. There is no unblock command, by design: on
+  this applet "blocked" means "needs a new key set", and a card that could unblock itself is a
+  card whose counter proves nothing.
+- **Tearing.** There is no transaction primitive on the 3.0.5 API this applet targets
+  (`OwnerPINx` with `updateValidated` is 3.1). Instead a persistent `pinState` byte — 0 not set,
+  1 set, 2 blocked — is the commit point and is written *after* the PIN it describes. A
+  `SET_PIN` torn after the PIN write reads as not set, and `SET_PIN` runs again; a failed
+  `VERIFY_PIN` that spends the last try leaves the byte at 1 until the next call writes 2 on its
+  way to answering `6983`, which is the same terminal outcome. A card can therefore never read
+  as set with a PIN nobody knows.
+- **Version.** `SELECT` answers `02 00 90 00`: the applet's major then minor version, two data
+  bytes and no FCI, so the first byte of the answer is the version. Any change to the command
+  set above increments the major.
+- **No allocation.** `OwnerPIN` is built in the constructor; the PIN buffers are the existing
+  65-byte `tmp`, the APDU buffer, and one `PIN_MAX`-byte `newPin` for the half being written, all
+  wiped on every exit path. `newPin` is separate from `tmp` because `checkPin` wipes `tmp` on its
+  way out, so the new PIN parked there during `CHANGE_PIN` would be written as zeros.
+  `NoAllocationTest` scans the applet sources for a `new` outside the install-time methods.
+
+Not built, and named so nobody assumes otherwise: no `GET_INFO` (the version bytes above are
+only the applet's, not the card's state), no unblock, no owner-signed `SET_PIN`, and nothing in
+the Rust `host/card` sends a PIN yet — the bridge and PC/SC paths must `SET_PIN` on a fresh card
+and `VERIFY_PIN` before each spend before a real card the applet has not seen can be used.
 
 ## EEPROM
 

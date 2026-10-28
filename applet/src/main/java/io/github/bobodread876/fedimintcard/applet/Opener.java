@@ -11,9 +11,10 @@ import javacard.framework.ISOException;
  * cashucard/javacard found that the chip fails the INSTALL that both instantiates a
  * package for the first time and runs a heavy constructor (6F00 or no answer), and
  * takes the same applet once a small one has been instantiated from the package
- * before it. {@link FedimintCardApplet}'s constructor builds four EC key pairs, a key
- * generator and the signer, so it is that kind of heavy. This applet does nothing: it
- * answers its SELECT and refuses everything else, and is never spoken to again.
+ * before it. {@link FedimintCardApplet}'s constructor builds 8 slots' worth of EC key
+ * objects, a key generator, the signer and the PIN store, so it is that kind of
+ * heavy. This applet does nothing: it answers its SELECT and refuses everything else,
+ * and is never spoken to again.
  *
  * Pattern from cashucard/javacard (MIT, (c) 2026 The Cashu Card authors, getfoxy).
  */
