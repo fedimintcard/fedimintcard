@@ -26,11 +26,11 @@ screen shows and what the next tap acts on.
 
 The AIDs come from `applet/build.xml` and nowhere else:
 
-| Object         | AID                                   | Bytes                     |
-| -------------- | ------------------------------------- | ------------------------- |
-| Package        | `F0` then `FMCARD`                    | `F0 46 4D 43 41 52 44`    |
-| Opener applet  | instantiated first                    | `F0 46 4D 43 41 52 44 4D` |
-| Card applet    | what hosts select                     | `F0 46 4D 43 41 52 44 01` |
+| Object        | AID                | Bytes                     |
+| ------------- | ------------------ | ------------------------- |
+| Package       | `F0` then `FMCARD` | `F0 46 4D 43 41 52 44`    |
+| Opener applet | instantiated first | `F0 46 4D 43 41 52 44 4D` |
+| Card applet   | what hosts select  | `F0 46 4D 43 41 52 44 01` |
 
 The J3R180 will not take the card's applet as its package's first instance, so
 the plan installs the opener first and the applet second. The sweep deletes them

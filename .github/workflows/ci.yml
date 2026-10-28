@@ -28,6 +28,7 @@ jobs:
         with: { node-version: '22', cache: yarn, cache-dependency-path: tools/cardkit/yarn.lock }
       - run: yarn install --frozen-lockfile
       - run: yarn typecheck
+      - run: yarn format:check
       # These tests run the install against a model of the J3R180, so they say
       # nothing about a card in a reader. Without applet/target/fedimint-card-0.1.cap
       # the install suites fall back to a placeholder load file and skip the CAP

@@ -88,9 +88,15 @@ function assetOf(size: number): LoadFileAsset {
   ];
   const pkg = FEDIMINT_PACKAGE_AID;
   const header = tlv(0x01, [
-    0xde, 0xca, 0xbe, 0xef, // magic
-    0x01, 0x02, // minor, major
-    0x00, 0x00, 0x03, // flags, package minor, package major
+    0xde,
+    0xca,
+    0xbe,
+    0xef, // magic
+    0x01,
+    0x02, // minor, major
+    0x00,
+    0x00,
+    0x03, // flags, package minor, package major
     pkg.length,
     ...pkg,
   ]);
@@ -180,7 +186,11 @@ describe('provision: the Fedimint card', () => {
     );
     // as gp sends them: Le 00 after the MAC on every one (GPSession.transmit)
     for (const a of card.log.filter(x => (x[0] & 0x04) !== 0)) {
-      assert.equal(parseCommand(a).le, 0x00, `INS ${toHex([a[1]])} ends in Le 00`);
+      assert.equal(
+        parseCommand(a).le,
+        0x00,
+        `INS ${toHex([a[1]])} ends in Le 00`,
+      );
     }
     // probe (no guard) and installTag (no tag applet) are the two phases this
     // plan never reaches; every other phase runs once, in order
@@ -191,7 +201,9 @@ describe('provision: the Fedimint card', () => {
     assert.equal(r.apdus.length, card.log.length);
     assert.deepEqual(r.blocks, {at: BLOCKS, of: BLOCKS});
     assert.ok(
-      r.freeBefore && r.freeAfter && r.freeAfter.nonVolatile < r.freeBefore.nonVolatile,
+      r.freeBefore &&
+        r.freeAfter &&
+        r.freeAfter.nonVolatile < r.freeBefore.nonVolatile,
     );
   });
 
@@ -222,7 +234,9 @@ describe('provision: the Fedimint card', () => {
       assert.ok(m, `${name} in FedimintCardApplet.java`);
       return parseInt(m[1], 16);
     });
-    const select = PLAN.checks.find(c => toHex(c.apdu) === toHex(selectAid(CARD_AID)));
+    const select = PLAN.checks.find(
+      c => toHex(c.apdu) === toHex(selectAid(CARD_AID)),
+    );
     assert.deepEqual(select?.data, version, "verify's whole-AID SELECT");
     const card = new FakeCard();
     assert.equal((await provision(card.transceive, PLAN, options())).ok, true);
@@ -233,7 +247,7 @@ describe('provision: the Fedimint card', () => {
     );
   });
 
-  it("records each APDU as phase, INS, Lc, SW, reply length and time, and never its bytes", async () => {
+  it('records each APDU as phase, INS, Lc, SW, reply length and time, and never its bytes', async () => {
     const card = new FakeCard();
     const r = await provision(card.transceive, PLAN, options());
     for (const record of r.apdus) {
@@ -261,10 +275,18 @@ describe('provision: the Fedimint card', () => {
           const where = `${partialLoad}/${when}/APDU ${n}`;
           assert.equal(first.ok, false, where);
           assert.equal(first.kind, 'pulled', where);
-          assert.equal(pull.state.late, 0, `${where}: nothing was sent after the pull`);
+          assert.equal(
+            pull.state.late,
+            0,
+            `${where}: nothing was sent after the pull`,
+          );
           card.reset();
           const again = await provision(card.transceive, PLAN, options());
-          assert.equal(again.ok, true, `${where}: ${again.kind} ${again.reason}`);
+          assert.equal(
+            again.ok,
+            true,
+            `${where}: ${again.kind} ${again.reason}`,
+          );
           assertInstalled(card);
         }
       }
@@ -308,7 +330,8 @@ describe('provision: the Fedimint card', () => {
     assert.equal(result.kind, 'pulled');
     assert.deepEqual(result.blocks, {at: 2, of: BLOCKS});
     const written = events.filter(
-      (event): event is Extract<RunEvent, {type: 'block'}> => event.type === 'block',
+      (event): event is Extract<RunEvent, {type: 'block'}> =>
+        event.type === 'block',
     );
     assert.equal(written.at(-1)?.index, 1);
   });
@@ -317,7 +340,9 @@ describe('provision: the Fedimint card', () => {
     const card = new FakeCard();
     let installs = 0;
     card.override = apdu =>
-      apdu[1] === 0xe6 && apdu[2] === 0x0c && ++installs === 2 ? 'mute' : undefined;
+      apdu[1] === 0xe6 && apdu[2] === 0x0c && ++installs === 2
+        ? 'mute'
+        : undefined;
     const first = await provision(card.transceive, PLAN, options());
     assert.equal(first.kind, 'pulled');
     assert.equal(first.phase, 'installCard');
@@ -360,14 +385,21 @@ describe('provision: the Fedimint card', () => {
       ['the last LOAD', a => a[1] === 0xe8 && a[2] === 0x80],
       // 84 E6 0C 00 Lc | 07 <package: 6..12> | 08 <module: 14..21> | 08 <instance: 23..30>
       // Offsets derived from the APDU, never counted by hand: MACed Lc is at 4.
-      ['INSTALL the opener', a => a[1] === 0xe6 && a[2] === 0x0c && installModule(a) === OPENER],
-      ['INSTALL the card applet', a => a[1] === 0xe6 && a[2] === 0x0c && installModule(a) === CARD],
+      [
+        'INSTALL the opener',
+        a => a[1] === 0xe6 && a[2] === 0x0c && installModule(a) === OPENER,
+      ],
+      [
+        'INSTALL the card applet',
+        a => a[1] === 0xe6 && a[2] === 0x0c && installModule(a) === CARD,
+      ],
     ];
     for (const sw of [0x6f00, 0x6985, 0x6a80]) {
       for (const [name, match] of targets) {
         const card = new FakeCard();
         let at = -1;
-        card.override = (apdu, i) => (at < 0 && match(apdu) ? ((at = i), sw) : undefined);
+        card.override = (apdu, i) =>
+          at < 0 && match(apdu) ? ((at = i), sw) : undefined;
         const r = await provision(card.transceive, PLAN, options());
         assert.ok(at >= 0, `${name} was sent`);
         assert.equal(r.kind, 'refused', name);
@@ -391,7 +423,11 @@ describe('provision: the Fedimint card', () => {
     ];
     for (const loadFile of tampered) {
       const card = new FakeCard();
-      const r = await provision(card.transceive, {...PLAN, loadFile}, options());
+      const r = await provision(
+        card.transceive,
+        {...PLAN, loadFile},
+        options(),
+      );
       assert.equal(r.kind, 'guarded');
       assert.equal(card.log.length, 0);
       assert.equal(r.apdus.length, 0);
@@ -409,7 +445,10 @@ describe('provision: the Fedimint card', () => {
       () => {
         throw new Error('the screen is gone');
       },
-      (() => Promise.reject(new Error('async listener'))) as unknown as ProvisionOptions['onEvent'],
+      (() =>
+        Promise.reject(
+          new Error('async listener'),
+        )) as unknown as ProvisionOptions['onEvent'],
     ];
     for (const onEvent of listeners) {
       const card = new FakeCard();
@@ -421,7 +460,10 @@ describe('provision: the Fedimint card', () => {
     const phases = events
       .filter(e => e.type === 'phase')
       .map(e => (e as {phase: string}).phase);
-    assert.deepEqual(phases, PHASES.filter(p => p !== 'probe' && p !== 'installTag'));
+    assert.deepEqual(
+      phases,
+      PHASES.filter(p => p !== 'probe' && p !== 'installTag'),
+    );
     const blocks = events.filter(e => e.type === 'block') as {
       index: number;
       of: number;
@@ -431,7 +473,10 @@ describe('provision: the Fedimint card', () => {
       Array.from({length: BLOCKS}, (_, i) => i + 1),
     );
     assert.ok(blocks.every(b => b.of === BLOCKS));
-    assert.equal(events.filter(e => e.type === 'apdu').length, INSTALL_ORDER.length);
+    assert.equal(
+      events.filter(e => e.type === 'apdu').length,
+      INSTALL_ORDER.length,
+    );
   });
 
   it('stops before EXTERNAL AUTHENTICATE on a card with other keys', async () => {
@@ -458,14 +503,22 @@ describe('provision: the Fedimint card', () => {
     assert.equal(r.sw, 0x6300);
     assert.equal(card.log.length, 4);
     card.reset();
-    const again = await provision(card.transceive, PLAN, options({macOverModifiedApdu: false}));
+    const again = await provision(
+      card.transceive,
+      PLAN,
+      options({macOverModifiedApdu: false}),
+    );
     assert.equal(again.ok, true, again.reason);
   });
 
   it('loads in smaller blocks when the plan says so', async () => {
     const loadFile = assetOf(1000);
     const card = new FakeCard();
-    const r = await provision(card.transceive, {...fedimintPlan(loadFile), blockSize: 128}, options());
+    const r = await provision(
+      card.transceive,
+      {...fedimintPlan(loadFile), blockSize: 128},
+      options(),
+    );
     assert.equal(r.ok, true, r.reason);
     assert.equal(card.insLog().filter(i => i === 0xe8).length, 8);
     assertInstalled(card);
@@ -503,7 +556,10 @@ describe('provision: the Fedimint card', () => {
     // and the reinstalled applet is empty
     const aid = card.instanceAids().find(a => a.endsWith('01'))!;
     const state = card.instances.get(aid)!.state;
-    assert.ok(state.used.every(used => used === false), 'every slot is empty after the install');
+    assert.ok(
+      state.used.every(used => used === false),
+      'every slot is empty after the install',
+    );
   });
 
   it('fails verify when a slot answers a key: the check is not satisfied by any 9000', () => {
@@ -552,20 +608,28 @@ describe('provision: the fake card', () => {
     const card = new FakeCard();
     assert.equal((await provision(card.transceive, PLAN, options())).ok, true);
     // the opener is an instance of this package; its AID begins with the package's
-    assert.deepEqual(await card.transceive(selectAid(OPENER_AID)), [0x90, 0x00]);
+    assert.deepEqual(
+      await card.transceive(selectAid(OPENER_AID)),
+      [0x90, 0x00],
+    );
     assert.deepEqual(
       await card.transceive([0xb0, 0x11, 0x00, 0x00, 0x00]),
       [0x6d, 0x00],
       'the opener has no GET_PUB',
     );
     // and the card applet, whose AID also begins with the package's, still answers as itself
-    assert.deepEqual(await card.transceive(selectAid(CARD_AID)), [0x02, 0x00, 0x90, 0x00]);
+    assert.deepEqual(
+      await card.transceive(selectAid(CARD_AID)),
+      [0x02, 0x00, 0x90, 0x00],
+    );
   });
 
   it('answers a selected instance from its module even after another is installed', async () => {
     const card = new FakeCard();
     assert.equal((await provision(card.transceive, PLAN, options())).ok, true);
-    const modules = card.instanceAids().map(aid => card.instances.get(aid)!.module);
+    const modules = card
+      .instanceAids()
+      .map(aid => card.instances.get(aid)!.module);
     assert.deepEqual(modules, [OPENER_MODULE, CARD_MODULE]);
   });
 });

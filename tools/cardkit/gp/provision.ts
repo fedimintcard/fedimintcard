@@ -509,7 +509,10 @@ export async function provision(
           `${toHex(guard)} answers ${toHex(selected.data)} ${swHex(selected.sw)}, not a 2.x card applet: the app will not remove it`,
         );
       }
-      const info = expectOk(await run.plain([0xb0, 0x01, 0x00, 0x00, 0x00]), 0x01);
+      const info = expectOk(
+        await run.plain([0xb0, 0x01, 0x00, 0x00, 0x00]),
+        0x01,
+      );
       const why = notEmpty(info.data);
       if (why) {
         throw new Guard(

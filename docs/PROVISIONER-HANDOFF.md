@@ -56,10 +56,10 @@ Be explicit about this with anyone downstream.
   building at the time of writing; its result is the first real check of `host/`.
 - **Rust is unverified.** `cargo test --workspace` does not build on this machine
   (`aws-lc-sys-0.41.0` panics). Only CI can check `host/`.
-- **`format:check` fails** on 6 files (prettier). It is a package script but not in CI.
-  I left it out of CI because the repo's Rust job does not gate on `rustfmt` either; if
-  you want a formatting gate, run `npx prettier --write .` in `tools/cardkit` and add the
-  step.
+- ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
+  (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
+  upstream's import layout so it stays diffable against cashucard, and is listed in
+  `.prettierignore` (the reason is also in `NOTICE`).
 
 ## 4. Exact commands
 

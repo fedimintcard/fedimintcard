@@ -13,12 +13,7 @@ import assert from 'node:assert/strict';
 import {randomBytes} from 'node:crypto';
 import {describe, it} from 'node:test';
 
-import {
-  CARD_AID,
-  FEDIMINT_PACKAGE_AID,
-  ISD_AID,
-  OPENER_AID,
-} from '../aids';
+import {CARD_AID, FEDIMINT_PACKAGE_AID, ISD_AID, OPENER_AID} from '../aids';
 import {concat, fromHex, toHex} from '../bytes';
 import {
   CardError,
@@ -46,12 +41,7 @@ import {
   type KeySet,
   type Transceiver,
 } from '../scp02';
-import {
-  nodeCbc,
-  nodeEcb,
-  nodeFullMac,
-  nodeRetailMac,
-} from './node-des';
+import {nodeCbc, nodeEcb, nodeFullMac, nodeRetailMac} from './node-des';
 
 function rnd(n: number): number[] {
   return Array.from(randomBytes(n));
@@ -350,10 +340,7 @@ describe('SCP02: replies', () => {
 describe('GP commands, byte for byte as GlobalPlatformPro v25.10.20 sends them', () => {
   it('SELECT by name, with Le', () => {
     assert.equal(toHex(selectAid(ISD_AID)), '00A4040008A00000015100000000');
-    assert.equal(
-      toHex(selectAid(CARD_AID)),
-      '00A4040008F0464D434152440100',
-    );
+    assert.equal(toHex(selectAid(CARD_AID)), '00A4040008F0464D434152440100');
   });
 
   it('GET DATA FF21, and its parse', () => {

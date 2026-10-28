@@ -10,7 +10,11 @@ These differ only in the statements named, all of them about this card's AIDs:
 
     gp/scp02.ts          one line: a comment says this card's DELETE whitelist
                          holds three AIDs rather than Cashu's six
-    gp/test/des.test.ts  one line: the import path of node-des
+    gp/test/des.test.ts  one line: the import path of node-des, and the
+                         import's multi-line layout, which is kept
+                         verbatim against this repo's prettier settings so
+                         the file stays diffable against upstream (it is
+                         listed in .prettierignore for that reason)
 
     gp/test/scp02.test.ts
                          adapted: this card's AIDs and byte-for-byte literals,

@@ -98,8 +98,7 @@ export function fedimintLoadFile(): LoadFileAsset {
   try {
     // Loaded lazily: an absent file must be a runtime fallback, not a compile error.
     real = require('./fixtures/load-file').FEDIMINT_LOAD_FILE as
-      | LoadFileAsset
-      | undefined;
+      LoadFileAsset | undefined;
   } catch {
     real = undefined;
   }
