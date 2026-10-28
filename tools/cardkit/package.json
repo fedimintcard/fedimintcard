@@ -1,0 +1,25 @@
+{
+  "name": "@fedimintcard/cardkit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GlobalPlatform over an injected transceiver: SCP02, the card-manager commands and a recovering install, for the Fedimint card provisioner.",
+  "license": "MIT",
+  "main": "index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx --test 'gp/test/**/*.test.ts'",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@noble/hashes": "1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "prettier": "3.9.10",
+    "tsx": "4.23.15",
+    "typescript": "5.0.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

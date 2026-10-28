@@ -62,7 +62,7 @@ class GenKeyGetPubTest {
         pubs[0] = new SchnorrHWSignTest.CompressedPub(pubs[0]);
         assertArrayEquals(pub, c.getPub(0));
         byte[] msg = CardTestSupport.fill(32, 5);
-        assertTrue(Bip340.verify(pub, msg, c.sign(0, msg)));
+        assertTrue(Bip340.verify(pub, msg, c.signPin(CardTestSupport.DEFAULT_PIN, 0, msg)));
     }
 
     @Test
@@ -75,7 +75,7 @@ class GenKeyGetPubTest {
             byte[] x = Bip340.bytes32(Bip340.pubkey(BigInteger.valueOf(d))[0]);
             assertArrayEquals(x, c.getPub(0));
             byte[] msg = CardTestSupport.fill(32, d);
-            assertTrue(Bip340.verify(x, msg, c.sign(0, msg)), "d=" + d);
+            assertTrue(Bip340.verify(x, msg, c.signPin(CardTestSupport.DEFAULT_PIN, 0, msg)), "d=" + d);
             pubs[0] = ((SchnorrHWSignTest.CompressedPub) pubs[0]).d;
         }
     }
@@ -112,7 +112,7 @@ class GenKeyGetPubTest {
         assertNotEquals(oldD, newD);
         assertArrayEquals(Bip340.bytes32(Bip340.pubkey(newD)[0]), newPub);
         byte[] msg = CardTestSupport.fill(32, 9);
-        byte[] sig = c.sign(7, msg);
+        byte[] sig = c.signPin(CardTestSupport.DEFAULT_PIN, 7, msg);
         assertTrue(Bip340.verify(newPub, msg, sig));
         assertFalse(Bip340.verify(oldPub, msg, sig), "old pubkey must not verify");
         // Neither response carries a scalar, old or new.

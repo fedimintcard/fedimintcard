@@ -22,6 +22,12 @@ load file 4,643 bytes (without the Descriptor), 35 past a multiple of 256. That 
 the size window cashucard measured on the J3R180 may not apply; `stripcap.py` and
 `refcheck.py` were not needed.
 
+With the PIN commands of P1b the applet has grown: a build on 2026-10-27 gives a load file of
+**5,513 bytes**, sha256 `4411d43e…79962`, 23 LOAD commands at 247 bytes. That is the figure
+`tools/cardkit/make-assets.py` pins; the 4,643 above is the earlier build and is kept as the
+record of what was measured then. Each PIN command adds a method and its branch code, and
+`VERIFY_PIN` carries the attempt counter and the session flag.
+
 ## Pins
 
 | Item | Value |
@@ -51,10 +57,19 @@ gp --list                                                                 # what
 gp --install applet/target/fedimint-card-0.1.cap --applet F0464D434152444D # load, instantiate the opener
 gp --create F0464D4341524401 --package F0464D43415244 --applet F0464D4341524401
 gp --list                                                                 # expect APP F0464D434152444D and F0464D4341524401
-gp --apdu 00A4040008F0464D4341524401                                      # 9000
+gp --apdu 00A4040008F0464D4341524401                                      # 02009000: version 2.0
 gp --apdu B0100000                                                        # GEN_KEY slot 0: 32 bytes + 9000
+gp --apdu B04100000431323334                                              # SET_PIN "1234" -> 9000
+gp --apdu B04000000431323334                                              # VERIFY_PIN "1234" -> 9000, opens the session
+gp --apdu B012000020<32-byte message in hex>                              # SIGN slot 0: 64 bytes + 9000
 gp --uninstall applet/target/fedimint-card-0.1.cap                        # cleanup: the package and both instances
 ```
+
+The three PIN lines are new in P1b and have not been run on silicon yet; the applet answers them
+under jCardSim (`applet/src/test/.../PinTest.java`). `SIGN` before `VERIFY_PIN` is `6A94`
+(`6984` if no PIN was ever set), so the order above matters. A `VERIFY_PIN` is not sticky across a
+card reset or a SELECT of another AID. Three wrong PINs block the card for good (`6983`), so
+check the PIN before spending tries on a card you care about.
 
 Then the Rust tests over PC/SC, from `host/`:
 

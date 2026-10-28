@@ -1,7 +1,11 @@
 name: CI
 on: { push: { branches: ['**'] }, pull_request: {} }
 permissions: { contents: read }
-concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+# Block form, not a flow mapping: a `{ ... }` map containing `${{ }}` does not
+# parse, and a workflow that fails to parse fails every push with zero jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   java:
     runs-on: ubuntu-latest
@@ -10,9 +14,30 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with: { distribution: temurin, java-version: '${{ matrix.java }}', cache: maven }
       - run: mvn -B -ntp test
+  cardkit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults: { run: { working-directory: tools/cardkit } }
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v7
+        with: { node-version: '22', cache: yarn, cache-dependency-path: tools/cardkit/yarn.lock }
+      - run: yarn install --frozen-lockfile
+      - run: yarn typecheck
+      - run: yarn format:check
+      # These tests run the install against a model of the J3R180, so they say
+      # nothing about a card in a reader. Without applet/target/fedimint-card-0.1.cap
+      # the install suites fall back to a placeholder load file and skip the CAP
+      # bytes; the DES, SCP02 and fake-card suites are unaffected.
+      - run: yarn test
+      # make-assets.py --check is deliberately not run here: it needs
+      # applet/target/fedimint-card-0.1.cap, and a hosted runner has no JavaCard
+      # SDK to build one. The load file is pinned by size and sha256 in the
+      # script, and the provisioner re-checks that hash before it sends a byte.
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 90

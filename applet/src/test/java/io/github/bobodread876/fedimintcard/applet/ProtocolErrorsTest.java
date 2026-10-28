@@ -29,17 +29,20 @@ class ProtocolErrorsTest {
         assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 0xFF, null));
         assertSw(0x6B00, c.tx(0xB0, 0x11, 0xFF, 0, null));
         assertSw(0x6B00, c.tx(0xB0, 0x11, 0, 1, null));
-        assertSw(0x6B00, c.tx(0xB0, 0x12, 0, 1, new byte[32]));
-        assertSw(0x6B00, c.tx(0xB0, 0x12, 0, 2, new byte[32]));
+        // SIGN is gated on the PIN, and a PIN-less card answers 6984 before P1/P2 are looked at:
+        // the slot must not be probeable without the PIN.
+        assertSw(0x6984, c.tx(0xB0, 0x12, 0, 1, new byte[32]));
+        assertSw(0x6984, c.tx(0xB0, 0x12, 0, 2, new byte[32]));
     }
 
     @Test
-    void selectIs9000WithNoData() {
+    void selectAnswersVersion() {
         CardTestSupport c = new CardTestSupport();
         javax.smartcardio.ResponseAPDU r = c.sim.transmitCommand(new javax.smartcardio.CommandAPDU(
             0x00, 0xA4, 0x04, 0x00, Bip340.hex(CardTestSupport.AID_HEX)));
         assertSw(0x9000, r);
-        assertEquals(0, r.getData().length);
+        // P1b: SELECT answers the applet version, 2 bytes, instead of a bare 9000.
+        assertArrayEquals(new byte[] { 0x02, 0x00 }, r.getData());
     }
 
     @Test

@@ -1,6 +1,9 @@
 applet/src/main/java/io/github/bobodread876/fedimintcard/applet/SchnorrHW.java is copied
 from cashucard/javacard and trimmed. Its licence follows verbatim.
 
+tools/cardkit is ported from cashucard's tools/cardkit. Its own NOTICE, in
+that directory, names what was copied and carries the same licence.
+
 MIT License
 
 Copyright (c) 2026 The Cashu Card authors
