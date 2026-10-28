@@ -65,9 +65,12 @@ gp --apdu B012000020<32-byte message in hex>                              # SIGN
 gp --uninstall applet/target/fedimint-card-0.1.cap                        # cleanup: the package and both instances
 ```
 
-The three PIN lines are new in P1b and have not been run on silicon yet; the applet answers them
-under jCardSim (`applet/src/test/.../PinTest.java`). `SIGN` before `VERIFY_PIN` is `6A94`
-(`6984` if no PIN was ever set), so the order above matters. A `VERIFY_PIN` is not sticky across a
+The three PIN lines are new in P1b. Hardware was authorised on 2026-10-28 and the ordered
+checklist is in `PROVISIONER-PLAN.md` § 9 — **it has not been run**, so the only evidence for
+these commands is still jCardSim (`applet/src/test/.../PinTest.java`). `SIGN` before
+`VERIFY_PIN` is `6984` on a card with no PIN set and `6A94` once one is, so the order above
+matters: the SCRIPT checks the PIN gate before the slot, and a `6985` where `6984` belongs
+means that ordering broke. A `VERIFY_PIN` is not sticky across a
 card reset or a SELECT of another AID. Three wrong PINs block the card for good (`6983`), so
 check the PIN before spending tries on a card you care about.
 

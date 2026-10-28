@@ -60,10 +60,12 @@ Be explicit about this with anyone downstream.
   workflow did not parse (§ 6.5), so all 14 earlier runs were 0-second failures with no
   jobs. A cancelled `rust` in between was the concurrency group doing its job, not a
   failure — read the step conclusion before reading a run's conclusion.
-- **Rust is verified by CI, not locally.** `cargo test --workspace` does not build on this
-  machine (`aws-lc-sys-0.41.0` panics). Run [40618880405](https://github.com/fedimintcard/fedimintcard/actions/runs/40618880405) on 2026-10-28 built and passed
-  it: **20 tests, 0 failed**, fleet tests included. Nothing here reproduces that locally,
-  so any `host/` change must go through CI.
+- **Rust builds locally as of 2026-10-28**, once `cmake` and `pkg-config` are installed
+  (`brew install cmake pkg-config`); without them `aws-lc-sys-0.41.0` panics with "Required
+  build dependency is missing", which is a missing prerequisite, not a code fault. With
+  them, `cargo test --locked --workspace -- --test-threads=1` runs **84 tests** here, all
+  passing (2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar unit + 22 wallet +
+  20 till). CI's `rust` job is still the gate for a clean checkout.
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
   upstream's import layout so it stays diffable against cashucard, and is listed in
@@ -142,6 +144,27 @@ Worth reading if you touch the same code, because the failure modes repeat.
    tests where the tree has 79 — and the handoff carried "87 tests" as a result. A green
    count that does not match `grep -c @Test` means stale output; `mvn clean test` is the
    only count worth quoting. Real figure: **85 (79 applet + 6 bridge)**.
+
+## 6a. Dependabot alerts (open, 2026-10-28)
+
+14 open alerts, all Rust, all transitive under `host/Cargo.lock`. Fixed here by a lockfile
+bump alone — no `Cargo.toml` change:
+
+| Crate | Was | Now | Reaches |
+|---|---|---|---|
+| `rustls` | 0.23.45 | 0.23.46 | `bitreq` → `esplora-client` → `fedimint-bitcoind` → sidecar |
+| `rand` | 0.8.5 | 0.8.8 | `bip39` → `bdk_wallet` → `fedimint-ldk-node` → sidecar |
+
+**Not fixable here:** `hickory-proto` 0.25.2 and `hickory-resolver` 0.25.2, six alerts
+between them. `iroh 0.35.0` requires `hickory-resolver = "^0.25.1"` and
+`hickory-proto = "^0.25"`; the fixes are 0.26.x. The pin comes from
+`fedimint-connectors v0.13.0-beta.1`, so it lifts when Fedimint moves `iroh`. Do not try
+to force it — `cargo update --precise` refuses, correctly. Recheck on the next Fedimint
+bump; until then these are accepted risk, and the exposure is iroh's DNS resolution.
+
+`lru` 0.16.3 and `rustls-webpki` 0.103.15 are already at or past their fixed versions;
+their alerts fire on *other* locked copies, and the older `lru` 0.12/0.13 and
+`rustls-webpki` 0.101/0.102 copies are pinned by crates that have not moved.
 
 ## 7. Next moves, in order
 

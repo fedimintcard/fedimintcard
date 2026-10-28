@@ -753,7 +753,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_core 0.6.4",
  "serde",
  "unicode-normalization",
@@ -863,7 +863,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b65c2e1ab98050c93cc9ada070d5070e014329c65196d03f6f8f1f75c2666f37"
 dependencies = [
  "base64 0.22.1",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-webpki 0.103.15",
  "serde",
  "serde_json",
@@ -1652,7 +1652,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.104",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1988,7 +1988,7 @@ dependencies = [
  "byteorder",
  "libc",
  "log",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "serde",
  "serde_json",
  "webpki-roots 0.25.4",
@@ -2005,7 +2005,7 @@ dependencies = [
  "byteorder",
  "libc",
  "log",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "serde",
  "serde_json",
  "webpki-roots 0.25.4",
@@ -2201,7 +2201,7 @@ source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0-beta.1#f9dccb6656
 dependencies = [
  "argon2",
  "hex",
- "rand 0.8.5",
+ "rand 0.8.8",
  "ring",
  "thiserror 2.0.21",
 ]
@@ -2223,7 +2223,7 @@ dependencies = [
  "log",
  "parity-scale-codec",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.8",
  "thiserror 1.0.69",
 ]
 
@@ -2243,7 +2243,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonrpsee-core",
  "lru 0.16.3",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2261,7 +2261,7 @@ dependencies = [
  "fedimint-client",
  "fedimint-core",
  "fedimint-derive-secret",
- "rand 0.8.5",
+ "rand 0.8.8",
 ]
 
 [[package]]
@@ -2318,7 +2318,7 @@ dependencies = [
  "anyhow",
  "hex",
  "pcsc",
- "rand 0.8.5",
+ "rand 0.8.8",
  "secp256k1",
  "serde_json",
  "ureq",
@@ -2408,7 +2408,7 @@ dependencies = [
  "fedimint-logging",
  "futures",
  "itertools 0.14.0",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2495,7 +2495,7 @@ dependencies = [
  "macro_rules_attribute",
  "miniscript",
  "n0-future 0.1.3",
- "rand 0.8.5",
+ "rand 0.8.8",
  "scopeguard",
  "secp256k1",
  "semver",
@@ -2582,7 +2582,7 @@ dependencies = [
  "fedimint-core",
  "fedimint-dummy-common",
  "futures",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "strum 0.27.1",
  "strum_macros 0.28.0",
@@ -2710,7 +2710,7 @@ dependencies = [
  "lightning-invoice",
  "lockable",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2745,7 +2745,7 @@ dependencies = [
  "futures",
  "iroh 0.35.0",
  "lightning-invoice",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "strum 0.27.1",
  "strum_macros 0.28.0",
@@ -2883,7 +2883,7 @@ dependencies = [
  "lightning-types",
  "log",
  "prost 0.11.9",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -2942,7 +2942,7 @@ dependencies = [
  "itertools 0.14.0",
  "lightning-invoice",
  "lnurl-rs",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3012,7 +3012,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "lightning-invoice",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "strum 0.27.1",
@@ -3034,7 +3034,7 @@ dependencies = [
  "fedimint-tpe",
  "group",
  "lightning-invoice",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3131,7 +3131,7 @@ dependencies = [
  "fedimint-threshold-crypto",
  "futures",
  "itertools 0.14.0",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "strum 0.27.1",
  "strum_macros 0.28.0",
@@ -3163,7 +3163,7 @@ dependencies = [
  "futures",
  "hex",
  "itertools 0.14.0",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "serdect 0.2.0",
@@ -3206,7 +3206,7 @@ dependencies = [
  "fedimint-threshold-crypto",
  "futures",
  "itertools 0.14.0",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "strum 0.27.1",
  "strum_macros 0.28.0",
@@ -3222,7 +3222,7 @@ dependencies = [
  "dirs",
  "fedimint-core",
  "fs2",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "tracing",
@@ -3282,7 +3282,7 @@ dependencies = [
  "parity-scale-codec",
  "pin-project",
  "pkarr",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rayon",
  "rcgen",
@@ -3349,7 +3349,7 @@ dependencies = [
  "fedimint-core",
  "group",
  "hex",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_chacha 0.3.1",
  "serde",
  "sha3",
@@ -3388,7 +3388,7 @@ dependencies = [
  "fedimint-testing-core",
  "fs-lock",
  "lightning-invoice",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "tempfile",
  "tokio",
@@ -3410,7 +3410,7 @@ dependencies = [
  "fedimint-rocksdb",
  "fedimint-server",
  "futures",
- "rand 0.8.5",
+ "rand 0.8.8",
  "tempfile",
  "tokio",
  "tokio-rustls 0.26.6",
@@ -3430,7 +3430,7 @@ dependencies = [
  "hex_fmt",
  "log",
  "pairing",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_chacha 0.3.1",
  "serde",
  "subtle",
@@ -3450,7 +3450,7 @@ dependencies = [
  "hyper-rustls 0.27.7",
  "hyper-util",
  "prost 0.13.5",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pemfile",
  "tokio",
  "tokio-stream",
@@ -3467,7 +3467,7 @@ dependencies = [
  "bls12_381",
  "fedimint-core",
  "group",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_chacha 0.3.1",
  "serde",
  "serde-big-array",
@@ -3512,7 +3512,7 @@ dependencies = [
  "fedimint-logging",
  "fedimint-wallet-common",
  "futures",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "strum 0.27.1",
@@ -4362,7 +4362,7 @@ dependencies = [
  "http 1.3.1",
  "hyper 1.11.1",
  "hyper-util",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.6",
@@ -4419,7 +4419,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.59.0",
 ]
 
 [[package]]
@@ -4803,11 +4803,11 @@ dependencies = [
  "pin-project",
  "pkarr",
  "portmapper 0.5.0",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rcgen",
  "reqwest 0.12.28",
  "ring",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-webpki 0.102.8",
  "serde",
  "smallvec",
@@ -4864,7 +4864,7 @@ dependencies = [
  "rand 0.10.1",
  "reqwest 0.13.1",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "serde",
  "smallvec",
@@ -4929,7 +4929,7 @@ dependencies = [
  "n0-future 0.3.2",
  "portable-atomic",
  "rand 0.10.1",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "simple-dns 0.12.0",
  "strum 0.28.0",
  "tokio",
@@ -5019,7 +5019,7 @@ dependencies = [
  "iroh-quinn-udp",
  "pin-project-lite",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
@@ -5035,10 +5035,10 @@ checksum = "929d5d8fa77d5c304d3ee7cae9aede31f13908bd049f9de8c7c0094ad6f7c535"
 dependencies = [
  "bytes",
  "getrandom 0.2.16",
- "rand 0.8.5",
+ "rand 0.8.8",
  "ring",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.21",
@@ -5088,9 +5088,9 @@ dependencies = [
  "pin-project",
  "pkarr",
  "postcard",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.12.28",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-webpki 0.102.8",
  "serde",
  "sha1",
@@ -5137,7 +5137,7 @@ dependencies = [
  "postcard",
  "rand 0.10.1",
  "reqwest 0.13.1",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
@@ -5385,7 +5385,7 @@ dependencies = [
  "http 1.3.1",
  "jsonrpsee-core",
  "pin-project",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "soketto",
  "thiserror 1.0.69",
@@ -5412,7 +5412,7 @@ dependencies = [
  "jsonrpsee-types",
  "parking_lot",
  "pin-project",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -6069,7 +6069,7 @@ dependencies = [
  "rand 0.10.1",
  "reqwest 0.13.1",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "simple-dns 0.12.0",
  "system-configuration 0.8.0",
  "tokio",
@@ -6504,7 +6504,7 @@ dependencies = [
  "noq-udp",
  "pin-project-lite",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "socket2 0.6.1",
  "thiserror 2.0.21",
  "tokio",
@@ -6530,7 +6530,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "slab",
  "sorted-index-buffer",
@@ -7195,7 +7195,7 @@ dependencies = [
  "nested_enum_utils",
  "netwatch 0.5.0",
  "num_enum",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "smallvec",
  "snafu",
@@ -7486,7 +7486,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap 0.10.1",
@@ -7603,7 +7603,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
@@ -7623,7 +7623,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.21",
@@ -7685,9 +7685,9 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -7969,7 +7969,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -8009,7 +8009,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "sync_wrapper 1.0.2",
@@ -8146,9 +8146,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -8202,7 +8202,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "once_cell",
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.15",
@@ -8352,7 +8352,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
  "bitcoin_hashes",
- "rand 0.8.5",
+ "rand 0.8.8",
  "secp256k1-sys",
  "serde",
 ]
@@ -8736,7 +8736,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -8774,7 +8774,7 @@ dependencies = [
  "http 1.3.1",
  "httparse",
  "log",
- "rand 0.8.5",
+ "rand 0.8.8",
  "sha1",
 ]
 
@@ -9279,7 +9279,7 @@ version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
- "rustls 0.23.45",
+ "rustls 0.23.46",
  "tokio",
 ]
 
@@ -9741,7 +9741,7 @@ dependencies = [
  "bitcoin_hashes",
  "prost 0.11.9",
  "prost-build 0.11.9",
- "rand 0.8.5",
+ "rand 0.8.8",
  "reqwest 0.11.27",
  "serde",
  "serde_json",
