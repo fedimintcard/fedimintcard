@@ -376,6 +376,22 @@ is done when its verification line is true, not when it compiles.
 | P6 | hardening | wrong-keys lockout, foreign card, torn load, a `pinNotSet` card, campaign of 50 cards | 50 cards: zero wrong-key attempts, every torn run recovered, no orphaned key set in the sidecar, no card leaves without a verifying PIN |
 | P7 | store readiness (§ 7) | TestFlight + Play internal track first, then the public listing: demo mode as the reviewer path, privacy manifest naming the registry, data-safety forms, signing from CI secrets | TestFlight and internal track builds accepted; then App Review and Play production review pass on the same build |
 
+**P2 status (2026-10-28): built, and verified short of its own done-line.** The five
+screens, settings, store, PIN handling, the demo fake card and the registry adapter exist
+in `apps/provisioner/`, and `npx jest` is green (57 tests / 4 suites) with `tsc` clean.
+`demo.test.ts` holds — each demo state maps to the stop it must produce — and the real
+`<App />` mounts and renders SignIn. What the done-line also requires, and what has **not**
+happened: walking every screen and every stop on both phones, and settings surviving a
+relaunch on a device. Until a phone runs it, P2 is a Jest-verified tree, not a working app.
+Two structural notes for whoever picks it up:
+- **The registry has no origin yet.** `api.ts`'s `REGISTRY_ORIGINS` is empty by design
+  (P1c ships the registry, and this repo names no host), so sign-in refuses with a message
+  saying so. Filling two strings is the whole wiring once P1c lands.
+- **`replace` gates nothing on this applet.** cardkit checks it only inside `probe`, and
+  `FEDIMINT_PLAN` has no `guard`, so a card already holding the applet is swept with or
+  without Replace. The sidecar precheck is therefore the only pre-write gate; the screen
+  must not claim a refusal the engine never makes.
+
 P0, P1a and P1c can run in parallel with different hands. **P1b is the long pole**: it is
 applet code on an already-proven card, and P4, P6 and the public listing all wait on it.
 P3 is the only phase that needs the phone and the pile of cards. Both P3 and P1b need

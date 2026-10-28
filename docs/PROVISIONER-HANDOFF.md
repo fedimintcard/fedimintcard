@@ -18,7 +18,13 @@ rest checkable.
 | `7209966`, `a1acf88` | `setup-java@v6`/`setup-node@v7`, Prettier and a `format:check` gate |
 | `2771a61`, `897c4ad` | This document corrected to what was actually verified |
 
-`main` is at `3b274a3` — the merge commit, with all four CI jobs green.
+`main` is at `ed9487b` as of 2026-10-28 (confirmed by
+`gh api repos/fedimintcard/fedimintcard/commits/main`). It carries, on top of the merge:
+
+| Commit | Contents |
+|---|---|
+| `c68db6a` | cardkit becomes an installable package: `main`/`types`/`exports`, `reactNative: index.ts`, `tsconfig.build.json`, CI's `yarn build`, and the load file moved out of `gp/test/fixtures/` into `gp/` |
+| `ed9487b` | `apps/provisioner/` — the P2 app (five screens, settings, store, PIN handling, demo fake card, `RegistryStoreApi`) and the bug fixes in § 6.7–6.16 |
 
 **Pushing needs the `islandbitcoin` identity.** `bobodread876` is an org member with
 `pull` only on this repo, so `git push` fails 403 however the URL is formed; the
