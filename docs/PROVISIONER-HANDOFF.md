@@ -302,8 +302,13 @@ their alerts fire on *other* locked copies, and the older `lru` 0.12/0.13 and
 4. ~~P0 (sidecar endpoints).~~ **Done 2026-10-28**, uncommitted at the time of writing.
    Next: commit and push it, then the device pass below. P1c (hosted registry) can run in
    parallel with a different hand; P3 needs the phone and the cards.
-5. **Run the app against the sidecar on a real reader.** This is the next real work, and no
-   part of it has been done:
+5. **Run the app against the sidecar on a real reader.** This is the next real work, and none
+   of it has been done. Blocked as of 2026-10-28 on: **no phone attached** (`adb devices` is
+   empty), the **relay APK not built** (`android-relay/app/build/outputs/apk/debug/` does not
+   exist), and **no wallet data dir** anywhere on this machine (`till serve` refuses with
+   `no wallet in <dir>: run 'join <invite>' first`). An APDU CCID reader driver is installed,
+   and the release binary builds (`host/target/release/card-sidecar`), so the gaps are the
+   phone/relay and a federation to join, not the code. Then:
    - `android-relay/` up (`adb forward tcp:9876 tcp:9876`, per its README — do not modify it);
    - `card-sidecar till serve` on the laptop, data dir the one the batch signs with;
    - `cd apps/provisioner && yarn start`, debug build on the phone.
