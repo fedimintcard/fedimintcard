@@ -1,7 +1,11 @@
 name: CI
 on: { push: { branches: ['**'] }, pull_request: {} }
 permissions: { contents: read }
-concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+# Block form, not a flow mapping: a `{ ... }` map containing `${{ }}` does not
+# parse, and a workflow that fails to parse fails every push with zero jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   java:
     runs-on: ubuntu-latest
