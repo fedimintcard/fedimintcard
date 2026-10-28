@@ -1,31 +1,29 @@
 # Handoff: cardkit (P1a) and applet PIN (P1b)
 
-Written 2026-10-27. Repo `fedimintcard/fedimintcard`, local `main` at `2c78c07`, **whose
-working tree has uncommitted work**. Read § 1 before you run anything.
+Written 2026-10-27; § 1 and § 6 updated 2026-10-28 after the work was committed. Repo
+`fedimintcard/fedimintcard`, local `main` at `2c78c07` —
+**re-verified**: committed on `feat/cardkit-pin`, tree now clean.
 
 ## 1. State of the tree
 
-Nothing below is committed. `main` at `2c78c07` does not contain any of it.
+Committed and pushed 2026-10-27 to `feat/cardkit-pin` (not `main`):
 
-```
- M .github/workflows/ci.yml
- M NOTICE
- M README.md
- M applet/src/main/java/.../FedimintCardApplet.java        P1b
- M applet/src/main/java/.../Opener.java                    P1b
- M applet/src/test/java/.../{CardTestSupport,GenKeyGetPubTest,NoPrivateKeyLeakTest,
-                             ProtocolErrorsTest,SignTest}.java   P1b
- M bridge/src/test/java/.../BridgeHttpTest.java            P1b
- M docs/CAP-BUILD.md                                       P1b + today's size
- M docs/DESIGN-NOTE.md                                     P1b
-?? applet/src/test/java/.../{NoAllocationTest,PinTest}.java  P1b
-?? docs/PROVISIONER-PLAN.md                                  the 569-line plan
-?? tools/                                                    P1a, all of cardkit
-```
+| Commit | Contents |
+|---|---|
+| `0923ba0` | P1b — applet PIN commands, `Opener`, applet tests, bridge test, DESIGN-NOTE, CAP-BUILD PIN section |
+| `aa9823c` | P1a — `tools/cardkit`, `NOTICE`, README, CI job, `PROVISIONER-PLAN.md`, this handoff, `.gitignore` |
+| `bd25581` | CI fix — see § 6.5; the workflow had never parsed |
 
-**There is no push token in this session**, so none of it is on GitHub. The first thing
-to do is commit it in two commits — P1b (applet, bridge, DESIGN-NOTE, CAP-BUILD's PIN
-section) and P1a (`tools/`, plan, CI, README, NOTICE) — or the work exists on one disk.
+`main` is still at `2c78c07`. Merging is a decision for the operator, not a formality.
+
+**Pushing needs the `islandbitcoin` identity.** `bobodread876` is an org member with
+`pull` only on this repo, so `git push` fails 403 however the URL is formed; the
+`islandbitcoin` token is org admin with `push` and `admin`. `gh auth switch --user
+islandbitcoin` (or `GH_TOKEN=$(gh auth token --user islandbitcoin) git push ...`) is the
+way in. The commits stay authored as `Dread`.
+
+`node_modules/` was untracked and unignored — `git add tools/` would have committed 578
+dependency files. `.gitignore` now covers it.
 
 ## 2. What is done and verified
 
@@ -52,8 +50,10 @@ Be explicit about this with anyone downstream.
   J3R180*. That has not happened. The PIN commands are proven under jCardSim only, and
   the install is proven against a software model of the card manager. Neither is
   evidence about silicon. Hardware authorisation is still not granted (plan § 9).
-- **CI has not run on GitHub.** The job is written and its commands pass locally, but no
-  run has happened.
+- **CI ran on GitHub on 2026-10-28 and passed `cardkit` (17s), `java (11)` and
+  `java (17)`.** Before that, no run had ever executed: the workflow did not parse (§ 6.5),
+  so all 14 earlier runs were 0-second failures with no jobs. The `rust` job was still
+  building at the time of writing; its result is the first real check of `host/`.
 - **Rust is unverified.** `cargo test --workspace` does not build on this machine
   (`aws-lc-sys-0.41.0` panics). Only CI can check `host/`.
 - **`format:check` fails** on 6 files (prettier). It is a package script but not in CI.
@@ -116,12 +116,36 @@ Worth reading if you touch the same code, because the failure modes repeat.
    (`installModule()`), never from a literal.
 4. **`tsx` can serve a stale transform.** An edit can appear not to have taken effect.
    Verify in a fresh `node --import tsx -e` process before concluding a fix failed.
+5. **The CI workflow never parsed, so CI never ran.** `concurrency` was a flow mapping
+   holding an expression:
+
+   ```yaml
+   concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+   ```
+
+   `{ ... }` containing `${{ }}` is not valid YAML, and GitHub rejects the whole file. The
+   symptom is easy to misread: the run appears instantly as `failure` in **0s with zero
+   jobs and no logs**, which looks like an infrastructure problem rather than a syntax
+   one. Every push since the file was added failed this way, `main` included. Fixed in
+   `bd25581` by writing it as a block mapping; `yaml.safe_load` is the cheap check, and
+   CI then ran the three jobs for the first time.
+6. **Surefire reports outlive the tests that made them.** `target/surefire-reports` held
+   `TmpProbeTest` and `ZzProbeTest` from deleted scratch files, so a run reported 81 applet
+   tests where the tree has 79 — and the handoff carried "87 tests" as a result. A green
+   count that does not match `grep -c @Test` means stale output; `mvn clean test` is the
+   only count worth quoting. Real figure: **85 (79 applet + 6 bridge)**.
 
 ## 7. Next moves, in order
 
-1. Commit P1b and P1a (§ 1). Nothing else is safe until this happens.
+1. ~~Commit P1b and P1a (§ 1).~~ Done on `feat/cardkit-pin`. **Still open: merge that
+   branch.** Until it is merged, `main` has no cardkit, no PIN, and no working CI.
 2. Decide **app identity** — bundle id, Play application id, display name (plan § 8.6).
-   It is baked into the first TestFlight build.
+   It is baked into the first TestFlight build. Constraints found on 2026-10-28:
+   `android-relay` already ships `org.fedimintcard.relay` as both namespace and
+   applicationId, so the provisioner wants a **sibling** id under the same reverse-domain
+   root, not that one — `org.fedimintcard.provisioner` (Android) with
+   `org.fedimintcard.provisioner` as the iOS bundle id, and the display name left to the
+   operator. Undecided on purpose: it is a product name, not a technical choice.
 3. Get hardware authorisation (plan § 9), then run P1b's silicon checklist on a J3R180:
    `SIGN` before `VERIFY_PIN` → `6A94`; after → signature verifies under the slot key;
    three wrong PINs → `6983`; `SET_PIN`/`VERIFY_PIN` over the APDU bridge.

@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with: { distribution: temurin, java-version: '${{ matrix.java }}', cache: maven }
       - run: mvn -B -ntp test
   cardkit:
@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '22', cache: yarn, cache-dependency-path: tools/cardkit/yarn.lock }
       - run: yarn install --frozen-lockfile
       - run: yarn typecheck
