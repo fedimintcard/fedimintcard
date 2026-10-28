@@ -37,7 +37,7 @@ Every number here was produced by running the command in this session.
 | The tests bite | Mutating the fake card to answer every slot as keyed and dropping `CARD_AID` from the whitelist → 22 failures; restored → 0. Mutating the C-MAC ICV to skip its single-DES pass → 1 failure; widening the DELETE whitelist → 1 failure; restored → 0. |
 | Real CAP bytes | `ant cap` → `applet/target/fedimint-card-0.1.cap`, converter verifier passes. Load file **5,513 bytes**, sha256 `4411d43e…79962`, 23 LOAD commands. `make-assets.py --check` → exit 0. |
 | Suite on real bytes | With the fixture committed, the install suite runs the real CAP and prints no placeholder warning (still 62/62). |
-| CI | `cardkit` job added: `yarn install --frozen-lockfile`, `yarn typecheck`, `yarn test`. Verified locally with those exact commands; the YAML has three jobs and no duplicate keys. |
+| CI | Runs on GitHub, **green in full** on `a1acf88`: `cardkit` (install, typecheck, `format:check`, test), `java (11)`, `java (17)`, `rust` (20 tests). See § 1 and § 6.5 — before the parse fix no job had ever been queued. |
 
 `docs/CAP-BUILD.md` said 4,643 bytes. That was the pre-PIN build; the PIN commands grew
 the applet by 870 bytes. The doc now records both, and says which is current.
@@ -50,12 +50,15 @@ Be explicit about this with anyone downstream.
   J3R180*. That has not happened. The PIN commands are proven under jCardSim only, and
   the install is proven against a software model of the card manager. Neither is
   evidence about silicon. Hardware authorisation is still not granted (plan § 9).
-- **CI ran on GitHub on 2026-10-28 and passed `cardkit` (17s), `java (11)` and
-  `java (17)`.** Before that, no run had ever executed: the workflow did not parse (§ 6.5),
-  so all 14 earlier runs were 0-second failures with no jobs. The `rust` job was still
-  building at the time of writing; its result is the first real check of `host/`.
-- **Rust is unverified.** `cargo test --workspace` does not build on this machine
-  (`aws-lc-sys-0.41.0` panics). Only CI can check `host/`.
+- **CI passed in full on 2026-10-28** — `cardkit`, `java (11)`, `java (17)` and `rust` on
+  commit `a1acf88` (run [run 40618880405](https://github.com/fedimintcard/fedimintcard/actions/runs/40618880405)). Before that, no run had ever executed: the
+  workflow did not parse (§ 6.5), so all 14 earlier runs were 0-second failures with no
+  jobs. A cancelled `rust` in between was the concurrency group doing its job, not a
+  failure — read the step conclusion before reading a run's conclusion.
+- **Rust is verified by CI, not locally.** `cargo test --workspace` does not build on this
+  machine (`aws-lc-sys-0.41.0` panics). Run [run 40618880405](https://github.com/fedimintcard/fedimintcard/actions/runs/40618880405) on 2026-10-28 built and passed
+  it: **20 tests, 0 failed**, fleet tests included. Nothing here reproduces that locally,
+  so any `host/` change must go through CI.
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
   upstream's import layout so it stays diffable against cashucard, and is listed in
