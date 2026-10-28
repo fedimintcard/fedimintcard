@@ -148,9 +148,9 @@ the operator's machine, which also drives the card through the phone's relay.
 | `GET /v1/health`, `GET /v1/status` | local | exists | federation name/id, relay reachability |
 | `POST /v1/card/balance` | local | exists | reconcile |
 | `POST /v1/charge`, `GET /v1/sales` | local | exists | merchant (till) |
-| `POST /v1/cards/precheck` | local | **delivered (P0)** | read-only: what is on this card, is the ISD open, does the applet answer |
-| `POST /v1/cards/keySetup` | local | **delivered (P0)** | `card setup`, then `SET_PIN`; returns keys + short id + PIN state |
-| `POST /v1/cards/issue` | local | **delivered (P0)** | body: amounts; previewed plan + `client_ref`; returns notes/txid |
+| `POST /v1/cards/precheck` | local | **delivered (P0)**, silicon-read-only | read-only: what is on this card, is the ISD open, does the applet answer |
+| `POST /v1/cards/keySetup` | local | **delivered (P0)**, silicon refusal only | `card setup`, then `SET_PIN`; returns keys + short id + PIN state |
+| `POST /v1/cards/issue` | local | **delivered (P0)**, silicon refusal only | body: amounts; previewed plan + `client_ref`; returns notes/txid |
 | `POST /auth/operator/session` | hosted | **new** | operator token |
 | `POST /registry/cards`, `GET /registry/cards?batch_id=` | hosted | **new** | idempotent card rows |
 | `POST /registry/batches` | hosted | **new** | batch record (federation id, PIN policy, count, load sha) |
