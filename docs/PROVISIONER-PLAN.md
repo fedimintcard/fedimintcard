@@ -397,7 +397,17 @@ relaunch on a device. Until a phone runs it, P2 is a Jest-verified tree, not a w
 Two structural notes for whoever picks it up:
 - **The registry has no origin yet.** `api.ts`'s `REGISTRY_ORIGINS` is empty by design
   (P1c ships the registry, and this repo names no host), so sign-in refuses with a message
-  saying so. Filling two strings is the whole wiring once P1c lands.
+  saying so. Filling two strings is the whole wiring once P1c lands. This is also what caps
+  the Android device pass at SignIn: the screen renders and the app mounts on a Pixel 8 Pro
+  (2026-10-28), and nothing past it is reachable without an operator session.
+- **The iOS build cannot be signed as the project stands.** `xcodebuild` to the paired
+  iPhone 13 Pro Max fails with *Provisioning profile "iOS Team Provisioning Profile: *"
+  doesn't include the NFC Tag Reading capability* and the matching
+  `com.apple.developer.nfc.readersession.formats` entitlement error. The project is
+  correct — `CODE_SIGN_ENTITLEMENTS` and the entitlements file both declare NFC — but the
+  wildcard profile the account issues has no NFC capability, so this needs an explicit App
+  ID (`org.fedimintcard.provisioner`) with NFC Tag Reading enabled in the Apple portal. Not
+  faked around.
 - **`replace` gates nothing on this applet.** cardkit checks it only inside `probe`, and
   `FEDIMINT_PLAN` has no `guard`, so a card already holding the applet is swept with or
   without Replace. The sidecar precheck is therefore the only pre-write gate; the screen
