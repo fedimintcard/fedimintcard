@@ -464,7 +464,12 @@ leaves the device.
 
 ### Apple App Store
 
-- **Guideline 2.1 (demo account / working app).** The reviewer cannot program a card.
+- **Guideline 2.1 (demo account / working app).** **Wired 2026-10-29.** `src/screens/DemoScreen.tsx`
+  reaches all seven demo states through `runDemo` over the real engine, and it is reachable
+  from SignIn *ahead of* the sign-in gate (a cold reviewer has no account) and from Settings.
+  All seven states verified against the engine headlessly. **Not yet seen on a screen**: the
+  test Pixel was locked behind a device PIN, so this is verified-in-code, not verified-in-UI.
+  The original requirement:
   Ship a **demo mode that is a first-class reviewer path**: it must run the full install
   loop against a simulated card and show a complete batch summary, plus notes in
   App Review that name the mode and the exact steps. A build that only says "connect a
@@ -523,11 +528,31 @@ leaves the device.
 
 ### Both
 
-- Version and build numbers wired to a single source (`package.json` → `Info.plist` and
-  `build.gradle` via a script), not hand-edited.
-- An `apps/provisioner/fastlane` layout like Cashu's (`Appfile`, `Fastfile`,
-  `Matchfile`), with the App Store Connect key and Play service account in CI secrets.
+- **Done (2026-10-29): version and build numbers from one source.** `package.json`'s
+  `version` and `provisionerBuild` are the source; `apps/provisioner/scripts/sync-version.cjs`
+  writes them into Gradle (`versionCode`/`versionName`), the Xcode project
+  (`CURRENT_PROJECT_VERSION`/`MARKETING_VERSION`, both configurations) and `Info.plist`'s
+  literal. `--check` gates every Android build (`preBuild`, so debug too) and a `--check`
+  against a hand-edited Gradle file exits 1 (verified). Set to **1.0.0 (11)**: the
+  marketing version the devices already carried, with the build number moved forward
+  because a store will not accept a reused one. Bump `provisionerBuild` before every
+  upload.
+- **Open: `apps/provisioner/fastlane`** (`Appfile`, `Fastfile`, `Matchfile`), with the App
+  Store Connect key and Play service account in CI secrets.
+- **Done (2026-10-29): the two release-gate scripts the Gradle file called.** Both had
+  never existed, so `assembleRelease` failed before producing anything; with them present
+  a signed release builds (verified with a throwaway key, `apksigner` confirming the
+  upload cert). `configure-service.cjs --check --production` refuses a fake local
+  session, a non-loopback sidecar, or a non-https registry origin; `check-android-signing.cjs`
+  names the missing key variable and refuses placeholder passwords.
 - No card data, no keys, no ecash in logs, crash reports or screenshots.
+
+**Two deviations found while doing the above, neither fixed here:**
+- **`minSdkVersion = 24`, not the 26 this section states.** Play accepts 24; the plan's
+  26 was chosen deliberately, so this is a decision to re-make or the plan to correct —
+  not a change to make silently.
+- **`targetSdkVersion = 36`**, ahead of the 35 written above (Play's floor is a rolling
+  requirement; 36 satisfies it).
 
 ## 8. Decisions
 

@@ -184,6 +184,45 @@ Be explicit about this with anyone downstream.
   upstream's import layout so it stays diffable against cashucard, and is listed in
   `.prettierignore` (the reason is also in `NOTICE`).
 
+## 3a. Store readiness, 2026-10-29 (`11dc29a`)
+
+Plan § 7's first batch, done and pushed. All three were verified by running them.
+
+**The two scripts `build.gradle` called did not exist.** Every `assembleRelease` died in
+`validateFedimintCardReleaseConfiguration` with `Cannot find module
+scripts/configure-service.cjs` before producing output. Both now exist:
+`scripts/configure-service.cjs` (parses `src/*.ts` as **text** — those modules import React
+Native and cannot be loaded under Node, so a bundler-dependent gate would be skippable) and
+`scripts/check-android-signing.cjs`. A signed release was produced with a throwaway
+keystore and `apksigner verify --print-certs` printed its `CN=Test` cert — note
+`keytool -printcert -jarfile` says "Not a signed jar file" on an APK, which is expected for
+Signature Scheme v2+; use `apksigner`.
+
+**The demo was a library, not a path.** `runDemo` was imported only by its own test.
+`src/screens/DemoScreen.tsx` now reaches all seven states through the real engine over
+`fakeCard`, and is reachable from `SignInScreen` (ahead of the sign-in gate, since a cold
+reviewer has no account) and `SettingsScreen`. `stopFor`'s `foreign`/`hasOld`/`oldVersion`/
+`noSession` are demo scenarios, not engine stops; `cardStop()` maps them to `refused`.
+
+**Versions had four sources.** `package.json` 0.1.0/1, Xcode 1.0/10, Gradle 1.0.0/10, and a
+literal in `Info.plist`. `scripts/sync-version.cjs` makes `package.json`
+(`version` + `provisionerBuild`) the source and stamps all three; `--check` gates every
+Android build via `preBuild`, so debug too. Set to **1.0.0 (11)** — bump
+`provisionerBuild` before every upload, since a store refuses a reused one.
+
+### The device-proof gap, stated plainly
+
+**Nothing was seen on a phone.** The Pixel (`42201FDJG00048`) is locked behind a device PIN,
+so `screencap` and `uiautomator` show the lock screen; every screenshot was 22,348 bytes,
+byte-identical. A stash-and-rebuild proved the black screen was pre-existing, not caused by
+this work. The engine path is proven (7/7 demo states run headlessly); the *screen* is not.
+
+While chasing that, one real thing was found: **Metro returns HTTP 500 when a new file is
+added without `--reset-cache`** — `Unable to resolve module ./src/screens/DemoScreen`. A dev
+client then renders a black frame with no error in `logcat`. Check
+`curl -s -o /dev/null -w "%{http_code}" "http://localhost:8081/index.bundle?platform=android&dev=true"`
+before blaming the UI.
+
 ## 4. Exact commands
 
 ```sh
