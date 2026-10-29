@@ -96,7 +96,15 @@ Be explicit about this with anyone downstream.
 - **The app has now run on two devices, to SignIn and no further.** On 2026-10-28 a Pixel 8
   Pro (Android, RN 0.77.1, Fabric) ran `org.fedimintcard.provisioner`: Metro served the
   bundle, the app mounted (`Running "FedimintProvisioner"`, JS log) and rendered SignIn with
-  the real build stamp (`4411d43e · 5513 bytes`). Everything past SignIn is unreachable on
+  the real build stamp (`4411d43e · 5513 bytes`). The iPhone 13 Pro Max (iOS 26.5.2) runs it
+  too — installed from `/tmp/fcdd/Build/Products/Debug-iphoneos/FedimintProvisioner.app`,
+  1.0.0 (10), launched with `devicectl device process launch`, process alive and the SignIn
+  screen confirmed on the device. The iPhone build embeds its own 4.4 MB Hermes
+  `main.jsbundle`, so it runs without Metro; on a device the iOS app never connects to the
+  packager, which is expected, not a fault. (No iOS screenshot was possible:
+  `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" on
+  26.5, and `devicectl` has no screenshot subcommand — the screen was confirmed by the
+  operator, not captured here.) Everything past SignIn is unreachable on
   device: `signedIn` comes only from a hosted operator session, and `REGISTRY_ORIGINS` is
   empty (§ below), so the loop, batch setup, summary, Settings and the NFC path have still
   never run on hardware. The iOS device pass has not started. Fonts, safe areas, the iOS
