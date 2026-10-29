@@ -15,6 +15,7 @@ export const SIGNIN = {
   button: 'SIGN IN',
   signingIn: 'SIGNING IN…',
   note: 'Use the operator account provided by your administrator.',
+  demo: 'TRY THE DEMO — NO ACCOUNT NEEDED',
   namePlaceholder: 'Operator name',
   passwordPlaceholder: 'Password',
   failed: (reason: string) =>
@@ -132,6 +133,12 @@ export const SETTINGS = {
   about: 'About',
   experimental: 'Experimental',
   session: 'Session',
+  demo: 'Demo',
+  demoTitle: 'Run the demo',
+  demoSub: 'The whole install loop on a simulated card',
+  demoHelp:
+    'Programs a simulated card with the real engine: no reader, no network, and nothing recorded to the registry. Start here if you do not have a card to hand.',
+  demoBlocked: 'A batch is running. End it before running the demo.',
   signOut: 'Sign out',
   signOutSub: 'Signs out without deleting the settings saved on this phone.',
   signOutBlocked: 'A batch is running. End or leave it before signing out.',

@@ -75,7 +75,13 @@ function parseAmounts(text: string): readonly number[] {
     .filter(n => Number.isSafeInteger(n) && n > 0);
 }
 
-export function SettingsScreen({onBack}: {onBack: () => void}) {
+export function SettingsScreen({
+  onBack,
+  onDemo,
+}: {
+  onBack: () => void;
+  onDemo: () => void;
+}) {
   const settings = useSettings();
   const app = useStore();
   const t = useTheme();
@@ -221,6 +227,22 @@ export function SettingsScreen({onBack}: {onBack: () => void}) {
               />
             </View>
           </Card>
+        </View>
+
+        {/* Above Session on purpose: a reviewer reaches this before signing in
+            to anything, which is the point of the demo (plan § 7, 2.1). */}
+        <View style={local.section}>
+          <SectionHeader>{SETTINGS.demo}</SectionHeader>
+          <Card>
+            <EntryRow
+              title={SETTINGS.demoTitle}
+              subtitle={running ? SETTINGS.demoBlocked : SETTINGS.demoSub}
+              onPress={onDemo}
+              disabled={running}
+              testID="settings-demo-entry"
+            />
+          </Card>
+          <Text style={s.note}>{SETTINGS.demoHelp}</Text>
         </View>
 
         <View style={local.section}>

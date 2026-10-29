@@ -23,6 +23,7 @@ import {LOCAL_SESSION_ENABLED, localStoreApi} from './src/localSession';
 import {RegistryClient, RegistryStoreApi, registryOrigin} from './src/api';
 import {BatchSetupScreen} from './src/screens/BatchSetupScreen';
 import {BatchSummaryScreen} from './src/screens/BatchSummaryScreen';
+import {DemoScreen} from './src/screens/DemoScreen';
 import {LoopScreen} from './src/screens/LoopScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {SignInScreen} from './src/screens/SignInScreen';
@@ -30,15 +31,22 @@ import {SettingsProvider, useSettings} from './src/settings';
 import {StoreProvider, useStore} from './src/store';
 import type {StoreApi} from './src/store';
 
-type Route = 'home' | 'settings' | 'summary';
+type Route = 'home' | 'settings' | 'summary' | 'demo';
 
 function Navigator(): React.JSX.Element {
   const {batch, signedIn} = useStore();
   const [route, setRoute] = React.useState<Route>('home');
   const phase = batch?.phase ?? 'idle';
 
+  // The demo is deliberately ahead of the sign-in gate: App Review opens a
+  // cold build with no operator account, and a demo they cannot reach is a
+  // rejection (plan § 7, Guideline 2.1). It touches no card and no registry,
+  // so there is nothing here to protect.
+  if (route === 'demo') {
+    return <DemoScreen onBack={() => setRoute('home')} />;
+  }
   if (!signedIn) {
-    return <SignInScreen />;
+    return <SignInScreen onDemo={() => setRoute('demo')} />;
   }
   // A batch owns the screen from START until CLOSE: a torn install is never
   // navigated away from, and the loop's stops are the only way out.
@@ -59,7 +67,12 @@ function Navigator(): React.JSX.Element {
     );
   }
   if (route === 'settings') {
-    return <SettingsScreen onBack={() => setRoute('home')} />;
+    return (
+      <SettingsScreen
+        onBack={() => setRoute('home')}
+        onDemo={() => setRoute('demo')}
+      />
+    );
   }
   return (
     <BatchSetupScreen

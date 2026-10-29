@@ -82,7 +82,7 @@ android {
         applicationId "org.fedimintcard.provisioner"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 10
+        versionCode 11
         versionName "1.0.0"
     }
     signingConfigs {
@@ -135,10 +135,22 @@ def validateFedimintCardReleaseConfiguration = tasks.register("validateFedimintC
     workingDir rootProject.projectDir.parentFile
     commandLine "node", "scripts/configure-service.cjs", "--check", "--production"
 }
+// package.json owns the version; a build whose project file drifted from it
+// uploads a duplicate or wrong build number, which a store refuses.
+def validateFedimintCardVersionSync = tasks.register("validateFedimintCardVersionSync", Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine "node", "scripts/sync-version.cjs", "--check"
+}
 tasks.configureEach {
     if (name == "preReleaseBuild" || name == "validateSigningRelease") {
         dependsOn(validateFedimintCardUploadSigning)
         dependsOn(validateFedimintCardReleaseConfiguration)
+        dependsOn(validateFedimintCardVersionSync)
+    }
+    // Every build, not just release: a debug build that prints one version and
+    // a store build that prints another is the drift this guards.
+    if (name == "preBuild") {
+        dependsOn(validateFedimintCardVersionSync)
     }
     if (name == "createBundleReleaseJsAndAssets") {
         dependsOn(validateFedimintCardReleaseConfiguration)

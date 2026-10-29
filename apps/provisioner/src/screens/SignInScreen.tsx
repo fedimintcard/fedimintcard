@@ -26,13 +26,14 @@ import {
   FONT,
   PrimaryButton,
   Screen,
+  SecondaryButton,
   signInReason,
   styles,
   useTheme,
   wasCancelled,
 } from '../ui';
 
-export function SignInScreen() {
+export function SignInScreen({onDemo}: {onDemo?: () => void} = {}) {
   const app = useStore();
   const t = useTheme();
   const s = styles(t);
@@ -180,6 +181,16 @@ export function SignInScreen() {
                 : SIGNIN.note}
             </Text>
           )}
+          {/* No account, no card, no registry — the reviewer's way in
+              (plan § 7, Guideline 2.1). */}
+          {onDemo ? (
+            <SecondaryButton
+              title={SIGNIN.demo}
+              onPress={onDemo}
+              disabled={busy}
+              testID="sign-in-demo"
+            />
+          ) : null}
         </View>
       </Screen>
     </KeyboardAvoidingView>

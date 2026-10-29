@@ -50,7 +50,7 @@ import {
 } from '../ui';
 
 /** What the stop list calls each kind: short, because it sits in a row. */
-const STOP_NAMES: Record<CardStop, string> = {
+export const STOP_NAMES: Record<CardStop, string> = {
   pulled: 'Card left early',
   refused: 'Card refused',
   wrongKeys: 'Wrong manager keys',
