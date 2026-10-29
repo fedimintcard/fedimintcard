@@ -400,14 +400,23 @@ Two structural notes for whoever picks it up:
   saying so. Filling two strings is the whole wiring once P1c lands. This is also what caps
   the Android device pass at SignIn: the screen renders and the app mounts on a Pixel 8 Pro
   (2026-10-28), and nothing past it is reachable without an operator session.
-- **The iOS build cannot be signed as the project stands.** `xcodebuild` to the paired
-  iPhone 13 Pro Max fails with *Provisioning profile "iOS Team Provisioning Profile: *"
-  doesn't include the NFC Tag Reading capability* and the matching
-  `com.apple.developer.nfc.readersession.formats` entitlement error. The project is
-  correct — `CODE_SIGN_ENTITLEMENTS` and the entitlements file both declare NFC — but the
-  wildcard profile the account issues has no NFC capability, so this needs an explicit App
-  ID (`org.fedimintcard.provisioner`) with NFC Tag Reading enabled in the Apple portal. Not
-  faked around.
+- **The iOS build now runs on the iPhone 13 Pro Max (2026-10-28).** Two faults had kept it
+  off the phone, both in the Xcode project rather than in code:
+  - `CODE_SIGN_STYLE` was unset, so Xcode fell back to the account's **wildcard**
+    `iOS Team Provisioning Profile: *`, and a wildcard App ID cannot carry an app-specific
+    capability — the build failed on "doesn't include the NFC Tag Reading capability" and
+    the matching `com.apple.developer.nfc.readersession.formats` entitlement. Signing in to
+    Xcode did not change it; the setting did. Both configurations are now
+    `CODE_SIGN_STYLE = Automatic`, which registers `org.fedimintcard.provisioner` with the
+    entitlement and mints a real profile.
+  - The "Bundle React Native code and images" phase ran `$SRCROOT/../scripts/bundle-ios.sh`,
+    a file that has never existed in this repo, so `PhaseScriptExecution` failed on every
+    build. Restored to RN 0.77's standard invocation
+    (`with-environment.sh` + `react-native-xcode.sh`), which embeds `main.jsbundle`.
+  With both fixed, `xcodebuild … -allowProvisioningUpdates build` → **BUILD SUCCEEDED**, and
+  the app installs and launches on the device with its own 4.4 MB Hermes bundle. It stops at
+  the same place as Android: SignIn, because the registry has no origin. Nothing past it has
+  been tapped on iOS either.
 - **`replace` gates nothing on this applet.** cardkit checks it only inside `probe`, and
   `FEDIMINT_PLAN` has no `guard`, so a card already holding the applet is swept with or
   without Replace. The sidecar precheck is therefore the only pre-write gate; the screen

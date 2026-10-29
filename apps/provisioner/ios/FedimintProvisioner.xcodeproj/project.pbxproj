@@ -211,7 +211,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\n/bin/bash \"$SRCROOT/../scripts/bundle-ios.sh\"\n";
+			shellScript = "set -e\nWITH_ENVIRONMENT=\"$SRCROOT/../node_modules/react-native/scripts/xcode/with-environment.sh\"\nREACT_NATIVE_XCODE=\"$SRCROOT/../node_modules/react-native/scripts/react-native-xcode.sh\"\n\n/bin/sh -c \"$WITH_ENVIRONMENT $REACT_NATIVE_XCODE\"\n";
 		};
 		00EEFC60759A1932668264C0 /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -291,6 +291,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = FedimintProvisioner/FedimintProvisioner.entitlements;
 				CURRENT_PROJECT_VERSION = 10;
+				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = H7UAM79QQP;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = FedimintProvisioner/Info.plist;
@@ -321,6 +322,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = FedimintProvisioner/FedimintProvisioner.entitlements;
 				CURRENT_PROJECT_VERSION = 10;
+				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = H7UAM79QQP;
 				INFOPLIST_FILE = FedimintProvisioner/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;

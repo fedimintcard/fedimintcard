@@ -88,7 +88,12 @@ Be explicit about this with anyone downstream.
   passing (was 84 before P0: 2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar
   unit + 22 wallet + 20 till; P0 added 7 in `sidecar/tests/cards.rs`). CI's `rust` job is
   still the gate for a clean checkout.
-- **The app has now run on one device, to SignIn and no further.** On 2026-10-28 a Pixel 8
+- **The iOS project had never built, and nothing said so in code.** `CODE_SIGN_STYLE` was
+  unset (→ wildcard profile, which cannot carry NFC Tag Reading: the build failed on the
+  entitlement) and the bundle phase ran `scripts/bundle-ios.sh`, a file this repo has never
+  had. Both are fixed in the project file; § 6 bug 22. Signed in to Xcode did **not** fix it —
+  signing in gives identities, not an App ID with the capability.
+- **The app has now run on two devices, to SignIn and no further.** On 2026-10-28 a Pixel 8
   Pro (Android, RN 0.77.1, Fabric) ran `org.fedimintcard.provisioner`: Metro served the
   bundle, the app mounted (`Running "FedimintProvisioner"`, JS log) and rendered SignIn with
   the real build stamp (`4411d43e · 5513 bytes`). Everything past SignIn is unreachable on
@@ -350,6 +355,20 @@ Worth reading if you touch the same code, because the failure modes repeat.
     and accepted `6D00`, which a card gives when it does not implement the command — not
     when the ISD is open. Now one probe, `6A82`/`6A88` only.
 
+
+22. **The iOS target could not build or sign.** Two project-file faults, neither visible from
+    `tsc` or Jest:
+    - `CODE_SIGN_STYLE` was absent from both configurations, so `xcodebuild` used the account's
+      wildcard `iOS Team Provisioning Profile: *`. A wildcard App ID cannot carry a
+      capability, so the NFC entitlement check failed before anything compiled. Fixed:
+      `CODE_SIGN_STYLE = Automatic` (team `H7UAM79QQP`), which makes Xcode register
+      `org.fedimintcard.provisioner` with the entitlement and mint a matching profile.
+    - The "Bundle React Native code and images" phase invoked `$SRCROOT/../scripts/bundle-ios.sh`,
+      which does not exist and never did, so `PhaseScriptExecution` failed on every build.
+      Restored to RN 0.77's own invocation. It now embeds `main.jsbundle`, so the debug app
+      runs without Metro.
+    **How it was found:** only by building for a device. Both are invisible to the JS gates,
+    and the earlier "needs a portal change" reading was wrong — no portal change was needed.
 ## 6a. Dependabot alerts (open, 2026-10-28)
 
 14 open alerts, all Rust, all transitive under `host/Cargo.lock`. Fixed here by a lockfile
