@@ -22,7 +22,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fedimint_card_host_card::{BridgeError, BridgeTransport, Card, CardClient, StatusWord};
+use fedimint_card_host_card::{
+    BridgeError, BridgeTransport, Card, CardClient, StatusWord, status_word,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -132,9 +134,23 @@ impl Card for NoCard {
 }
 
 /// Open the card behind the phone relay at `relay` and select the applet. Blocking.
+/// Get the card in the relay's field. Succeeds whenever a card is there.
+///
+/// It does **not** select the applet: a blank card answers `6A82` to SELECT, and that is the
+/// normal first state of a card in a batch, not a failure. Selecting here made every route —
+/// including `precheck`, whose whole job is to describe a card with no applet — answer 502 on the
+/// one card the provisioner most needs to see. Commands that need the applet select it themselves
+/// (`precheck`) or fail with the card's own status word.
 pub fn open_relay_card(relay: &str) -> Result<Box<dyn Card>> {
     let mut c = CardClient::new(BridgeTransport::new(relay));
-    c.select().with_context(|| format!("card relay at {relay}"))?;
+    // One card-manager probe, no SELECT: this is what distinguishes "no card in the field" (the
+    // relay answers 503, a transport error) from "card present, applet absent" (a status word).
+    c.get_data_ff21()
+        .or_else(|e| match status_word(&e) {
+            Some(_) => Ok(vec![]),
+            None => Err(e),
+        })
+        .with_context(|| format!("card relay at {relay}"))?;
     Ok(Box::new(c))
 }
 

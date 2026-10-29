@@ -31,6 +31,12 @@ pub const SW_PIN_BLOCKED: u16 = 0x6983;
 pub const SW_NO_PIN_SET: u16 = 0x6984;
 /// A PIN is set and this session has not verified it.
 pub const SW_PIN_REQUIRED: u16 = 0x6A94;
+/// The card has no dispatcher for this CLA. On a J3R180 with no fedimint applet installed, every
+/// `B0 xx` command answers this — including `GET_PUB`, which is why it means "no applet", not
+/// "a key we do not know".
+pub const SW_CLA_NOT_SUPPORTED: u16 = 0x6E00;
+/// The applet is selected but does not implement this instruction.
+pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 
 /// Upper bound on 61xx / 6Cxx follow-ups for one command.
 const MAX_CHAIN: usize = 16;
@@ -286,8 +292,23 @@ impl SoftCard {
     }
 }
 
+impl SoftCard {
+    /// What the chip does with any command when the applet is not installed: CLA `B0` has no
+    /// dispatcher, so every instruction answers `6E00` — not `6A82`, which is what `SELECT`
+    /// gives. Modelled here because the trait methods used to skip the APDU layer and accept
+    /// commands a blank card rejects; a real J3R180 answered `6E00` to `GET_PUB` on 2026-10-28.
+    fn require_installed(&self) -> Result<()> {
+        if self.installed {
+            Ok(())
+        } else {
+            Err(StatusWord(SW_CLA_NOT_SUPPORTED).into())
+        }
+    }
+}
+
 impl Card for SoftCard {
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
+        self.require_installed()?;
         if self.slot(slot)?.is_some() {
             return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
         }
@@ -297,6 +318,7 @@ impl Card for SoftCard {
     }
 
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
+        self.require_installed()?;
         self.slot(slot)?;
         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
         self.slots[slot as usize] = Some(kp);
@@ -304,6 +326,7 @@ impl Card for SoftCard {
     }
 
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
+        self.require_installed()?;
         match self.slot(slot)? {
             Some(kp) => Ok(kp.x_only_public_key().0),
             None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
@@ -311,6 +334,7 @@ impl Card for SoftCard {
     }
 
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
+        self.require_installed()?;
         match self.slot(slot)? {
             Some(kp) => Ok(SECP256K1.sign_schnorr(&Message::from_digest(*msg32), kp)),
             None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
@@ -324,7 +348,7 @@ impl Card for SoftCard {
         let (cla, ins) = (apdu[0], apdu[1]);
         match (cla, ins) {
             // The applet refuses any CLA but its own before looking at the INS.
-            (c, _) if c != CLA && c != CLA_ISO => Err(StatusWord(0x6E00).into()),
+            (c, _) if c != CLA && c != CLA_ISO => Err(StatusWord(SW_CLA_NOT_SUPPORTED).into()),
             (CLA_ISO, 0xA4) => {
                 let lc = apdu[4] as usize;
                 ensure!(apdu.len() >= 5 + lc, "SELECT too short for its Lc");
@@ -368,7 +392,7 @@ impl Card for SoftCard {
                 self.tries_left -= 1;
                 Err(StatusWord(0x6300 | u16::from(self.tries_left)).into())
             }
-            _ => Err(StatusWord(0x6D00).into()),
+            _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }
     }
 }

@@ -19,8 +19,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use fedimint_card_host_card::{
-    PIN_MAX, PIN_MIN, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_PIN_SET, SW_PIN_BLOCKED, SW_PIN_REQUIRED,
-    status_word,
+    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
+    SW_NO_PIN_SET, SW_PIN_BLOCKED, SW_PIN_REQUIRED, status_word,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,7 +145,13 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
     let mut foreign = vec![];
     let mut applet = AppletState::Unknown;
 
-    for slot in 0..SLOTS {
+    // SELECT decides whether the slot walk is meaningful at all: a card without our applet has no
+    // dispatcher for CLA `B0`, so every GET_PUB answers `6E00` (CLA not supported) and the walk
+    // would mistake "no applet" for a transport failure and answer 502. A blank card is a normal
+    // state — the first one a batch meets — so it is reported, not refused.
+    let applet_present = on_card(|| cw.card.select_applet()).is_ok();
+    if applet_present {
+        for slot in 0..SLOTS {
         match on_card(|| cw.card.get_pub(slot)) {
             Ok(pk) => {
                 let hexpk = pk.to_string();
@@ -157,6 +163,8 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
             }
             Err(e) => match status_word(&e) {
                 Some(SW_CONDITIONS_NOT_SATISFIED) | Some(SW_FILE_NOT_FOUND) => empty.push(slot),
+                // No dispatcher for `B0` at all: a card with no applet, so every slot is empty.
+                Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED) => empty.push(slot),
                 // A slot answered a PIN word: the applet is live and this is its PIN state.
                 Some(SW_PIN_BLOCKED) => {
                     applet = AppletState::Blocked;
@@ -173,6 +181,7 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
                 _ => return Err(e),
             },
         }
+        }
     }
 
     let kind = if !foreign.is_empty() {
@@ -187,13 +196,15 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
         CardKind::Blank
     };
 
-    // One byte of SELECT-less traffic to prove the reader still answers. A card with no applet
-    // answers `6A82`/`6A88`, which is still an answer.
-    // Any answer but a transport error means the ISD is there and reachable.
-    let isd_open = on_card(|| cw.card.get_data_ff21()).is_ok()
+    // One probe of the card manager, no SELECT first: data or a status word proves it answered.
+    // Only `6A82`/`6A88` mean "the ISD is there but has no such file" — anything else that is not
+    // data is a refusal, and reporting a refusal as `isd_open` would send the app into a load the
+    // card will reject.
+    let isd = on_card(|| cw.card.get_data_ff21());
+    let isd_open = isd.is_ok()
         || matches!(
-            on_card(|| cw.card.get_data_ff21()).err().as_ref().and_then(status_word),
-            Some(SW_FILE_NOT_FOUND) | Some(SW_CONDITIONS_NOT_SATISFIED) | Some(0x6A88) | Some(0x6D00)
+            isd.err().as_ref().and_then(status_word),
+            Some(SW_FILE_NOT_FOUND) | Some(0x6A88)
         );
 
     let live_notes: Vec<(u8, u64)> = cw
@@ -204,9 +215,6 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
         .filter(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending))
         .map(|n| (n.slot, n.amount_msat))
         .collect();
-
-    // SELECT, which is the only thing that answers "is *our* applet here": `6A82` means no.
-    let applet_present = on_card(|| cw.card.select_applet()).is_ok();
 
     Ok(Precheck {
         kind,
@@ -300,6 +308,10 @@ pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutc
         .map(|slot| match on_card(|| cw.card.get_pub(slot)) {
             Ok(pk) => Some(pk.to_string()),
             Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => None,
+            // No applet to dispatch `B0`: every slot is empty, because there are no slots yet.
+            // Reading this as "a key we did not produce" refused the blank card — the one card a
+            // batch always starts from — and named a slot that does not exist (`!6e00`).
+            Err(e) if matches!(status_word(&e), Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED)) => None,
             Err(e) => Some(format!("!{}", status_word(&e).map(|w| format!("{w:04x}")).unwrap_or_else(|| e.to_string()))),
         })
         .collect();
