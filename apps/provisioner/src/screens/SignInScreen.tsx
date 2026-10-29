@@ -18,6 +18,7 @@ import {
   View,
 } from 'react-native';
 
+import {LOCAL_SESSION_ENABLED, LOCAL_SESSION_LABEL} from '../localSession';
 import {LOAD_LINE} from '../settings';
 import {SIGNIN} from '../strings';
 import {useStore} from '../store';
@@ -107,6 +108,16 @@ export function SignInScreen() {
           <Text style={[local.wordmark, {color: t.ink}]}>{'card'}</Text>
           <Text style={[local.loadSha, {color: t.dim}]}>{LOAD_LINE}</Text>
           <Text style={[local.tagline, {color: t.dim}]}>{SIGNIN.tagline}</Text>
+          {LOCAL_SESSION_ENABLED && __DEV__ ? (
+            // A fake session must never look like a real one: this line is
+            // what stops a walked-through batch from being read as registered.
+            <Text
+              style={[local.tagline, {color: t.dim}]}
+              accessibilityLiveRegion="polite"
+              testID="local-session-label">
+              {LOCAL_SESSION_LABEL}
+            </Text>
+          ) : null}
           <View style={local.form}>
             <TextInput
               value={name}

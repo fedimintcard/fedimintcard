@@ -132,7 +132,7 @@ export const REGISTRY_ENDPOINTS: readonly RegistryEndpoint[] = Object.freeze([
  * `issue`. Fixed, loopback only, as the till keeps it; a LAN cleartext
  * exception is not defensible at review.
  */
-export const LOCAL_SIDECAR_ORIGIN = 'http://127.0.0.1:9878';
+export const LOCAL_SIDECAR_ORIGIN = 'http://127.0.0.1:9877';
 
 /**
  * The federation, as an invite string the picker also accepts typed by hand

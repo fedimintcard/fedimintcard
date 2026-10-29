@@ -1,0 +1,20 @@
+{
+  "name": "@fedimintcard/registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The hosted provisioning registry: operator sessions, batches, idempotent card rows (docs/PROVISIONER-PLAN.md \u00a7 4, P1c).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.9.14",
+    "@cloudflare/workers-types": "^4.20251011.0",
+    "typescript": "^5.9.3",
+    "vitest": "~3.2.4",
+    "wrangler": "4.44.0"
+  }
+}

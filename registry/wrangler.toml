@@ -1,0 +1,25 @@
+# The hosted provisioning registry (docs/PROVISIONER-PLAN.md § 4, P1c).
+#
+# One Worker, one SQLite-backed Durable Object. The object owns every row and
+# every session, so there is exactly one writer and no cross-request race to
+# reason about: two phones posting the same short_id converge on the same
+# answer because they queue behind the same object.
+name = "fedimintcard-registry"
+main = "src/index.ts"
+compatibility_date = "2025-10-01"
+
+# The operator password is a secret, never a var:
+#   npx wrangler secret put OPERATOR_PASSWORD      # deployed
+#   OPERATOR_PASSWORD="..." in .dev.vars           # `wrangler dev`
+# `wrangler dev` does NOT read the shell environment: with the variable only
+# exported, the Worker sees it undefined and every route answers 503, which is
+# the guard working but looks like a bug. Sessions are signed with it, so
+# rotating it signs every operator out.
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Registry"]

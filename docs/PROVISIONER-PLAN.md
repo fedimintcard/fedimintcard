@@ -379,13 +379,38 @@ is done when its verification line is true, not when it compiles.
 | P0 | Card-side and local service surface | sidecar `precheck`, `keySetup`, `issue` endpoints + tests | **delivered** — `host/sidecar/tests/cards.rs`, 7 tests, all four named cases plus body validation: precheck on blank / installed / foreign card; keySetup idempotent; issue `client_ref` replay; issue refuses a known holding card. **Proved against `SoftCard`, which now models the applet's PIN machine** (`SET_PIN` once, three tries, `63 CX`, `6984`, `6983`); nothing here has run on a J3R180 — the PIN state machine on silicon is P1b's done-line, and the reader/relay path is P3's |
 | P1a | cardkit port | `tools/cardkit/gp/` ported to `apps/provisioner/tools/`, AIDs and `FEDIMINT_PLAN` | engine's unit tests run unchanged; plan's `checks` include SELECT → `9000` with empty body and `GET_PUB 0` = `6985`; the fake card answers Fedimint framing, not Cashu's; NOTICE/credit added |
 | P1b | **applet PIN** | `SET_PIN`, `VERIFY_PIN` and a PIN-gated `SIGN` in `FedimintCardApplet.java`; new CAP and load sha; host wrappers in `host/card`; a PIN section in `docs/DESIGN-NOTE.md` matching what is built | on a J3R180: `SIGN` before `VERIFY_PIN` → `6A 94`; after `VERIFY_PIN` → signature verifies under the slot key; three wrong PINs → `69 83` and no `SIGN`; `SET_PIN`/`VERIFY_PIN` over the APDU bridge; CAP under the applet-size bound and within the transient budget (`SPIKE.md`: ~610 B).<br><br>**Status note (P0, 2026-10-28):** the applet side of P1b is still open, and the "host wrappers in `host/card`" half of this line was not in the tree when P0 started — `Card` was keys-only (`gen_key`/`get_pub`/`sign`), with no way to send `SET_PIN`, `VERIFY_PIN` or `SELECT`. P0 added them as defaulted `Card` methods (`select_applet`, `get_data_ff21`, `set_pin`, `verify_pin`, backed by an `apdu()` hook) so the sidecar could be built and tested; the trait's shape is now whatever P1b builds against. `SoftCard` models the applet's PIN state machine so these paths are testable before silicon, which is the only place they have run.<br><br>**Test surface, measured before the work:** baseline is 44 green jCardSim tests (`mvn -B -f applet/pom.xml test`: 6 classes, 0 failures). Four things break or are unguarded, and P1b must handle each:<br>• `NoPrivateKeyLeakTest.onlyThreeCommandsExist` hard-asserts the INS set is exactly `0x10,0x11,0x12`; it **will fail** when PIN commands land and must be updated to include `0x40,0x41,0x42`.<br>• Every `CardTestSupport.sign(...)` call site — `SignTest`, `GenKeyGetPubTest`, `NoPrivateKeyLeakTest` — asserts `9000` and **will fail** once `SIGN` requires a PIN. `CardTestSupport` needs a `verifyPin(...)` helper.<br>• The `NoPrivateKeyLeakTest` 256-INS sweeps will send bogus PINs and can exhaust the retry counter; each sweep must either reinstall the card or use a PIN-exempt clause.<br>• There is **no** mechanical no-allocation test here (`noAllocationOutsideInstallTime` / `INSTALL_TIME_METHODS` do not exist); the no-`new`-outside-constructor rule is javadoc only, so PIN code is unguarded against allocation. P1b adds such a test or states the gap explicitly in `DESIGN-NOTE.md`.<br><br>There is no `OwnerPIN`, no `SW_PIN_*` constant, no session state and no transaction anywhere in the applet today. Three status words (`6983`, `6984`, `6A94`) are new and must be defined in the applet. |
-| P1c | **hosted registry** | Worker + Durable Object, operator session, `/registry/batches`, `/registry/cards` idempotent upsert with the two new card fields (PIN state, PIN policy) | identical body → 200 with the stored row; changed body → 409; unauthenticated → 401; a row survives a Worker restart; tested against `wrangler dev` |
+| P1c | **hosted registry** | Worker + Durable Object, operator session, `/registry/batches`, `/registry/cards` idempotent upsert with the two new card fields (PIN state, PIN policy) | **delivered locally** — `registry/`; identical body → 200 with the stored row (same `received_at`); changed body → 409 and nothing overwritten; unauthenticated → 401; a row survives a Worker restart (verified across a real `wrangler dev` process restart); 16 vitest cases + curl against `wrangler dev`. Not deployed: no host is named, so `REGISTRY_ORIGINS` stays empty |
 | P2 | app skeleton, demo mode | five screens (§ 5, trimmed), `settings.tsx`, store, demo fake card, scripted stops | demo mode walks every screen and every stop on both phones with no card; `demo.test.ts` green, so each demo state still maps to the stop it must produce; settings persist across a relaunch; no per-batch field outside federation, count, PIN policy and the plan preview |
 | P3 | real install | probe → ISD → auth → sweep → load → install (opener, applet) → verify over NFC | 10 consecutive blank J3R180s installed from one phone; loop counter correct; a mid-run pull recovers on the next tap |
 | P4 | key setup, PIN, issue | `keySetup` → `SET_PIN` → `VERIFY_PIN` → `issue` wired to P0 and P1b | a blank card taps once and comes out with 8 keys, a verifying PIN and the batch's notes; a `SIGN` from a till succeeds only after the PIN is entered, and the POS charges it for the demo amount |
 | P5 | summary, registry, outbox | S4 + retry, against P1c | ending a batch with pending rows says so; killing the app mid-batch, relaunching, retrying the row works; the row's PIN state matches the card's |
 | P6 | hardening | wrong-keys lockout, foreign card, torn load, a `pinNotSet` card, campaign of 50 cards | 50 cards: zero wrong-key attempts, every torn run recovered, no orphaned key set in the sidecar, no card leaves without a verifying PIN |
 | P7 | store readiness (§ 7) | TestFlight + Play internal track first, then the public listing: demo mode as the reviewer path, privacy manifest naming the registry, data-safety forms, signing from CI secrets | TestFlight and internal track builds accepted; then App Review and Play production review pass on the same build |
+
+**P1c status (2026-10-28): built and tested, not deployed.** `registry/` is a Worker
+(`src/index.ts`) in front of one SQLite-backed Durable Object at `idFromName('registry')`.
+Every done-line case is exercised twice — 16 `vitest` cases through the real Worker
+(`SELF`, so the auth gate is covered) and `curl` against `wrangler dev`:
+- identical body → 200 returning the **stored** row, `received_at` unchanged (a retry
+  reads, it does not overwrite);
+- changed body, same `short_id` → 409 with a `reason` naming the id, and the list still
+  shows the first row; a `pin_set` change alone is a 409 too;
+- unauthenticated, forged or expired token → 401 (the app signs out on it);
+- a row survives a **process** restart: the row was re-read after killing and restarting
+  `wrangler dev`, same `received_at`, out of `.wrangler/state`.
+What that does **not** prove, and must not be read as proven:
+- **No host exists.** `REGISTRY_ORIGINS` is still empty in `api.ts`, so no build can reach
+  this service. Deploying and filling the two strings is the remaining wiring.
+- **Never deployed.** A local `wrangler dev` is Miniflare; it says nothing about the
+  production Durable Object's storage, a real `wrangler secret put`, or Cloudflare's
+  clock. A deployed service also needs its own check that a restart keeps rows, which is
+  a deploy, not a test.
+- One operator account, no rate limit on `/auth/operator/session`, and no way to list or
+  delete a card row. None is on the done-line; each matters before a public listing (§ 7).
+`wrangler dev` reads the operator password from `.dev.vars`, **not** the shell environment
+— with only `OPERATOR_PASSWORD=` exported the Worker sees it undefined and every route
+answers 503 (correctly: the guard that refuses to run unauthenticated). `.dev.vars` and
+`.wrangler/` are gitignored.
 
 **P2 status (2026-10-28): built, and verified short of its own done-line.** The five
 screens, settings, store, PIN handling, the demo fake card and the registry adapter exist
@@ -457,7 +482,8 @@ leaves the device.
   `iso7816.select-identifiers` must list `F0464D4341524401` and the ISD
   `A000000151000000` (the applet *and* the card manager are selected).
   Entitlements come with the provisioning profile; a free/personal team cannot sign them.
-- **App Transport Security**: the local sidecar API is `http://127.0.0.1:9878`. A localhost
+- **App Transport Security**: the local sidecar API is `http://127.0.0.1:9877` (`till.rs`
+  `DEFAULT_LISTEN`, reached on the phone through `adb reverse tcp:9877`). A localhost
   exception is required and is defensible; a LAN cleartext exception is not. Keep the
   sidecar on loopback (USB/tether), as the till already does.
 - **Privacy**: the registry is hosted (§ 4), so the app does transmit provisioning

@@ -123,6 +123,22 @@ Be explicit about this with anyone downstream.
   purpose — P1c builds the registry and this repo names no host. The app therefore cannot
   sign in today, and says so ("no registry client configured for this build") rather than
   posting credentials at a guessed server. Filling those two strings is the whole wiring.
+- **A local build can reach every screen past SignIn without a registry.**
+  `apps/provisioner/src/localSession.ts` holds `LOCAL_SESSION_ENABLED` (**`false`** in the
+  tree) and `localStoreApi()`, a fake `StoreApi`. `App.tsx` uses it only when
+  `registryOrigin()` is null **and** `__DEV__` is true, so a Release bundle cannot take the
+  path even if the constant is flipped. SignIn shows
+  `LOCAL SESSION — nothing is sent to a registry`; it accepts any non-empty name and
+  password, and `postBatch`/`postCard`/`retryPending` **reject** rather than resolve, so a
+  row the fake never posted stays pending and the summary says so. It does not touch
+  `REGISTRY_ORIGINS`. Walked on the Pixel 8 Pro on 2026-10-28: label rendered, typed
+  `operator` / `devpass`, SIGN IN → NEW BATCH. The iOS bundle was checked for the same
+  code by string, but its screen was not seen (`idevicescreenshot` still fails). Flip it
+  for a local walk, flip it back before committing; `src/localSession.test.ts` asserts it
+  is `false`.
+- **The sidecar origin was `:9878` and the till listens on `:9877`** (`till.rs`
+  `DEFAULT_LISTEN`, `adb reverse tcp:9877`). Fixed in `settings.tsx` — every sidecar call
+  from the app was going to a port nothing listens on.
 - **The three P0 routes have crossed a reader, read-only — first through a laptop PC/SC
   relay, then through the phone's own NFC reader.** `till serve` with
   `CARD_BACKEND=bridge` pointed at a PC/SC relay on `:9876` (the contract the phone relay

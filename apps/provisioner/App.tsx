@@ -19,6 +19,7 @@ import {
 } from 'react-native-safe-area-context';
 
 import {BatchPinProvider, PinRevealProvider} from './src/pin';
+import {LOCAL_SESSION_ENABLED, localStoreApi} from './src/localSession';
 import {RegistryClient, RegistryStoreApi, registryOrigin} from './src/api';
 import {BatchSetupScreen} from './src/screens/BatchSetupScreen';
 import {BatchSummaryScreen} from './src/screens/BatchSummaryScreen';
@@ -27,6 +28,7 @@ import {SettingsScreen} from './src/screens/SettingsScreen';
 import {SignInScreen} from './src/screens/SignInScreen';
 import {SettingsProvider, useSettings} from './src/settings';
 import {StoreProvider, useStore} from './src/store';
+import type {StoreApi} from './src/store';
 
 type Route = 'home' | 'settings' | 'summary';
 
@@ -69,9 +71,10 @@ function Navigator(): React.JSX.Element {
 
 /**
  * The registry client, built from the endpoint the settings name. Null when
- * this build has no origin for it (`REGISTRY_ORIGINS` is empty until P1c
- * ships a registry), in which case sign-in fails with a message that says so
- * rather than posting credentials at a guessed host.
+ * this build has no origin for it (`REGISTRY_ORIGINS` is empty until a
+ * registry is deployed), in which case sign-in fails with a message that says
+ * so rather than posting credentials at a guessed host. A local dev build with
+ * `LOCAL_SESSION_ENABLED` gets the fake client instead, and SignIn says so.
  */
 function ConnectedStore({
   children,
@@ -79,11 +82,18 @@ function ConnectedStore({
   children: React.ReactNode;
 }): React.JSX.Element {
   const {registryEndpoint} = useSettings();
-  const api = React.useMemo<RegistryStoreApi | undefined>(() => {
+  const api = React.useMemo<StoreApi | undefined>(() => {
     const origin = registryOrigin(registryEndpoint);
-    return origin === null
-      ? undefined
-      : new RegistryStoreApi(new RegistryClient({baseUrl: origin}), origin);
+    if (origin !== null) {
+      return new RegistryStoreApi(
+        new RegistryClient({baseUrl: origin}),
+        origin,
+      );
+    }
+    // No registry host is named by this repo. A local dev build may still walk
+    // past SignIn on a fake session (`src/localSession.ts`); a Release bundle
+    // cannot, because that module gates on `__DEV__` too.
+    return LOCAL_SESSION_ENABLED && __DEV__ ? localStoreApi() : undefined;
   }, [registryEndpoint]);
   return <StoreProvider api={api}>{children}</StoreProvider>;
 }
