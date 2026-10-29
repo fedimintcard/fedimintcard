@@ -88,16 +88,25 @@ Be explicit about this with anyone downstream.
   passing (was 84 before P0: 2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar
   unit + 22 wallet + 20 till; P0 added 7 in `sidecar/tests/cards.rs`). CI's `rust` job is
   still the gate for a clean checkout.
-- **The app has never run on a device.** No phone, no Metro bundle on hardware, no NFC
-  session against a real reader. Everything above is Jest against a fake card, a scripted
-  registry and a rendered tree under `react-test-renderer`. Fonts, safe areas, the iOS
-  sheet's real behaviour, Android's 15 s `setTimeout` clamp and the actual NFC `transceive`
-  path are all unexercised.
+- **The app has now run on one device, to SignIn and no further.** On 2026-10-28 a Pixel 8
+  Pro (Android, RN 0.77.1, Fabric) ran `org.fedimintcard.provisioner`: Metro served the
+  bundle, the app mounted (`Running "FedimintProvisioner"`, JS log) and rendered SignIn with
+  the real build stamp (`4411d43e · 5513 bytes`). Everything past SignIn is unreachable on
+  device: `signedIn` comes only from a hosted operator session, and `REGISTRY_ORIGINS` is
+  empty (§ below), so the loop, batch setup, summary, Settings and the NFC path have still
+  never run on hardware. The iOS device pass has not started. Fonts, safe areas, the iOS
+  sheet, Android's 15 s `setTimeout` clamp and `transceive` remain unexercised.
+- **The provisioner would not build until `react-native-svg` was pinned to 15.11.1.**
+  15.15.5 (what `package.json` carried) uses `yoga::StyleSizeLength`, which RN 0.77.1 does
+  not have, so `app:buildCMakeDebug` failed in `RNSVGLayoutableShadowNode.cpp` and no APK
+  was produced. 15.11.1 is the last release that compiles against 0.77's Yoga; the fix
+  belongs with RN 0.78, not with the svg pin.
 - **The registry has no origin.** `REGISTRY_ORIGINS` is `{test: '', production: ''}` on
   purpose — P1c builds the registry and this repo names no host. The app therefore cannot
   sign in today, and says so ("no registry client configured for this build") rather than
   posting credentials at a guessed server. Filling those two strings is the whole wiring.
-- **The three P0 routes have crossed a reader, read-only.** `till serve` with
+- **The three P0 routes have crossed a reader, read-only — first through a laptop PC/SC
+  relay, then through the phone's own NFC reader.** `till serve` with
   `CARD_BACKEND=bridge` pointed at a PC/SC relay on `:9876` (the contract the phone relay
   speaks: `{"apdu":"<hex>"}` → `{"response":"<hex data||SW>"}`) answered against the
   J3R180 above: `precheck` → 200 `kind:"foreign"`, `foreign_slots:[0..7]`,
@@ -107,6 +116,24 @@ Be explicit about this with anyone downstream.
   before the fix in § 6). **No write has crossed a reader**: no `SET_PIN`, no `GEN_KEY`,
   no `topup` on silicon. `keySetup` idempotency and the issue replay path remain proved
   against `SoftCard` only.
+- **The phone relay path works end to end.** `android-relay` installed on the Pixel
+  (package `org.fedimintcard.relay`; the previous install was signed with another key and
+  had to be uninstalled first), `adb forward tcp:9876` + `adb reverse tcp:9877`, app in the
+  foreground with the card on the antenna: `/health` → `{"ok":true}`, and `SELECT` of the
+  applet over NFC → `9000`. `precheck` through it reproduced the laptop reader's answer
+  byte for byte on the same card.
+- **A blank J3R180 was found and correctly described.** ISD `9000`, package and applet
+  `6A82`, every `B0 xx` → `6E00`: nothing loaded. `precheck` now answers
+  `kind:"blank"`, `applet_present:false`, `isd_open:true`, `safe_to_replace:true`,
+  `slots:8`, 200 — after the fixes in § 6, and only after them: before, the route 502'd,
+  because `open_relay_card` selected the applet up front and `precheck`'s slot walk read
+  `6E00` as a transport failure.
+- **A blank card cannot be keyed without a load, by design.** Against that card `keySetup`
+  answers 502 `card_error: slot 0: card returned status word 6E00`. `card_setup` generates
+  into slots the applet owns, and with no applet there are none. The install (cardkit
+  SCP02 load) is the app's `install` phase, not a sidecar route — `apps/provisioner/src/api.ts`
+  says so at the top. So the ordering that matters is precheck → install → keySetup →
+  issue, and a blank card is the correct starting point, not a fault.
 
 - ~~`format:check` fails on 6 files~~ — fixed 2026-10-28 and now **gated in CI**
   (`yarn format:check`). One file is deliberately exempt: `gp/test/des.test.ts` keeps
@@ -287,6 +314,31 @@ Worth reading if you touch the same code, because the failure modes repeat.
     reached the app as a server fault. Now `PlanError::NoFreeSlots { need, free }` →
     422 `no_exact_plan`. Caught by calling `issue` against the real (full) card; the
     `SoftCard` fixtures were never full, so no test had reached it.
+19. **A blank card was a 502 instead of a described card.** Two separate faults, both found
+    by presenting a blank J3R180 to the phone relay:
+    - `open_relay_card` selected the applet before handing the card to any job, so `SELECT`
+      → `6A82` aborted with "card relay at …: card returned status word 6A82" **before**
+      `precheck` ran. Every route, including the one whose job is to describe a card with no
+      applet, refused the only card a batch starts from. Now it probes `GET DATA FF21`,
+      which any card answers: a status word means a card is there, a transport error means
+      one is not, and the job decides the rest.
+    - `precheck`'s slot walk took `6E00` for a transport failure. Now `6E00`/`6D00` mean
+      "no dispatcher, so every slot is empty", and `select_applet` gates the walk.
+    `SoftCard` modelled the chip too generously here: its trait methods bypassed `apdu()`,
+    so a not-installed card answered `6985` per slot where the silicon answers `6E00`.
+    They now call `require_installed()` first. `precheck_on_a_blank_card_says_blank_and_safe`
+    had passed only because of that leniency.
+20. **`key_setup` invented a foreign key on a blank card.** Its `before` probe treated any
+    status word but `6985` as "a key is present", so `6E00` became slot-0 key `!6e00` and
+    the card was refused as foreign (`slot 0 holds a key this wallet did not produce
+    (!6e00)`). Now `6E00`/`6D00` mean an empty slot, matching `precheck`. `keySetup` still
+    refuses a genuinely blank card: `card_setup` reads the slot as empty and calls `GEN_KEY`,
+    which the card answers `6E00` — "slot 0: card returned status word 6E00". That refusal
+    is correct; keys cannot be generated into an applet that is not loaded, and install
+    (cardkit) comes first.
+21. **`isd_open` could report a refusing ISD as open.** It called `get_data_ff21()` twice
+    and accepted `6D00`, which a card gives when it does not implement the command — not
+    when the ISD is open. Now one probe, `6A82`/`6A88` only.
 
 ## 6a. Dependabot alerts (open, 2026-10-28)
 
