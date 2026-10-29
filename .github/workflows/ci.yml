@@ -41,6 +41,23 @@ jobs:
       # applet/target/fedimint-card-0.1.cap, and a hosted runner has no JavaCard
       # SDK to build one. The load file is pinned by size and sha256 in the
       # script, and the provisioner re-checks that hash before it sends a byte.
+  # The registry is the one service that ships without a device in the loop,
+  # so it can be gated here. Its `.dev.vars` is gitignored; the password comes
+  # from the test config's `miniflare.bindings`, not from a repository secret.
+  registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults: { run: { working-directory: registry } }
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v7
+        with: { node-version: '22', cache: npm, cache-dependency-path: registry/package-lock.json }
+      - run: npm ci
+      - run: npx tsc --noEmit
+      # The suite needs workerd's SQLite, which the pool ships; no wrangler
+      # login and no Cloudflare account are involved.
+      - run: npx vitest run
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 90
