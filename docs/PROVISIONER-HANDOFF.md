@@ -84,10 +84,11 @@ Be explicit about this with anyone downstream.
 - **Rust builds locally as of 2026-10-28**, once `cmake` and `pkg-config` are installed
   (`brew install cmake pkg-config`); without them `aws-lc-sys-0.41.0` panics with "Required
   build dependency is missing", which is a missing prerequisite, not a code fault. With
-  them, `cargo test --locked --workspace -- --test-threads=1` runs **91 tests** here, all
+  them, `cargo test --locked --workspace -- --test-threads=1` runs **92 tests** here, all
   passing (was 84 before P0: 2 issue + 7 spend + 2 card unit + 12 roundtrip + 19 sidecar
-  unit + 22 wallet + 20 till; P0 added 7 in `sidecar/tests/cards.rs`). CI's `rust` job is
-  still the gate for a clean checkout.
+  unit + 22 wallet + 20 till; P0 added 7 in `sidecar/tests/cards.rs`, and the blank-card
+  work added 1 more in `sidecar/tests/cards.rs`). CI's `rust` job is still the gate for a
+  clean checkout.
 - **The iOS project had never built, and nothing said so in code.** `CODE_SIGN_STYLE` was
   unset (→ wildcard profile, which cannot carry NFC Tag Reading: the build failed on the
   entitlement) and the bundle phase ran `scripts/bundle-ios.sh`, a file this repo has never
@@ -99,7 +100,11 @@ Be explicit about this with anyone downstream.
   the real build stamp (`4411d43e · 5513 bytes`). The iPhone 13 Pro Max (iOS 26.5.2) runs it
   too — installed from `/tmp/fcdd/Build/Products/Debug-iphoneos/FedimintProvisioner.app`,
   1.0.0 (10), launched with `devicectl device process launch`, process alive and the SignIn
-  screen confirmed on the device. The iPhone build embeds its own 4.4 MB Hermes
+  screen confirmed on the device, and inside it: the SignIn fields accept text, and pressing
+  **SIGN IN raises the designed refusal** rather than anything unexpected — `store.tsx`'s
+  `signIn` throws `no registry client configured for this build` whenever no `api` is
+  supplied, and `api.ts`'s `registryOrigin()` returns null for both endpoints, so the app
+  never attempts a request. That path is exercised on silicon now, not only in Jest. The iPhone build embeds its own 4.4 MB Hermes
   `main.jsbundle`, so it runs without Metro; on a device the iOS app never connects to the
   packager, which is expected, not a fault. (No iOS screenshot was possible:
   `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" on
