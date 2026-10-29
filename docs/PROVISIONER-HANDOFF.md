@@ -128,6 +128,16 @@ Be explicit about this with anyone downstream.
   `slots:8`, 200 — after the fixes in § 6, and only after them: before, the route 502'd,
   because `open_relay_card` selected the applet up front and `precheck`'s slot walk read
   `6E00` as a transport failure.
+- **Two NFC owners, and only one can be foreground.** `apps/provisioner` reads
+  cards itself through `react-native-nfc-manager` (`src/session.ts`); the sidecar reaches a card
+  only through `android-relay` on `:9876`, and that relay services APDUs **only while it is the
+  foreground activity** (its README says so; on 2026-10-28 the provisioner being foregrounded
+  made `/health` hang until the relay was raised). So the phases alternate owners: install /
+  sweep / load are the app's own session, then keySetup / setPin / issue are the sidecar's, over
+  the relay, **after** the app's session closes (plan § 5's phase table says exactly this at
+  `keySetup`). Nothing in the tree enforces the handoff yet — it is a UI responsibility that has
+  never run end to end. The relay also cannot be driven while the app is in front, so any test
+  that leaves the app foregrounded will see the relay time out rather than refuse.
 - **A blank card cannot be keyed without a load, by design.** Against that card `keySetup`
   answers 502 `card_error: slot 0: card returned status word 6E00`. `card_setup` generates
   into slots the applet owns, and with no applet there are none. The install (cardkit
