@@ -102,6 +102,8 @@ class GenKeyGetPubTest {
         CardTestSupport c = new CardTestSupport();
         byte[] oldPub = c.genKey(7);
         BigInteger oldD = c.scalar(7);
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.verifyPin(CardTestSupport.DEFAULT_PIN);
         ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 7, 1, null);
         assertSw(0x9000, r);
         byte[] newPub = r.getData();
@@ -147,6 +149,8 @@ class GenKeyGetPubTest {
     void failedOverwriteLeavesSlotEmpty() throws Exception {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.verifyPin(CardTestSupport.DEFAULT_PIN);
         javacard.security.ECPrivateKey[] privs = (javacard.security.ECPrivateKey[]) c.field("privs");
         javacard.security.ECPrivateKey real = privs[0];
         privs[0] = new SchnorrHWSignTest.LyingKey(real, false, (short) 32) {
@@ -163,6 +167,8 @@ class GenKeyGetPubTest {
     void overwriteWhereGenKeyPairThrowsLeavesSlotEmpty() throws Exception {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.verifyPin(CardTestSupport.DEFAULT_PIN);
         javacard.security.ECPrivateKey real = ((javacard.security.ECPrivateKey[]) c.field("privs"))[0];
         java.lang.reflect.Field f = FedimintCardApplet.class.getDeclaredField("gen");
         f.setAccessible(true);
@@ -178,5 +184,31 @@ class GenKeyGetPubTest {
         assertTrue(refused, "genKeyPair must fail");
         assertFalse(real.isInitialized(), "old private key must be wiped");
         assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
+    }
+
+    /** Once a PIN is set, replacing a used key needs it: not entered, the key stays. */
+    @Test
+    void overwriteOfAUsedSlotNeedsThePin() {
+        CardTestSupport c = new CardTestSupport();
+        byte[] pub = c.genKey(3);
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        assertSw(0x6A94, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 3, 1, null));
+        assertArrayEquals(pub, c.getPub(3));
+        c.verifyPin(CardTestSupport.DEFAULT_PIN);
+        ResponseAPDU r = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 3, 1, null);
+        assertSw(0x9000, r);
+        assertFalse(java.util.Arrays.equals(pub, r.getData()));
+    }
+
+    /** A blocked card cannot be re-keyed: its keys, and the notes issued to them, stay. */
+    @Test
+    void overwriteOnABlockedCardIsRefused() {
+        CardTestSupport c = new CardTestSupport();
+        byte[] pub = c.genKey(2);
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        byte[] wrong = { '9', '9', '9', '9' };
+        for (int i = 0; i < 3; i++) c.verifyPinRaw(wrong);
+        assertSw(0x6983, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 2, 1, null));
+        assertArrayEquals(pub, c.getPub(2));
     }
 }

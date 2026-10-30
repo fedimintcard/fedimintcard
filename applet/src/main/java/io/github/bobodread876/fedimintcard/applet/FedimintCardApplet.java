@@ -19,7 +19,7 @@ import javacard.security.KeyPair;
  *
  * <pre>
  * CLA B0
- * 10 GEN_KEY  P1=slot  P2=0|1 Lc=0    -> 32 bytes x-only pubkey (P2=1 overwrites a used slot)
+ * 10 GEN_KEY  P1=slot  P2=0|1 Lc=0    -> 32 bytes x-only pubkey (P2=1 overwrites a used slot; after VERIFY_PIN once a PIN is set)
  * 11 GET_PUB  P1=slot  Lc=0          -> 32 bytes x-only pubkey
  * 12 SIGN     P1=slot  Lc=32 (msg)   -> 64 bytes R.x || s   (after VERIFY_PIN)
  * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN
@@ -165,6 +165,24 @@ public final class FedimintCardApplet extends Applet {
         pub.setG(G, (short) 0, (short) 65);
         pub.setR(N, (short) 0, (short) 32);
         pub.setK((short) 1);
+    }
+
+    /**
+     * A session is one selection. OwnerPIN keeps its validated flag in CLEAR_ON_RESET memory, so
+     * left alone a verified PIN outlives a SELECT of another applet, or of this one again, until
+     * the card loses power; on the J3R452 it held for a whole 17-minute run in a contact reader.
+     * Both ends of a selection drop it: select() covers a re-SELECT of this applet, which a card
+     * need not report as a deselect.
+     */
+    @Override
+    public boolean select() {
+        pin.reset();
+        return true;
+    }
+
+    @Override
+    public void deselect() {
+        pin.reset();
     }
 
     @Override
@@ -405,6 +423,13 @@ public final class FedimintCardApplet extends Applet {
         if (used[s]) {
             if (!overwrite) {
                 ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            }
+            // Replacing a key destroys whatever notes were issued to it, so once the card has a PIN it
+            // takes the same PIN as spending them: without this, any reader in range could wipe a slot
+            // with one APDU. Before the first SET_PIN nothing can be spent, so provisioning may still
+            // re-key freely; a blocked card refuses (69 83).
+            if (pinState == PIN_STATE_SET || pinState == PIN_STATE_BLOCKED) {
+                checkPinReady();
             }
             // The old key is being replaced: wipe it first so a failure below leaves the slot empty.
             used[s] = false;

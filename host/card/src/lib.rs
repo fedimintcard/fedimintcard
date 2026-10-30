@@ -130,8 +130,8 @@ pub trait Card {
         self.apdu(&pin_apdu(INS_SET_PIN, pin)?).map(|_| ())
     }
 
-    /// `VERIFY_PIN` for this session. `6A94` when no PIN is set, `63 CX` with X tries left,
-    /// `6983` when blocked.
+    /// `VERIFY_PIN` for this session. `6984` when no PIN is set, `63 CX` with X tries left,
+    /// `6983` when blocked. `6A94` is what `SIGN` answers once the session has no verified PIN.
     fn verify_pin(&mut self, pin: &[u8]) -> Result<()> {
         self.apdu(&pin_apdu(INS_VERIFY_PIN, pin)?).map(|_| ())
     }

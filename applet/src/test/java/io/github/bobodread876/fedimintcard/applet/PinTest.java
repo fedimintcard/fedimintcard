@@ -555,4 +555,33 @@ class PinTest {
         assertSw(0x9000, r);
         assertArrayEquals(new byte[] { 0x02, 0x00 }, r.getData());
     }
+
+    /** A verified PIN ends with the selection: another applet selected, then this one, asks again. */
+    @Test
+    void sessionEndsWhenAnotherAppletIsSelected() {
+        CardTestSupport c = new CardTestSupport();
+        javacard.framework.AID other = com.licel.jcardsim.utils.AIDUtil.create("F0464D4341524402");
+        c.sim.installApplet(other, FedimintCardApplet.class);
+        c.genKey(0);
+        c.setPin(pin("1111"));
+        c.verifyPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+        c.sim.selectApplet(other);
+        c.select();
+        assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+        c.verifyPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+    }
+
+    /** A SELECT of this applet again, with nothing in between, also asks again. */
+    @Test
+    void sessionEndsOnReselect() {
+        CardTestSupport c = new CardTestSupport();
+        c.genKey(0);
+        c.setPin(pin("1111"));
+        c.verifyPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+        assertSw(0x9000, c.select());
+        assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+    }
 }
