@@ -14,8 +14,21 @@ fn bridge_lock() -> std::sync::MutexGuard<'static, ()> {
     BRIDGE_CARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Provision a PIN on a card that has none, then open a session with it: `SIGN` needs both, as
+/// on the applet.
+fn open_session(card: &mut dyn Card) {
+    const PIN: &[u8] = b"1234";
+    if status_word(&card.verify_pin(PIN).unwrap_err()) == Some(SW_NO_PIN_SET) {
+        card.set_pin(PIN).expect("SET_PIN on a fresh card");
+    }
+    card.verify_pin(PIN).expect("VERIFY_PIN");
+}
+
 fn roundtrip(card: &mut dyn Card, slot: u8) {
     let pk = card.get_or_gen(slot).expect("key");
+    // get_or_gen runs before the session so a fresh card can still be provisioned: GEN_KEY on an
+    // empty slot needs no PIN, and SIGN (which does) comes after.
+    open_session(card);
     assert_eq!(card.get_pub(slot).unwrap(), pk, "GET_PUB is stable");
     let msg = [0x5Au8; 32];
     let sig = card.sign(slot, &msg).expect("sign");
@@ -33,6 +46,50 @@ fn roundtrip(card: &mut dyn Card, slot: u8) {
 #[test]
 fn soft_card_roundtrip() {
     roundtrip(&mut SoftCard::new(), 0);
+}
+
+/// `SIGN` is what spends a note, so the stand-in must refuse it exactly as the applet does:
+/// nothing before a PIN exists, nothing in a selection that has not verified, and nothing once
+/// the tries are gone — the applet's three status words, in the applet's precedence.
+#[test]
+fn soft_card_sign_needs_a_pin_in_this_session() {
+    const MSG: [u8; 32] = [0x42; 32];
+    let mut c = SoftCard::new();
+    c.gen_key(0).unwrap();
+
+    assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_NO_PIN_SET), "no PIN yet");
+    c.set_pin(b"1234").unwrap();
+    assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_REQUIRED), "not verified");
+    c.verify_pin(b"1234").unwrap();
+    c.sign(0, &MSG).expect("verified");
+
+    // A session is a selection: the applet clears the flag on SELECT.
+    assert_eq!(c.apdu(&SELECT_APDU).unwrap(), Vec::<u8>::new(), "SELECT answers no data");
+    assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_REQUIRED), "after SELECT");
+
+    // A wrong PIN leaves nothing open. The first two spend a try and say how many are left; the
+    // third leaves none, so the card is blocked from then on.
+    for left in [2, 1] {
+        let e = c.verify_pin(b"9999").unwrap_err();
+        assert_eq!(status_word(&e), Some(0x6300 | left), "tries left in the status word");
+        assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_REQUIRED));
+    }
+    assert_eq!(status_word(&c.verify_pin(b"9999").unwrap_err()), Some(0x6300), "no tries left");
+    assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_BLOCKED), "terminal");
+    assert_eq!(status_word(&c.verify_pin(b"1234").unwrap_err()), Some(SW_PIN_BLOCKED), "no unblock");
+}
+
+/// An overwrite destroys the key the slot's notes are locked to, so it takes the same PIN as
+/// spending them — but only once the card has a PIN: before SET_PIN there is nothing to spend.
+#[test]
+fn soft_card_overwrite_needs_the_pin_only_once_one_is_set() {
+    let mut c = SoftCard::new();
+    c.gen_key(0).unwrap();
+    c.gen_key_overwrite(0).expect("no PIN yet, provisioning may re-key");
+    c.set_pin(b"1234").unwrap();
+    assert_eq!(status_word(&c.gen_key_overwrite(0).unwrap_err()), Some(SW_PIN_REQUIRED));
+    c.verify_pin(b"1234").unwrap();
+    c.gen_key_overwrite(0).expect("verified");
 }
 
 #[test]
@@ -54,6 +111,10 @@ fn soft_card_overwrite() {
     let e = c.gen_key_overwrite(3).unwrap();
     assert_eq!(c.get_pub(3).unwrap(), e, "overwrite on an empty slot works");
     let a = c.gen_key(0).unwrap();
+    // The card now has a PIN, so an overwrite needs the PIN session it would need to spend.
+    c.set_pin(b"1234").unwrap();
+    assert_eq!(status_word(&c.gen_key_overwrite(0).unwrap_err()), Some(SW_PIN_REQUIRED));
+    c.verify_pin(b"1234").unwrap();
     let b = c.gen_key_overwrite(0).unwrap();
     assert_ne!(a, b);
     assert_eq!(c.get_pub(0).unwrap(), b);
@@ -109,6 +170,12 @@ impl Transport for FakeApplet {
                 assert_eq!(apdu.len(), 5 + 32 + 1, "SIGN: header, 32 bytes, Le");
                 let m: [u8; 32] = apdu[5..37].try_into().unwrap();
                 self.card.sign(slot, &m).map(|s| s.serialize().to_vec())
+            }
+            // The PIN commands the roundtrip needs to open a session. Forwarded whole to the
+            // card's own APDU layer, so the status words are the applet's, not a re-derivation.
+            0x40 | 0x41 => {
+                assert_eq!(apdu.len(), 5 + apdu[4] as usize + 1, "PIN command: Lc bytes, Le");
+                self.card.apdu(apdu)
             }
             _ => return Ok(vec![0x6D, 0x00]),
         };

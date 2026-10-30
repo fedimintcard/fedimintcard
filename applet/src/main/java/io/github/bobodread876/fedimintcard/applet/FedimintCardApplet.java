@@ -250,8 +250,11 @@ public final class FedimintCardApplet extends Applet {
      * <p>{@code len} is the Lc that {@link #lcOf} read. Only the {@code len} bytes of the old PIN
      * are checked, whichever is longer: CHANGE_PIN sends its new PIN after them and that half is
      * not part of the check.
+     *
+     * <p>The data must already be in the buffer: {@code setIncomingAndReceive} may be called only
+     * once per {@code process()}, so the caller receives it and this only compares.
      */
-    private void checkPin(APDU apdu, byte[] buf, short len) {
+    private void checkPinReceived(byte[] buf, short len) {
         if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
@@ -265,9 +268,6 @@ public final class FedimintCardApplet extends Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         try {
-            if (apdu.setIncomingAndReceive() < len) {
-                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-            }
             if (pin.check(buf, ISO7816.OFFSET_CDATA, (byte) len)) {
                 return;
             }
@@ -294,7 +294,14 @@ public final class FedimintCardApplet extends Applet {
         if (pinState != PIN_STATE_SET) {
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
-        checkPin(apdu, buf, len);
+        if (len < PIN_MIN || len > PIN_MAX) {
+            // Refused before any receive, so a wrong length costs neither a try nor a read.
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (apdu.setIncomingAndReceive() < len) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        checkPinReceived(buf, len);
     }
 
     /**
@@ -357,15 +364,26 @@ public final class FedimintCardApplet extends Applet {
         }
         short half = (short) (lc / 2);
         try {
-            // The new half is taken first: the old half's check wipes the APDU buffer and tmp, so
-            // a copy made after it would read zeros. Into newPin, not tmp, because checkPin wipes
-            // tmp on its way out.
+            // The whole data field is received here, before anything reads or wipes the buffer:
+            // `setIncomingAndReceive` may be called only once per process() (APDU spec), and on
+            // T=0 it "may return less than a full buffer of bytes". Reading only the new half
+            // below would copy bytes the card has not received yet — stale buffer content — and
+            // make it the new PIN. So take all `lc` bytes first, then split them in newPin.
+            //
+            // Not covered by a test: jCardSim is T=1 and always delivers the full field, and it
+            // answers 6F00 to a command that ends with the APDU still partially received, so the
+            // truncation cannot be injected from outside. The check below is the guard.
+            if (apdu.setIncomingAndReceive() < lc) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            // The new half is copied before the old half's check wipes the APDU buffer and tmp.
+            // Into newPin, not tmp, because checkPinReceived wipes tmp on its way out.
             Util.arrayCopyNonAtomic(buf, (short) (ISO7816.OFFSET_CDATA + half), newPin,
                 (short) 0, half);
-            // The old half goes through the same checks as VERIFY_PIN (one receive, one check of
-            // the first `half` bytes: the new half that follows is not part of it). A mismatch
-            // spends a try, and a call that finds no try left commits the block and answers 6983.
-            checkPin(apdu, buf, half);
+            // The old half goes through the same checks as VERIFY_PIN, comparing exactly the first
+            // `half` bytes: the new half that follows is not part of the check. A mismatch spends
+            // a try, and a call that finds no try left commits the block and answers 6983.
+            checkPinReceived(buf, half);
             // A change ends the session, so the next CHANGE_PIN needs its own VERIFY_PIN.
             pin.reset();
             // The new PIN, then the commit point again: with no transaction primitive on 3.0.5,

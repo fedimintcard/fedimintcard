@@ -3,7 +3,7 @@
 //! Runs against `CARD_BACKEND` (soft by default; bridge and pcsc without code changes).
 
 use fedimint_card_fed_tests::*;
-use fedimint_card_host_card::{Card, open_from_env};
+use fedimint_card_host_card::{Card, open_from_env, open_pin_session};
 use fedimint_core::Amount;
 use fedimint_core::encoding::Decodable;
 use fedimint_core::secp256k1::XOnlyPublicKey;
@@ -24,6 +24,8 @@ async fn fx(fees: bool, denom: u8) -> anyhow::Result<Fx> {
     let env = setup(fees).await;
     let mut card = open_from_env()?;
     let key = on_card(|| card.get_or_gen(SLOT))?;
+    // The key comes first: GEN_KEY on an empty slot needs no PIN, and SIGN does.
+    open_pin_session(card.as_mut())?;
     let note = issue_to_card(&env, key, Denomination(denom)).await?;
     Ok(Fx { env, card, key, note })
 }

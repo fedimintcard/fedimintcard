@@ -305,8 +305,8 @@ pins every line of it.
   set above increments the major.
 - **No allocation.** `OwnerPIN` is built in the constructor; the PIN buffers are the existing
   65-byte `tmp`, the APDU buffer, and one `PIN_MAX`-byte `newPin` for the half being written, all
-  wiped on every exit path. `newPin` is separate from `tmp` because `checkPin` wipes `tmp` on its
-  way out, so the new PIN parked there during `CHANGE_PIN` would be written as zeros.
+  wiped on every exit path. `newPin` is separate from `tmp` because `checkPinReceived` wipes
+  `tmp` on its way out, so the new PIN parked there during `CHANGE_PIN` would be written as zeros.
   `NoAllocationTest` scans the applet sources for a `new` outside the install-time methods.
 
 Not built, and named so nobody assumes otherwise: no `GET_INFO` (the version bytes above are

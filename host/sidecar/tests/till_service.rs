@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env};
+use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
 use fedimint_card_sidecar::plan::PlanError;
 use fedimint_card_sidecar::sales::SalesStore;
@@ -72,6 +72,8 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     // behaves like a new one.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
     cw.card_setup(!soft)?;
+    // `topup` and every charge sign, and SIGN needs a PIN in this selection.
+    open_pin_session(cw.card.as_mut())?;
     Ok(Fx { _fed: fed, cw, _dir: dir })
 }
 
@@ -197,6 +199,11 @@ impl Card for CountCard {
         self.1.set(self.1.get() + 1);
         self.0.borrow_mut().sign(s, m)
     }
+    // The PIN commands travel here, and SIGN needs their session, so the wrapper must not fall
+    // back to the trait's "cannot send raw APDUs".
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.borrow_mut().apdu(apdu)
+    }
 }
 
 type Counted = (Fx, Rc<RefCell<SoftCard>>, Rc<Cell<u32>>);
@@ -208,6 +215,8 @@ async fn fx_counted() -> anyhow::Result<Counted> {
     let signs = Rc::new(Cell::new(0));
     f.cw.card = Box::new(CountCard(card.clone(), signs.clone()));
     f.cw.card_setup(false)?;
+    // A fresh SoftCard has no PIN session, and this one replaces the card fx() already opened.
+    open_pin_session(f.cw.card.as_mut())?;
     f.cw.topup(&[1 << 16, 1 << 14]).await?;
     Ok((f, card, signs))
 }
@@ -415,6 +424,10 @@ impl Card for LostAnswerCard {
     fn sign(&mut self, s: u8, m: &[u8; 32]) -> anyhow::Result<Signature> {
         self.0.borrow_mut().sign(s, m)
     }
+    // The PIN session travels as APDUs; without this the trait default refuses them all.
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.borrow_mut().apdu(apdu)
+    }
 }
 
 /// A relay that is down: every call fails with the bridge's own error.
@@ -469,6 +482,8 @@ async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card()
     let mode = Rc::new(Cell::new(0u8));
     f.cw.card = Box::new(LostAnswerCard(card.clone(), mode.clone()));
     f.cw.card_setup(false)?;
+    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
+    open_pin_session(f.cw.card.as_mut())?;
     f.cw.topup(&[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     mode.set(1);
@@ -579,6 +594,9 @@ impl Card for SlowCard {
         std::thread::sleep(Duration::from_millis(1500));
         self.0.borrow_mut().sign(s, m)
     }
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.borrow_mut().apdu(apdu)
+    }
 }
 
 async fn call(app: axum::Router, method: &str, uri: &str, body: &str) -> (u16, Value) {
@@ -601,6 +619,8 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     let shared = Rc::new(RefCell::new(SoftCard::new()));
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
+    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
+    open_pin_session(f.cw.card.as_mut())?;
     f.cw.topup(&[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
@@ -664,6 +684,8 @@ async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
     let shared = Rc::new(RefCell::new(SoftCard::new()));
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
+    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
+    open_pin_session(f.cw.card.as_mut())?;
     f.cw.topup(&[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();

@@ -70,6 +70,21 @@ pub fn status_word(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<StatusWord>().map(|s| s.0)
 }
 
+/// The PIN the fixtures and tests provision on a card they own.
+pub const TEST_PIN: &[u8] = b"1234";
+
+/// Provision [`TEST_PIN`] if the card has none, then open this selection's session with it.
+///
+/// `SIGN` refuses until both are true, so anything that spends must call this after `SELECT` and
+/// after the keys are in place. A card that already holds a different PIN answers `63 CX` and
+/// spends a try, so only call it on a card whose PIN you own.
+pub fn open_pin_session(card: &mut dyn Card) -> Result<()> {
+    if status_word(&card.verify_pin(TEST_PIN).unwrap_err()) == Some(SW_NO_PIN_SET) {
+        card.set_pin(TEST_PIN).context("SET_PIN on a fresh card")?;
+    }
+    card.verify_pin(TEST_PIN).context("VERIFY_PIN")
+}
+
 pub trait Card {
     /// Generate a key in `slot`. Fails with `6985` if the slot is already used.
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
@@ -85,7 +100,9 @@ pub trait Card {
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
     /// x-only public key of the key in `slot`. Fails with `6985` if the slot is empty.
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey>;
-    /// BIP340 signature over the raw 32 bytes.
+    /// BIP340 signature over the raw 32 bytes. Requires a PIN on the card and a `VERIFY_PIN` in
+    /// this selection: `6984` before the first `SET_PIN`, `6983` when blocked, `6A94` otherwise.
+    /// `6985` means the slot is empty.
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature>;
 
     /// Public key of `slot`, generating a key first if the slot is empty. Idempotent, and safe
@@ -248,6 +265,9 @@ pub struct SoftCard {
     slots: [Option<Keypair>; SLOTS as usize],
     pin: Option<Vec<u8>>,
     tries_left: u8,
+    /// Whether this session has verified the PIN, which is what lets `SIGN` run. Cleared by
+    /// `SELECT`, as on the applet: a session is a selected applet, not a card.
+    validated: bool,
     /// Whether the applet is installed. A blank card answers `6A82` to SELECT.
     installed: bool,
 }
@@ -304,6 +324,22 @@ impl SoftCard {
             Err(StatusWord(SW_CLA_NOT_SUPPORTED).into())
         }
     }
+
+    /// The applet's `checkPinReady`: blocked outranks no PIN, which outranks not verified in
+    /// this session. `SIGN` always calls it, so a card that has never been pinned cannot sign, and
+    /// a fresh `SELECT` needs its own `VERIFY_PIN`.
+    fn require_pin_session(&self) -> Result<()> {
+        if self.tries_left == 0 {
+            return Err(StatusWord(SW_PIN_BLOCKED).into());
+        }
+        if self.pin.is_none() {
+            return Err(StatusWord(SW_NO_PIN_SET).into());
+        }
+        if !self.validated {
+            return Err(StatusWord(SW_PIN_REQUIRED).into());
+        }
+        Ok(())
+    }
 }
 
 impl Card for SoftCard {
@@ -320,6 +356,12 @@ impl Card for SoftCard {
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
         self.require_installed()?;
         self.slot(slot)?;
+        // Replacing a key destroys whatever is locked to it, so once the card has a PIN the
+        // overwrite needs `SIGN`'s PIN session. Before the first `SET_PIN` nothing can be spent,
+        // so provisioning re-keys freely.
+        if self.pin.is_some() || self.tries_left == 0 {
+            self.require_pin_session()?;
+        }
         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
         self.slots[slot as usize] = Some(kp);
         Ok(kp.x_only_public_key().0)
@@ -335,6 +377,9 @@ impl Card for SoftCard {
 
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
         self.require_installed()?;
+        // The gate comes first, as on the applet: without the PIN, a reader learns nothing
+        // about the slots.
+        self.require_pin_session()?;
         match self.slot(slot)? {
             Some(kp) => Ok(SECP256K1.sign_schnorr(&Message::from_digest(*msg32), kp)),
             None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
@@ -355,6 +400,8 @@ impl Card for SoftCard {
                 if !self.installed || &apdu[5..5 + lc] != SELECT_APDU_HEAD {
                     return Err(StatusWord(0x6A82).into());
                 }
+                // A session lives inside a selection: a fresh SELECT needs its own VERIFY_PIN.
+                self.validated = false;
                 Ok(vec![])
             }
             (CLA_ISO, 0xCA) if apdu[2] == 0xFF && apdu[3] == 0x21 => {
@@ -387,8 +434,11 @@ impl Card for SoftCard {
                 };
                 if want.as_slice() == pin {
                     self.tries_left = 3;
+                    self.validated = true;
                     return Ok(vec![]);
                 }
+                // A wrong PIN leaves nothing open.
+                self.validated = false;
                 self.tries_left -= 1;
                 Err(StatusWord(0x6300 | u16::from(self.tries_left)).into())
             }

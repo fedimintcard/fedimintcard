@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use fedimint_card_host_card::open_from_env;
+use fedimint_card_host_card::{open_from_env, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, nonce_for, on_card};
 use fedimint_card_sidecar::plan;
 use fedimint_card_sidecar::state::{HostKind, NoteStatus, StateStore};
@@ -71,6 +71,8 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     // behaves like a new one.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
     cw.card_setup(!soft)?;
+    // SIGN needs a PIN on the card and this selection's VERIFY_PIN; card_setup does not open one.
+    open_pin_session(cw.card.as_mut())?;
     Ok(Fx { fed, cw, _dir: dir })
 }
 
@@ -624,6 +626,7 @@ async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::R
     let store = StateStore::open(dir.path().join("card_state.json"))?;
     f.cw = CardWallet::new(f.cw.wallet.clone(), store, card);
     f.cw.card_setup(false)?;
+    open_pin_session(f.cw.card.as_mut())?;
     assert!(f.cw.store.state.free_slots().is_empty(), "unknown keys are not free");
     assert_eq!(f.cw.store.state.overwritable_slots().len(), 8);
 
