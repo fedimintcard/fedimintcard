@@ -29,11 +29,16 @@ describe('the local-session flag', () => {
 });
 
 describe('the flag as App uses it', () => {
-  it('never names a registry host', () => {
-    // The flag is not a way to fill REGISTRY_ORIGINS quietly: with no origin,
-    // `App` has nothing live to build and can only fall back to the fake.
-    expect(registryOrigin('test')).toBeNull();
-    expect(registryOrigin('production')).toBeNull();
+  it('is the only thing that puts the fake in front of a live registry', () => {
+    // The flag is not a way to fill REGISTRY_ORIGINS quietly: it supplies a
+    // fake store and nothing else, and the origins are a deploy fact set in
+    // `api.ts`. With the registry deployed there *is* an origin now, so what
+    // this pins is that the app has a real one to sign in to — the guard that
+    // keeps a Release build off the fake is the `false` above.
+    expect(registryOrigin('test')).toBe('https://registry.fedimintcard.org');
+    expect(registryOrigin('production')).toBe(
+      'https://registry.fedimintcard.org',
+    );
   });
 });
 

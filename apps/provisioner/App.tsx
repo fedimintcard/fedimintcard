@@ -84,10 +84,11 @@ function Navigator(): React.JSX.Element {
 
 /**
  * The registry client, built from the endpoint the settings name. Null when
- * this build has no origin for it (`REGISTRY_ORIGINS` is empty until a
- * registry is deployed), in which case sign-in fails with a message that says
- * so rather than posting credentials at a guessed host. A local dev build with
- * `LOCAL_SESSION_ENABLED` gets the fake client instead, and SignIn says so.
+ * this build has no origin for it (both `REGISTRY_ORIGINS` entries name a
+ * deployed registry, so a build from this tree always has one), in which case
+ * sign-in fails with a message that says so rather than posting credentials at
+ * a guessed host. A local dev build with `LOCAL_SESSION_ENABLED` gets the fake
+ * client instead, and SignIn says so.
  */
 function ConnectedStore({
   children,
@@ -103,9 +104,11 @@ function ConnectedStore({
         origin,
       );
     }
-    // No registry host is named by this repo. A local dev build may still walk
-    // past SignIn on a fake session (`src/localSession.ts`); a Release bundle
-    // cannot, because that module gates on `__DEV__` too.
+    // Both endpoints name a registry now, so this branch is unreachable in a
+    // build from this tree; it stays because a forked build may empty
+    // `REGISTRY_ORIGINS`, and then a local dev build must still be able to
+    // walk past SignIn on a fake session (`src/localSession.ts`). A Release
+    // bundle cannot, because that module gates on `__DEV__` too.
     return LOCAL_SESSION_ENABLED && __DEV__ ? localStoreApi() : undefined;
   }, [registryEndpoint]);
   return <StoreProvider api={api}>{children}</StoreProvider>;

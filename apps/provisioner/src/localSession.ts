@@ -1,12 +1,18 @@
 /**
  * The local-session dev flag.
  *
- * Purpose: `REGISTRY_ORIGINS` is empty by design until a registry is deployed,
- * and `src/api.ts:registryOrigin` therefore answers null, so `StoreProvider`
- * gets no `api` and `signIn` throws "no registry client configured for this
- * build". That is the right behaviour at review, but it means nobody can walk
- * past SignIn on a device — the batch loop, the registry outbox, the summary
- * and the settings are all unreachable without a server.
+ * Purpose: when `REGISTRY_ORIGINS` names no origin for the chosen endpoint,
+ * `src/api.ts:registryOrigin` answers null, so `StoreProvider` gets no `api`
+ * and `signIn` throws "no registry client configured for this build". That is
+ * the right behaviour at review, but it means nobody can walk past SignIn on a
+ * device — the batch loop, the registry outbox, the summary and the settings
+ * are all unreachable without a server.
+ *
+ * Both endpoints name the deployed registry now (`api.ts`), so no build from
+ * this tree takes the null branch: this flag is dormant rather than active.
+ * It stays for a fork that empties `REGISTRY_ORIGINS`, and because a device
+ * walk without posting to the live registry is still a reasonable thing to
+ * want while the loop and the NFC path have never run on hardware.
  *
  * This flag supplies a **fake** session for exactly that purpose on a local
  * build. It is off unless a build turns it on, and when it is on the app says

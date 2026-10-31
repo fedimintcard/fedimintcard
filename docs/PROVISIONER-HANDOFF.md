@@ -109,20 +109,41 @@ Be explicit about this with anyone downstream.
   packager, which is expected, not a fault. (No iOS screenshot was possible:
   `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" on
   26.5, and `devicectl` has no screenshot subcommand — the screen was confirmed by the
-  operator, not captured here.) Everything past SignIn is unreachable on
-  device: `signedIn` comes only from a hosted operator session, and `REGISTRY_ORIGINS` is
-  empty (§ below), so the loop, batch setup, summary, Settings and the NFC path have still
-  never run on hardware. The iOS device pass has not started. Fonts, safe areas, the iOS
-  sheet, Android's 15 s `setTimeout` clamp and `transceive` remain unexercised.
+  operator, not captured here.) Everything past SignIn was unreachable on
+  device *at that time*: `signedIn` comes only from a hosted operator session, and
+  `REGISTRY_ORIGINS` was empty then (§ below) — it is filled now, so a device pass should
+  get past SignIn, but the loop, batch setup, summary, Settings and the NFC path have still
+  never run on hardware as of 2026-10-31. The iOS device pass has not started. Fonts, safe
+  areas, the iOS sheet, Android's 15 s `setTimeout` clamp and `transceive` remain
+  unexercised.
 - **The provisioner would not build until `react-native-svg` was pinned to 15.11.1.**
   15.15.5 (what `package.json` carried) uses `yoga::StyleSizeLength`, which RN 0.77.1 does
   not have, so `app:buildCMakeDebug` failed in `RNSVGLayoutableShadowNode.cpp` and no APK
   was produced. 15.11.1 is the last release that compiles against 0.77's Yoga; the fix
   belongs with RN 0.78, not with the svg pin.
-- **The registry has no origin.** `REGISTRY_ORIGINS` is `{test: '', production: ''}` on
-  purpose — P1c builds the registry and this repo names no host. The app therefore cannot
-  sign in today, and says so ("no registry client configured for this build") rather than
-  posting credentials at a guessed server. Filling those two strings is the whole wiring.
+- **The registry is deployed.** `REGISTRY_ORIGINS` names
+  `https://registry.fedimintcard.org` for both `test` and `production`, so the previous
+  "the app cannot sign in today" no longer holds. Worker `fedimintcard-registry` (account
+  `2c4e0a6e…`, SQLite-backed Durable Object `Registry`, migration `v1`), version
+  `d41e239a-c133-408e-a203-3e61a59887f5`, deployed 2026-10-31. `OPERATOR_PASSWORD` is a
+  Worker secret set with `wrangler secret put`; it is not in this repo and must not be.
+  Verified against the live Worker, not from config: `GET /health` → `200 {"ok":true}`;
+  wrong password → `401`; unauthenticated `GET /registry/batches` → `401 "sign in first"`;
+  correct password → `200` with an 83-character token and `operator_id` 1; `POST
+  /registry/batches` with that token → `200` and a stored `batch_id`. TLS verifies (result
+  0, HTTP/2). The `/test/*` hooks are unreachable from outside — `GET /test/reset` → 404 —
+  so nothing can wipe a deployment through a route. **One test batch is stored in
+  production** from that check (`batch_id` 1, a fabricated federation id and a shape-valid
+  but wrong `load_sha256`); the registry validates that hash's *shape* only, never that it
+  equals the pinned CAP, so it is indistinguishable from a real row except by its contents.
+  It cannot be removed through the Worker: there is no batch-read route, and the `/test/*`
+  wipe hook is unroutable, so batch rows are write-only and the same object is named on
+  every request. The row is therefore inert as well as unreadable — no client lists
+  batches — but it is real storage, and deleting it needs the Durable Object's storage
+  cleared out of band (an API token, not the OAuth token `wrangler` holds; a `DELETE` on
+  the object returns 405 `10405` for the OAuth scheme). **Still not verified:** the app
+  signing in on a device against this origin — that needs the device pass below, and every
+  screen past SignIn is still unreached on hardware.
 - **A local build can reach every screen past SignIn without a registry.**
   `apps/provisioner/src/localSession.ts` holds `LOCAL_SESSION_ENABLED` (**`false`** in the
   tree) and `localStoreApi()`, a fake `StoreApi`. `App.tsx` uses it only when
@@ -135,7 +156,9 @@ Be explicit about this with anyone downstream.
   `operator` / `devpass`, SIGN IN → NEW BATCH. The iOS bundle was checked for the same
   code by string, but its screen was not seen (`idevicescreenshot` still fails). Flip it
   for a local walk, flip it back before committing; `src/localSession.test.ts` asserts it
-  is `false`.
+  is `false`. **Note (2026-10-31):** with `REGISTRY_ORIGINS` filled, `App.tsx` returns the
+  real client before that branch, so the fake no longer engages in any build from this
+  tree. Leave `LOCAL_SESSION_ENABLED` false; the flag is now dead rather than dormant.
 - **The sidecar origin was `:9878` and the till listens on `:9877`** (`till.rs`
   `DEFAULT_LISTEN`, `adb reverse tcp:9877`). Fixed in `settings.tsx` — every sidecar call
   from the app was going to a port nothing listens on.

@@ -663,16 +663,24 @@ export class RegistryStoreApi {
  * endpoint as a name (`'test' | 'production'`) rather than a URL, precisely so
  * the URL lives in one place; this is that place.
  *
- * Both are empty because neither deployment exists yet: P1c builds the
- * registry, and this repo records no host for it. `registryOrigin` returns
- * null for an unset one, and the app then cannot sign in — visibly, with a
- * message naming the build — instead of posting an operator's credentials at a
- * host someone guessed.
+ * Both name the same deployment: the registry is one Worker, and `test` and
+ * `production` exist as separate names so a build can be pointed at a stage
+ * that is not live without editing the URL. `registryOrigin` returns null for
+ * an empty entry, and the app then cannot sign in — visibly, with a message
+ * naming the build — instead of posting an operator's credentials at a host
+ * someone guessed.
+ *
+ * Deployed 2026-10-31: Worker `fedimintcard-registry`, SQLite-backed Durable
+ * Object, custom domain `registry.fedimintcard.org` (TLS valid).
+ * `OPERATOR_PASSWORD` is a Worker secret, set with `wrangler secret put`; no
+ * password is in this tree.
  */
-export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
-  test: '',
-  production: '',
-} as const);
+export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze(
+  {
+    test: 'https://registry.fedimintcard.org',
+    production: 'https://registry.fedimintcard.org',
+  } as const,
+);
 
 /** The origin for `endpoint`, or null when this build has none configured. */
 export function registryOrigin(endpoint: string): string | null {
