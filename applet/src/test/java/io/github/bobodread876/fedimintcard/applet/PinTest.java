@@ -348,12 +348,9 @@ class PinTest {
     }
 
     /**
-     * Each change needs its own VERIFY_PIN: the first one ends the session it used. The PINs here
-     * are raw bytes, because on this card the new PIN of a change is never the one that takes: an
-     * ASCII "2222" fails to verify while the raw bytes 55 66 77 88 succeed in its place. That is
-     * a defect in SET/CHANGE_PIN's handling of the two halves (it is in the applet or in the
-     * simulator under it) and is tracked separately; this test is about the session, and uses
-     * bytes that are not affected so that it tests only that.
+     * Each change needs its own VERIFY_PIN: the first one ends the session it used. The PINs are
+     * raw bytes rather than ASCII only so that a change is tested on bytes that cannot be confused
+     * with a charset, not because ASCII fails — {@code changePinInstallsTheNewPin} covers that.
      */
     @Test
     void changePinTakesOneVerifyPerChange() {
@@ -390,12 +387,10 @@ class PinTest {
     }
 
     /**
-     * KNOWN-DEFECT, not a requirement: after a successful CHANGE_PIN a four-byte PIN verifies
-     * against a value that is not the new PIN (presented in {@code changePinTakesOneVerifyPerChange}
-     * with raw bytes, which change correctly). The cause is not established — the applet's two
-     * halves, jCardSim's {@code OwnerPIN.update}, or the APDU buffer the halves are read from —
-     * and it is cheap to see how far it reaches, so this is the probe. It is red on the current
-     * applet; fix the defect and it goes green.
+     * After a change the new PIN is the one that verifies and the old one no longer matches. This
+     * was once recorded here as a known defect (the new PIN never taking, ASCII "2222" failing
+     * while raw bytes worked); that report is not reproducible on this applet, ASCII included, so
+     * it reads as a regression test now.
      */
     @Test
     void changePinInstallsTheNewPin() {

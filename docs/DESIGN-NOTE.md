@@ -265,7 +265,7 @@ pins every line of it.
 |---|---|---|---|---|
 | `VERIFY_PIN` | `40` | `00 00` | 4..8 | `9000` and this session may `SIGN`; `63 CX` wrong, X tries left; `6983` blocked; `6984` no PIN set |
 | `SET_PIN` | `41` | `00 00` | 4..8 | `9000` first and only time; `6985` when a PIN is already set; never opens a session |
-| `CHANGE_PIN` | `42` | `00 00` | 8..16 (old ‖ new, equal halves) | `9000`; needs a `VERIFY_PIN` first; ends the session |
+| `CHANGE_PIN` | `42` | `00 00` | 8..16 (old ‖ new, equal halves) | `9000`; needs a `VERIFY_PIN` first; ends the session; see the length bound below |
 | `SIGN` | `12` | slot, `00` | 32 | `6A94` unless this session verified the PIN; `6984` if no PIN was ever set; `6983` if blocked |
 
 - **No no-PIN allowance.** Cashucard's PIN arms a spending limit; here there is nothing behind
@@ -286,6 +286,12 @@ pins every line of it.
   first (`6B00`) because the frame it was sent can be refused without touching the state. On a
   card with a PIN, all three check the frame first. `SET_PIN` on a card that already has one is
   `6985`, and the blocked and not-set checks come before it.
+- **`CHANGE_PIN` cannot change the PIN's length.** The data field is `old ‖ new` with no boundary
+  marker, so the applet splits it at `Lc / 2` and rejects odd `Lc`; a change from 8 bytes to 4
+  would send `Lc = 12`, which the applet reads as two 6-byte PINs and refuses with `6700`. Only
+  equal-length changes work, `SET_PIN` remains the way to pick any length in 4..8. This is a
+  bound, not a gap: no flow needs a length change, and lifting it would mean a length-prefixed
+  data field, which every already-flashed card would answer `6700` to.
 - **Tries.** `javacard.framework.OwnerPIN` holds the PIN and the counter: 3 tries, 4..8 bytes,
   never reset by a card reset. `check()` spends a try even when it succeeds and puts it back, so
   `63CX` always reports what is left, and a correct PIN can never lock the card. The third
@@ -310,8 +316,10 @@ pins every line of it.
   `NoAllocationTest` scans the applet sources for a `new` outside the install-time methods.
 
 Not built, and named so nobody assumes otherwise: no `GET_INFO` (the version bytes above are
-only the applet's, not the card's state), no unblock, no owner-signed `SET_PIN`, and nothing in
-the Rust `host/card` sends a PIN yet — the bridge and PC/SC paths must `SET_PIN` on a fresh card
+only the applet's, not the card's state), no unblock, no owner-signed `SET_PIN`, no
+`CHANGE_PIN` over T=0's partial receive (jCardSim is T=1 and always delivers the full field, so
+the guard in `changePin` is unreachable from a test), and nothing in the Rust `host/card` sends a
+PIN yet — the bridge and PC/SC paths must `SET_PIN` on a fresh card
 and `VERIFY_PIN` before each spend before a real card the applet has not seen can be used.
 
 ## EEPROM

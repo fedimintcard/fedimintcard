@@ -46,7 +46,7 @@ CLA `B0`. Applet AID `F0464D4341524401`. Eight key slots (P1 = 0..7). P2 = 0 on 
 | SIGN | `12` | 32-byte message | 64-byte BIP340 signature; `6985` if empty; needs a `VERIFY_PIN` in the same session |
 | VERIFY_PIN | `40` | 4..8-byte PIN | `9000` and this session may SIGN; `63CX` wrong, X tries left; `6983` blocked; `6984` no PIN set |
 | SET_PIN | `41` | 4..8-byte PIN | `9000` the first time; `6985` if a PIN is already set; does not open a session |
-| CHANGE_PIN | `42` | old PIN then new PIN, 8..16 bytes | `9000`; needs a `VERIFY_PIN` first and ends the session |
+| CHANGE_PIN | `42` | old PIN then new PIN, 8..16 bytes, equal lengths | `9000`; needs a `VERIFY_PIN` first and ends the session; a length change needs `SET_PIN` on a re-keyed card |
 
 `SELECT` answers `02009000`: the applet's version 2.0 in two data bytes, then the status word.
 
