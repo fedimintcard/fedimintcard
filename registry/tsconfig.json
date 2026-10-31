@@ -8,7 +8,7 @@
     ],
     "types": [
       "@cloudflare/workers-types",
-      "@cloudflare/vitest-pool-workers"
+      "@cloudflare/vitest-plugin/types"
     ],
     "strict": true,
     "noUncheckedIndexedAccess": true,

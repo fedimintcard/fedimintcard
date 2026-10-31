@@ -1,23 +1,19 @@
-import {defineWorkersConfig} from '@cloudflare/vitest-pool-workers/config';
+import {cloudflareTest} from '@cloudflare/vitest-plugin';
+import {defineConfig} from 'vitest/config';
 
-export default defineWorkersConfig({
-  test: {
-    poolOptions: {
-      workers: {
-        // The binding and the secret come from here, so tests exercise the
-        // same wiring a deployment uses rather than a mock in front of it.
-        wrangler: {configPath: './wrangler.toml'},
-        miniflare: {
-          bindings: {OPERATOR_PASSWORD: 'correct horse battery staple'},
-        },
-        // The pool isolates storage per test by stacking SQLite files, and the
-        // SQLite-backed Durable Object leaves a `.sqlite-shm` sidecar it does
-        // not recognise (developers.cloudflare.com/workers/testing/vitest-
-        // integration/known-issues/#isolated-storage). Tests reset rows
-        // themselves in `beforeEach` instead, which is the same guarantee for
-        // this suite: every test starts from an empty table.
-        isolatedStorage: false,
+// The integration is a Vite plugin rather than a config wrapper, so the
+// options live in `plugins` instead of `test.poolOptions.workers`.
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      // The binding and the secret come from here, so tests exercise the
+      // same wiring a deployment uses rather than a mock in front of it.
+      wrangler: {configPath: './wrangler.toml'},
+      miniflare: {
+        bindings: {OPERATOR_PASSWORD: 'correct horse battery staple'},
       },
-    },
-  },
+      // Tests reset rows themselves in `beforeEach`, so every test starts
+      // from an empty table.
+    }),
+  ],
 });
