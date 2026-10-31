@@ -675,12 +675,10 @@ export class RegistryStoreApi {
  * `OPERATOR_PASSWORD` is a Worker secret, set with `wrangler secret put`; no
  * password is in this tree.
  */
-export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze(
-  {
-    test: 'https://registry.fedimintcard.org',
-    production: 'https://registry.fedimintcard.org',
-  } as const,
-);
+export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
+  test: 'https://registry.fedimintcard.org',
+  production: 'https://registry.fedimintcard.org',
+} as const);
 
 /** The origin for `endpoint`, or null when this build has none configured. */
 export function registryOrigin(endpoint: string): string | null {

@@ -104,7 +104,45 @@ Be explicit about this with anyone downstream.
   **SIGN IN raises the designed refusal** rather than anything unexpected — `store.tsx`'s
   `signIn` throws `no registry client configured for this build` whenever no `api` is
   supplied, and `api.ts`'s `registryOrigin()` returns null for both endpoints, so the app
-  never attempts a request. That path is exercised on silicon now, not only in Jest. The iPhone build embeds its own 4.4 MB Hermes
+  never attempts a request. That path is exercised on silicon now, not only in Jest.
+- **Android now signs in against the deployment, and that is verified on hardware
+  (2026-10-30).** A release APK built after the `REGISTRY_ORIGINS` change
+  (`assembleRelease`, `assets/index.android.bundle` contains
+  `registry.fedimintcard.org`) was installed on the Pixel 8 Pro and driven through SignIn
+  with the deployed operator credentials: it left SignIn and rendered **NEW BATCH**. The
+  build has no `DEBUGGABLE` flag, so `__DEV__` is false and `localSession` cannot be what
+  let it through — the only path past SignIn is a real `POST /auth/operator/session` against
+  `https://registry.fedimintcard.org`. **Negative control:** the same build with a wrong
+  password stays on SignIn and shows `Sign-in could not be completed. Try again, or ask your
+  administrator for help.` A local fake would have accepted any password, so the refusal
+  proves the request reaches the deployment. What NEW BATCH showed: the batch form
+  populated (1 card by default), the PIN radio on "One PIN for the batch", the top-up plan
+  at `1,965 sats in 4 notes per card`, and a red
+  `The federation list could not be loaded. Check the connection and retry, or enter a
+  federation invite.` — expected, since no sidecar was running and no `adb reverse` tunnel
+  was open; the federation list is the sidecar's, not the registry's. Fonts, safe areas and
+  the Android 15 s `setTimeout` clamp are now exercised; NFC, `transceive`, the loop, summary
+  and Settings are not.
+- **iOS has NOT been signed in. The build could not start.** Two `xcodebuild` attempts
+  (20:49 and 20:52) both failed with
+  `Timed out waiting for all destinations ... Max may need to be unlocked to recover from
+  previously reported preparation errors`, and `devicectl device info details` returns
+  `The operation failed because the device was still locked.` with
+  `tunnelState: disconnected` (`developerModeStatus: enabled`, `pairingState: paired`).
+  Nothing in the project is at fault here; the phone has to be unlocked and left awake. No
+  iOS claim in this document covers the deployment yet. **Do not install
+  `/tmp/fcdd/Build/Products/Debug-iphoneos/FedimintProvisioner.app`** — it is from 2026-10-28,
+  before `REGISTRY_ORIGINS` was filled, and its embedded 4.4 MB `main.jsbundle` names no
+  registry host, so it would fail at SignIn by design and prove nothing. Once the phone is
+  unlocked, rebuild to the device and check the fresh artifact before installing:
+  `xcodebuild -workspace ios/FedimintProvisioner.xcworkspace -scheme FedimintProvisioner
+  -configuration Debug -destination 'id=810FE33E-9790-5BD9-AD8D-F985CBF85A23'
+  -allowProvisioningUpdates build`, then
+  `grep -c registry.fedimintcard.org <app>/main.jsbundle` (expect 1) and only then
+  `xcrun devicectl device install app --device 810FE33E-...`. The Debug configuration
+  embeds the JS bundle, so Metro is not needed. Drive SignIn with operator name `operator`
+  and the deployed password; the pass is **NEW BATCH**, and a wrong password must stay on
+  SignIn with the generic refusal, as it does on Android. The iPhone build embeds its own 4.4 MB Hermes
   `main.jsbundle`, so it runs without Metro; on a device the iOS app never connects to the
   packager, which is expected, not a fault. (No iOS screenshot was possible:
   `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" on
@@ -140,6 +178,13 @@ Be explicit about this with anyone downstream.
   not have, so `app:buildCMakeDebug` failed in `RNSVGLayoutableShadowNode.cpp` and no APK
   was produced. 15.11.1 is the last release that compiles against 0.77's Yoga; the fix
   belongs with RN 0.78, not with the svg pin.
+- **`REGISTRY_ORIGINS` must be written as `Object.freeze({` on one line.** The Android
+  release gate runs `scripts/configure-service.cjs --check --production`, whose parser
+  matches `REGISTRY_ORIGINS[^=]*=\s*Object\.freeze\(\{`. Prettier's wrapping form —
+  `Object.freeze(` newline `{` — silently fails that match, and the build dies at
+  `validateFedimintCardReleaseConfiguration` with
+  `src/api.ts: no REGISTRY_ORIGINS object literal`. The value is unchanged; only the
+  layout matters. Do not let a formatter move the brace.
 - **The registry is deployed.** `REGISTRY_ORIGINS` names
   `https://registry.fedimintcard.org` for both `test` and `production`, so the previous
   "the app cannot sign in today" no longer holds. Worker `fedimintcard-registry` (account
