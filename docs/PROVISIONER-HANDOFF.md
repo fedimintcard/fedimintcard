@@ -116,6 +116,25 @@ Be explicit about this with anyone downstream.
   never run on hardware as of 2026-10-31. The iOS device pass has not started. Fonts, safe
   areas, the iOS sheet, Android's 15 s `setTimeout` clamp and `transceive` remain
   unexercised.
+- **28 advisories in `apps/provisioner/yarn.lock`, all build-time only.** `yarn audit`
+  reports 4 high, 20 moderate, 4 low, from four packages: `image-size` 1.2.1 (high),
+  `fast-xml-parser`, `minimatch`, `deepmerge`. None is in the app bundle — every one is a
+  dependency of Metro, ESLint or the React Native CLI, reached only when the packager
+  reads assets, lint runs, or the CLI inspects a project. **Not fixed, deliberately:**
+  `image-size`'s only patched release is 2.0.3, which is a *major* that drops the callable
+  default export Metro uses (`getImageSize(content)` in `metro/src/Assets.js`), so a
+  `resolutions` pin would break asset resolution; the advisory (CVE-2025-71329, infinite
+  loop on a crafted JXL/HEIF box) needs an attacker-supplied image, and this repo tracks
+  **zero** `.jxl`/`.heic`/`.heif`/`.avif` files. Metro ≥ 0.85 drops `image-size` entirely,
+  but RN 0.77.1 pins `@react-native/metro-config` to `metro-config ^0.81`, so closing it
+  means upgrading React Native, not patching a package. Revisit with the RN upgrade.
+- **The 31 `registry/` Dependabot alerts are all stale.** `npm audit` in `registry/`
+  reports **0 vulnerabilities**, and every installed version is already at or past the
+  alert's own `first_patched_version`: `undici` 7.30.1 (21 alerts), `sharp` 0.35.5 (3),
+  `@vitest/mocker` 4.1.12 (2), `vitest` 4.1.12, `ws` 8.21.0, `wrangler` 4.156.0. The
+  lock moved under alerts GitHub had already opened, and it did not re-evaluate them.
+  There is no `tinypool` in the tree at all. Trust the lockfile and `npm audit` over the
+  alert count; no action needed.
 - **The provisioner would not build until `react-native-svg` was pinned to 15.11.1.**
   15.15.5 (what `package.json` carried) uses `yoga::StyleSizeLength`, which RN 0.77.1 does
   not have, so `app:buildCMakeDebug` failed in `RNSVGLayoutableShadowNode.cpp` and no APK
