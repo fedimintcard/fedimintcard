@@ -123,37 +123,60 @@ Be explicit about this with anyone downstream.
   was open; the federation list is the sidecar's, not the registry's. Fonts, safe areas and
   the Android 15 s `setTimeout` clamp are now exercised; NFC, `transceive`, the loop, summary
   and Settings are not.
-- **iOS has NOT been signed in. The build could not start.** Two `xcodebuild` attempts
-  (20:49 and 20:52) both failed with
+- **iOS signs in against the deployment too, and that is verified from a screenshot
+  (2026-11-02).** A Debug build made to the device on 2026-11-02 (its own 4.4 MB
+  `main.jsbundle`, `registry.fedimintcard.org` present, no `LOCAL SESSION` string) was
+  installed on the iPhone 13 Pro Max and driven through SignIn: it left SignIn and
+  rendered **NEW BATCH** with the same substance as Android — cards stepper, PIN radios,
+  the four-note top-up plan totalling `1,965 sat`, `START BATCH`, and the footer
+  `Load file 4411d43e · 5513 bytes`, i.e. `LOAD_FILE_SHA256.slice(0, 8)` and the real
+  5,513 bytes. **Wrong-password control:** the same build with a wrong password stays on
+  SignIn with `Sign-in could not be completed. Try again, or ask your administrator for
+  help.`, and the Worker recorded that attempt as a burst of requests, so the refusal is a
+  live 401 rather than a local one. Treating the attempt and the success as one event is
+  wrong: the burst measured at 18:04Z was the refusal, and the successful sign-in fell
+  outside the queried windows.
+  **How far the evidence goes:** the pass beyond SignIn is a screenshot of NEW BATCH, not
+  a screenshot of the transition, and the success itself was not captured in Worker
+  analytics — the OAuth token expired before that window could be queried. What rules out
+  a local fake is the build: `localSession` is off in source (`LOCAL_SESSION_ENABLED` is
+  `false`), both `REGISTRY_ORIGINS` endpoints name the deployment so `App` returns the real
+  client before that branch is ever reached, the shipped `main.jsbundle` contains no
+  `LOCAL SESSION` string and does carry `registry.fedimintcard.org`, and ATS
+  (`NSAllowsArbitraryLoads` false, `NSAllowsLocalNetworking` true) admits HTTPS to the
+  registry and nothing plaintext. The fake is unreachable by construction, not by
+  `__DEV__`: `App.tsx` returns `RegistryStoreApi` as soon as
+  `registryOrigin(...) !== null`, and the `localStoreApi()` branch is only reached when the
+  origin is null — impossible with both endpoints naming the deployment. The Android
+  release APK additionally has no `DEBUGGABLE` flag; the iOS pass used a **Debug** build
+  (which embeds its bundle too), so on iOS the ordering and the ATS config above are what
+  carry the claim.
+  As on Android, the red `federation list could not be loaded` banner is the sidecar being
+  absent from the phone, not a registry fault.
+- **The iOS build recipe that works, and the one artifact never to install.** Two
+  `xcodebuild` attempts on 2026-10-30 (20:49, 20:52) failed with
   `Timed out waiting for all destinations ... Max may need to be unlocked to recover from
-  previously reported preparation errors`, and `devicectl device info details` returns
+  previously reported preparation errors`, and `devicectl device info details` returned
   `The operation failed because the device was still locked.` with
   `tunnelState: disconnected` (`developerModeStatus: enabled`, `pairingState: paired`).
-  Nothing in the project is at fault here; the phone has to be unlocked and left awake. No
-  iOS claim in this document covers the deployment yet. **Do not install
-  `/tmp/fcdd/Build/Products/Debug-iphoneos/FedimintProvisioner.app`** — it is from 2026-10-28,
-  before `REGISTRY_ORIGINS` was filled, and its embedded 4.4 MB `main.jsbundle` names no
-  registry host, so it would fail at SignIn by design and prove nothing. Once the phone is
-  unlocked, rebuild to the device and check the fresh artifact before installing:
+  That was the phone, not the project: with Max unlocked the same command completed in 145 s
+  with `BUILD SUCCEEDED`. The sequence, in this order:
   `xcodebuild -workspace ios/FedimintProvisioner.xcworkspace -scheme FedimintProvisioner
   -configuration Debug -destination 'id=810FE33E-9790-5BD9-AD8D-F985CBF85A23'
-  -allowProvisioningUpdates build`, then
-  `grep -c registry.fedimintcard.org <app>/main.jsbundle` (expect 1) and only then
-  `xcrun devicectl device install app --device 810FE33E-...`. The Debug configuration
-  embeds the JS bundle, so Metro is not needed. Drive SignIn with operator name `operator`
-  and the deployed password; the pass is **NEW BATCH**, and a wrong password must stay on
-  SignIn with the generic refusal, as it does on Android. The iPhone build embeds its own 4.4 MB Hermes
-  `main.jsbundle`, so it runs without Metro; on a device the iOS app never connects to the
-  packager, which is expected, not a fault. (No iOS screenshot was possible:
-  `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" on
-  26.5, and `devicectl` has no screenshot subcommand — the screen was confirmed by the
-  operator, not captured here.) Everything past SignIn was unreachable on
-  device *at that time*: `signedIn` comes only from a hosted operator session, and
-  `REGISTRY_ORIGINS` was empty then (§ below) — it is filled now, so a device pass should
-  get past SignIn, but the loop, batch setup, summary, Settings and the NFC path have still
-  never run on hardware as of 2026-10-31. The iOS device pass has not started. Fonts, safe
-  areas, the iOS sheet, Android's 15 s `setTimeout` clamp and `transceive` remain
-  unexercised.
+  -allowProvisioningUpdates build`, then check the fresh artifact before installing —
+  `grep -c registry.fedimintcard.org <app>/main.jsbundle` must print `1` — then
+  `xcrun devicectl device install app --device 810FE33E-... <app>`, then
+  `devicectl device process launch --device 810FE33E-... org.fedimintcard.provisioner`.
+  The Debug configuration embeds its own 4.4 MB Hermes `main.jsbundle`, so Metro is not
+  needed; on a device the iOS app never connects to the packager, which is expected.
+  **Never install `/tmp/fcdd/Build/Products/Debug-iphoneos/FedimintProvisioner.app`** — it
+  is from 2026-10-28, before `REGISTRY_ORIGINS` was filled, its `main.jsbundle` names no
+  registry host, and it would fail at SignIn by design. **Launch covers the console.** A
+  `--console` launch is killed when the attached session ends, which also tears down the
+  app; launch without it and the app stays up. **Screenshots remain impossible**: on 26.5
+  `idevicescreenshot` fails with "Could not start screenshotr service: Invalid service" and
+  `devicectl` has no screenshot subcommand, so an iOS screen is confirmed by a screenshot
+  the operator takes on the phone, as the 2026-11-02 pass was.
 - **28 advisories in `apps/provisioner/yarn.lock`, all build-time only.** `yarn audit`
   reports 4 high, 20 moderate, 4 low, from four packages: `image-size` 1.2.1 (high),
   `fast-xml-parser`, `minimatch`, `deepmerge`. None is in the app bundle — every one is a
