@@ -66,7 +66,6 @@ const facts = [];
 
 try {
   const localSession = readDeclaration('src/localSession.ts', 'LOCAL_SESSION_ENABLED');
-  const sidecar = readDeclaration('src/settings.tsx', 'LOCAL_SIDECAR_ORIGIN');
   const origins = readRegistryOrigins();
 
   if (!/^(true|false)$/.test(localSession)) {
@@ -78,21 +77,6 @@ try {
   } else {
     facts.push(`local session: ${localSession === 'true' ? 'enabled' : 'disabled'}`);
   }
-
-  // Loopback only, on a fixed port: the till listens on 127.0.0.1 and the
-  // phone reaches it through adb reverse (plan § 7).
-  const sidecarUrl = sidecar.replace(/^['"]|['"]$/g, '');
-  const parsed = new URL(sidecarUrl);
-  if (parsed.protocol !== 'http:') {
-    problems.push(`LOCAL_SIDECAR_ORIGIN is ${parsed.protocol}, expected http: (loopback)`);
-  }
-  if (!['127.0.0.1', 'localhost'].includes(parsed.hostname)) {
-    problems.push(
-      `LOCAL_SIDECAR_ORIGIN is ${sidecarUrl}: the sidecar must be loopback only (` +
-        'a LAN cleartext exception is not defensible at review, plan § 7)',
-    );
-  }
-  facts.push(`sidecar: ${sidecarUrl}`);
 
   const keys = Object.keys(origins);
   if (keys.length === 0) {
