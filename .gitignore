@@ -10,3 +10,6 @@ android-relay/local.properties
 node_modules/
 tools/cardkit/dist/
 .wrangler/
+
+# Kotlin compiler session cache gradle writes under android/
+apps/provisioner/android/.kotlin/
