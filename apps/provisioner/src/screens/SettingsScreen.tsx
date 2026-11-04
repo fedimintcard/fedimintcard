@@ -97,6 +97,10 @@ export function SettingsScreen({
   const parsed = parseAmount(amounts);
   const amountsValid = isValidTopup(parsed);
   const inviteValid = isInviteCode(invite);
+  // Nothing to save when the field already holds what is stored: a scan saves
+  // on its own, so the button says so instead of sitting live and doing nothing.
+  const inviteStored = normalizeInvite(invite) === settings.federation;
+  const amountsStored = parsed === settings.topupSats;
   const running = app.batch?.phase === 'running';
 
   const saveFederation = () => {
@@ -169,9 +173,13 @@ export function SettingsScreen({
                 testID="settings-federation-scan"
               />
               <SecondaryButton
-                title={SETTINGS.saveFederation}
+                title={
+                  inviteValid && inviteStored
+                    ? SETTINGS.saved
+                    : SETTINGS.saveFederation
+                }
                 onPress={saveFederation}
-                disabled={!inviteValid}
+                disabled={!inviteValid || inviteStored}
                 testID="settings-federation-save"
               />
             </View>
@@ -219,9 +227,13 @@ export function SettingsScreen({
                 </Text>
               )}
               <SecondaryButton
-                title={SETTINGS.saveAmounts}
+                title={
+                  amountsValid && amountsStored
+                    ? SETTINGS.saved
+                    : SETTINGS.saveAmounts
+                }
                 onPress={saveAmounts}
-                disabled={!amountsValid}
+                disabled={!amountsValid || amountsStored}
                 testID="settings-amounts-save"
               />
             </View>

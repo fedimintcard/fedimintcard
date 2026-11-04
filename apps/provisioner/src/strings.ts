@@ -118,6 +118,7 @@ export const SETTINGS = {
   inviteProblem:
     'A federation invite starts with fed11 or fedimint. Scan its QR code or paste it.',
   saveFederation: 'SAVE FEDERATION',
+  saved: 'SAVED',
   scanFederation: 'SCAN QR',
   registry: 'Registry endpoint',
   registryNow: (label: string) => `Recording to the ${label.toLowerCase()} registry.`,
