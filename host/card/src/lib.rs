@@ -73,16 +73,38 @@ pub fn status_word(err: &anyhow::Error) -> Option<u16> {
 /// The PIN the fixtures and tests provision on a card they own.
 pub const TEST_PIN: &[u8] = b"1234";
 
-/// Provision [`TEST_PIN`] if the card has none, then open this selection's session with it.
+/// The PIN this process will use, from `CARD_PIN`, falling back to [`TEST_PIN`].
+///
+/// A card provisioned by anyone else holds a PIN this crate cannot guess, and a guess costs a
+/// retry (`63 CX`), so the operator has to name it. Defaulting to `TEST_PIN` keeps every test
+/// and soft-card fixture working unchanged.
+pub fn pin_from_env() -> Vec<u8> {
+    match std::env::var("CARD_PIN") {
+        Ok(p) => p.into_bytes(),
+        Err(_) => TEST_PIN.to_vec(),
+    }
+}
+
+/// Provision the PIN if the card has none, then open this selection's session with it.
 ///
 /// `SIGN` refuses until both are true, so anything that spends must call this after `SELECT` and
 /// after the keys are in place. A card that already holds a different PIN answers `63 CX` and
 /// spends a try, so only call it on a card whose PIN you own.
-pub fn open_pin_session(card: &mut dyn Card) -> Result<()> {
-    if status_word(&card.verify_pin(TEST_PIN).unwrap_err()) == Some(SW_NO_PIN_SET) {
-        card.set_pin(TEST_PIN).context("SET_PIN on a fresh card")?;
+pub fn open_pin_session_with(card: &mut dyn Card, pin: &[u8]) -> Result<()> {
+    match card.verify_pin(pin) {
+        // Already verified: the session is open.
+        Ok(()) => Ok(()),
+        Err(e) if status_word(&e) == Some(SW_NO_PIN_SET) => {
+            card.set_pin(pin).context("SET_PIN on a fresh card")?;
+            card.verify_pin(pin).context("VERIFY_PIN after SET_PIN")
+        }
+        Err(e) => Err(e).context("VERIFY_PIN"),
     }
-    card.verify_pin(TEST_PIN).context("VERIFY_PIN")
+}
+
+/// [`open_pin_session_with`] using [`pin_from_env`].
+pub fn open_pin_session(card: &mut dyn Card) -> Result<()> {
+    open_pin_session_with(card, &pin_from_env())
 }
 
 pub trait Card {

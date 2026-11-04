@@ -120,6 +120,13 @@ async fn card_wallet(cli: &Cli) -> Result<CardWallet> {
     let store = StateStore::open(state_path(&cli.data_dir))?;
     let card = open_from_env().context("opening the card")?;
     let mut cw = CardWallet::new(wallet, store, card);
+    // The applet drops its PIN session on every SELECT (`select()` calls `pin.reset()`), and
+    // `open_from_env` has just done the one SELECT this connection will make, so verifying here
+    // covers every later command on it. A card whose PIN nobody named answers `CARD_PIN` or the
+    // test PIN; a wrong one costs a retry, so this is reported rather than fatal.
+    if let Err(e) = cw.verify_pin_session() {
+        tracing::warn!("could not open the PIN session: {e:#}");
+    }
     // Any command that resolves a till sale must record it where the till service looks.
     let sales = std::sync::Arc::new(std::sync::Mutex::new(SalesStore::open(sales_path(&cli.data_dir))?));
     fedimint_card_sidecar::till::ensure_hook(&mut cw, &sales);

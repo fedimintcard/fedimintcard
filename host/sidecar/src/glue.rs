@@ -246,6 +246,18 @@ impl CardWallet {
         Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None }
     }
 
+    /// Open the card's PIN session for this selection.
+    ///
+    /// `SIGN`, and re-keying a slot that already holds a key, both refuse with `6A94` until the
+    /// selection has verified the PIN. The applet clears that on every `select()`, so this has to
+    /// run once after the card is opened and before anything signs. A `SoftCard` has no PIN state
+    /// and answers the verify with success, so tests need no setup.
+    pub fn verify_pin_session(&mut self) -> Result<()> {
+        let pin = fedimint_card_host_card::pin_from_env();
+        on_card(|| fedimint_card_host_card::open_pin_session_with(self.card.as_mut(), &pin))
+            .context("opening the PIN session")
+    }
+
     fn fee_fn(&self) -> impl Fn(u64) -> u64 + use<> {
         let cfg = self.wallet.mint_cfg.fee_consensus.clone();
         move |a| cfg.fee(Amount::from_msats(a)).msats
