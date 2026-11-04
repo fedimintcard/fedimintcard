@@ -22,7 +22,8 @@
  *              GET  /registry/federations        names tills reported
  *   operator   GET  /cards/:short_id/state
  *   or till
- *   till       POST /cards/:short_id/intent      the charge, unsigned, before the card signs
+ *   till       POST /cards/:short_id/intent      the charge, unsigned, before the card signs;
+ *                                                 with no inputs, a load from the till's wallet
  *              POST /cards/:short_id/submitted   the signed bytes, before the till sends them
  *              POST /cards/:short_id/outcome     the federation's answer
  *              POST /federations                 {federation_id, name} from the federation's config

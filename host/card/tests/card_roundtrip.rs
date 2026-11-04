@@ -67,14 +67,14 @@ fn soft_card_sign_needs_a_pin_in_this_session() {
     assert_eq!(c.apdu(&SELECT_APDU).unwrap(), Vec::<u8>::new(), "SELECT answers no data");
     assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_REQUIRED), "after SELECT");
 
-    // A wrong PIN leaves nothing open. The first two spend a try and say how many are left; the
-    // third leaves none, so the card is blocked from then on.
+    // A wrong PIN leaves nothing open. The first two spend a try and say how many are left
+    // (`63 CX`, as the applet's PinTest); the third leaves none and is the block itself (`6983`).
     for left in [2, 1] {
         let e = c.verify_pin(b"9999").unwrap_err();
-        assert_eq!(status_word(&e), Some(0x6300 | left), "tries left in the status word");
+        assert_eq!(status_word(&e), Some(0x63C0 | left), "tries left in the status word");
         assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_REQUIRED));
     }
-    assert_eq!(status_word(&c.verify_pin(b"9999").unwrap_err()), Some(0x6300), "no tries left");
+    assert_eq!(status_word(&c.verify_pin(b"9999").unwrap_err()), Some(SW_PIN_BLOCKED), "the last try blocks");
     assert_eq!(status_word(&c.sign(0, &MSG).unwrap_err()), Some(SW_PIN_BLOCKED), "terminal");
     assert_eq!(status_word(&c.verify_pin(b"1234").unwrap_err()), Some(SW_PIN_BLOCKED), "no unblock");
 }

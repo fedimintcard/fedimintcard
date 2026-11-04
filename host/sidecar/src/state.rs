@@ -102,6 +102,11 @@ pub struct PendingTx {
     /// The federation accepted it; only collection of outputs remains.
     #[serde(default)]
     pub accepted: bool,
+    /// On ops: the signed bytes were posted to ops (`submitted`) and no definitive answer came
+    /// back. Never sent, never abandoned on that alone: the next job with the card posts the same
+    /// bytes again, and sends only once ops has taken them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ops_unconfirmed: bool,
     /// Nonces (hex) of the card notes it spends.
     #[serde(default)]
     pub inputs: Vec<String>,
@@ -155,6 +160,35 @@ pub struct CardState {
     /// even after a crash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<IssueRec>,
+    /// Writes a till on ops still owes the registry, oldest first (docs/OPS-PLAN.md § 6). Saved
+    /// before they are sent and dropped once the registry has them, so a till that dies or loses
+    /// ops in between sends them on its next job with this card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ops_outbox: Vec<OpsWrite>,
+}
+
+/// One write to the ops registry that this till has decided on and not yet delivered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum OpsWrite {
+    /// How a charge ended. `change` is `(nonce, signature)` of every card change note, hex, when
+    /// accepted.
+    Outcome { txid: String, accepted: bool, change: Vec<(String, String)> },
+    /// A slot this till re-keyed (GEN_KEY with P2 = 1).
+    Slot { slot: u8, old_pubkey: String, pubkey: String },
+    /// Notes this till's wallet issued to the card (`topup`), recorded once they are live.
+    Load { txid: String, client_ref: String, notes: Vec<LoadNote> },
+}
+
+/// A card note created by a [`OpsWrite::Load`]. The blinding key is kept because the registry
+/// records each pending note with it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoadNote {
+    pub slot: u8,
+    pub amount_msat: u64,
+    pub nonce: String,
+    pub blinding_key: String,
+    pub out_idx: u64,
 }
 
 /// One `POST /v1/cards/issue`, kept so its `client_ref` can be replayed.

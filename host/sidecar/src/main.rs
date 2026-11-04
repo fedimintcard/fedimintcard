@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
+use fedimint_card_sidecar::ops::OpsConfig;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::{NoteStatus, StateStore};
 use fedimint_card_sidecar::wallet::{Wallet, sales_path, state_path};
@@ -49,6 +50,13 @@ enum TillCmd {
         /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
         #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
         relay: String,
+        /// The ops registry (docs/OPS-PLAN.md § 6). With it, each card's state comes from ops,
+        /// keyed by the card's short id, instead of card_state.json. Needs --ops-token.
+        #[arg(long, env = "OPS_URL", requires = "ops_token")]
+        ops_url: Option<String>,
+        /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url.
+        #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
+        ops_token: Option<String>,
     },
 }
 
@@ -205,11 +213,15 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay }) => {
+        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
-            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone()).await?;
+            let ops = match (ops_url, ops_token) {
+                (Some(url), Some(token)) => Some(OpsConfig { url: url.clone(), token: token.clone() }),
+                _ => None,
+            };
+            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops).await?;
         }
         Cmd::Card(c) => {
             let mut cw = card_wallet(&cli).await?;

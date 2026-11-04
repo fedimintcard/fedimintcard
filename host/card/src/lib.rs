@@ -462,7 +462,12 @@ impl Card for SoftCard {
                 // A wrong PIN leaves nothing open.
                 self.validated = false;
                 self.tries_left -= 1;
-                Err(StatusWord(0x6300 | u16::from(self.tries_left)).into())
+                // `63 CX` with X tries left, as the applet answers (`PinTest`); the try that
+                // spends the last one is the block itself and answers `6983`, not `63C0`.
+                if self.tries_left == 0 {
+                    return Err(StatusWord(SW_PIN_BLOCKED).into());
+                }
+                Err(StatusWord(0x63C0 | u16::from(self.tries_left)).into())
             }
             _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }

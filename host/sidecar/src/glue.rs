@@ -38,7 +38,10 @@ use tbs::BlindingKey;
 
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
-use crate::state::{HostKind, HostPending, IssueRec, NoteRec, NoteStatus, PendingOverwrite, PendingTx, StateStore, Tombstone};
+use crate::ops::{OpsError, OpsLink};
+use crate::state::{
+    HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
+};
 use crate::wallet::Wallet;
 
 /// Short wait used when recovering old records, where the answer may simply not exist.
@@ -226,10 +229,15 @@ pub struct CashoutReport {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
-    /// After signing, before the transaction is marked submitted.
+    /// After signing, before the transaction is marked submitted. On ops: after ops has the
+    /// signed bytes (so the charge counts as submitted), before it is sent.
     BeforeSubmit,
     /// After the federation accepted the transaction, before anything is collected.
     AfterSubmit,
+    /// On ops: `submitted` gets no answer and is never posted.
+    SubmittedUnreachable,
+    /// On ops: `submitted` is posted and taken, but its answer is lost.
+    SubmittedAnswerLost,
 }
 
 pub struct CardWallet {
@@ -242,11 +250,17 @@ pub struct CardWallet {
     pub crash_point: Option<CrashPoint>,
     /// See [`PromoteHook`].
     pub on_promote: Option<PromoteHook>,
+    /// Set for a job on a till configured with ops (`crate::ops`): the card side of `store` came
+    /// from the registry, and every write to it goes back there.
+    pub ops: Option<OpsLink>,
+    /// The holder's PIN for this job (`POST /v1/charge` `pin`). When unset the PIN session uses
+    /// `CARD_PIN`, which is for the CLI and the tests.
+    pub pin: Option<Vec<u8>>,
 }
 
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
-        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None }
+        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None, ops: None, pin: None }
     }
 
     /// Open the card's PIN session for this selection.
@@ -255,7 +269,13 @@ impl CardWallet {
     /// selection has verified the PIN. The applet clears that on every `select()`, so this has to
     /// run once after the card is opened and before anything signs. A `SoftCard` has no PIN state
     /// and answers the verify with success, so tests need no setup.
+    ///
+    /// The holder's PIN, when the job has one, is only verified: a card without a PIN is not
+    /// pinned at a till with whatever the holder typed.
     pub fn verify_pin_session(&mut self) -> Result<()> {
+        if let Some(pin) = self.pin.as_deref() {
+            return on_card(|| self.card.verify_pin(pin)).context("verifying the holder's PIN");
+        }
         let pin = fedimint_card_host_card::pin_from_env();
         on_card(|| fedimint_card_host_card::open_pin_session_with(self.card.as_mut(), &pin))
             .context("opening the PIN session")
@@ -384,6 +404,7 @@ impl CardWallet {
         };
         if let Some(pk) = new {
             self.store.state.set_slot_pubkey(slot, pk.to_string());
+            self.ops_enqueue(OpsWrite::Slot { slot, old_pubkey: p.old_pubkey.clone(), pubkey: pk.to_string() });
         }
         self.store.state.pending_overwrites.retain(|q| q.slot != slot);
         self.store.save()
@@ -397,12 +418,14 @@ impl CardWallet {
             "slot {slot} still carries live or pending notes, or has no spent note to retire"
         );
         let old = self.store.state.slot_pubkey(slot).expect("overwritable implies cached").to_owned();
+        ensure!(self.may_renew(slot), "slot {slot}'s key names the card in ops and is never renewed");
         let rec = PendingOverwrite { slot, old_pubkey: old };
         self.store.state.pending_overwrites.push(rec.clone());
         self.store.save()?;
         match on_card(|| self.card.gen_key_overwrite(slot)) {
             Ok(pk) => {
                 self.store.state.set_slot_pubkey(slot, pk.to_string());
+                self.ops_enqueue(OpsWrite::Slot { slot, old_pubkey: rec.old_pubkey.clone(), pubkey: pk.to_string() });
                 self.store.state.pending_overwrites.retain(|q| q.slot != slot);
                 self.store.save()?;
                 Ok(pk)
@@ -419,7 +442,8 @@ impl CardWallet {
     /// Returns the slots renewed. Failures are reported, not fatal.
     pub async fn renew_spent_slots(&mut self) -> Result<Vec<u8>> {
         let mut done = vec![];
-        for slot in self.store.state.overwritable_slots() {
+        let slots: Vec<u8> = self.store.state.overwritable_slots().into_iter().filter(|s| self.may_renew(*s)).collect();
+        for slot in slots {
             let notes: Vec<NoteRec> = self.store.state.notes_on_current_key(slot).cloned().collect();
             let mut safe = true;
             for n in &notes {
@@ -575,8 +599,27 @@ impl CardWallet {
                 r.txid = txid.to_string();
             }
         }
+        // On ops the notes are recorded once they are live (the stock client builds and sends in
+        // one call, so there are no unsigned bytes to post first). The blinding keys are kept in
+        // the queued write because the registry records each note with its key.
+        self.ops_enqueue(OpsWrite::Load {
+            txid: txid.to_string(),
+            client_ref: client_ref.map_or_else(|| txid.to_string(), str::to_owned),
+            notes: outs
+                .iter()
+                .enumerate()
+                .map(|(i, o)| LoadNote {
+                    slot: o.slot,
+                    amount_msat: o.amount,
+                    nonce: nonce_hex(o.nonce),
+                    blinding_key: enc(&o.key),
+                    out_idx: i as u64,
+                })
+                .collect(),
+        });
         self.store.save()?;
 
+        let client = &self.wallet.client;
         let accepted = tokio::time::timeout(
             SUBMIT_TIMEOUT,
             client.transaction_updates(op).await.await_tx_accepted(txid),
@@ -594,6 +637,7 @@ impl CardWallet {
         for (i, o) in outs.iter().enumerate() {
             self.finalize_card_note(&nonce_hex(o.nonce), OutPoint { txid, out_idx: i as u64 }, FETCH_TIMEOUT).await?;
         }
+        self.ops_sync().await;
         Ok(outs.iter().map(|o| (o.slot, o.amount)).collect())
     }
 
@@ -649,6 +693,8 @@ impl CardWallet {
     /// Records of a transaction that never became money: its pending outputs die, the inputs
     /// (still live) are untouched.
     fn abandon_group(&mut self, txid: &str) {
+        // On ops: the charge is recorded rejected, so its change notes die there too.
+        self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: false, change: vec![] });
         for n in self.store.state.notes.iter_mut().filter(|n| n.status == NoteStatus::Pending && n.txid.as_deref() == Some(txid)) {
             n.status = NoteStatus::Dead;
             n.blinding_key = None;
@@ -819,9 +865,35 @@ impl CardWallet {
         Ok(rec)
     }
 
-    async fn resolve_tx(&mut self, ptx: PendingTx, timeout: Duration, rec: &mut Recovered) -> Result<()> {
+    async fn resolve_tx(&mut self, mut ptx: PendingTx, timeout: Duration, rec: &mut Recovered) -> Result<()> {
         let txid = ptx.txid.clone();
         let txid_parsed = parse_txid(&txid)?;
+        if !ptx.submitted && ptx.ops_unconfirmed {
+            // Signed bytes ops never answered for: post them again. A yes means send as normal; a
+            // definitive no (resolved meanwhile) means it never left this till; no answer waits.
+            if self.ops.is_none() {
+                return Ok(());
+            }
+            let hex_tx = ptx.tx_hex.clone().context("unconfirmed charge without stored bytes")?;
+            match self.ops_submitted(&txid, &hex_tx).await {
+                Ok(()) => {
+                    if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == txid) {
+                        p.submitted = true;
+                        p.ops_unconfirmed = false;
+                    }
+                    self.store.save()?;
+                    ptx.submitted = true;
+                }
+                Err(e) if crate::ops::unanswered(&e) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("charge {txid} was not taken by ops ({e:#}); it was never sent: abandoning");
+                    self.abandon_group(&txid);
+                    self.store.save()?;
+                    rec.abandoned += 1;
+                    return Ok(());
+                }
+            }
+        }
         if !ptx.submitted {
             // Signed or not, it never left this machine.
             self.abandon_group(&txid);
@@ -888,7 +960,12 @@ impl CardWallet {
             self.store.save()?;
         }
         let received_before = rec.till_received;
-        if self.collect_group(&txid, timeout, rec).await? {
+        let collected = self.collect_group(&txid, timeout, rec).await?;
+        // The card's side is done once its change notes are live, whether or not this till's own
+        // notes are collected yet: ops must not keep the card's charge open for the merchant's.
+        self.ops_accepted(&txid);
+        self.store.save()?;
+        if collected {
             // Make sure the card notes this transaction spent are marked before the record goes.
             self.confirm_inputs_spent(txid_parsed, &ptx.inputs, RECOVER_TIMEOUT).await?;
             // A record that carries a client_ref is never removed unless its sale is recorded:
@@ -1038,7 +1115,16 @@ impl CardWallet {
     /// Build, persist, sign and submit a spend of `inputs` (live note records) into `outs`.
     /// Returns the txid once the federation accepted it. Any error before the transaction is
     /// submitted removes the records of its outputs again.
+    ///
+    /// On ops (`self.ops`) the same order runs through the registry: the intent (the unsigned
+    /// transaction) is recorded there after step 1, and the signed bytes before anything is sent.
+    /// If ops does not take either, the charge is abandoned here and never sent.
     async fn sign_and_submit(&mut self, inputs: &[NoteRec], outs: Vec<PlannedOut>, template: PendingTx) -> Result<TransactionId> {
+        // Writes this till still owes ops for the card (an earlier outcome, a renewed slot) go
+        // first: the intent below is refused while ops thinks the card is mid-charge.
+        if self.ops.is_some() {
+            self.ops_push().await.context("delivering earlier writes for this card to ops")?;
+        }
         let mint_id = self.wallet.mint_id;
         let mut tx_inputs = vec![];
         let mut keys = vec![];
@@ -1087,6 +1173,7 @@ impl CardWallet {
             }
         }
         let input_nonces: Vec<String> = inputs.iter().map(|n| n.nonce.clone()).collect();
+        let client_ref = template.client_ref.clone();
         self.store.state.pending_txs.push(PendingTx {
             txid: group.clone(),
             tx_hex: None,
@@ -1096,6 +1183,28 @@ impl CardWallet {
             ..template
         });
         self.store.save()?;
+
+        // 1b. On ops: the intent, before the card signs. Refused or unreachable: nothing was
+        //     signed, so the records go (and ops is told, in case it took the intent after all).
+        if self.ops.is_some() {
+            let change: Vec<serde_json::Value> = outs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| match &o.owner {
+                    Owner::Card { slot, nonce, key } => Some(serde_json::json!({
+                        "slot": slot, "amount_msat": o.amount, "nonce": nonce_hex(*nonce),
+                        "blinding_key": enc(key), "out_idx": i,
+                    })),
+                    Owner::Host { .. } => None,
+                })
+                .collect();
+            let unsigned = tx.consensus_encode_to_hex();
+            if let Err(e) = self.ops_intent(&group, client_ref.as_deref(), &unsigned, &input_nonces, change).await {
+                self.abandon_group(&group);
+                self.store.save()?;
+                return Err(e);
+            }
+        }
 
         // 2. Sign on the card. Failure here means nothing was sent: forget the records.
         let signed: Result<()> = (|| {
@@ -1122,10 +1231,46 @@ impl CardWallet {
             return Err(e);
         }
         // 3. Record the signed bytes, then that we are about to send, then send.
+        let signed_hex = tx.consensus_encode_to_hex();
         if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
-            p.tx_hex = Some(tx.consensus_encode_to_hex());
+            p.tx_hex = Some(signed_hex.clone());
         }
         self.store.save()?;
+        if self.ops.is_some() {
+            // 3b. On ops the signed bytes go there first; only then may this till send. Once ops
+            //     has them any till may resubmit them, so the charge counts as submitted from here
+            //     on (before the crash point below), and recovery asks the federation, never
+            //     abandons it.
+            let posted = match self.crash_point {
+                Some(CrashPoint::SubmittedUnreachable) => Err(OpsError::Unreachable("simulated: no answer".into()).into()),
+                Some(CrashPoint::SubmittedAnswerLost) => match self.ops_submitted(&group, &signed_hex).await {
+                    Ok(()) => Err(OpsError::Unreachable("simulated: answer lost".into()).into()),
+                    e => e,
+                },
+                _ => self.ops_submitted(&group, &signed_hex).await,
+            };
+            if let Err(e) = posted {
+                if crate::ops::unanswered(&e) {
+                    // Ops may have the bytes. Not sent, not abandoned: the next job with this card
+                    // posts them again and sends only on a yes (`resolve_tx`).
+                    if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
+                        p.ops_unconfirmed = true;
+                    }
+                    self.store.save()?;
+                    return Err(SpendFault::Undecided(format!(
+                        "ops did not answer for the signed charge {group}; it was not sent, and the next job with this card settles it: {e:#}"
+                    ))
+                    .into());
+                }
+                self.abandon_group(&group);
+                self.store.save()?;
+                return Err(e.context("the charge was not sent"));
+            }
+            if let Some(p) = self.store.state.pending_txs.iter_mut().find(|p| p.txid == group) {
+                p.submitted = true;
+            }
+            self.store.save()?;
+        }
         if self.crash_point == Some(CrashPoint::BeforeSubmit) {
             bail!("simulated crash before submit");
         }
@@ -1233,6 +1378,10 @@ impl CardWallet {
             match attempt(self) {
                 Ok(r) => break r,
                 Err(e) if matches!(e.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoExactPlan { .. })) => {
+                    // Re-keying a slot needs this selection's PIN session, as signing does, and
+                    // the till opens a fresh selection per job: without it every renewal here
+                    // answers 6A94 and the sale is refused for want of a slot.
+                    self.verify_pin_session()?;
                     let freed = self.renew_spent_slots().await?;
                     if freed.is_empty() || renewed >= RENEW_ROUNDS {
                         return Err(e);

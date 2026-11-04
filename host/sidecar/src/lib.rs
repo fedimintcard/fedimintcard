@@ -1,5 +1,6 @@
 pub mod cards;
 pub mod glue;
+pub mod ops;
 pub mod plan;
 pub mod sales;
 pub mod shares;

@@ -10,6 +10,21 @@ All responses are JSON. Failures are `{"ok":false,"error":"<code>","detail":"<te
 No auth: keep it on loopback. Responses never contain ecash strings or secrets.
 While `serve` runs it owns the data directory; do not run other `card-sidecar` commands.
 
+### On ops
+
+`till serve --ops-url <registry> --ops-token <till_…>` (or `OPS_URL`, `OPS_TILL_TOKEN`; both or
+neither) puts the till on ops (`docs/OPS-PLAN.md` § 6). Each card job (charge, balance, issue)
+reads the card's short id (`GET_PUB` slot 0), loads that card's slots, notes and open charge from
+the registry, and works in `cards/<short_id>.json` in the data directory instead of
+`card_state.json`. The charge is recorded in ops before the card signs (`intent`), its signed
+bytes before the till sends them (`submitted`), and its outcome after; a charge another till left
+open is finished first (resubmitted if ops has its signed bytes, recorded rejected if not). If ops
+gives no answer for the signed bytes, the charge is `undecided` and not sent; the next job with the
+card (or a repeat of the `client_ref`) posts them again and sends only once ops takes them. The
+till's own outputs, `sales.json` and `cashouts.log` stay local. Slot 0 is never re-keyed on ops:
+its key is the card's short id. At startup the till reports the federation's name to ops. The
+token is never logged.
+
 ## GET /v1/health
 `200 {"ok":true}`
 
@@ -19,7 +34,10 @@ While `serve` runs it owns the data directory; do not run other `card-sidecar` c
 `card_relay_ok` means the phone relay answered `/health`; it does not mean a card is present.
 
 ## POST /v1/charge
-Body: `{"price_msat":N,"client_ref":"<optional string, e.g. a UUID>"}`.
+Body: `{"price_msat":N,"client_ref":"<optional string, e.g. a UUID>","pin":"<optional, 4-8 digits>"}`.
+`pin` is the holder's, typed on the till's screen; the card verifies it in the selection that
+signs. It is never logged, stored, echoed or sent to ops. Without it the till uses `CARD_PIN`
+(for the CLI and tests).
 Send it only once the card is present on the phone. Blocks until the federation decides,
 normally 5–20 s, worst case about 120 s: use a read timeout of at least 120 s.
 
@@ -56,6 +74,12 @@ starts a second spend while the first may still count:
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
 | `undecided` | 202 | submitted, not yet confirmed; nothing further to do now | show "pending", then poll /v1/sales |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
+| `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
+| `pin_blocked` | 423 | the card's PIN is blocked (`69 83`) | stop: the card cannot pay |
+| `card_changed` | 409 | on ops: the card's state changed under this till (another till, a stale version) | retry the tap |
+| `unknown_card` | 404 | on ops: the registry has no such card for this till's operator | card not provisioned for this operator |
+| `ops_unreachable` | 502 | on ops: the registry could not be reached; nothing was sent | retry; check the network |
+| `ops_refused` | 502 | on ops: the registry refused the till (bad or revoked token) | check the till token |
 | `internal` | 500 | anything else | show detail |
 
 ## GET /v1/sales

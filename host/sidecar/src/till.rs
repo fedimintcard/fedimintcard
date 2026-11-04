@@ -5,6 +5,11 @@
 //! task that calls [`serve`], on the same runtime as the CLI commands, so the blocking card calls
 //! keep using `on_card` unchanged.
 //!
+//! With ops configured (`serve --ops-url`), a card job (charge, balance, issue) first reads the
+//! card's short id and switches the wallet to that card's file, loaded from the registry; the
+//! writes it owes the registry go out at the end of the job (`crate::ops`). The sales ledger and
+//! the till's own outputs stay local either way.
+//!
 //! At most one job (charge or card balance) runs at a time. The busy flag is set by the handler
 //! that admits the job and cleared by the actor when the job is finished, so a client that
 //! disconnects mid-charge cannot let a second charge start while the first is in flight.
@@ -23,13 +28,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use fedimint_card_host_card::{
-    BridgeError, BridgeTransport, Card, CardClient, StatusWord, status_word,
+    BridgeError, BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, SW_PIN_BLOCKED, StatusWord, status_word,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
+use crate::ops::{Ops, OpsConfig, OpsError};
 use crate::plan::PlanError;
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
@@ -78,6 +84,21 @@ pub struct Class {
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
     for cause in err.chain() {
+        if let Some(o) = cause.downcast_ref::<OpsError>() {
+            return match o {
+                OpsError::Changed(_) => c(409, "card_changed"),
+                OpsError::UnknownCard(_) => c(404, "unknown_card"),
+                OpsError::Unreachable(_) => c(502, "ops_unreachable"),
+                OpsError::Refused(..) => c(502, "ops_refused"),
+            };
+        }
+        if let Some(StatusWord(sw)) = cause.downcast_ref::<StatusWord>() {
+            match *sw {
+                0x63C0..=0x63CF => return c(403, "wrong_pin"),
+                SW_PIN_BLOCKED => return c(423, "pin_blocked"),
+                _ => {}
+            }
+        }
         if let Some(b) = cause.downcast_ref::<BridgeError>() {
             return match b {
                 BridgeError::NoCard(_) => c(409, "no_card"),
@@ -110,7 +131,17 @@ pub fn classify(err: &anyhow::Error) -> Class {
 
 fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
-    Reply::fail(class.status, class.code, format!("{err:#}"))
+    let detail = match class.code {
+        // Said plainly, for the holder: the status word is the card's, the tries left are its low
+        // nibble (`63 CX`).
+        "wrong_pin" => {
+            let left = err.chain().find_map(|c| c.downcast_ref::<StatusWord>()).map_or(0, |s| s.0 & 0x0F);
+            format!("wrong PIN; {left} tries left before the card blocks")
+        }
+        "pin_blocked" => "the card's PIN is blocked after too many wrong tries; the card cannot pay".into(),
+        _ => format!("{err:#}"),
+    };
+    Reply::fail(class.status, class.code, detail)
 }
 
 // ------------------------------------------------------------------ the card behind the relay
@@ -164,7 +195,8 @@ pub type CardOpener = Box<dyn Fn() -> Result<Box<dyn Card>>>;
 // ------------------------------------------------------------------ jobs and the actor
 
 enum Job {
-    Charge { price: u64, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
+    /// `pin` is the holder's, typed at the till. Never logged, stored or sent to ops.
+    Charge { price: u64, client_ref: Option<String>, pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
     Balance { reply: oneshot::Sender<Reply> },
     Precheck { reply: oneshot::Sender<Reply> },
     KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
@@ -195,11 +227,22 @@ pub async fn new(
     sales: SalesStore,
     opener: CardOpener,
 ) -> (TillHandle, impl std::future::Future<Output = ()>) {
+    new_with_ops(cw, relay, sales, opener, None).await
+}
+
+/// [`new`] for a till on ops: every card job loads the card's state from the registry.
+pub async fn new_with_ops(
+    cw: CardWallet,
+    relay: String,
+    sales: SalesStore,
+    opener: CardOpener,
+    ops: Option<Ops>,
+) -> (TillHandle, impl std::future::Future<Output = ()>) {
     let (tx, rx) = mpsc::channel(1);
     let busy = Arc::new(AtomicBool::new(false));
     let sales = Arc::new(Mutex::new(sales));
     let inflight = Arc::new(Mutex::new(None));
-    let pending_refs = Arc::new(Mutex::new(refs_of(&cw)));
+    let pending_refs = Arc::new(Mutex::new(refs_now(&cw, ops.as_ref())));
     let federation_name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
     let handle = TillHandle {
         tx,
@@ -211,9 +254,18 @@ pub async fn new(
         sales: sales.clone(),
         federation_name,
     };
-    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener))
+    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, ops))
 }
 
+/// `client_ref`s of unresolved charges: in the wallet's file, or on ops in every card file.
+fn refs_now(cw: &CardWallet, ops: Option<&Ops>) -> Vec<String> {
+    match ops {
+        Some(o) => o.pending_refs(),
+        None => refs_of(cw),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn actor(
     mut cw: CardWallet,
     mut rx: mpsc::Receiver<Job>,
@@ -222,24 +274,24 @@ async fn actor(
     pending_refs: Arc<Mutex<Vec<String>>>,
     sales: Arc<Mutex<SalesStore>>,
     opener: CardOpener,
+    ops: Option<Ops>,
 ) {
     ensure_hook(&mut cw, &sales);
     while let Some(job) = rx.recv().await {
         let (reply_tx, reply) = match job {
-            Job::Charge { price, client_ref, reply } => {
+            Job::Charge { price, client_ref, pin, reply } => {
                 let r = match on_card(|| opener()) {
                     Ok(card) => {
                         cw.card = card;
-                        charge_with(&mut cw, price, client_ref, &sales).await
+                        cw.pin = pin;
+                        charge_job(&mut cw, ops.as_ref(), price, client_ref, &sales).await
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
                         let settled = match client_ref.as_deref() {
                             Some(c) => {
                                 cw.card = Box::new(NoCard);
-                                let r = settle(&mut cw, c, price, &sales).await;
-                                sync_sales(&mut cw, &sales);
-                                r
+                                settle_without_card(&mut cw, ops.as_ref(), c, price, &sales).await
                             }
                             None => None,
                         };
@@ -252,7 +304,7 @@ async fn actor(
                 let r = match on_card(|| opener()) {
                     Ok(card) => {
                         cw.card = card;
-                        balance_job(&mut cw, &sales).await
+                        card_balance_job(&mut cw, ops.as_ref(), &sales).await
                     }
                     Err(e) => error_reply(&e),
                 };
@@ -288,7 +340,17 @@ async fn actor(
                 let r = match on_card(|| opener()) {
                     Ok(card) => {
                         cw.card = card;
-                        issue_job(&mut cw, &amounts, client_ref).await
+                        match ops.as_ref() {
+                            None => issue_job(&mut cw, &amounts, client_ref).await,
+                            Some(o) => match o.attach(&mut cw).await {
+                                Ok(base) => {
+                                    let r = issue_job(&mut cw, &amounts, client_ref).await;
+                                    Ops::finish(&mut cw, base).await;
+                                    r
+                                }
+                                Err(e) => error_reply(&e),
+                            },
+                        }
                     }
                     Err(e) => error_reply(&e),
                 };
@@ -296,7 +358,9 @@ async fn actor(
             }
         };
         cw.card = Box::new(NoCard);
-        *pending_refs.lock().unwrap() = refs_of(&cw);
+        // The holder's PIN lives for one job.
+        cw.pin = None;
+        *pending_refs.lock().unwrap() = refs_now(&cw, ops.as_ref());
         // Free the service before answering, so a client that retries at once is not told
         // "busy". Both are cleared under the lock admission takes, so no request can see "busy"
         // for a job that is already over.
@@ -424,6 +488,68 @@ pub async fn balance_job(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) ->
     sync_sales(cw, sales);
     // Ecash strings are never sent over the API; they are in cashouts.log.
     cw.recovered_cashouts.clear();
+    r
+}
+
+/// `POST /v1/charge` with the card in `cw.card`: on ops, the card's state is loaded from the
+/// registry first and the writes it owes go back after; without ops this is [`charge_with`].
+pub async fn charge_job(
+    cw: &mut CardWallet,
+    ops: Option<&Ops>,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+) -> Reply {
+    let Some(ops) = ops else { return charge_with(cw, price, client_ref, sales).await };
+    if let Some(bad) = validate_price(price) {
+        return bad;
+    }
+    let base = match ops.attach(cw).await {
+        Ok(b) => b,
+        Err(e) => return error_reply(&e),
+    };
+    let r = charge_with(cw, price, client_ref, sales).await;
+    Ops::finish(cw, base).await;
+    r
+}
+
+/// `POST /v1/card/balance` with the card in `cw.card`, through ops when it is configured.
+pub async fn card_balance_job(cw: &mut CardWallet, ops: Option<&Ops>, sales: &Arc<Mutex<SalesStore>>) -> Reply {
+    let Some(ops) = ops else { return balance_job(cw, sales).await };
+    let base = match ops.attach(cw).await {
+        Ok(b) => b,
+        Err(e) => return error_reply(&e),
+    };
+    let r = balance_job(cw, sales).await;
+    Ops::finish(cw, base).await;
+    r
+}
+
+/// A repeated `client_ref` while no card is in the field. On ops, the card is the one whose file
+/// holds the ref; its state is loaded from the registry by short id.
+async fn settle_without_card(
+    cw: &mut CardWallet,
+    ops: Option<&Ops>,
+    client_ref: &str,
+    price: u64,
+    sales: &Arc<Mutex<SalesStore>>,
+) -> Option<Reply> {
+    let Some(ops) = ops else {
+        let r = settle(cw, client_ref, price, sales).await;
+        sync_sales(cw, sales);
+        return r;
+    };
+    let id = ops.card_for_ref(client_ref)?;
+    let base = match ops.attach_id(cw, &id).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("settling {client_ref} without the card: {e:#}");
+            return None;
+        }
+    };
+    let r = settle(cw, client_ref, price, sales).await;
+    sync_sales(cw, sales);
+    Ops::finish(cw, base).await;
     r
 }
 
@@ -729,6 +855,8 @@ async fn status(State(h): State<TillHandle>) -> Reply {
 struct ChargeReq {
     price_msat: Option<u64>,
     client_ref: Option<String>,
+    /// The holder's PIN, typed at the till. Replaces `CARD_PIN` for this charge.
+    pin: Option<String>,
 }
 
 /// Admit a job (or say busy) and wait for the actor's answer. A repeat of the `client_ref` that
@@ -778,12 +906,17 @@ async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
     if req.client_ref.as_deref().is_some_and(|c| c.is_empty() || c.len() > MAX_CLIENT_REF) {
         return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {MAX_CLIENT_REF} bytes"));
     }
+    // Checked here, so a malformed PIN never reaches the card and costs no try. Never echoed.
+    if req.pin.as_deref().is_some_and(|p| !(PIN_MIN..=PIN_MAX).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return Reply::fail(400, "bad_request", format!("pin must be {PIN_MIN} to {PIN_MAX} digits"));
+    }
     // A repeat of a finished sale needs neither the card nor the busy flag.
     if let Some(r) = replay(&h.sales, req.client_ref.as_deref(), price) {
         return r;
     }
     let cref = req.client_ref.clone();
-    run_job(&h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, reply }).await
+    let pin = req.pin.map(String::into_bytes);
+    run_job(&h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, pin, reply }).await
 }
 
 async fn card_balance(State(h): State<TillHandle>) -> Reply {
@@ -884,18 +1017,31 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 
 /// Run the till service until Ctrl-C. Owns the data directory (the sales file is stored next to
 /// the state file). Starts without a card: each job opens the card behind `relay` afresh.
-pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String) -> Result<()> {
+///
+/// With `ops`, each card job loads that card's state from the registry (see the module docs), and
+/// the federation's name is reported to it once at startup.
+pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Option<OpsConfig>) -> Result<()> {
     if !listen.ip().is_loopback() {
         eprintln!("warning: {listen} is not a loopback address; the till API has no authentication");
     }
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
     let sales = SalesStore::open(sales_path(&dir))?;
+    let ops = match ops {
+        Some(cfg) => {
+            let o = Ops::new(&cfg, &dir)?;
+            let name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
+            crate::ops::report_federation(&o.client, &cw.wallet.federation_id().to_string(), name.as_deref()).await;
+            eprintln!("card state from ops at {}", cfg.url);
+            Some(o)
+        }
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     let relay_for_jobs = relay.clone();
     let opener: CardOpener = Box::new(move || open_relay_card(&relay_for_jobs));
     let mut cw = cw;
     cw.card = Box::new(NoCard);
-    let (handle, actor) = new(cw, relay.clone(), sales, opener).await;
+    let (handle, actor) = new_with_ops(cw, relay.clone(), sales, opener, ops).await;
     eprintln!("till service listening on http://{} (card relay {relay})", listener.local_addr()?);
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;

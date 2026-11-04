@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::http::Request;
 use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
+use fedimint_card_sidecar::ops::OpsError;
 use fedimint_card_sidecar::plan::PlanError;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
@@ -117,6 +118,32 @@ async fn charge_happy_path_records_a_sale() -> anyhow::Result<()> {
         assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_holder_pin_is_its_own_error_and_moves_nothing() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    f.cw.topup(&[1 << 16]).await?;
+    let sales = sales_of(&f);
+    // A fresh selection, as the till's opener gives every job: no PIN session yet.
+    on_select(&mut f.cw);
+    f.cw.pin = Some(b"9999".to_vec());
+    let r = charge_with(&mut f.cw, 20_000, Some("pin".into()), &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (403, Some("wrong_pin")), "{:?}", r.body);
+    assert!(r.body["detail"].as_str().unwrap().contains("2 tries left"), "{:?}", r.body);
+    assert!(!r.body.to_string().contains("9999"));
+    assert!(f.cw.store.state.pending_txs.is_empty(), "nothing left to recover");
+    assert_eq!(f.cw.store.state.live_total_msat(), 1 << 16);
+    // The holder types it right: the same ref is a fresh attempt.
+    f.cw.pin = Some(b"1234".to_vec());
+    let r = charge_with(&mut f.cw, 20_000, Some("pin".into()), &sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    Ok(())
+}
+
+/// What `open_relay_card` does on every job: a SELECT, which drops the PIN session.
+fn on_select(cw: &mut CardWallet) {
+    cw.card.apdu(&fedimint_card_host_card::SELECT_APDU).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -522,6 +549,12 @@ fn classify_pins_codes_and_statuses() {
     assert_eq!(c(wrap(SpendFault::Declined("d".into()).into())), k(402, "declined"));
     assert_eq!(c(wrap(SpendFault::Undecided("u".into()).into())), k(202, "undecided"));
     assert_eq!(c(wrap(SpendFault::Unresolved("r".into()).into())), k(503, "recovering"));
+    assert_eq!(c(wrap(StatusWord(0x63C2).into())), k(403, "wrong_pin"));
+    assert_eq!(c(wrap(StatusWord(0x6983).into())), k(423, "pin_blocked"));
+    assert_eq!(c(wrap(OpsError::Changed("v".into()).into())), k(409, "card_changed"));
+    assert_eq!(c(wrap(OpsError::UnknownCard("n".into()).into())), k(404, "unknown_card"));
+    assert_eq!(c(wrap(OpsError::Unreachable("u".into()).into())), k(502, "ops_unreachable"));
+    assert_eq!(c(wrap(OpsError::Refused(401, "r".into()).into())), k(502, "ops_refused"));
     assert_eq!(c(anyhow::anyhow!("something else")), k(500, "internal"));
     // Display text is unchanged from the old anyhow strings.
     assert_eq!(SpendFault::Declined("federation rejected the spend: e".into()).to_string(), "federation rejected the spend: e");
@@ -668,6 +701,11 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     // Validation and malformed bodies.
     assert_eq!(call(app.clone(), "POST", "/v1/charge", "{}").await.0, 400);
     assert_eq!(call(app.clone(), "POST", "/v1/charge", "not json").await.0, 400);
+    for bad in ["12a4", "123", "123456789"] {
+        let (code, body) = call(app.clone(), "POST", "/v1/charge", &format!(r#"{{"price_msat":5000,"pin":"{bad}"}}"#)).await;
+        assert_eq!((code, body["error"].as_str()), (400, Some("bad_request")));
+        assert!(!body.to_string().contains(bad), "a PIN is never echoed: {body}");
+    }
     assert_eq!(call(app.clone(), "GET", "/v1/health", "").await, (200, serde_json::json!({"ok": true})));
 
     let (code, s) = call(app, "GET", "/v1/sales", "").await;

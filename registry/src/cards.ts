@@ -341,7 +341,7 @@ export interface NoteView {
   readonly nonce: string;
   readonly signature: string | null;
   readonly blinding_key: string | null;
-  readonly status: 'live' | 'pending';
+  readonly status: 'live' | 'pending' | 'spent' | 'dead';
   readonly txid: string | null;
   readonly out_idx: number | null;
 }
@@ -351,10 +351,16 @@ export function cardState(sql: Sql, shortId: string) {
     .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ? ORDER BY slot', shortId)
     .toArray()
     .map(r => ({slot: Number(r.slot), pubkey: String(r.pubkey)}));
+  // Live and pending notes, and the spent or dead ones still on a slot's current
+  // key: that key is burned until a till renews the slot, and a till that never
+  // saw the card learns it only from here (the sidecar's `overwritable_slots`).
   const notes: NoteView[] = sql
     .exec(
       `SELECT slot, amount_msat, nonce, signature, blinding_key, status, txid, out_idx
-       FROM notes WHERE short_id = ? AND status IN ('live', 'pending') ORDER BY slot`,
+       FROM notes WHERE short_id = ? AND (status IN ('live', 'pending')
+         OR nonce IN (SELECT '02' || pubkey FROM card_slots WHERE short_id = ?))
+       ORDER BY slot`,
+      shortId,
       shortId,
     )
     .toArray()
@@ -364,7 +370,7 @@ export function cardState(sql: Sql, shortId: string) {
       nonce: String(r.nonce),
       signature: r.signature === null ? null : String(r.signature),
       blinding_key: r.blinding_key === null ? null : String(r.blinding_key),
-      status: String(r.status) as 'live' | 'pending',
+      status: String(r.status) as NoteView['status'],
       txid: r.txid === null ? null : String(r.txid),
       out_idx: r.out_idx === null ? null : Number(r.out_idx),
     }));
@@ -381,7 +387,7 @@ export function cardState(sql: Sql, shortId: string) {
       // Null: the charge never left its till, so it can be recorded rejected.
       signed_hex: r.signed_hex === null ? null : String(r.signed_hex),
       created_at: Number(r.created_at),
-      ...(JSON.parse(String(r.body)) as {tx_hex: string; inputs: string[]; change: ChangeOut[]}),
+      ...(JSON.parse(String(r.body)) as {tx_hex: string | null; inputs: string[]; change: ChangeOut[]}),
     }));
   return {
     short_id: shortId,
@@ -407,17 +413,22 @@ function parseIntent(r: Record<string, unknown>) {
   if (typeof r.client_ref !== 'string' || r.client_ref.length < 1 || r.client_ref.length > 128) {
     throw new BadRequest('client_ref must be 1 to 128 characters');
   }
+  if (!Array.isArray(r.inputs) || !r.inputs.every(n => isHex(n, 33))) {
+    throw new BadRequest('inputs must be the spent notes’ nonces, 33 bytes hex each');
+  }
+  // No inputs is a load: notes a till's own wallet issued to the card. The
+  // wallet funds and signs it, so there are no unsigned bytes for anyone to
+  // resubmit, and tx_hex is optional; a charge must carry them.
+  const load = r.inputs.length === 0;
   if (
-    typeof r.tx_hex !== 'string' ||
-    r.tx_hex.length === 0 ||
-    r.tx_hex.length > MAX_TX_HEX ||
-    r.tx_hex.length % 2 !== 0 ||
-    !/^[0-9a-f]*$/.test(r.tx_hex)
+    !(load && r.tx_hex === undefined) &&
+    (typeof r.tx_hex !== 'string' ||
+      r.tx_hex.length === 0 ||
+      r.tx_hex.length > MAX_TX_HEX ||
+      r.tx_hex.length % 2 !== 0 ||
+      !/^[0-9a-f]*$/.test(r.tx_hex))
   ) {
     throw new BadRequest('tx_hex must be the unsigned transaction, lower-case hex');
-  }
-  if (!Array.isArray(r.inputs) || r.inputs.length === 0 || !r.inputs.every(n => isHex(n, 33))) {
-    throw new BadRequest('inputs must be the spent notes’ nonces, 33 bytes hex each');
   }
   if (new Set(r.inputs).size !== r.inputs.length) {
     throw new BadRequest('inputs name a note twice');
@@ -451,10 +462,13 @@ function parseIntent(r: Record<string, unknown>) {
   if (new Set(change.map(c => c.slot)).size !== change.length) {
     throw new BadRequest('change names a slot twice');
   }
+  if (load && change.length === 0) {
+    throw new BadRequest('a load (no inputs) needs at least one note');
+  }
   return {
     txid: r.txid,
     client_ref: r.client_ref,
-    body: {tx_hex: r.tx_hex, inputs: r.inputs as string[], change},
+    body: {tx_hex: (r.tx_hex as string | undefined) ?? null, inputs: r.inputs as string[], change},
   };
 }
 
@@ -528,6 +542,14 @@ export function recordIntent(
         .toArray();
       if (held.length > 0 || spentSlots.has(c.slot)) {
         throw new Conflict(`slot ${c.slot} of card ${shortId} already backs a note`);
+      }
+      // A key carries one note in its life: a spent or dead note's key is
+      // renewed (PUT /slots/:n) before the slot takes another.
+      const used = sql
+        .exec('SELECT status FROM notes WHERE short_id = ? AND nonce = ?', shortId, c.nonce)
+        .toArray();
+      if (used.length > 0) {
+        throw new Conflict(`the key behind change nonce ${c.nonce} already carried a note; renew slot ${c.slot} first`);
       }
     }
     sql.exec(
@@ -749,6 +771,11 @@ export function renewSlot(
 ): {version: number} {
   if (!Number.isSafeInteger(slot) || slot < 0 || slot >= SLOTS) {
     throw new BadRequest('slot must be 0 to 7');
+  }
+  // Slot 0's key names the card: its short id is the key's last 4 bytes, so
+  // a renewed slot 0 would leave every till unable to find the card.
+  if (slot === 0) {
+    throw new Conflict('slot 0’s key is the card’s short id and is never renewed');
   }
   if (!isHex(r.old_pubkey, 32) || !isHex(r.pubkey, 32)) {
     throw new BadRequest('old_pubkey and pubkey must be x-only keys, 64 lower-case hex');

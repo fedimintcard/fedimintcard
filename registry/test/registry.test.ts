@@ -510,21 +510,102 @@ describe('card state', () => {
     const token = await signIn();
     const till = await newTill(token);
     const {shortId} = await cardWithNote(token);
-    const old = slots(shortId)[0]!;
+    await hook('/test/note', {short_id: shortId, nonce: nonce(5), slot: 2, amount_msat: 2_048_000, signature: 'c'.repeat(96)});
+    const old = slots(shortId)[2]!;
     const renew = (version: number, over: Record<string, unknown> = {}) =>
-      call('PUT', `/cards/${shortId}/slots/0`, till.token, {version, old_pubkey: old, pubkey: key(50), ...over});
-    expect((await renew(0)).status).toBe(409); // slot 0 backs the live note
+      call('PUT', `/cards/${shortId}/slots/2`, till.token, {version, old_pubkey: old, pubkey: key(50), ...over});
+    expect((await renew(0)).status).toBe(409); // slot 2 backs the live note
 
-    await post(`/cards/${shortId}/intent`, till.token, intent(0));
-    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature: 'f'.repeat(96)}]});
+    const spend = intent(0, {
+      inputs: [nonce(5)],
+      change: [{slot: 3, amount_msat: 24_000, nonce: nonce(6), blinding_key: 'e'.repeat(64), out_idx: 1}],
+    });
+    await post(`/cards/${shortId}/intent`, till.token, spend);
+    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(6), signature: 'f'.repeat(96)}]});
     expect((await renew(2, {old_pubkey: key(77)})).status).toBe(409);
     expect((await renew(1)).status).toBe(409); // stale version
     const ok = await renew(2);
     expect(await ok.json()).toEqual({ok: true, version: 3});
-    expect((await state(till.token, shortId)).slots[0]!.pubkey).toBe(key(50));
+    expect((await state(till.token, shortId)).slots[2]!.pubkey).toBe(key(50));
     // The provisioning row still re-posts cleanly: it is compared as provisioned.
     const batchId = ((await (await get('/registry/batches', token)).json()) as {batches: {batch_id: number}[]}).batches[0]!.batch_id;
     expect((await post('/registry/cards', token, card({batch_id: batchId}))).status).toBe(200);
+  });
+});
+
+describe('O3: loads, burned keys and slot 0', () => {
+  /** Slot `n`'s key as a note nonce (even parity), the way the sidecar writes it. */
+  const keyNonce = (shortId: string, n: number) => '02' + slots(shortId)[n]!;
+
+  it('takes a load (no inputs, no tx_hex) from a till and finishes it like a charge', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    const shortId = '0a0b0c0d';
+    await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId}));
+    const load = {
+      version: 0,
+      txid: txid(9),
+      client_ref: 'issue-1',
+      inputs: [],
+      change: [{slot: 1, amount_msat: 4_096_000, nonce: keyNonce(shortId, 1), blinding_key: 'e'.repeat(64), out_idx: 0}],
+    };
+    const res = await post(`/cards/${shortId}/intent`, till.token, load);
+    expect(await res.json()).toEqual({ok: true, version: 1, replayed: false});
+    expect(await (await post(`/cards/${shortId}/intent`, till.token, load)).json()).toEqual({ok: true, version: 1, replayed: true});
+    const sig = {txid: txid(9), accepted: true, change: [{nonce: keyNonce(shortId, 1), signature: 'f'.repeat(96)}]};
+    expect((await post(`/cards/${shortId}/outcome`, till.token, sig)).status).toBe(200);
+    const s = await state(till.token, shortId);
+    expect(s.notes).toEqual([expect.objectContaining({slot: 1, status: 'live', amount_msat: 4_096_000})]);
+    expect(s.open_txs).toEqual([]);
+  });
+
+  it('refuses a load with no notes, and a charge without tx_hex', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/intent`, till.token, intent(0, {inputs: [], change: []}))).status).toBe(400);
+    expect((await post(`/cards/${shortId}/intent`, till.token, intent(0, {tx_hex: undefined}))).status).toBe(400);
+  });
+
+  it('reports a spent note while its key is unrenewed, and refuses change under that key', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    const shortId = '0a0b0c0e';
+    await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId}));
+    await hook('/test/note', {short_id: shortId, nonce: keyNonce(shortId, 2), slot: 2, amount_msat: 2_048_000, signature: 'c'.repeat(96)});
+    const spend = intent(0, {
+      inputs: [keyNonce(shortId, 2)],
+      change: [{slot: 3, amount_msat: 24_000, nonce: keyNonce(shortId, 3), blinding_key: 'e'.repeat(64), out_idx: 1}],
+    });
+    await post(`/cards/${shortId}/intent`, till.token, spend);
+    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: keyNonce(shortId, 3), signature: 'f'.repeat(96)}]});
+    const s = await state(till.token, shortId);
+    expect(s.notes.map(n => [n.slot, n.status])).toEqual([[2, 'spent'], [3, 'live']]);
+    // Change back into slot 2 under its burned key is refused, not a 500.
+    const reuse = intent(2, {
+      txid: txid(8),
+      inputs: [keyNonce(shortId, 3)],
+      change: [{slot: 2, amount_msat: 1_000, nonce: keyNonce(shortId, 2), blinding_key: 'e'.repeat(64), out_idx: 1}],
+    });
+    const res = await post(`/cards/${shortId}/intent`, till.token, reuse);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as {reason: string}).reason).toMatch(/renew slot 2/);
+    // Once renewed, the old key's history is no longer reported.
+    const renewed = await call('PUT', `/cards/${shortId}/slots/2`, till.token, {version: 2, old_pubkey: slots(shortId)[2], pubkey: key(60)});
+    expect(renewed.status).toBe(200);
+    expect((await state(till.token, shortId)).notes.map(n => n.slot)).toEqual([3]);
+  });
+
+  it('never renews slot 0: its key is the short id', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    const shortId = '0a0b0c0f';
+    await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId}));
+    const res = await call('PUT', `/cards/${shortId}/slots/0`, till.token, {version: 0, old_pubkey: slots(shortId)[0], pubkey: key(61)});
+    expect(res.status).toBe(409);
   });
 });
 
