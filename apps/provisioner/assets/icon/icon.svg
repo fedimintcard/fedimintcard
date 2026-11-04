@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 460" width="460" height="460">
+  <!-- fedimintcard app icon: the github.com/fedimintcard avatar, redrawn as vectors.
+       Geometry was measured from the 460 px raster; see render.py for the targets. -->
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#24428E"/>
+      <stop offset="1" stop-color="#12214A"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#E1CF89"/>
+      <stop offset="1" stop-color="#AF9244"/>
+    </linearGradient>
+    <clipPath id="panel"><rect x="95" y="128" width="269" height="203" rx="30"/></clipPath>
+  </defs>
+  <rect width="460" height="460" fill="url(#navy)"/>
+  <g id="chip">
+    <rect x="95" y="128" width="269" height="203" rx="30" fill="url(#gold)"/>
+    <g clip-path="url(#panel)" fill="none" stroke="#24418C" stroke-width="7" stroke-linecap="butt">
+      <line x1="230" y1="186" x2="230" y2="128"/>
+      <line x1="264.4" y1="202.6" x2="365" y2="120"/>
+      <line x1="195.6" y1="202.6" x2="95" y2="120"/>
+      <line x1="272.9" y1="239.8" x2="370" y2="262"/>
+      <line x1="187.1" y1="239.8" x2="90" y2="262"/>
+      <line x1="249.1" y1="269.6" x2="283" y2="340"/>
+      <line x1="210.9" y1="269.6" x2="177" y2="340"/>
+      <polygon points="230,186 264.4,202.6 272.9,239.8 249.1,269.6 210.9,269.6 187.1,239.8 195.6,202.6"/>
+    </g>
+  </g>
+</svg>
