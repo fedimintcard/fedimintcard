@@ -1096,6 +1096,12 @@ impl CardWallet {
 
         // 2. Sign on the card. Failure here means nothing was sent: forget the records.
         let signed: Result<()> = (|| {
+            // SIGN refuses with 6A94 unless this selection has verified a PIN, and the applet
+            // drops that on every SELECT (`select()` calls `pin.reset()`). The till re-selects
+            // between sales and outlives the one verify done when the wallet opened, so the
+            // session is opened here, in the selection that is about to sign. One verify covers
+            // every slot's signature below.
+            self.verify_pin_session()?;
             let digest = txid.to_byte_array();
             let msg = Message::from_digest(digest);
             let mut sigs = vec![];

@@ -55,7 +55,13 @@ export CS=host/target/debug/card-sidecar
 export D=~/.local/share/fedimint-card-demo/wallet
 export CARD_BACKEND=bridge CARD_BRIDGE_URL=http://127.0.0.1:9876   # phone till
 # or: export CARD_BACKEND=pcsc                                        # laptop reader till
+export CARD_PIN=1111    # the PIN on this card; without it every signing command fails 6A94
 ```
+
+`CARD_PIN` is required, not optional. The applet opens a PIN session per selection and drops it on
+every SELECT, so the sidecar verifies immediately before it signs; a missing or wrong `CARD_PIN`
+shows up as `6A94` from `SIGN` (or from renewing a spent slot), and a wrong one spends one of the
+card's three retries. Check it before the demo, never during.
 
 ## Before the demo (not shown)
 
@@ -99,9 +105,14 @@ relay reachable) and a "Card: none" chip.
 
 ### 3. Tap to pay at the point of sale (about 20 s each)
 
-Cashier keys `300`, presses Charge, customer holds the card to the phone. The screen goes
-"Hold card to phone" -> "Card present" -> "Signing… 7s" -> green receipt: 300 sats, change
+Cashier keys `131`, presses Charge, customer holds the card to the phone. The screen goes
+"Hold card to phone" -> "Card present" -> "Signing… 7s" -> green receipt: 131 sats, change
 returned to card (5 notes), txid. Press New sale.
+
+The price must be an amount the card's notes can cover *exactly*, plus fees — the cashier's price
+is not rounded off some arbitrary total. Keying a price the notes cannot make (300 sat out of
+1048/524/262/131 sat notes is one) is refused with "no exact-balance spend", and nothing moves.
+131 and 131.072 both work from a fresh 4-note topup; check the amount before the demo, not during.
 
 Repeat with `100`: receipt again, two of the change notes consumed, one new change note.
 
@@ -113,7 +124,8 @@ charge the card twice; the service and the app were both reviewed for exactly th
 screen shows the ledger. Show it.
 
 Fallback if the phone misbehaves: the same sale from the laptop reader,
-`CARD_BACKEND=pcsc $CS --data-dir $D card spend --price 300000` (stop `till serve` first).
+`CARD_BACKEND=pcsc CARD_PIN=1111 $CS --data-dir $D card spend --price 131000` (stop `till serve`
+first). Every card command needs `CARD_PIN`; the PIN is the one written on the card, not a default.
 
 ### 4. Card back to Fedi app (about 60 s)
 
