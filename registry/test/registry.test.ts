@@ -1,9 +1,13 @@
 import {env, runDurableObjectAlarm, runInDurableObject, SELF} from 'cloudflare:test';
 import {beforeEach, describe, expect, it} from 'vitest';
 
+import {bls12_381} from '@noble/curves/bls12-381.js';
+
 import {applySetup, LOGIN_MAX_ATTEMPTS, parseSetup} from '../src/auth';
 import {decrypt, nextBackupAt} from '../src/backup';
 import {migrate, MIGRATIONS} from '../src/db';
+import {fromHex, toHex} from '../src/http';
+import {messageOf} from '../src/tbs';
 
 /**
  * OPS-PLAN O2's done-line: a test for each route, including 409 on a stale
@@ -46,6 +50,20 @@ function card(over: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/**
+ * A test mint: one secret key per note tier, the tier keys a till reports (`tbs_pks`), and the
+ * unblinded signature the federation's blind flow ends in (`message * sk`), so outcomes carry
+ * signatures that verify. `tbs.test.ts` holds the port itself to the Rust code's vectors.
+ */
+const TIERS = [1_000, 24_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
+const tierSecret = (amount: number) => BigInt(amount) * 0x1f2e3d4c5b6an + 7n;
+const TBS_PKS = Object.fromEntries(
+  TIERS.map(a => [String(a), toHex(bls12_381.G2.Point.BASE.multiply(tierSecret(a)).toBytes())]),
+);
+function sign(nonceHex: string, amount: number): string {
+  return toHex(messageOf(fromHex(nonceHex)).multiply(tierSecret(amount)).toBytes());
+}
+
 function call(method: string, path: string, token: string | null, body?: unknown) {
   return SELF.fetch(`https://r.test${path}`, {
     method,
@@ -78,10 +96,13 @@ async function newBatch(token: string): Promise<number> {
   return ((await res.json()) as {batch: {batch_id: number}}).batch.batch_id;
 }
 
+/** A till, which reports the test mint's keys for FED as a till does at startup. */
 async function newTill(token: string, name = 'front desk'): Promise<{till_id: number; token: string}> {
   const res = await post('/tills', token, {name});
   expect(res.status).toBe(200);
-  return (await res.json()) as {till_id: number; token: string};
+  const till = (await res.json()) as {till_id: number; token: string};
+  expect((await post('/federations', till.token, {federation_id: FED, tbs_pks: TBS_PKS})).status).toBe(200);
+  return till;
 }
 
 const stub = () => env.REGISTRY.get(env.REGISTRY.idFromName('registry'));
@@ -439,12 +460,12 @@ describe('card state', () => {
     const {shortId} = await cardWithNote(token);
     await post(`/cards/${shortId}/intent`, till.token, intent(0));
     expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: []})).status).toBe(400);
-    const outcome = {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature: 'f'.repeat(96)}]};
+    const outcome = {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature: sign(nonce(2), 24_000)}]};
     const res = await post(`/cards/${shortId}/outcome`, till.token, outcome);
     expect(await res.json()).toEqual({ok: true, version: 2, replayed: false});
     const s = await state(till.token, shortId);
     expect(s.open_txs).toEqual([]);
-    expect(s.notes).toEqual([expect.objectContaining({slot: 1, status: 'live', signature: 'f'.repeat(96), amount_msat: 24_000})]);
+    expect(s.notes).toEqual([expect.objectContaining({slot: 1, status: 'live', signature: sign(nonce(2), 24_000), amount_msat: 24_000})]);
     expect(await (await post(`/cards/${shortId}/outcome`, till.token, outcome)).json()).toEqual({ok: true, version: 2, replayed: true});
     expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: false})).status).toBe(409);
   });
@@ -470,7 +491,7 @@ describe('card state', () => {
     const res = await post(`/cards/${shortId}/outcome`, second.token, {
       txid: txid(7),
       accepted: true,
-      change: [{nonce: nonce(2), signature: 'f'.repeat(96)}],
+      change: [{nonce: nonce(2), signature: sign(nonce(2), 24_000)}],
     });
     expect(res.status).toBe(200);
   });
@@ -522,7 +543,7 @@ describe('card state', () => {
       change: [{slot: 3, amount_msat: 24_000, nonce: nonce(6), blinding_key: 'e'.repeat(64), out_idx: 1}],
     });
     await post(`/cards/${shortId}/intent`, till.token, spend);
-    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(6), signature: 'f'.repeat(96)}]});
+    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(6), signature: sign(nonce(6), 24_000)}]});
     expect((await renew(2, {old_pubkey: key(77)})).status).toBe(409);
     expect((await renew(1)).status).toBe(409); // stale version
     const ok = await renew(2);
@@ -554,7 +575,7 @@ describe('O3: loads, burned keys and slot 0', () => {
     const res = await post(`/cards/${shortId}/intent`, till.token, load);
     expect(await res.json()).toEqual({ok: true, version: 1, replayed: false});
     expect(await (await post(`/cards/${shortId}/intent`, till.token, load)).json()).toEqual({ok: true, version: 1, replayed: true});
-    const sig = {txid: txid(9), accepted: true, change: [{nonce: keyNonce(shortId, 1), signature: 'f'.repeat(96)}]};
+    const sig = {txid: txid(9), accepted: true, change: [{nonce: keyNonce(shortId, 1), signature: sign(keyNonce(shortId, 1), 4_096_000)}]};
     expect((await post(`/cards/${shortId}/outcome`, till.token, sig)).status).toBe(200);
     const s = await state(till.token, shortId);
     expect(s.notes).toEqual([expect.objectContaining({slot: 1, status: 'live', amount_msat: 4_096_000})]);
@@ -581,7 +602,7 @@ describe('O3: loads, burned keys and slot 0', () => {
       change: [{slot: 3, amount_msat: 24_000, nonce: keyNonce(shortId, 3), blinding_key: 'e'.repeat(64), out_idx: 1}],
     });
     await post(`/cards/${shortId}/intent`, till.token, spend);
-    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: keyNonce(shortId, 3), signature: 'f'.repeat(96)}]});
+    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: keyNonce(shortId, 3), signature: sign(keyNonce(shortId, 3), 24_000)}]});
     const s = await state(till.token, shortId);
     expect(s.notes.map(n => [n.slot, n.status])).toEqual([[2, 'spent'], [3, 'live']]);
     // Change back into slot 2 under its burned key is refused, not a 500.
@@ -633,6 +654,223 @@ describe('federation names', () => {
     expect((await post('/federations', till.token, {federation_id: 'fed11abc', name: 'x'})).status).toBe(400);
     expect((await post('/federations', till.token, {federation_id: FED, name: '   '})).status).toBe(400);
     expect((await get('/registry/federations', till.token)).status).toBe(403);
+  });
+});
+
+describe('O4: mint keys, and every live note verified', () => {
+  it('takes a federation’s tier keys once; the same set replays, another set is 409', async () => {
+    const token = await signIn();
+    const till = await newTill(token); // posts TBS_PKS for FED
+    expect((await post('/federations', till.token, {federation_id: FED, tbs_pks: TBS_PKS})).status).toBe(200);
+    const other = {...TBS_PKS, '1000': TBS_PKS['24000']};
+    expect((await post('/federations', till.token, {federation_id: FED, tbs_pks: other})).status).toBe(409);
+    // Keys without a name are fine; neither is not; a key that is not a G2 point is refused.
+    const fed2 = 'c'.repeat(64);
+    expect((await post('/federations', till.token, {federation_id: fed2})).status).toBe(400);
+    expect((await post('/federations', till.token, {federation_id: fed2, tbs_pks: {'1000': 'ab'.repeat(96)}})).status).toBe(400);
+    expect((await post('/federations', till.token, {federation_id: fed2, tbs_pks: {'0': TBS_PKS['1000']}})).status).toBe(400);
+    expect((await post('/federations', token, {federation_id: fed2, tbs_pks: TBS_PKS})).status).toBe(403);
+    // Keys alone make no name row.
+    expect(((await (await get('/registry/federations', token)).json()) as {federations: unknown[]}).federations).toEqual([]);
+  });
+
+  it('refuses a till’s outcome whose change signature the federation did not make, and changes nothing', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, till.token, intent(0));
+    for (const signature of [
+      'c'.repeat(96), // not a point
+      sign(nonce(3), 24_000), // a real signature, on another nonce
+      sign(nonce(2), 1_000), // the right nonce, another tier's key
+    ]) {
+      const res = await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature}]});
+      expect(res.status).toBe(422);
+    }
+    const s = await state(till.token, shortId);
+    expect(s.open_txs.map(t => t.txid)).toEqual([txid(7)]);
+    expect(s.notes.map(n => [n.slot, n.status])).toEqual([[0, 'live'], [1, 'pending']]);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature: sign(nonce(2), 24_000)}]})).status).toBe(200);
+  });
+
+  it('refuses an accepted outcome while no till has reported the federation’s keys', async () => {
+    const token = await signIn();
+    const res = await post('/tills', token, {name: 'keyless'});
+    const till = (await res.json()) as {token: string};
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, till.token, intent(0));
+    const out = await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [{nonce: nonce(2), signature: sign(nonce(2), 24_000)}]});
+    expect(out.status).toBe(422);
+    expect(((await out.json()) as {reason: string}).reason).toMatch(/mint keys/);
+    // A rejection needs no keys.
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: false})).status).toBe(200);
+  });
+});
+
+describe('O4: holder loading', () => {
+  const keyNonce = (shortId: string, n: number) => '02' + slots(shortId)[n]!;
+  const BK = 'e'.repeat(64);
+
+  /** A provisioned card with no notes, and a till of its operator that reported the mint keys. */
+  async function freshCard(shortId = '1a2b3c4d') {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId}))).status).toBe(200);
+    return {token, till, shortId};
+  }
+
+  function load(shortId: string, version: number, notes: [slot: number, amount: number][], t = txid(20)) {
+    return {
+      version,
+      txid: t,
+      notes: notes.map(([slot, amount], i) => ({slot, amount_msat: amount, nonce: keyNonce(shortId, slot), blinding_key: BK, out_idx: i})),
+    };
+  }
+  function signed(shortId: string, notes: [slot: number, amount: number][], t = txid(20)) {
+    return {txid: t, notes: notes.map(([slot, amount]) => ({nonce: keyNonce(shortId, slot), signature: sign(keyNonce(shortId, slot), amount)}))};
+  }
+  const slotsOf = async (shortId: string) => {
+    const res = await get(`/cards/${shortId}/slots`, null);
+    expect(res.status).toBe(200);
+    return (await res.json()) as {version: number; federation_id: string; free: {slot: number; pubkey: string}[]};
+  };
+
+  it('answers the free slot keys without a token, and nothing about balances', async () => {
+    const {shortId} = await freshCard();
+    await hook('/test/note', {short_id: shortId, nonce: keyNonce(shortId, 2), slot: 2, amount_msat: 2_048_000, signature: 'c'.repeat(96)});
+    const res = await get(`/cards/${shortId}/slots`, null);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(['federation_id', 'free', 'ok', 'version']);
+    expect(body.federation_id).toBe(FED);
+    expect((body.free as {slot: number}[]).map(f => f.slot)).toEqual([0, 1, 3, 4, 5, 6, 7]);
+    expect(JSON.stringify(body)).not.toMatch(/amount|signature|notes|2048000/);
+  });
+
+  it('answers 404 for an unknown card, and 400 for a malformed short id', async () => {
+    await signIn();
+    expect((await get('/cards/99999999/slots', null)).status).toBe(404);
+    expect((await post('/cards/99999999/load', null, load('99999999', 0, [[1, 1_000]]))).status).toBe(404);
+    expect((await post('/cards/99999999/load/outcome', null, signed('99999999', [[1, 1_000]]))).status).toBe(404);
+    expect((await get('/cards/XYZ/slots', null)).status).toBe(400);
+  });
+
+  it('loads from a holder’s wallet: pending, then live once every signature verifies', async () => {
+    const {till, shortId} = await freshCard();
+    const notes: [number, number][] = [[1, 4_096_000], [3, 1_024_000]];
+    const res = await post(`/cards/${shortId}/load`, null, load(shortId, 0, notes));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(expect.objectContaining({ok: true, version: 1, replayed: false}));
+    expect(await (await post(`/cards/${shortId}/load`, null, load(shortId, 0, notes))).json()).toEqual(expect.objectContaining({version: 1, replayed: true}));
+    expect((await slotsOf(shortId)).free.map(f => f.slot)).toEqual([0, 2, 4, 5, 6, 7]);
+
+    // A till sees the slots held, but neither the txid nor the blinding key, so it never tries
+    // to collect a holder's notes; and it cannot put change there.
+    const pending = await state(till.token, shortId);
+    expect(pending.notes).toEqual([
+      expect.objectContaining({slot: 1, status: 'pending', txid: null, blinding_key: null}),
+      expect.objectContaining({slot: 3, status: 'pending', txid: null, blinding_key: null}),
+    ]);
+
+    const done = await post(`/cards/${shortId}/load/outcome`, null, signed(shortId, notes));
+    expect(await done.json()).toEqual({ok: true, version: 2, replayed: false});
+    const s = await state(till.token, shortId);
+    expect(s.notes.map(n => [n.slot, n.status, n.amount_msat])).toEqual([[1, 'live', 4_096_000], [3, 'live', 1_024_000]]);
+    expect(s.notes[0]!.signature).toBe(sign(keyNonce(shortId, 1), 4_096_000));
+    expect(await (await post(`/cards/${shortId}/load/outcome`, null, signed(shortId, notes))).json()).toEqual({ok: true, version: 2, replayed: true});
+    expect((await post(`/cards/${shortId}/load/outcome`, null, {txid: txid(20), accepted: false})).status).toBe(409);
+    // The loaded notes are spendable at a till like any other.
+    const charge = intent(2, {inputs: [keyNonce(shortId, 1)], change: [{slot: 4, amount_msat: 24_000, nonce: keyNonce(shortId, 4), blinding_key: BK, out_idx: 1}]});
+    expect((await post(`/cards/${shortId}/intent`, till.token, charge)).status).toBe(200);
+  });
+
+  it('refuses a forged signature (422) and changes nothing; the real ones still finish it', async () => {
+    const {till, shortId} = await freshCard();
+    const notes: [number, number][] = [[1, 4_096_000], [2, 1_000]];
+    await post(`/cards/${shortId}/load`, null, load(shortId, 0, notes));
+    const good = signed(shortId, notes);
+    const forgeries = [
+      // A flipped bit in one signature.
+      {...good, notes: [good.notes[0]!, {...good.notes[1]!, signature: good.notes[1]!.signature.slice(0, 94) + 'ff'}]},
+      // Each note's signature made under another tier's key: claims 4,096 sat for a 1-sat note.
+      {...good, notes: [{...good.notes[0]!, signature: sign(keyNonce(shortId, 1), 1_000)}, good.notes[1]!]},
+      // Real signatures, swapped between the two notes.
+      {...good, notes: [{...good.notes[0]!, signature: good.notes[1]!.signature}, {...good.notes[1]!, signature: good.notes[0]!.signature}]},
+    ];
+    for (const forged of forgeries) {
+      const res = await post(`/cards/${shortId}/load/outcome`, null, forged);
+      expect(res.status).toBe(422);
+    }
+    const s = await state(till.token, shortId);
+    expect(s.version).toBe(1);
+    expect(s.notes.map(n => n.status)).toEqual(['pending', 'pending']);
+    expect((await post(`/cards/${shortId}/load/outcome`, null, good)).status).toBe(200);
+  });
+
+  it('a load the federation refused frees its slots, keys unburned', async () => {
+    const {till, shortId} = await freshCard();
+    await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 1_000]]));
+    expect(await (await post(`/cards/${shortId}/load/outcome`, null, {txid: txid(20), accepted: false})).json()).toEqual({ok: true, version: 2, replayed: false});
+    expect((await state(till.token, shortId)).notes).toEqual([]);
+    expect((await slotsOf(shortId)).free.map(f => f.slot)).toContain(1);
+    // The same key takes the next load.
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 2, [[1, 1_000]], txid(21)))).status).toBe(200);
+  });
+
+  it('checks the version, the slots, the keys and the tiers', async () => {
+    const {shortId} = await freshCard();
+    await hook('/test/note', {short_id: shortId, nonce: keyNonce(shortId, 2), slot: 2, amount_msat: 2_048_000, signature: 'c'.repeat(96)});
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 5, [[1, 1_000]]))).status).toBe(409); // stale
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[2, 1_000]]))).status).toBe(409); // held
+    const wrongKey = load(shortId, 0, [[1, 1_000]]);
+    wrongKey.notes[0]!.nonce = keyNonce(shortId, 3);
+    expect((await post(`/cards/${shortId}/load`, null, wrongKey)).status).toBe(409); // not slot 1's key
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 3_000]]))).status).toBe(422); // no such tier
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 1_000], [1, 1_000]]))).status).toBe(400);
+    expect((await post(`/cards/${shortId}/load`, null, {...load(shortId, 0, []), notes: []})).status).toBe(400);
+    expect((await slotsOf(shortId)).version).toBe(0);
+  });
+
+  it('allows one open load per card', async () => {
+    const {shortId} = await freshCard();
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 1_000]]))).status).toBe(200);
+    const second = await post(`/cards/${shortId}/load`, null, load(shortId, 1, [[3, 1_000]], txid(21)));
+    expect(second.status).toBe(409);
+    expect(((await second.json()) as {reason: string}).reason).toMatch(/in flight/);
+  });
+
+  it('expires an open load: its slots are free again and another load can take them', async () => {
+    const {till, shortId} = await freshCard();
+    await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 1_000], [3, 24_000]]));
+    await runInDurableObject(stub(), async (_i, st) => {
+      st.storage.sql.exec('UPDATE holder_loads SET expires_at = ?', Date.now() - 1);
+    });
+    expect((await slotsOf(shortId)).free.map(f => f.slot)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect((await state(till.token, shortId)).notes).toEqual([]);
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 1, [[1, 1_000]], txid(21)))).status).toBe(200);
+    // The expired load's wallet comes back late: slot 1 was used since, so it cannot finish.
+    expect((await post(`/cards/${shortId}/load/outcome`, null, signed(shortId, [[1, 1_000], [3, 24_000]]))).status).toBe(409);
+  });
+
+  it('finishes an expired load late while its slots are untouched', async () => {
+    const {till, shortId} = await freshCard();
+    await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[5, 8_192_000]]));
+    await runInDurableObject(stub(), async (_i, st) => {
+      st.storage.sql.exec('UPDATE holder_loads SET expires_at = ?', Date.now() - 1);
+    });
+    expect((await slotsOf(shortId)).free.map(f => f.slot)).toContain(5);
+    expect((await post(`/cards/${shortId}/load/outcome`, null, signed(shortId, [[5, 8_192_000]]))).status).toBe(200);
+    expect((await state(till.token, shortId)).notes).toEqual([expect.objectContaining({slot: 5, status: 'live', amount_msat: 8_192_000})]);
+  });
+
+  it('budgets holder writes per card: past the limit in an hour answers 429', async () => {
+    const {shortId} = await freshCard();
+    for (let i = 0; i < 12; i += 1) {
+      expect((await post(`/cards/${shortId}/load`, null, load(shortId, 99, [[1, 1_000]], txid(30 + i)))).status).toBe(409);
+    }
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, [[1, 1_000]]))).status).toBe(429);
+    expect((await get(`/cards/${shortId}/slots`, null)).status).toBe(200); // reading is not budgeted
   });
 });
 

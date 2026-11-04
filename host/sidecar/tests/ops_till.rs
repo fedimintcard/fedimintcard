@@ -5,9 +5,12 @@
 //!
 //! ```text
 //! npx wrangler dev --port 8799 --persist-to <scratch dir> \
-//!   --var 'OPERATOR_SETUP:{"action":"bootstrap","nonce":"local-o3-nonce-0001","name":"op","password":"local o3 password"}'
+//!   --var 'OPERATOR_SETUP:{"action":"bootstrap","nonce":"local-o4-nonce-0001","name":"op","password":"local o4 password"}'
 //! OPS_TEST_URL=http://127.0.0.1:8799 cargo test -p fedimint-card-sidecar --test ops_till
 //! ```
+//!
+//! O4 adds the holder's side: a card loaded by the reference loader (`holder.rs`) from a wallet of
+//! its own, then charged at a till; and a load whose signatures are forged, refused by ops.
 //!
 //! `OPS_TEST_OPERATOR` and `OPS_TEST_PASSWORD` default to that bootstrap. Each test makes its own
 //! batch, till tokens and cards (random short ids), so a persisted registry can be reused. Never
@@ -24,7 +27,9 @@ use std::time::Duration;
 
 use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
-use fedimint_card_sidecar::ops::{Ops, OpsConfig, short_id_of};
+use fedimint_card_sidecar::holder::{LoadCrash, Loader, outcome_body};
+use fedimint_card_sidecar::ops::{FederationReport, Ops, OpsConfig, report_federation, short_id_of};
+use fedimint_card_sidecar::shares;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{card_balance_job, charge_job};
@@ -60,7 +65,7 @@ impl Registry {
             return Ok(None);
         };
         let name = std::env::var("OPS_TEST_OPERATOR").unwrap_or_else(|_| "op".into());
-        let password = std::env::var("OPS_TEST_PASSWORD").unwrap_or_else(|_| "local o3 password".into());
+        let password = std::env::var("OPS_TEST_PASSWORD").unwrap_or_else(|_| "local o4 password".into());
         let http = reqwest::Client::new();
         let url = url.trim_end_matches('/').to_owned();
         let session: Value = http
@@ -196,8 +201,11 @@ impl Till {
         let wallet = Wallet::from_client(client).await?;
         let dir = tempfile::tempdir()?;
         let store = StateStore::open(dir.path().join("card_state.json"))?;
-        let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
         let ops = reg.till(name, dir.path()).await?;
+        // What `serve` does at startup: the federation's name and mint keys, which ops checks
+        // every note against.
+        report_federation(&ops.client, &FederationReport::of(&wallet).await).await;
+        let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
         let sales = Arc::new(Mutex::new(SalesStore::open(dir.path().join("sales.json"))?));
         Ok(Self { cw, ops, sales, dir })
     }
@@ -267,7 +275,9 @@ async fn a_charge_runs_through_ops_end_to_end() -> anyhow::Result<()> {
     assert_eq!(till.sale_refs(), vec!["o3-a".to_string()]);
 
     // What `serve` does at startup: the federation's name, for the provisioner to show.
-    fedimint_card_sidecar::ops::report_federation(&till.ops.client, &fed_id(&fed), Some("O3 test federation")).await;
+    let mut report = FederationReport::of(&till.cw.wallet).await;
+    report.name = Some("O3 test federation".into());
+    report_federation(&till.ops.client, &report).await;
     let feds = reg.http.get(format!("{}/registry/federations", reg.url)).bearer_auth(&reg.operator).send().await?.json::<Value>().await?;
     assert!(
         feds["federations"].as_array().unwrap().iter().any(|f| f["federation_id"] == fed_id(&fed) && f["name"] == "O3 test federation"),
@@ -412,5 +422,139 @@ async fn signed_bytes_ops_never_answered_for_are_posted_again_never_abandoned() 
     assert!(st.pending_txs.is_empty() && st.host_pending.iter().all(|h| h.group != lost), "{st:?}");
     assert_eq!(till.sale_refs(), vec!["o3-u1".to_string(), "o3-u2".to_string()], "o3-u3 never became a sale");
     assert!(open_txs(&reg.state(&short_id).await?).is_empty());
+    Ok(())
+}
+
+// ------------------------------------------------------------------ O4: holder loading
+
+/// A holder's own wallet, separate from every till's: its own client and data directory.
+struct Holder {
+    wallet: Wallet,
+    dir: tempfile::TempDir,
+}
+
+impl Holder {
+    async fn new(fed: &FederationTest, funds: Amount) -> anyhow::Result<Self> {
+        let client = fed.new_client().await;
+        fund(&client, funds).await?;
+        Ok(Self { wallet: Wallet::from_client(client).await?, dir: tempfile::tempdir()? })
+    }
+
+    fn loader(&self, reg: &Registry) -> anyhow::Result<Loader<'_>> {
+        Loader::new(&self.wallet, &reg.url, self.dir.path())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_loaded_from_the_holders_wallet_is_charged_at_a_till() -> anyhow::Result<()> {
+    let fed = federation().await?;
+    let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
+    // The till only reports the federation's keys; it puts no value on the card.
+    let mut till = Till::new(&fed, &reg, "o4 till", Amount::ZERO).await?;
+    let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let short_id = reg.provision(&card).await?;
+    let before = holder.wallet.balance_msat().await?;
+
+    let r = holder.loader(&reg)?.load(&mut Shared(card.clone()), &[(1 << 16) + (1 << 14)]).await?;
+    assert_eq!(r.short_id, short_id);
+    assert_eq!(r.notes.iter().map(|(_, a)| a).sum::<u64>(), (1 << 16) + (1 << 14));
+    assert!(holder.loader(&reg)?.pending()?.is_empty(), "the journal is empty once ops has the outcome");
+    assert!(holder.wallet.balance_msat().await? < before - ((1 << 16) + (1 << 14)), "the value came from the holder's wallet");
+    let s = reg.state(&short_id).await?;
+    assert_eq!(live_msat(&s), (1 << 16) + (1 << 14), "{s}");
+    assert!(s["notes"].as_array().unwrap().iter().all(|n| n["signature"].is_string()), "{s}");
+
+    // The holder walks up to the till and types the PIN.
+    let (status, body) = till.charge(&card, 30_000, "o4-a", "1234").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(till.sale_refs(), vec!["o4-a".to_string()]);
+    let s = reg.state(&short_id).await?;
+    assert!(open_txs(&s).is_empty() && live_msat(&s) < (1 << 16) + (1 << 14), "{s}");
+
+    // A second load goes into the slots still free; the till's change notes are not touched.
+    let held = live_msat(&s);
+    holder.loader(&reg)?.load(&mut Shared(card.clone()), &[1 << 15]).await?;
+    assert_eq!(live_msat(&reg.state(&short_id).await?), held + (1 << 15));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_with_forged_signatures_is_refused_and_the_real_ones_finish_it() -> anyhow::Result<()> {
+    let fed = federation().await?;
+    let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
+    let _till = Till::new(&fed, &reg, "o4 keys", Amount::ZERO).await?;
+    let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let short_id = reg.provision(&card).await?;
+
+    // The wallet submits, then dies before ops has the outcome.
+    let mut loader = holder.loader(&reg)?;
+    loader.crash = Some(LoadCrash::AfterCommit);
+    assert!(loader.load(&mut Shared(card.clone()), &[(1 << 16) + (1 << 14)]).await.is_err());
+    let pending = loader.pending()?;
+    assert_eq!(pending.len(), 1);
+    let p = &pending[0];
+    let s = reg.state(&short_id).await?;
+    assert_eq!(live_msat(&s), 0, "pending, not live: {s}");
+
+    // The federation's real signatures, as the wallet would collect them.
+    let txid: fedimint_core::TransactionId = p.txid.parse().map_err(|_| anyhow::anyhow!("txid"))?;
+    holder.wallet.client.api().await_transaction(txid).await;
+    let mut real = vec![];
+    for n in &p.notes {
+        use fedimint_core::encoding::{Decodable, Encodable};
+        let nonce = fedimint_mint_common::Nonce(n.nonce.parse()?);
+        let key = tbs::BlindingKey::consensus_decode_hex(&n.blinding_key, &Default::default())?;
+        let out = fedimint_core::OutPoint { txid, out_idx: n.out_idx };
+        let sig = shares::note_signature(&holder.wallet, out, Amount::from_msats(n.amount_msat), nonce, key, Duration::from_secs(60)).await?;
+        real.push((n.nonce.clone(), sig.consensus_encode_to_hex()));
+    }
+    let post = |body: Value| {
+        let url = format!("{}/cards/{short_id}/load/outcome", reg.url);
+        let http = reg.http.clone();
+        async move { http.post(url).json(&body).send().await.unwrap().status().as_u16() }
+    };
+    // Swapped between the two notes: each a real signature, on the other note (and the other tier).
+    let swapped = vec![(real[0].0.clone(), real[1].1.clone()), (real[1].0.clone(), real[0].1.clone())];
+    assert_eq!(post(outcome_body(&p.txid, &swapped)).await, 422);
+    // One bit of one signature flipped.
+    let mut flipped = real.clone();
+    let last = flipped[1].1.pop().unwrap();
+    flipped[1].1.push(if last == '0' { '1' } else { '0' });
+    assert_eq!(post(outcome_body(&p.txid, &flipped)).await, 422);
+    let s = reg.state(&short_id).await?;
+    assert_eq!(live_msat(&s), 0, "a refused outcome changes nothing: {s}");
+
+    // The wallet comes back and finishes with the real signatures.
+    let r = holder.loader(&reg)?.resume().await?;
+    assert_eq!(r, 1);
+    assert_eq!(live_msat(&reg.state(&short_id).await?), (1 << 16) + (1 << 14));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_that_never_left_the_wallet_frees_its_slots_on_the_next_run() -> anyhow::Result<()> {
+    let fed = federation().await?;
+    let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
+    let _till = Till::new(&fed, &reg, "o4 uncommitted", Amount::ZERO).await?;
+    let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let short_id = reg.provision(&card).await?;
+    let before = holder.wallet.balance_msat().await?;
+
+    let mut loader = holder.loader(&reg)?;
+    loader.crash = Some(LoadCrash::BeforeCommit);
+    assert!(loader.load(&mut Shared(card.clone()), &[1 << 16]).await.is_err());
+    assert_eq!(holder.wallet.balance_msat().await?, before, "nothing left the wallet");
+    let free = |s: &Value| s["notes"].as_array().unwrap().is_empty();
+    assert!(!free(&reg.state(&short_id).await?), "ops holds the load pending");
+
+    // The next run tells ops it was never sent, then loads.
+    let r = holder.loader(&reg)?.load(&mut Shared(card.clone()), &[1 << 16]).await?;
+    assert_eq!(r.resumed, 1);
+    let s = reg.state(&short_id).await?;
+    assert_eq!(live_msat(&s), 1 << 16, "{s}");
+    assert_eq!(s["notes"].as_array().unwrap().len(), 1, "the first load left no note behind: {s}");
     Ok(())
 }

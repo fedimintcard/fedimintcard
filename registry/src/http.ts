@@ -4,6 +4,13 @@
  * (`apps/provisioner/src/api.ts` `reasonOf`), so every answer here is JSON.
  */
 
+/** Refusals a route throws; `index.ts` turns each into its status. */
+export class Conflict extends Error {}
+export class NotFound extends Error {}
+export class BadRequest extends Error {}
+/** 422: well-formed, but not true (a signature the federation did not make). */
+export class Unprocessable extends Error {}
+
 export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,

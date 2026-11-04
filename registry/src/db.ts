@@ -124,6 +124,34 @@ export const MIGRATIONS: readonly string[] = [
     error      TEXT
   );
   `,
+  // v5 (OPS-PLAN O4): the mint's key per note tier, which every note is checked
+  // against before it is live; holder loads in flight; the per-card budget of
+  // holder writes. A load's notes live in `notes` like a till's change.
+  `
+  CREATE TABLE federation_keys (
+    operator_id   INTEGER NOT NULL,
+    federation_id TEXT    NOT NULL,
+    tbs_pks       TEXT    NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (operator_id, federation_id)
+  );
+  CREATE TABLE holder_loads (
+    txid          TEXT    PRIMARY KEY,
+    short_id      TEXT    NOT NULL,
+    body          TEXT    NOT NULL,
+    status        TEXT    NOT NULL CHECK (status IN ('open', 'accepted', 'rejected', 'expired')),
+    outcome       TEXT,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    resolved_at   INTEGER
+  );
+  CREATE INDEX holder_loads_open ON holder_loads (short_id, status);
+  CREATE TABLE holder_budget (
+    short_id      TEXT    PRIMARY KEY,
+    window_start  INTEGER NOT NULL,
+    writes        INTEGER NOT NULL
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

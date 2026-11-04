@@ -1019,7 +1019,7 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 /// the state file). Starts without a card: each job opens the card behind `relay` afresh.
 ///
 /// With `ops`, each card job loads that card's state from the registry (see the module docs), and
-/// the federation's name is reported to it once at startup.
+/// the federation's name and mint keys are reported to it once at startup.
 pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Option<OpsConfig>) -> Result<()> {
     if !listen.ip().is_loopback() {
         eprintln!("warning: {listen} is not a loopback address; the till API has no authentication");
@@ -1029,8 +1029,7 @@ pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Optio
     let ops = match ops {
         Some(cfg) => {
             let o = Ops::new(&cfg, &dir)?;
-            let name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
-            crate::ops::report_federation(&o.client, &cw.wallet.federation_id().to_string(), name.as_deref()).await;
+            crate::ops::report_federation(&o.client, &crate::ops::FederationReport::of(&cw.wallet).await).await;
             eprintln!("card state from ops at {}", cfg.url);
             Some(o)
         }

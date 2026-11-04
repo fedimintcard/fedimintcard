@@ -135,6 +135,23 @@ pub fn nonce_for(key: XOnlyPublicKey) -> Nonce {
     Nonce(PublicKey::from_x_only_public_key(key, Parity::Even))
 }
 
+/// Mint outputs for card notes, `(msat, blinded nonce)` each, with no state machine: the caller
+/// holds the blinding keys and collects the signatures itself. The stock client puts explicit
+/// outputs first, so output i of the transaction is note i.
+pub fn card_outputs(
+    wallet: &Wallet,
+    outs: impl Iterator<Item = (u64, tbs::BlindedMessage)>,
+) -> ClientOutputBundle {
+    ClientOutputBundle::new_no_sm(
+        outs.map(|(amount, blinded)| ClientOutput {
+            output: MintOutput::new_v0(Amount::from_msats(amount), BlindNonce(blinded)),
+            amounts: Amounts::new_bitcoin(Amount::from_msats(amount)),
+        })
+        .collect(),
+    )
+    .into_dyn(wallet.mint_id)
+}
+
 fn nonce_hex(n: Nonce) -> String {
     hex::encode(n.0.serialize())
 }
@@ -561,15 +578,7 @@ impl CardWallet {
         }
         self.store.save()?;
 
-        let bundle = ClientOutputBundle::new_no_sm(
-            outs.iter()
-                .map(|o| ClientOutput {
-                    output: MintOutput::new_v0(Amount::from_msats(o.amount), BlindNonce(o.blinded)),
-                    amounts: Amounts::new_bitcoin(Amount::from_msats(o.amount)),
-                })
-                .collect(),
-        )
-        .into_dyn(self.wallet.mint_id);
+        let bundle = card_outputs(&self.wallet, outs.iter().map(|o| (o.amount, o.blinded)));
         let client = &self.wallet.client;
         let op = OperationId::new_random();
         let range = match client
@@ -654,15 +663,7 @@ impl CardWallet {
         let key: BlindingKey = dec(rec.blinding_key.as_deref().context("pending note without blinding key")?)?;
         let nonce = nonce_from_hex(&rec.nonce)?;
         let amount = Amount::from_msats(rec.amount_msat);
-        let blinded = blind(nonce, key);
-        let sig = shares::fetch_blind_signature(
-            &self.wallet,
-            outpoint.txid,
-            OutSpec { out_idx: outpoint.out_idx, amount, blinded },
-            timeout,
-        )
-        .await?;
-        let signature = shares::finish_note(&self.wallet, amount, nonce, key, blinded, sig)?;
+        let signature = shares::note_signature(&self.wallet, outpoint, amount, nonce, key, timeout).await?;
         let n = &mut self.store.state.notes[idx];
         n.signature = Some(enc(&signature));
         n.status = NoteStatus::Live;

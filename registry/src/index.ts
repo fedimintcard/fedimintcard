@@ -15,6 +15,9 @@
  *
  *   anyone     GET  /health
  *              POST /auth/operator/session       {name, password} -> {operator_id, token}
+ *   a holder   GET  /cards/:short_id/slots       free slot keys and version, nothing else
+ *   (no token) POST /cards/:short_id/load        notes from the holder's wallet, before it submits
+ *              POST /cards/:short_id/load/outcome  their signatures, each verified (loads.ts)
  *   operator   POST /auth/operator/signout
  *              POST /registry/batches            GET /registry/batches
  *              POST /registry/cards              GET /registry/cards?batch_id=
@@ -27,7 +30,7 @@
  *                                                 with no inputs, a load from the till's wallet
  *              POST /cards/:short_id/submitted   the signed bytes, before the till sends them
  *              POST /cards/:short_id/outcome     the federation's answer
- *              POST /federations                 {federation_id, name} from the federation's config
+ *              POST /federations                 {federation_id, name, tbs_pks} from the federation's config
  *              PUT  /cards/:short_id/slots/:n    a renewed slot key
  *
  * An operator, and that operator's tills, see only their own batches and
@@ -66,7 +69,8 @@ import {
 } from './cards';
 import {backupStatus, nextBackupAt, runBackup} from './backup';
 import {migrate} from './db';
-import {bearer, fail, isPositiveInt, isShortId, json, objectBody} from './http';
+import {bearer, fail, isPositiveInt, isShortId, json, objectBody, Unprocessable} from './http';
+import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
 
 export interface Env {
   readonly REGISTRY: DurableObjectNamespace;
@@ -138,6 +142,7 @@ export class Registry {
       if (e instanceof BadRequest) return fail(400, e.message);
       if (e instanceof NotFound) return fail(404, e.message);
       if (e instanceof Conflict) return fail(409, e.message);
+      if (e instanceof Unprocessable) return fail(422, e.message);
       if (e instanceof RateLimited) return fail(429, e.message);
       throw e;
     }
@@ -177,6 +182,12 @@ export class Registry {
       return session
         ? json(200, {ok: true, ...session})
         : fail(401, 'the operator name or password is not correct');
+    }
+
+    // A holder has the card and nothing else: these answer without a token.
+    const holder = /^\/cards\/([^/]+)\/(slots|load|load\/outcome)$/.exec(path);
+    if (holder) {
+      return this.holderRoute(request, holder[1]!, holder[2]!, now);
     }
 
     const caller = await this.caller(request);
@@ -271,6 +282,7 @@ export class Registry {
       return fail(404, `no card ${shortId}`);
     }
     const method = request.method;
+    expireLoads(storage, shortId, now);
     if (rest === '/state' && method === 'GET') {
       return json(200, {ok: true, ...cardState(storage.sql, shortId)});
     }
@@ -295,6 +307,31 @@ export class Registry {
     return fail(404, 'no such route');
   }
 
+  /** The holder routes (`loads.ts`). Any card in the registry, whichever operator's. */
+  private async holderRoute(request: Request, shortId: string, what: string, now: number): Promise<Response> {
+    const storage = this.ctx.storage;
+    if (!isShortId(shortId)) {
+      return fail(400, 'short_id must be 8 lower-case hex characters');
+    }
+    if (cardOwner(storage.sql, shortId) === null) {
+      return fail(404, `no card ${shortId}`);
+    }
+    expireLoads(storage, shortId, now);
+    const method = request.method;
+    if (what === 'slots') {
+      if (method !== 'GET') return fail(405, 'use GET');
+      return json(200, {ok: true, ...freeSlots(storage.sql, shortId)});
+    }
+    if (method !== 'POST') return fail(405, 'use POST');
+    const body = await objectBody(request);
+    if (!body) return fail(400, 'expected a JSON object');
+    spendBudget(storage, shortId, now);
+    if (what === 'load') {
+      return json(200, {ok: true, ...recordLoad(storage, shortId, body, now)});
+    }
+    return json(200, {ok: true, ...recordLoadOutcome(storage, shortId, body, now)});
+  }
+
   /**
    * Test-only. Reachable only through the object's own stub
    * (`env.REGISTRY.get(...)`); the Worker refuses every `/test/` path, so a
@@ -306,6 +343,7 @@ export class Registry {
       for (const table of [
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
+        'federation_keys', 'holder_loads', 'holder_budget',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }

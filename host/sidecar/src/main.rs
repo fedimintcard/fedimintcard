@@ -97,6 +97,15 @@ enum CardCmd {
         #[arg(required = true)]
         amount_msat: Vec<u64>,
     },
+    /// Load the card from this wallet through ops, as a holder's wallet would (OPS-PLAN § 6):
+    /// one note per set bit of each amount, into the free slots ops reports. Needs no PIN.
+    Load {
+        #[arg(required = true)]
+        amount_msat: Vec<u64>,
+        /// The ops registry. Holder routes take no token.
+        #[arg(long, env = "OPS_URL")]
+        ops_url: String,
+    },
     /// Reconcile and list the card's notes (asks the federation about each live note).
     Balance,
     /// Pay the till from the card.
@@ -223,6 +232,21 @@ async fn main() -> Result<()> {
             };
             fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops).await?;
         }
+        Cmd::Card(CardCmd::Load { amount_msat, ops_url }) => {
+            // No `card_wallet`: a load never signs, so no PIN session is opened (a guessed PIN
+            // would cost the holder a try).
+            let w = Wallet::open(&cli.data_dir).await?;
+            let mut card = open_from_env().context("opening the card")?;
+            let loader = fedimint_card_sidecar::holder::Loader::new(&w, ops_url, &cli.data_dir)?;
+            let r = loader.load(card.as_mut(), amount_msat).await?;
+            if r.resumed > 0 {
+                println!("finished {} load(s) an earlier run left", r.resumed);
+            }
+            println!("card {}: load {} accepted and recorded in ops", r.short_id, r.txid);
+            for (slot, amount) in &r.notes {
+                println!("slot {slot:2}  +{}", sats(*amount));
+            }
+        }
         Cmd::Card(c) => {
             let mut cw = card_wallet(&cli).await?;
             let res = run_card(&mut cw, c).await;
@@ -264,6 +288,7 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
                 println!("slot {slot:2}  +{}", sats(amount));
             }
         }
+        CardCmd::Load { .. } => unreachable!("handled in main without a PIN session"),
         CardCmd::Balance => {
                         let r = cw.balance().await?;
             report_recovered(&r.recovered);

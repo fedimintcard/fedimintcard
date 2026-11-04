@@ -341,22 +341,9 @@ impl StateStore {
         &self.path
     }
 
-    /// Write to a temporary file in the same directory, fsync it, rename over the state file,
-    /// then fsync the directory so the rename itself is durable.
+    /// Save durably ([`write_private_json`]).
     pub fn save(&self) -> Result<()> {
-        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        create_private_dir(dir)?;
-        let tmp = self.path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(&self.state)?;
-        {
-            let mut f = private_options().truncate(true).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(&json)?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &self.path)?;
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        write_private_json(&self.path, &self.state)
     }
 
     /// Append `line` to `cashouts.log` next to the state file (mode 0600) and fsync it. Used for
@@ -383,6 +370,24 @@ pub fn private_options() -> std::fs::OpenOptions {
 }
 
 /// Create `dir` (and parents) with mode 0700 where it does not exist yet.
+/// Write `value` as JSON to `path` (mode 0600) durably: a temporary file in the same directory,
+/// fsynced, renamed over `path`, then the directory fsynced so the rename itself is durable.
+pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    create_private_dir(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(value)?;
+    {
+        let mut f = private_options().truncate(true).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(&json)?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 pub fn create_private_dir(dir: &Path) -> Result<()> {
     if dir.exists() {
         return Ok(());

@@ -123,8 +123,16 @@ impl OpsClient {
         Ok(Self { http, url: cfg.url.trim_end_matches('/').to_owned(), token: cfg.token.clone() })
     }
 
+    /// A client with no token, for the holder routes (`GET /cards/:id/slots`, `POST …/load`).
+    pub fn holder(url: &str) -> Result<Self> {
+        Self::new(&OpsConfig { url: url.to_owned(), token: String::new() })
+    }
+
     async fn call(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value, OpsError> {
-        let mut req = self.http.request(method, format!("{}{path}", self.url)).bearer_auth(&self.token);
+        let mut req = self.http.request(method, format!("{}{path}", self.url));
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -170,10 +178,63 @@ impl OpsClient {
         Self::version(&self.call(reqwest::Method::PUT, &format!("/cards/{short_id}/slots/{slot}"), Some(body)).await?)
     }
 
-    /// `POST /federations`: the name a till read from the federation's config.
-    pub async fn federation(&self, federation_id: &str, name: &str) -> Result<(), OpsError> {
-        let body = json!({"federation_id": federation_id, "name": name});
+    /// `POST /federations`: what a till read from the federation's config ([`FederationReport`]).
+    pub async fn federation(&self, report: &FederationReport) -> Result<(), OpsError> {
+        let mut body = json!({"federation_id": report.federation_id, "tbs_pks": report.tbs_pks});
+        if let Some(name) = report.name.as_deref().filter(|n| !n.trim().is_empty()) {
+            body["name"] = json!(name);
+        }
         self.call(reqwest::Method::POST, "/federations", Some(&body)).await.map(|_| ())
+    }
+
+    /// `GET /cards/:id/slots` (holder): the card's free slot keys, its version and federation.
+    pub async fn free_slots(&self, short_id: &str) -> Result<FreeSlots, OpsError> {
+        let v = self.call(reqwest::Method::GET, &format!("/cards/{short_id}/slots"), None).await?;
+        serde_json::from_value(v).map_err(|e| OpsError::Unreachable(format!("the free slots did not parse: {e}")))
+    }
+
+    /// `POST /cards/:id/load` (holder): the notes, pending, before the wallet submits.
+    pub async fn load(&self, short_id: &str, body: &Value) -> Result<u64, OpsError> {
+        Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/load"), Some(body)).await?)
+    }
+
+    /// `POST /cards/:id/load/outcome` (holder): the signatures, or `{accepted: false}`.
+    pub async fn load_outcome(&self, short_id: &str, body: &Value) -> Result<u64, OpsError> {
+        Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/load/outcome"), Some(body)).await?)
+    }
+}
+
+/// `GET /cards/:id/slots` as the registry answers it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FreeSlots {
+    pub version: u64,
+    pub federation_id: String,
+    pub free: Vec<RemoteSlot>,
+}
+
+/// What a till tells ops about its federation (`POST /federations`): the name, for the
+/// provisioner to show, and the mint's aggregate key per note tier, which ops checks every note's
+/// signature against before it is live (OPS-PLAN O4).
+#[derive(Debug, Clone)]
+pub struct FederationReport {
+    pub federation_id: String,
+    pub name: Option<String>,
+    /// Tier in msat (decimal) to its `tbs::AggregatePublicKey`, 96 bytes compressed G2, hex.
+    pub tbs_pks: std::collections::BTreeMap<String, String>,
+}
+
+impl FederationReport {
+    /// Read from the wallet's copy of the federation's client config.
+    pub async fn of(wallet: &crate::wallet::Wallet) -> Self {
+        use fedimint_core::encoding::Encodable as _;
+        let name = wallet.client.config().await.global.meta.get("federation_name").cloned();
+        let tbs_pks = wallet
+            .mint_cfg
+            .tbs_pks
+            .iter()
+            .map(|(amount, pk)| (amount.msats.to_string(), pk.consensus_encode_to_hex()))
+            .collect();
+        Self { federation_id: wallet.federation_id().to_string(), name, tbs_pks }
     }
 }
 
@@ -574,12 +635,13 @@ pub fn ops_error(err: &anyhow::Error) -> Option<&OpsError> {
     err.chain().find_map(|c| c.downcast_ref::<OpsError>())
 }
 
-/// Report the federation's name to ops at `serve` startup. A failure is a warning only.
-pub async fn report_federation(client: &OpsClient, federation_id: &str, name: Option<&str>) {
-    let Some(name) = name.filter(|n| !n.trim().is_empty()) else { return };
-    if let Err(e) = client.federation(federation_id, name).await {
-        tracing::warn!("ops: could not report the federation's name: {e}");
-        eprintln!("warning: could not report the federation's name to ops: {e}");
+/// Report the federation's name and mint keys to ops at `serve` startup. A failure is a warning
+/// only, but until some till of the operator has reported the keys, ops refuses every outcome
+/// that makes a note live.
+pub async fn report_federation(client: &OpsClient, report: &FederationReport) {
+    if let Err(e) = client.federation(report).await {
+        tracing::warn!("ops: could not report the federation: {e}");
+        eprintln!("warning: could not report the federation's name and mint keys to ops: {e}");
     }
 }
 

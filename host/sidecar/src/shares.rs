@@ -87,6 +87,22 @@ pub fn finish_note(
     Ok(signature)
 }
 
+/// The finished signature of a card note at `outpoint`: fetch the guardians' shares for its
+/// blinded nonce, aggregate, unblind and verify. Both the till's `topup` and the holder loader
+/// (`holder.rs`) end a load with this.
+pub async fn note_signature(
+    w: &Wallet,
+    outpoint: OutPoint,
+    amount: Amount,
+    nonce: Nonce,
+    key: BlindingKey,
+    timeout: Duration,
+) -> Result<tbs::Signature> {
+    let blinded = blind(nonce, key);
+    let sig = fetch_blind_signature(w, outpoint.txid, OutSpec { out_idx: outpoint.out_idx, amount, blinded }, timeout).await?;
+    finish_note(w, amount, nonce, key, blinded, sig)
+}
+
 /// The blinded message for a nonce under a blinding key.
 pub fn blind(nonce: Nonce, key: BlindingKey) -> BlindedMessage {
     tbs::blind_message(nonce.to_message(), key)

@@ -17,20 +17,22 @@
  * The federation's spent set stops a double spend whatever this says.
  */
 import {
+  BadRequest,
+  Conflict,
   isCount,
   isHex,
   isPinPolicy,
   isPositiveInt,
   isShortId,
+  NotFound,
 } from './http';
+import {checkNotes, putMintKeys} from './mint';
 
 export const SLOTS = 8;
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
 const MAX_TX_HEX = 64 * 1024;
 
-export class Conflict extends Error {}
-export class NotFound extends Error {}
-export class BadRequest extends Error {}
+export {BadRequest, Conflict, NotFound};
 
 type Sql = SqlStorage;
 
@@ -307,14 +309,14 @@ export function listCards(
 /* Card state                                                                */
 /* ------------------------------------------------------------------------- */
 
-function versionOf(sql: Sql, shortId: string): number {
+export function versionOf(sql: Sql, shortId: string): number {
   const row = sql
     .exec('SELECT version FROM card_versions WHERE short_id = ?', shortId)
     .toArray()[0] as {version: number} | undefined;
   return row ? Number(row.version) : 0;
 }
 
-function bump(sql: Sql, shortId: string): number {
+export function bump(sql: Sql, shortId: string): number {
   const next = versionOf(sql, shortId) + 1;
   sql.exec(
     `INSERT INTO card_versions (short_id, version) VALUES (?, ?)
@@ -325,7 +327,7 @@ function bump(sql: Sql, shortId: string): number {
   return next;
 }
 
-function requireVersion(sql: Sql, shortId: string, version: unknown): void {
+export function requireVersion(sql: Sql, shortId: string, version: unknown): void {
   if (!Number.isSafeInteger(version)) {
     throw new BadRequest('version must be the integer the state answered');
   }
@@ -354,10 +356,15 @@ export function cardState(sql: Sql, shortId: string) {
   // Live and pending notes, and the spent or dead ones still on a slot's current
   // key: that key is burned until a till renews the slot, and a till that never
   // saw the card learns it only from here (the sidecar's `overwritable_slots`).
+  // A holder's load in flight shows as pending notes without txid or blinding key:
+  // a till keeps off those slots but does not try to collect them (`loads.ts`).
   const notes: NoteView[] = sql
     .exec(
-      `SELECT slot, amount_msat, nonce, signature, blinding_key, status, txid, out_idx
-       FROM notes WHERE short_id = ? AND (status IN ('live', 'pending')
+      `SELECT slot, amount_msat, nonce, signature, status, out_idx,
+         CASE WHEN held THEN NULL ELSE txid END AS txid,
+         CASE WHEN held THEN NULL ELSE blinding_key END AS blinding_key
+       FROM (SELECT *, status = 'pending' AND txid IN (SELECT txid FROM holder_loads) AS held FROM notes)
+       WHERE short_id = ? AND (status IN ('live', 'pending')
          OR nonce IN (SELECT '02' || pubkey FROM card_slots WHERE short_id = ?))
        ORDER BY slot`,
       shortId,
@@ -634,6 +641,13 @@ export function recordOutcome(
       ) {
         throw new BadRequest('an accepted charge needs a signature for every change note, and no others');
       }
+      // Every live note in ops carries a signature the federation made (O4): a till's change
+      // and loads are checked as a holder's load is.
+      checkNotes(
+        sql,
+        shortId,
+        body.change.map(c => ({nonce: c.nonce, amount_msat: c.amount_msat, signature: signatures.get(c.nonce)!})),
+      );
       for (const nonce of body.inputs) {
         sql.exec(
           "UPDATE notes SET status = 'spent' WHERE short_id = ? AND nonce = ?",
@@ -718,7 +732,11 @@ export function recordSubmitted(
 /* Federation names                                                          */
 /* ------------------------------------------------------------------------- */
 
-/** A name a till read from the federation's config, kept per operator. */
+/**
+ * What a till read from the federation's config, kept per operator: its name, and the mint's
+ * key per note tier (`tbs_pks`, see `mint.ts`). Either may be absent, not both: a federation
+ * without a name still has keys.
+ */
 export function putFederationName(
   sql: Sql,
   operatorId: number,
@@ -728,18 +746,26 @@ export function putFederationName(
   if (!isHex(r.federation_id, 32)) {
     throw new BadRequest('federation_id must be the decoded federation id, 32 bytes hex');
   }
-  const name = typeof r.name === 'string' ? r.name.trim() : '';
-  if (name === '' || name.length > 128) {
-    throw new BadRequest('name must be 1 to 128 characters');
+  if (r.name === undefined && r.tbs_pks === undefined) {
+    throw new BadRequest('expected a name, the mint keys (tbs_pks), or both');
   }
-  sql.exec(
-    `INSERT INTO federations (operator_id, federation_id, name, updated_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (operator_id, federation_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`,
-    operatorId,
-    r.federation_id,
-    name,
-    now,
-  );
+  if (r.name !== undefined) {
+    const name = typeof r.name === 'string' ? r.name.trim() : '';
+    if (name === '' || name.length > 128) {
+      throw new BadRequest('name must be 1 to 128 characters');
+    }
+    sql.exec(
+      `INSERT INTO federations (operator_id, federation_id, name, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (operator_id, federation_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`,
+      operatorId,
+      r.federation_id,
+      name,
+      now,
+    );
+  }
+  if (r.tbs_pks !== undefined) {
+    putMintKeys(sql, operatorId, r.federation_id, r.tbs_pks, now);
+  }
 }
 
 export function listFederationNames(
