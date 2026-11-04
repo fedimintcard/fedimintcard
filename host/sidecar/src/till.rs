@@ -134,23 +134,27 @@ impl Card for NoCard {
 }
 
 /// Open the card behind the phone relay at `relay` and select the applet. Blocking.
-/// Get the card in the relay's field. Succeeds whenever a card is there.
 ///
-/// It does **not** select the applet: a blank card answers `6A82` to SELECT, and that is the
-/// normal first state of a card in a batch, not a failure. Selecting here made every route —
-/// including `precheck`, whose whole job is to describe a card with no applet — answer 502 on the
-/// one card the provisioner most needs to see. Commands that need the applet select it themselves
-/// (`precheck`) or fail with the card's own status word.
+/// The probe comes first: `GET DATA FF21` distinguishes "no card in the field" (the relay answers
+/// 503, a transport error) from "card present, applet absent" (a status word).
+///
+/// The SELECT is then attempted, and `6A82` is tolerated — a blank card answers it, and that is
+/// the normal first state of a card in a batch, not a failure. Skipping the SELECT altogether was
+/// a bug: every applet command after it (`GET_PUB`, `SIGN`, `VERIFY_PIN`) went to the **card
+/// manager** instead of the applet, which answers `6E00` (CLA not supported) — so a charge from the
+/// phone died on its first `GET_PUB` while the same charge from a laptop worked, because the laptop
+/// path had selected the applet when it opened.
 pub fn open_relay_card(relay: &str) -> Result<Box<dyn Card>> {
     let mut c = CardClient::new(BridgeTransport::new(relay));
-    // One card-manager probe, no SELECT: this is what distinguishes "no card in the field" (the
-    // relay answers 503, a transport error) from "card present, applet absent" (a status word).
     c.get_data_ff21()
         .or_else(|e| match status_word(&e) {
             Some(_) => Ok(vec![]),
             None => Err(e),
         })
         .with_context(|| format!("card relay at {relay}"))?;
+    // A blank card, or one whose applet is absent, answers a status word; that is `precheck`'s
+    // subject, not a reason to refuse to hand the card over.
+    let _ = c.select();
     Ok(Box::new(c))
 }
 
