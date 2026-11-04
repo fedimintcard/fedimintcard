@@ -389,9 +389,15 @@ export const styles = (t: Theme) =>
       borderWidth: 1.5,
       borderRadius: 14,
       paddingVertical: 14,
+      paddingHorizontal: 16,
       alignItems: 'center',
     },
-    secondaryText: {color: t.ink, fontFamily: FONT.medium, fontSize: 16},
+    secondaryText: {
+      color: t.ink,
+      fontFamily: FONT.medium,
+      fontSize: 16,
+      textAlign: 'center',
+    },
     row: {
       paddingHorizontal: 18,
       paddingVertical: 15,

@@ -23,10 +23,11 @@ import {LOAD_LINE} from '../settings';
 import {SIGNIN} from '../strings';
 import {useStore} from '../store';
 import {
+  Card,
+  EntryRow,
   FONT,
   PrimaryButton,
   Screen,
-  SecondaryButton,
   signInReason,
   styles,
   useTheme,
@@ -182,14 +183,20 @@ export function SignInScreen({onDemo}: {onDemo?: () => void} = {}) {
             </Text>
           )}
           {/* No account, no card, no registry — the reviewer's way in
-              (plan § 7, Guideline 2.1). */}
+              (plan § 7, Guideline 2.1). A row, not a button: it opens a
+              screen, and the demo chooser draws its own entries this way. */}
           {onDemo ? (
-            <SecondaryButton
-              title={SIGNIN.demo}
-              onPress={onDemo}
-              disabled={busy}
-              testID="sign-in-demo"
-            />
+            <View style={local.demo}>
+              <Card>
+                <EntryRow
+                  title={SIGNIN.demo}
+                  subtitle={SIGNIN.demoSub}
+                  onPress={onDemo}
+                  disabled={busy}
+                  testID="sign-in-demo"
+                />
+              </Card>
+            </View>
           ) : null}
         </View>
       </Screen>
@@ -228,4 +235,5 @@ const local = StyleSheet.create({
   },
   form: {alignSelf: 'stretch', gap: 10, paddingHorizontal: 8},
   footer: {gap: 12, paddingBottom: 8},
+  demo: {marginTop: 4},
 });

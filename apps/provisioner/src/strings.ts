@@ -15,7 +15,8 @@ export const SIGNIN = {
   button: 'SIGN IN',
   signingIn: 'SIGNING IN…',
   note: 'Use the operator account provided by your administrator.',
-  demo: 'TRY THE DEMO — NO ACCOUNT NEEDED',
+  demo: 'Try the demo',
+  demoSub: 'Real engine, simulated card, no account.',
   namePlaceholder: 'Operator name',
   passwordPlaceholder: 'Password',
   failed: (reason: string) =>
