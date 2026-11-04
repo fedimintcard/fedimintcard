@@ -54,6 +54,8 @@ export const LOOP = {
   title: 'BATCH',
   /** The counter under the title: cards done, of the batch. */
   progress: (done: number, of: number) => `${done} of ${of} cards`,
+  /** The stage's headline: the batch's own denominator, no noun. */
+  of: (done: number, of: number) => `${done} of ${of}`,
   done: (done: number, of: number) => `${done} of ${of} cards finished`,
   next: (card: number, of: number) => `Card ${card} of ${of}`,
   tap: 'Hold the card against the phone.',

@@ -25,6 +25,8 @@
 import React, {useCallback, useRef, useState} from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
+import {CardFigure} from '../CardFigure';
+
 import {LocalClient} from '../api';
 import {FEDIMINT_PLAN, provision} from '../cardkit';
 import {generatePin, useBatchPin, usePinReveal} from '../pin';
@@ -32,6 +34,7 @@ import {LOCAL_SIDECAR_ORIGIN} from '../settings';
 import {phaseMessage, withCard} from '../session';
 import {LOOP} from '../strings';
 import {
+  useLoop,
   type CardPhase,
   type CardStop,
   type RecordRow,
@@ -92,6 +95,7 @@ export function LoopScreen({
   onSettings: () => void;
 }) {
   const batch = useBatch();
+  const liveLoop = useLoop();
   const batchPin = useBatchPin();
   const reveal = usePinReveal();
   const t = useTheme();
@@ -292,7 +296,26 @@ export function LoopScreen({
   if (!batch || !config || !actions) {
     return null;
   }
+
   const {summary, stops, records} = batch;
+  const loop = liveLoop;
+  // The write's own progress, and 1 once the card is written. A batch with no
+  // card on the phone yet shows a blank face.
+  const figureFill =
+    !busy && records.length > 0 && records[records.length - 1]?.ok
+      ? 1
+      : loop?.loadProgress
+        ? loop.loadProgress.index / Math.max(1, loop.loadProgress.of)
+        : 0;
+  const figureState = stopShown
+    ? 'danger'
+    : !busy && records.length > 0 && records[records.length - 1]?.ok
+      ? 'done'
+      : busy
+        ? 'running'
+        : 'idle';
+  const phaseLine = loop?.phase ? phaseMessage(loop.phase) : LOOP.tap;
+  const nextLine = LOOP.tap;
   const left = Math.max(0, config.count - records.length);
   const cardNumber = Math.min(records.length + 1, config.count);
 
@@ -309,9 +332,11 @@ export function LoopScreen({
           : undefined
       }>
       <ScrollView contentContainerStyle={local.scroll} testID="loop-scroll">
-        <View style={local.progress}>
-          <Text style={[local.progressText, {color: t.ink}]}>
-            {LOOP.progress(records.length, config.count)}
+        {/* The counter is the screen's headline: the batch's own denominator,
+            with the run's real progress under it. */}
+        <View style={local.head}>
+          <Text testID="counter" style={local.counter}>
+            {LOOP.of(records.length, config.count)}
           </Text>
           <View style={[local.track, {backgroundColor: t.line}]}>
             <View
@@ -319,7 +344,9 @@ export function LoopScreen({
                 local.fill,
                 {
                   backgroundColor: t.accent,
-                  width: `${Math.round((records.length / config.count) * 100)}%`,
+                  width: `${Math.round(
+                    (records.length / Math.max(1, config.count)) * 100,
+                  )}%`,
                 },
               ]}
             />
@@ -329,6 +356,18 @@ export function LoopScreen({
               summary.empty +
               summary.unspendable} stopped`}
           </Dim>
+        </View>
+
+        {/* The card itself, filling as the write's blocks land. The sweep is
+            `loadProgress`, the block the card last acknowledged — never a
+            timed estimate, so a slow card looks slow. */}
+        <View style={local.figureWrap}>
+          <CardFigure fill={figureFill} state={figureState} />
+          <Text
+            style={[local.phase, {color: t.ink}]}
+            accessibilityLiveRegion="polite">
+            {busy ? line ?? phaseLine : nextLine}
+          </Text>
         </View>
 
         {blockedBy ? (
@@ -452,7 +491,24 @@ function RecordLine({row}: {row: RecordRow}) {
 }
 
 const local = StyleSheet.create({
-  scroll: {gap: 12, paddingBottom: 24},
+  scroll: {gap: 14, paddingBottom: 24, flexGrow: 1},
+  head: {alignItems: 'center', gap: 10, marginTop: 4},
+  counter: {
+    fontFamily: FONT.tabular,
+    fontVariant: ['tabular-nums'],
+    fontSize: 44,
+    letterSpacing: 0.5,
+    textAlign: 'center',
+  },
+  figureWrap: {alignItems: 'center', gap: 14, marginVertical: 12, flex: 1, justifyContent: 'center'},
+  phase: {
+    fontFamily: FONT.medium,
+    fontSize: 17,
+    textAlign: 'center',
+    letterSpacing: 0.3,
+    minHeight: 24,
+    paddingHorizontal: 8,
+  },
   progress: {gap: 8},
   progressText: {fontFamily: FONT.semibold, fontSize: 22},
   track: {height: 4, borderRadius: 2, overflow: 'hidden'},
