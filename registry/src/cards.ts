@@ -1,0 +1,693 @@
+/**
+ * Batches, card rows and card state (OPS-PLAN § 5).
+ *
+ * Card state is what the sidecar's `card_state.json` held
+ * (`host/sidecar/src/state.rs`), per card instead of one file per data dir:
+ * the eight slot keys, the notes behind them, and each charge a till made.
+ * None of it is spendable here. A note is spent only with a BIP340 signature
+ * from its slot key, which never leaves the card, behind the card's PIN. The
+ * blinding keys of pending change notes unblind a signature; the note still
+ * needs the card. The secret keys of a till's own outputs never come here.
+ *
+ * Writes follow the sidecar's write-ahead order (`glue.rs` `sign_and_submit`):
+ * a till records its intent before the card signs, and the outcome after the
+ * federation answers. Every write names the card `version` it read, and a
+ * stale one is a 409, so two tills cannot both write against the same notes.
+ * The federation's spent set stops a double spend whatever this says.
+ */
+import {
+  isCount,
+  isHex,
+  isPinPolicy,
+  isPositiveInt,
+  isShortId,
+} from './http';
+
+export const SLOTS = 8;
+/** A signed transaction's consensus encoding, hex; a charge's is a few KB. */
+const MAX_TX_HEX = 64 * 1024;
+
+export class Conflict extends Error {}
+export class NotFound extends Error {}
+export class BadRequest extends Error {}
+
+type Sql = SqlStorage;
+
+/* ------------------------------------------------------------------------- */
+/* Batches                                                                   */
+/* ------------------------------------------------------------------------- */
+
+export interface RegistryBatch {
+  readonly batch_id: number;
+  readonly federation_id: string;
+  readonly count: number;
+  readonly pin_policy: 'batch' | 'perCard';
+  readonly load_sha256: string;
+  readonly created_at: number;
+}
+
+export function createBatch(
+  sql: Sql,
+  operatorId: number,
+  r: Record<string, unknown>,
+  now: number,
+): RegistryBatch {
+  // The federation's id, hex, as the app decodes it from the invite (OPS-PLAN
+  // § 9.4). The first deployment took the whole invite; that is refused now.
+  if (!isHex(r.federation_id, 32)) {
+    throw new BadRequest('federation_id must be the 32-byte federation id, hex');
+  }
+  if (!isPositiveInt(r.count)) {
+    throw new BadRequest('count must be a positive integer');
+  }
+  if (!isPinPolicy(r.pin_policy)) {
+    throw new BadRequest("pin_policy must be 'batch' or 'perCard'");
+  }
+  if (!isHex(r.load_sha256, 32)) {
+    throw new BadRequest('load_sha256 must be 64 lower-case hex characters');
+  }
+  const row = sql
+    .exec(
+      `INSERT INTO batches (federation_id, count, pin_policy, load_sha256, created_at, operator_id)
+       VALUES (?, ?, ?, ?, ?, ?) RETURNING batch_id`,
+      r.federation_id,
+      r.count,
+      r.pin_policy,
+      r.load_sha256,
+      now,
+      operatorId,
+    )
+    .one() as {batch_id: number};
+  return {
+    batch_id: Number(row.batch_id),
+    federation_id: r.federation_id,
+    count: r.count,
+    pin_policy: r.pin_policy,
+    load_sha256: r.load_sha256,
+    created_at: now,
+  };
+}
+
+export function listBatches(sql: Sql, operatorId: number): RegistryBatch[] {
+  return sql
+    .exec(
+      `SELECT batch_id, federation_id, count, pin_policy, load_sha256, created_at
+       FROM batches WHERE operator_id = ? ORDER BY batch_id`,
+      operatorId,
+    )
+    .toArray()
+    .map(r => ({
+      batch_id: Number(r.batch_id),
+      federation_id: String(r.federation_id),
+      count: Number(r.count),
+      pin_policy: String(r.pin_policy) as 'batch' | 'perCard',
+      load_sha256: String(r.load_sha256),
+      created_at: Number(r.created_at),
+    }));
+}
+
+function batchOwner(sql: Sql, batchId: number): number | null {
+  const row = sql
+    .exec('SELECT operator_id FROM batches WHERE batch_id = ?', batchId)
+    .toArray()[0] as {operator_id: number} | undefined;
+  return row ? Number(row.operator_id) : null;
+}
+
+/** The operator a card belongs to, through its batch; null for no such card. */
+export function cardOwner(sql: Sql, shortId: string): number | null {
+  const row = sql
+    .exec(
+      'SELECT b.operator_id FROM cards c JOIN batches b ON b.batch_id = c.batch_id WHERE c.short_id = ?',
+      shortId,
+    )
+    .toArray()[0] as {operator_id: number} | undefined;
+  return row ? Number(row.operator_id) : null;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Card rows                                                                 */
+/* ------------------------------------------------------------------------- */
+
+export interface StoredCard {
+  readonly short_id: string;
+  readonly batch_id: number;
+  readonly installed_at: number;
+  readonly load_sha256: string;
+  readonly pin_set: boolean;
+  readonly pin_policy: 'batch' | 'perCard';
+  readonly notes_issued: number;
+  /** The eight slot keys as provisioned; empty for a row from before O2. */
+  readonly slot_pubkeys: readonly string[];
+  readonly received_at: number;
+}
+
+type CardBody = Omit<StoredCard, 'received_at'>;
+
+/**
+ * The card body, or why it is not one. Unknown keys are ignored, so a newer
+ * app does not break an older server. `slot_pubkeys` is optional for rows an
+ * older app queued before it sent them; when present it must be all eight
+ * x-only keys, and slot 0's last 4 bytes must be the short id.
+ */
+function parseCard(r: Record<string, unknown>): CardBody {
+  if (!isShortId(r.short_id)) {
+    throw new BadRequest('short_id must be 8 lower-case hex characters');
+  }
+  if (!isPositiveInt(r.batch_id)) {
+    throw new BadRequest('batch_id must be a positive integer');
+  }
+  if (!isPositiveInt(r.installed_at)) {
+    throw new BadRequest('installed_at must be epoch milliseconds');
+  }
+  if (!isHex(r.load_sha256, 32)) {
+    throw new BadRequest('load_sha256 must be 64 lower-case hex characters');
+  }
+  if (typeof r.pin_set !== 'boolean') {
+    throw new BadRequest('pin_set must be a boolean');
+  }
+  if (!isPinPolicy(r.pin_policy)) {
+    throw new BadRequest("pin_policy must be 'batch' or 'perCard'");
+  }
+  if (!isCount(r.notes_issued)) {
+    throw new BadRequest('notes_issued must be a non-negative integer');
+  }
+  let slots: string[] = [];
+  if (r.slot_pubkeys !== undefined) {
+    const keys = r.slot_pubkeys;
+    if (!Array.isArray(keys) || keys.length !== SLOTS || !keys.every(k => isHex(k, 32))) {
+      throw new BadRequest('slot_pubkeys must be 8 x-only keys, 64 lower-case hex each');
+    }
+    if ((keys[0] as string).slice(-8) !== r.short_id) {
+      throw new BadRequest('short_id must be the last 4 bytes of slot 0’s key');
+    }
+    slots = keys as string[];
+  }
+  return {
+    short_id: r.short_id,
+    batch_id: r.batch_id,
+    installed_at: r.installed_at,
+    load_sha256: r.load_sha256,
+    pin_set: r.pin_set,
+    pin_policy: r.pin_policy,
+    notes_issued: r.notes_issued,
+    slot_pubkeys: slots,
+  };
+}
+
+function storedCard(sql: Sql, shortId: string): StoredCard | null {
+  const row = sql.exec('SELECT * FROM cards WHERE short_id = ?', shortId).toArray()[0];
+  if (!row) {
+    return null;
+  }
+  // The keys as provisioned, kept on the row; `card_slots` holds the current
+  // ones, which change when a till renews a spent slot.
+  const slots =
+    row.slot_pubkeys === null || row.slot_pubkeys === undefined
+      ? []
+      : (JSON.parse(String(row.slot_pubkeys)) as string[]);
+  return {
+    short_id: String(row.short_id),
+    batch_id: Number(row.batch_id),
+    installed_at: Number(row.installed_at),
+    load_sha256: String(row.load_sha256),
+    pin_set: Number(row.pin_set) === 1,
+    pin_policy: String(row.pin_policy) as 'batch' | 'perCard',
+    notes_issued: Number(row.notes_issued),
+    slot_pubkeys: slots,
+    received_at: Number(row.received_at),
+  };
+}
+
+function sameCard(a: CardBody, b: CardBody): boolean {
+  return (
+    a.batch_id === b.batch_id &&
+    a.installed_at === b.installed_at &&
+    a.load_sha256 === b.load_sha256 &&
+    a.pin_set === b.pin_set &&
+    a.pin_policy === b.pin_policy &&
+    a.notes_issued === b.notes_issued &&
+    a.slot_pubkeys.length === b.slot_pubkeys.length &&
+    a.slot_pubkeys.every((k, i) => k === b.slot_pubkeys[i])
+  );
+}
+
+/**
+ * The idempotent upsert: an identical body answers the stored row, a
+ * different one for a stored short id is a Conflict and stores nothing. The
+ * batch must be this operator's. `received_at` is ours and never compared;
+ * slot keys are compared as provisioned, so a renewal does not make the
+ * outbox's re-post a conflict.
+ */
+export function postCard(
+  storage: DurableObjectStorage,
+  operatorId: number,
+  r: Record<string, unknown>,
+  now: number,
+): StoredCard {
+  const card = parseCard(r);
+  const sql = storage.sql;
+  const owner = batchOwner(sql, card.batch_id);
+  if (owner !== operatorId) {
+    throw new NotFound(`no batch ${card.batch_id} for this operator`);
+  }
+  return storage.transactionSync(() => {
+    const existing = storedCard(sql, card.short_id);
+    if (existing) {
+      if (sameCard(existing, card)) {
+        return existing;
+      }
+      throw new Conflict(`card ${card.short_id} is already stored with different contents`);
+    }
+    sql.exec(
+      `INSERT INTO cards
+         (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      card.short_id,
+      card.batch_id,
+      card.installed_at,
+      card.load_sha256,
+      card.pin_set ? 1 : 0,
+      card.pin_policy,
+      card.notes_issued,
+      now,
+      card.slot_pubkeys.length > 0 ? JSON.stringify(card.slot_pubkeys) : null,
+    );
+    card.slot_pubkeys.forEach((pubkey, slot) => {
+      sql.exec(
+        'INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)',
+        card.short_id,
+        slot,
+        pubkey,
+      );
+    });
+    sql.exec(
+      'INSERT INTO card_versions (short_id, version) VALUES (?, 0)',
+      card.short_id,
+    );
+    return {...card, received_at: now};
+  });
+}
+
+export function listCards(
+  sql: Sql,
+  operatorId: number,
+  batchId: number,
+): StoredCard[] {
+  if (batchOwner(sql, batchId) !== operatorId) {
+    throw new NotFound(`no batch ${batchId} for this operator`);
+  }
+  return sql
+    .exec('SELECT short_id FROM cards WHERE batch_id = ? ORDER BY received_at', batchId)
+    .toArray()
+    .map(r => storedCard(sql, String(r.short_id))!);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Card state                                                                */
+/* ------------------------------------------------------------------------- */
+
+function versionOf(sql: Sql, shortId: string): number {
+  const row = sql
+    .exec('SELECT version FROM card_versions WHERE short_id = ?', shortId)
+    .toArray()[0] as {version: number} | undefined;
+  return row ? Number(row.version) : 0;
+}
+
+function bump(sql: Sql, shortId: string): number {
+  const next = versionOf(sql, shortId) + 1;
+  sql.exec(
+    `INSERT INTO card_versions (short_id, version) VALUES (?, ?)
+     ON CONFLICT(short_id) DO UPDATE SET version = excluded.version`,
+    shortId,
+    next,
+  );
+  return next;
+}
+
+function requireVersion(sql: Sql, shortId: string, version: unknown): void {
+  if (!Number.isSafeInteger(version)) {
+    throw new BadRequest('version must be the integer the state answered');
+  }
+  const current = versionOf(sql, shortId);
+  if (version !== current) {
+    throw new Conflict(`card ${shortId} is at version ${current}, not ${version}; read it again`);
+  }
+}
+
+export interface NoteView {
+  readonly slot: number;
+  readonly amount_msat: number;
+  readonly nonce: string;
+  readonly signature: string | null;
+  readonly blinding_key: string | null;
+  readonly status: 'live' | 'pending';
+  readonly txid: string | null;
+  readonly out_idx: number | null;
+}
+
+export function cardState(sql: Sql, shortId: string) {
+  const slots = sql
+    .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ? ORDER BY slot', shortId)
+    .toArray()
+    .map(r => ({slot: Number(r.slot), pubkey: String(r.pubkey)}));
+  const notes: NoteView[] = sql
+    .exec(
+      `SELECT slot, amount_msat, nonce, signature, blinding_key, status, txid, out_idx
+       FROM notes WHERE short_id = ? AND status IN ('live', 'pending') ORDER BY slot`,
+      shortId,
+    )
+    .toArray()
+    .map(r => ({
+      slot: Number(r.slot),
+      amount_msat: Number(r.amount_msat),
+      nonce: String(r.nonce),
+      signature: r.signature === null ? null : String(r.signature),
+      blinding_key: r.blinding_key === null ? null : String(r.blinding_key),
+      status: String(r.status) as 'live' | 'pending',
+      txid: r.txid === null ? null : String(r.txid),
+      out_idx: r.out_idx === null ? null : Number(r.out_idx),
+    }));
+  const open = sql
+    .exec(
+      "SELECT txid, till_id, client_ref, body, created_at FROM card_txs WHERE short_id = ? AND status = 'open'",
+      shortId,
+    )
+    .toArray()
+    .map(r => ({
+      txid: String(r.txid),
+      till_id: Number(r.till_id),
+      client_ref: String(r.client_ref),
+      created_at: Number(r.created_at),
+      ...(JSON.parse(String(r.body)) as {tx_hex: string; inputs: string[]; change: ChangeOut[]}),
+    }));
+  return {
+    short_id: shortId,
+    version: versionOf(sql, shortId),
+    slots,
+    notes,
+    open_txs: open,
+  };
+}
+
+interface ChangeOut {
+  readonly slot: number;
+  readonly amount_msat: number;
+  readonly nonce: string;
+  readonly blinding_key: string;
+  readonly out_idx: number;
+}
+
+function parseIntent(r: Record<string, unknown>) {
+  if (!isHex(r.txid, 32)) {
+    throw new BadRequest('txid must be 32 bytes, hex');
+  }
+  if (typeof r.client_ref !== 'string' || r.client_ref.length < 1 || r.client_ref.length > 128) {
+    throw new BadRequest('client_ref must be 1 to 128 characters');
+  }
+  if (
+    typeof r.tx_hex !== 'string' ||
+    r.tx_hex.length === 0 ||
+    r.tx_hex.length > MAX_TX_HEX ||
+    r.tx_hex.length % 2 !== 0 ||
+    !/^[0-9a-f]*$/.test(r.tx_hex)
+  ) {
+    throw new BadRequest('tx_hex must be the signed transaction, lower-case hex');
+  }
+  if (!Array.isArray(r.inputs) || r.inputs.length === 0 || !r.inputs.every(n => isHex(n, 33))) {
+    throw new BadRequest('inputs must be the spent notes’ nonces, 33 bytes hex each');
+  }
+  if (new Set(r.inputs).size !== r.inputs.length) {
+    throw new BadRequest('inputs name a note twice');
+  }
+  if (!Array.isArray(r.change)) {
+    throw new BadRequest('change must be a list');
+  }
+  const change: ChangeOut[] = r.change.map(c => {
+    const o = c as Record<string, unknown>;
+    if (
+      typeof o !== 'object' ||
+      o === null ||
+      !Number.isSafeInteger(o.slot) ||
+      (o.slot as number) < 0 ||
+      (o.slot as number) >= SLOTS ||
+      !isPositiveInt(o.amount_msat) ||
+      !isHex(o.nonce, 33) ||
+      !isHex(o.blinding_key, 32) ||
+      !isCount(o.out_idx)
+    ) {
+      throw new BadRequest('each change output needs slot 0-7, amount_msat, nonce, blinding_key and out_idx');
+    }
+    return {
+      slot: o.slot as number,
+      amount_msat: o.amount_msat,
+      nonce: o.nonce,
+      blinding_key: o.blinding_key,
+      out_idx: o.out_idx,
+    };
+  });
+  if (new Set(change.map(c => c.slot)).size !== change.length) {
+    throw new BadRequest('change names a slot twice');
+  }
+  return {
+    txid: r.txid,
+    client_ref: r.client_ref,
+    body: {tx_hex: r.tx_hex, inputs: r.inputs as string[], change},
+  };
+}
+
+/**
+ * A till's charge, recorded before the card signs. Replaying the same intent
+ * answers the current version; a different body under the same txid, a
+ * stale version, a second open charge, an input that is not a live note of
+ * this card, or change into an occupied or unknown slot is refused.
+ */
+export function recordIntent(
+  storage: DurableObjectStorage,
+  shortId: string,
+  tillId: number,
+  r: Record<string, unknown>,
+  now: number,
+): {version: number; replayed: boolean} {
+  const intent = parseIntent(r);
+  const sql = storage.sql;
+  return storage.transactionSync(() => {
+    const prior = sql
+      .exec('SELECT short_id, client_ref, body FROM card_txs WHERE txid = ?', intent.txid)
+      .toArray()[0] as {short_id: string; client_ref: string; body: string} | undefined;
+    if (prior) {
+      if (
+        prior.short_id === shortId &&
+        prior.client_ref === intent.client_ref &&
+        prior.body === JSON.stringify(intent.body)
+      ) {
+        return {version: versionOf(sql, shortId), replayed: true};
+      }
+      throw new Conflict(`transaction ${intent.txid} is already recorded differently`);
+    }
+    requireVersion(sql, shortId, r.version);
+    const open = sql
+      .exec("SELECT txid FROM card_txs WHERE short_id = ? AND status = 'open'", shortId)
+      .toArray();
+    if (open.length > 0) {
+      throw new Conflict(`card ${shortId} has an open charge ${String(open[0]!.txid)}; resolve it first`);
+    }
+    for (const nonce of intent.body.inputs) {
+      const note = sql
+        .exec('SELECT status FROM notes WHERE short_id = ? AND nonce = ?', shortId, nonce)
+        .toArray()[0] as {status: string} | undefined;
+      if (!note || note.status !== 'live') {
+        throw new Conflict(`input ${nonce} is not a live note of card ${shortId}`);
+      }
+    }
+    const slots = new Set(
+      sql
+        .exec('SELECT slot FROM card_slots WHERE short_id = ?', shortId)
+        .toArray()
+        .map(s => Number(s.slot)),
+    );
+    const spentSlots = new Set(
+      intent.body.inputs.map(n =>
+        Number(
+          (sql.exec('SELECT slot FROM notes WHERE short_id = ? AND nonce = ?', shortId, n).one() as {slot: number}).slot,
+        ),
+      ),
+    );
+    for (const c of intent.body.change) {
+      if (!slots.has(c.slot)) {
+        throw new Conflict(`card ${shortId} has no key in slot ${c.slot}`);
+      }
+      const held = sql
+        .exec(
+          "SELECT nonce FROM notes WHERE short_id = ? AND slot = ? AND status IN ('live', 'pending')",
+          shortId,
+          c.slot,
+        )
+        .toArray();
+      if (held.length > 0 || spentSlots.has(c.slot)) {
+        throw new Conflict(`slot ${c.slot} of card ${shortId} already backs a note`);
+      }
+    }
+    sql.exec(
+      `INSERT INTO card_txs (txid, short_id, till_id, client_ref, body, status, outcome, created_at, resolved_at)
+       VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL)`,
+      intent.txid,
+      shortId,
+      tillId,
+      intent.client_ref,
+      JSON.stringify(intent.body),
+      now,
+    );
+    for (const c of intent.body.change) {
+      sql.exec(
+        `INSERT INTO notes (short_id, nonce, slot, amount_msat, signature, blinding_key, status, txid, out_idx)
+         VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?)`,
+        shortId,
+        c.nonce,
+        c.slot,
+        c.amount_msat,
+        c.blinding_key,
+        intent.txid,
+        c.out_idx,
+      );
+    }
+    return {version: bump(sql, shortId), replayed: false};
+  });
+}
+
+/**
+ * What the federation decided. Accepted: the inputs are spent and each change
+ * note becomes live with its unblinded signature. Rejected: the change notes
+ * are dead and the inputs stay live. Any till of the operator may record it,
+ * so a charge whose till died is finished by the next one to see the card.
+ * A repeat of the recorded outcome answers 200; a different one is a 409.
+ */
+export function recordOutcome(
+  storage: DurableObjectStorage,
+  shortId: string,
+  r: Record<string, unknown>,
+  now: number,
+): {version: number; replayed: boolean} {
+  if (!isHex(r.txid, 32)) {
+    throw new BadRequest('txid must be 32 bytes, hex');
+  }
+  if (typeof r.accepted !== 'boolean') {
+    throw new BadRequest('accepted must be a boolean');
+  }
+  const signatures = new Map<string, string>();
+  if (r.accepted) {
+    if (!Array.isArray(r.change)) {
+      throw new BadRequest('an accepted charge needs change: [{nonce, signature}]');
+    }
+    for (const c of r.change) {
+      const o = c as Record<string, unknown>;
+      if (typeof o !== 'object' || o === null || !isHex(o.nonce, 33) || !isHex(o.signature, 48)) {
+        throw new BadRequest('each change note needs nonce (33 bytes) and signature (48 bytes), hex');
+      }
+      signatures.set(o.nonce, o.signature);
+    }
+  }
+  const outcome = JSON.stringify({accepted: r.accepted, change: [...signatures].sort()});
+  const sql = storage.sql;
+  return storage.transactionSync(() => {
+    const tx = sql
+      .exec('SELECT short_id, body, status, outcome FROM card_txs WHERE txid = ?', r.txid)
+      .toArray()[0] as {short_id: string; body: string; status: string; outcome: string | null} | undefined;
+    if (!tx || tx.short_id !== shortId) {
+      throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
+    }
+    if (tx.status !== 'open') {
+      if (tx.outcome === outcome) {
+        return {version: versionOf(sql, shortId), replayed: true};
+      }
+      throw new Conflict(`charge ${String(r.txid)} is already resolved differently`);
+    }
+    const body = JSON.parse(tx.body) as {inputs: string[]; change: ChangeOut[]};
+    if (r.accepted) {
+      if (
+        signatures.size !== body.change.length ||
+        !body.change.every(c => signatures.has(c.nonce))
+      ) {
+        throw new BadRequest('an accepted charge needs a signature for every change note, and no others');
+      }
+      for (const nonce of body.inputs) {
+        sql.exec(
+          "UPDATE notes SET status = 'spent' WHERE short_id = ? AND nonce = ?",
+          shortId,
+          nonce,
+        );
+      }
+      for (const c of body.change) {
+        sql.exec(
+          "UPDATE notes SET status = 'live', signature = ? WHERE short_id = ? AND nonce = ?",
+          signatures.get(c.nonce)!,
+          shortId,
+          c.nonce,
+        );
+      }
+    } else {
+      for (const c of body.change) {
+        sql.exec(
+          "UPDATE notes SET status = 'dead' WHERE short_id = ? AND nonce = ?",
+          shortId,
+          c.nonce,
+        );
+      }
+    }
+    sql.exec(
+      'UPDATE card_txs SET status = ?, outcome = ?, resolved_at = ? WHERE txid = ?',
+      r.accepted ? 'accepted' : 'rejected',
+      outcome,
+      now,
+      r.txid,
+    );
+    return {version: bump(sql, shortId), replayed: false};
+  });
+}
+
+/**
+ * A slot's new key after the till renewed it (GEN_KEY with P2 = 01): only a
+ * slot that backs no live or pending note, and only from the key on record.
+ */
+export function renewSlot(
+  storage: DurableObjectStorage,
+  shortId: string,
+  slot: number,
+  r: Record<string, unknown>,
+): {version: number} {
+  if (!Number.isSafeInteger(slot) || slot < 0 || slot >= SLOTS) {
+    throw new BadRequest('slot must be 0 to 7');
+  }
+  if (!isHex(r.old_pubkey, 32) || !isHex(r.pubkey, 32)) {
+    throw new BadRequest('old_pubkey and pubkey must be x-only keys, 64 lower-case hex');
+  }
+  const sql = storage.sql;
+  return storage.transactionSync(() => {
+    requireVersion(sql, shortId, r.version);
+    const row = sql
+      .exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot = ?', shortId, slot)
+      .toArray()[0] as {pubkey: string} | undefined;
+    if (!row) {
+      throw new NotFound(`card ${shortId} has no slot ${slot} on record`);
+    }
+    if (row.pubkey !== r.old_pubkey) {
+      throw new Conflict(`slot ${slot} of card ${shortId} does not hold that key`);
+    }
+    const held = sql
+      .exec(
+        "SELECT nonce FROM notes WHERE short_id = ? AND slot = ? AND status IN ('live', 'pending')",
+        shortId,
+        slot,
+      )
+      .toArray();
+    if (held.length > 0) {
+      throw new Conflict(`slot ${slot} of card ${shortId} still backs a note`);
+    }
+    sql.exec(
+      'UPDATE card_slots SET pubkey = ? WHERE short_id = ? AND slot = ?',
+      r.pubkey,
+      shortId,
+      slot,
+    );
+    return {version: bump(sql, shortId)};
+  });
+}

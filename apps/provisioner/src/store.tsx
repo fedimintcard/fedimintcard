@@ -192,6 +192,11 @@ export interface RecordRow extends CardOutcome {
   at: number;
   /** A registry write is outstanding; the summary shows it and retry re-posts. */
   pending: boolean;
+  /**
+   * The card's eight slot keys, x-only hex, slot 0 first, when key setup ran.
+   * The registry keeps them so a till can find the card's notes (OPS-PLAN § 5).
+   */
+  slotKeys?: readonly string[];
 }
 
 /** The loop's live view: the next card's number and what the card is doing. */
@@ -241,6 +246,8 @@ export interface BatchSummary {
 export interface CardResult extends CardOutcome {
   /** A successful run's card key. Absent when the run failed before KEY_SETUP. */
   pubkey?: readonly number[];
+  /** All eight slot keys, slot 0 first, from a finished key setup. */
+  slotKeys?: readonly (readonly number[])[];
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +377,8 @@ export interface StoreApi {
     rows: readonly RecordRow[],
     session: Session,
   ): Promise<readonly RecordRow[]>;
+  /** Revokes the session on the service; best effort, never blocks sign-out. */
+  signOut?(): Promise<void>;
 }
 
 export interface StoreShape {
@@ -477,6 +486,8 @@ export function StoreProvider({
   );
 
   const signOut = useCallback((): void => {
+    // The service forgets the token too; signing out here never waits on it.
+    apiRef.current?.signOut?.().catch(() => undefined);
     // The outbox's frozen bodies outlive the session on purpose (api.ts); the
     // batch does not. Ending it drops the one PIN the app holds.
     pinSlot.wipe();
@@ -516,7 +527,13 @@ export function StoreProvider({
       pinState,
       id: result.pubkey ? shortIdOf(result.pubkey) : `unkeyed-${at}`,
       at,
-      pending: true,
+      // A run that stopped before the card had keys has no short id, so the
+      // registry has nothing to record: the row is the batch's own, never
+      // posted, and never shown as waiting on the registry.
+      pending: result.pubkey !== undefined,
+      slotKeys: result.slotKeys?.map(k =>
+        k.map(b => b.toString(16).padStart(2, '0')).join(''),
+      ),
     };
     setBatch(b => {
       if (!b || b.phase !== 'running') {
@@ -537,6 +554,9 @@ export function StoreProvider({
         },
       };
     });
+    if (!row.pending) {
+      return;
+    }
     apiRef.current?.postCard(row).then(
       () => {
         setBatch(b =>

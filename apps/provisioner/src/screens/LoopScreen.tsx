@@ -278,6 +278,7 @@ export function LoopScreen({
         pinState: 'set',
         notesIssued: [],
         pubkey,
+        slotKeys: setup.keys,
       });
       if (policy === 'perCard') {
         reveal.grant(id, pin);

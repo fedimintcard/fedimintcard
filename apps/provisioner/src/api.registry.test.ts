@@ -43,3 +43,41 @@ test('a batch or a card before sign-in is refused, not sent', async () => {
   await expect(api.postBatch({federation: 'f', count: 1, pinPolicy: 'batch'}))
     .rejects.toThrow(/before an operator signed in/);
 });
+
+test('a finished card carries its eight slot keys; sign-out revokes the token on the registry', async () => {
+  const seen: {path: string; body: any; auth?: string}[] = [];
+  const origin = 'https://registry.test';
+  const fetcher = async (url: string, init?: RequestInit) => {
+    const path = String(url).replace(origin, '');
+    seen.push({
+      path,
+      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      auth: (init?.headers as any)?.Authorization ?? (init?.headers as any)?.authorization,
+    });
+    if (path === '/auth/operator/session') return post({operator_id: 1, token: 'op_tok'});
+    if (path === '/registry/batches') return post({batch: {batch_id: 9}});
+    if (path === '/registry/cards') return post({stored: {}});
+    if (path === '/auth/operator/signout') return post({ok: true});
+    throw new Error('unexpected ' + path);
+  };
+  const api = new RegistryStoreApi(new RegistryClient({baseUrl: origin, fetcher}), origin);
+  await api.signIn('dread', 'pw');
+  await api.postBatch({federation: 'x', count: 1, pinPolicy: 'perCard'});
+  const keys = Array.from({length: 8}, (_, i) => String(i).repeat(64));
+  await api.postCard({
+    id: '00000000', at: 1, phase: 'done', ok: true, pinPolicy: 'perCard',
+    pinState: 'set', notesIssued: [], pending: false, slotKeys: keys,
+  } as any);
+  await api.postCard({
+    id: 'unkeyed-1', at: 2, phase: 'probe', ok: false, stop: 'pulled', pinPolicy: 'perCard',
+    pinState: 'unknown', notesIssued: [], pending: false,
+  } as any);
+  const cards = seen.filter(s => s.path === '/registry/cards');
+  expect(cards[0]!.body.slot_pubkeys).toEqual(keys);
+  expect('slot_pubkeys' in cards[1]!.body).toBe(false);
+
+  await api.signOut();
+  const out = seen.find(s => s.path === '/auth/operator/signout');
+  expect(out?.auth).toBe('Bearer op_tok');
+  await expect(api.postBatch({federation: 'x', count: 1, pinPolicy: 'batch'})).rejects.toThrow(/before an operator signed in/);
+});

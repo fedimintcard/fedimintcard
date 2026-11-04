@@ -31,6 +31,7 @@ import {decodeInvite} from './federation';
 /** The hosted registry's own reasons, surfaced verbatim (plan § 3, S1: never improvised). */
 export type ServiceOperation =
   | 'sign-in'
+  | 'sign-out'
   | 'create-batch'
   | 'post-card'
   | 'list-cards';
@@ -266,6 +267,12 @@ export interface CardRegistryRow {
   readonly pin_policy: 'batch' | 'perCard';
   /** Notes issued onto the card, satoshi. Zero is a keyed, PIN'd, empty card. */
   readonly notes_issued: number;
+  /**
+   * The eight slot keys, x-only hex, slot 0 first (OPS-PLAN § 5): the public
+   * half only, which a till needs to find the card's notes. Absent on a row
+   * whose key setup did not finish.
+   */
+  readonly slot_pubkeys?: readonly string[];
 }
 
 export interface OperatorSession {
@@ -328,6 +335,15 @@ export class RegistryClient extends HttpTransport {
     // keys to rotate, so a key environment is not part of a session here. A
     // service that still sends one is ignored rather than rejected.
     return {operator_id: json.operator_id as number, token: json.token};
+  }
+
+  /** POST /auth/operator/signout — the registry revokes this token. */
+  async signOut(token: string): Promise<void> {
+    await this.post('/auth/operator/signout', {
+      token,
+      body: {},
+      operation: 'sign-out',
+    });
   }
 
   /** POST /registry/batches. */
@@ -512,6 +528,15 @@ export class RegistryStoreApi {
     return {operatorId: s.operator_id, token: s.token};
   }
 
+  /** Revokes the session on the registry, then forgets it here. */
+  async signOut(): Promise<void> {
+    const token = this.current;
+    this.current = null;
+    if (token !== null) {
+      await this.client.signOut(token);
+    }
+  }
+
   /** Open the batch once; a card row cannot be posted before it. */
   async postBatch(config: StoreBatchConfig): Promise<void> {
     const token = this.token();
@@ -587,6 +612,9 @@ export class RegistryStoreApi {
       pin_policy: row.pinPolicy,
       // the loop records each note it wrote; the registry stores the total
       notes_issued: row.notesIssued.reduce((sum, n) => sum + n, 0),
+      ...(row.slotKeys && row.slotKeys.length === 8
+        ? {slot_pubkeys: [...row.slotKeys]}
+        : {}),
     };
   }
 }
