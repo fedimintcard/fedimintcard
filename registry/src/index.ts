@@ -20,6 +20,7 @@
  *              POST /registry/cards              GET /registry/cards?batch_id=
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
  *              GET  /registry/federations        names tills reported
+ *              GET  /registry/backup-status      last backup; 503 if none or stale
  *   operator   GET  /cards/:short_id/state
  *   or till
  *   till       POST /cards/:short_id/intent      the charge, unsigned, before the card signs;
@@ -63,6 +64,7 @@ import {
   recordSubmitted,
   renewSlot,
 } from './cards';
+import {backupStatus, nextBackupAt, runBackup} from './backup';
 import {migrate} from './db';
 import {bearer, fail, isPositiveInt, isShortId, json, objectBody} from './http';
 
@@ -74,19 +76,29 @@ export interface Env {
    * Applied once per nonce when the object starts. `wrangler secret put OPERATOR_SETUP`.
    */
   readonly OPERATOR_SETUP?: string;
+  /** R2 bucket for the nightly encrypted backup (`backup.ts`). */
+  readonly BACKUPS?: R2Bucket;
+  /** The age recipient (age1…) backups are encrypted to; its identity lives outside Cloudflare. */
+  readonly BACKUP_RECIPIENT?: string;
 }
 
 type Caller = {kind: 'operator'; operatorId: number} | {kind: 'till'; till: Till};
 
 export class Registry {
   private readonly ctx: DurableObjectState;
+  private readonly env: Env;
   /** Why the object cannot serve, when the setup command was refused. */
   private broken: string | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
+    this.env = env;
     ctx.blockConcurrencyWhile(async () => {
       migrate(ctx.storage);
+      // The nightly backup runs on the object's alarm; arm it if nothing is.
+      if ((await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(nextBackupAt(Date.now()));
+      }
       try {
         await applySetup(ctx.storage, env.OPERATOR_SETUP, Date.now());
       } catch (e) {
@@ -96,10 +108,26 @@ export class Registry {
     });
   }
 
+  /** The nightly backup. A failure is recorded (backup-status) and retried in an hour. */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    try {
+      await runBackup(this.ctx.storage, this.env.BACKUPS, this.env.BACKUP_RECIPIENT, now);
+      await this.ctx.storage.setAlarm(nextBackupAt(now));
+    } catch {
+      await this.ctx.storage.setAlarm(now + 60 * 60 * 1000);
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/test/')) {
       return this.testHook(url.pathname, request);
+    }
+    // Reached only through the object's own stub: the Worker refuses /internal/.
+    if (url.pathname === '/internal/backup' && request.method === 'POST') {
+      const done = await runBackup(this.ctx.storage, this.env.BACKUPS, this.env.BACKUP_RECIPIENT, Date.now());
+      return json(200, {ok: true, ...done});
     }
     if (this.broken) {
       return fail(503, `the registry's operator setup was refused: ${this.broken}`);
@@ -197,6 +225,11 @@ export class Registry {
       if (!body) return fail(400, 'the card row must be an object');
       return json(200, {ok: true, stored: postCard(storage, op, body, now)});
     }
+    if (path === '/registry/backup-status' && method === 'GET') {
+      // 503 until a backup succeeded, and when the last success is over 26 hours old.
+      const status = backupStatus(sql, Boolean(this.env.BACKUPS && this.env.BACKUP_RECIPIENT), now);
+      return json(status.stale ? 503 : 200, {ok: !status.stale, ...status});
+    }
     if (path === '/registry/federations' && method === 'GET') {
       return json(200, {ok: true, federations: listFederationNames(sql, op)});
     }
@@ -272,7 +305,7 @@ export class Registry {
     if (path === '/test/reset') {
       for (const table of [
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
-        'tills', 'sessions', 'login_attempt_budget', 'federations',
+        'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }
@@ -315,7 +348,7 @@ export default {
     if (url.pathname === '/health') {
       return json(200, {ok: true});
     }
-    if (url.pathname.startsWith('/test/')) {
+    if (url.pathname.startsWith('/test/') || url.pathname.startsWith('/internal/')) {
       return fail(404, 'no such route');
     }
     // One global object: every request lands on the same writer.

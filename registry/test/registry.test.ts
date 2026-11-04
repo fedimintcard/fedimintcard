@@ -1,7 +1,8 @@
-import {env, runInDurableObject, SELF} from 'cloudflare:test';
+import {env, runDurableObjectAlarm, runInDurableObject, SELF} from 'cloudflare:test';
 import {beforeEach, describe, expect, it} from 'vitest';
 
 import {applySetup, LOGIN_MAX_ATTEMPTS, parseSetup} from '../src/auth';
+import {decrypt, nextBackupAt} from '../src/backup';
 import {migrate, MIGRATIONS} from '../src/db';
 
 /**
@@ -632,6 +633,69 @@ describe('federation names', () => {
     expect((await post('/federations', till.token, {federation_id: 'fed11abc', name: 'x'})).status).toBe(400);
     expect((await post('/federations', till.token, {federation_id: FED, name: '   '})).status).toBe(400);
     expect((await get('/registry/federations', till.token)).status).toBe(403);
+  });
+});
+
+describe('backups', () => {
+  /** The test-only identity for vitest.config.ts's BACKUP_RECIPIENT. */
+  const IDENTITY = 'AGE-SECRET-KEY-1AHS3RTK9NEEFMWRWJY6RQDF9HZZ9RQTD3UW0CNCX8YHQFSLN08LSECDQ2E';
+
+  it('status is 503 before the first backup', async () => {
+    const token = await signIn();
+    const res = await get('/registry/backup-status', token);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual(expect.objectContaining({configured: true, last_success_at: null, stale: true}));
+  });
+
+  it('writes an encrypted snapshot to R2 that decrypts to every card row and no secret', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    await post('/federations', till.token, {federation_id: FED, name: 'Island Bitcoin'});
+    const res = await stub().fetch('https://registry.internal/internal/backup', {method: 'POST'});
+    expect(res.status).toBe(200);
+    const {key} = (await res.json()) as {key: string};
+    const object = await env.BACKUPS!.get(key);
+    const armored = await object!.text();
+    expect(armored).toContain('BEGIN AGE ENCRYPTED FILE');
+    expect(armored).not.toContain(shortId);
+    const snap = await decrypt(armored, IDENTITY);
+    expect(snap.schema_version).toBe(MIGRATIONS.length);
+    expect(snap.tables.cards!.map(c => c.short_id)).toEqual([shortId]);
+    expect(snap.tables.notes).toEqual([expect.objectContaining({short_id: shortId, status: 'live'})]);
+    expect(snap.tables.federations).toEqual([expect.objectContaining({name: 'Island Bitcoin'})]);
+    const text = JSON.stringify(snap);
+    expect(text).not.toContain('password_hash');
+    expect(text).not.toContain('token_hash');
+    expect(text).not.toContain(till.token);
+    const status = await get('/registry/backup-status', token);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual(expect.objectContaining({last_key: key, stale: false, last_error: null}));
+  });
+
+  it('the object arms its own nightly alarm, and the alarm backs up and re-arms', async () => {
+    const token = await signIn();
+    expect(await runDurableObjectAlarm(stub())).toBe(true);
+    const status = (await (await get('/registry/backup-status', token)).json()) as {last_success_at: number; stale: boolean};
+    expect(status.stale).toBe(false);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(await state.storage.getAlarm()).toBe(nextBackupAt(status.last_success_at));
+    });
+  });
+
+  it('schedules for the next 03:17 UTC', () => {
+    expect(new Date(nextBackupAt(Date.UTC(2026, 10, 4, 1, 0))).toISOString()).toBe('2026-11-04T03:17:00.000Z');
+    expect(new Date(nextBackupAt(Date.UTC(2026, 10, 4, 3, 17))).toISOString()).toBe('2026-11-05T03:17:00.000Z');
+  });
+
+  it('the Worker never forwards /internal/', async () => {
+    expect((await SELF.fetch('https://r.test/internal/backup', {method: 'POST'})).status).toBe(404);
+  });
+
+  it('a till cannot read backup status', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    expect((await get('/registry/backup-status', till.token)).status).toBe(403);
   });
 });
 

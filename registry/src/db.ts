@@ -114,6 +114,16 @@ export const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (operator_id, federation_id)
   );
   `,
+  // v4 (OPS-PLAN § 8): each backup attempt, for the status route.
+  `
+  CREATE TABLE backup_runs (
+    at         INTEGER NOT NULL,
+    ok         INTEGER NOT NULL,
+    object_key TEXT,
+    bytes      INTEGER,
+    error      TEXT
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

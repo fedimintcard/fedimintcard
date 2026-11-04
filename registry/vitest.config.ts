@@ -19,7 +19,10 @@ export default defineConfig({
             name: 'operator',
             password: 'correct horse battery staple',
           }),
+          // A test-only age key pair; its identity is in registry.test.ts.
+          BACKUP_RECIPIENT: 'age1thskleqxjwaf5peh9adq5wz5jxmenhrhgwhl0c5j4xgyhwf9tf2q6zh9mt',
         },
+        r2Buckets: ['BACKUPS'],
       },
       // Tests reset rows themselves in `beforeEach`, so every test starts
       // from an empty table.

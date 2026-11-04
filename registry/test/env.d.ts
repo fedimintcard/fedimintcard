@@ -10,5 +10,7 @@ declare namespace Cloudflare {
   interface Env {
     readonly REGISTRY: DurableObjectNamespace;
     readonly OPERATOR_SETUP?: string;
+    readonly BACKUPS?: R2Bucket;
+    readonly BACKUP_RECIPIENT?: string;
   }
 }

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "The hosted provisioning registry: operator sessions, batches, idempotent card rows (docs/PROVISIONER-PLAN.md \u00a7 4, P1c).",
+  "description": "The hosted provisioning registry: operator sessions, batches, idempotent card rows (docs/PROVISIONER-PLAN.md § 4, P1c).",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
@@ -16,5 +16,8 @@
     "typescript": "^5.9.3",
     "vitest": "~4.1.12",
     "wrangler": "4.156.0"
+  },
+  "dependencies": {
+    "age-encryption": "0.2.4"
   }
 }

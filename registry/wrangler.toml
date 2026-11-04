@@ -32,6 +32,16 @@ new_sqlite_classes = ["Registry"]
 # workers.dev, so a change is exercised there before registry.fedimintcard.org.
 #   npx wrangler deploy --env staging
 #   npx wrangler secret put OPERATOR_SETUP --env staging
+# The nightly encrypted backup (src/backup.ts, OPS-PLAN § 8), run by the
+# object's own alarm (the account's free cron triggers are all in use). The
+# recipient is public; its identity is kept outside this Cloudflare account.
+[vars]
+BACKUP_RECIPIENT = "age1lh9eyz5nutavut9t5tvd2x0elf0ff37q95h2puyyj2yuwqvl65cs3zcn73"
+
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "fedimintcard-registry-backups"
+
 [env.staging]
 name = "fedimintcard-registry-staging"
 workers_dev = true
@@ -39,3 +49,10 @@ workers_dev = true
 [[env.staging.durable_objects.bindings]]
 name = "REGISTRY"
 class_name = "Registry"
+
+[env.staging.vars]
+BACKUP_RECIPIENT = "age1lh9eyz5nutavut9t5tvd2x0elf0ff37q95h2puyyj2yuwqvl65cs3zcn73"
+
+[[env.staging.r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "fedimintcard-registry-backups-staging"

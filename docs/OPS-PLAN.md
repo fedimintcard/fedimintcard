@@ -222,7 +222,13 @@ O1 stands alone and removes the laptop from provisioning. O2 and O3 move the til
 - **One Durable Object.** Fine for a pilot. At scale, one object per card or per operator.
 - **Ops is the only copy of card state.** Losing it strands every card's value: the card
   keeps its keys but no one knows its notes. Ops needs backups before O3 ships; cashucard's
-  nightly encrypted R2 backup is the model.
+  nightly encrypted R2 backup is the model. **Built 2026-11-04** (`registry/src/backup.ts`): a
+  nightly snapshot at 03:17 UTC on the object's own alarm (the account's five free cron
+  triggers are taken), age-encrypted to a recipient whose identity is kept off Cloudflare, in R2
+  (`fedimintcard-registry-backups`, `-staging`). No password or token hashes, no sessions.
+  `GET /registry/backup-status` is 503 before a first success or after 26 hours. Drilled on
+  staging: `registry/scripts/backup-drill.mjs` fetched and decrypted one. Not built: a restore
+  route; a restore today means a new object loaded from the snapshot by hand.
 - **iOS session length.** Install plus key setup must fit one reader session. O1 measures it.
 
 ## 9. Decisions (owner, 2026-11-04)
