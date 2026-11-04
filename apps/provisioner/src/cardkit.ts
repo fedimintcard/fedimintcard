@@ -28,7 +28,7 @@ export const LOAD_FILE_SIZE: number = FEDIMINT_LOAD_FILE.size;
 /**
  * The install: probe → selectIsd → auth → sweep → installForLoad → load →
  * installOpener → installCard → verify (→ done). No `guard`: this applet has no
- * `GET_INFO` to read, so the sweep is gated only by the sidecar pre-check and
- * the operator's Replace switch (plan § 5, § 10).
+ * `GET_INFO` to read. The sweep is gated by `cardSetup.ts`'s `probeApplet`
+ * instead: the loop never runs this plan on a card whose applet has keys.
  */
 export const FEDIMINT_PLAN = fedimintPlan(FEDIMINT_LOAD_FILE);

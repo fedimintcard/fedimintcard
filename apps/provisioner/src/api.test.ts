@@ -13,7 +13,6 @@ import {
   ApiCancelledError,
   ApiServiceError,
   ApiUnreachableError,
-  LocalClient,
   RegistryClient,
   RegistryOutbox,
   type CardRegistryRow,
@@ -187,74 +186,6 @@ test('the card row never carries a PIN', async () => {
 });
 
 /* ---------------------------------------------------------------- sidecar */
-
-test('the sidecar routes are the ones till.rs serves', async () => {
-  const {fetcher, urls, bodies} = scriptedFetcher([
-    () => ({status: 200, json: {ok: true}}),
-    () => ({status: 200, json: {federation_id: 'fed1', card_relay_ok: true}}),
-    () => ({status: 200, json: {ok: true, live_msat: 5, notes: [], free_slots: [0]}}),
-    () => ({
-      status: 200,
-      json: {applet_present: true, isd_open: true, keyed_slots: [], safe_to_replace: true},
-    }),
-    () => ({status: 200, json: {keys: [], short_id: 'abcd', pin_set: true}}),
-    () => ({
-      status: 200,
-      json: {client_ref: 'c1', txid: 'tx', notes: [{slot: 0, msat: 1000}], live_msat: 1000},
-    }),
-  ]);
-  const client = new LocalClient({baseUrl: 'http://127.0.0.1:9878', fetcher});
-  expect(await client.health()).toBe(true);
-  expect((await client.status()).card_relay_ok).toBe(true);
-  await client.balance();
-  await client.precheck(false);
-  await client.keySetup({pin: '123456', replace: false});
-  await client.issue({amounts_msat: [1000], client_ref: 'c1'});
-  expect(urls).toEqual([
-    'http://127.0.0.1:9878/v1/health',
-    'http://127.0.0.1:9878/v1/status',
-    'http://127.0.0.1:9878/v1/card/balance',
-    'http://127.0.0.1:9878/v1/cards/precheck',
-    'http://127.0.0.1:9878/v1/cards/keySetup',
-    'http://127.0.0.1:9878/v1/cards/issue',
-  ]);
-  expect(bodies[3]).toEqual({replace: false});
-  expect(bodies[4]).toEqual({pin: '123456', replace: false});
-  expect(bodies[5]).toEqual({amounts_msat: [1000], client_ref: 'c1'});
-});
-
-test('the sidecar keeps its own code on a failure', async () => {
-  const {fetcher} = scriptedFetcher([
-    () => ({status: 409, json: {ok: false, code: 'no_card', message: 'no card connected'}}),
-  ]);
-  const client = new LocalClient({baseUrl: 'http://127.0.0.1:9878', fetcher});
-  const error = await client.balance().catch(e => e);
-  expect(error).toMatchObject({
-    name: 'ApiServiceError',
-    status: 409,
-    code: 'no_card',
-    reason: 'no card connected',
-    operation: 'balance',
-  });
-});
-
-test('an undecided issue is the sidecar 202, code undecided', async () => {
-  const {fetcher} = scriptedFetcher([
-    () => ({status: 202, json: {ok: false, code: 'undecided', message: 'still resolving'}}),
-  ]);
-  const client = new LocalClient({baseUrl: 'http://127.0.0.1:9878', fetcher});
-  await expect(
-    client.issue({amounts_msat: [1000], client_ref: 'c1'}),
-  ).rejects.toMatchObject({status: 202, code: 'undecided'});
-});
-
-test('a missing relay is ApiUnreachableError, not a card failure', async () => {
-  const {fetcher} = scriptedFetcher([
-    () => ({status: 502, json: {ok: false, code: 'relay_unreachable', message: 'no'}}),
-  ]);
-  const client = new LocalClient({baseUrl: 'http://127.0.0.1:9878', fetcher});
-  await expect(client.balance()).rejects.toBeInstanceOf(ApiUnreachableError);
-});
 
 /* ---------------------------------------------------------------- outbox */
 

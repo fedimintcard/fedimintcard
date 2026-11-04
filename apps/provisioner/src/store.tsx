@@ -42,7 +42,6 @@ import {
   type PinPolicy,
   type PinRevealContext,
 } from './pin';
-import {topupNotesMsat, useSettings} from './settings';
 
 // ---------------------------------------------------------------------------
 // The card path: phases and stops
@@ -65,7 +64,6 @@ export const CARD_PHASES = [
   'verify',
   'keySetup',
   'setPin',
-  'issue',
   'done',
 ] as const;
 
@@ -89,7 +87,7 @@ export function nextPhase(phase: CardPhase): CardPhase {
  * never redefined — and the three below are this card's, from § 5's "Stops"
  * table.
  */
-export type CardStop = StopKind | 'differentCard' | 'pinNotSet' | 'issueFailed';
+export type CardStop = StopKind | 'differentCard' | 'pinNotSet';
 
 /** Every stop, in § 5's table order. */
 export const CARD_STOPS: readonly CardStop[] = [
@@ -99,7 +97,6 @@ export const CARD_STOPS: readonly CardStop[] = [
   'guarded',
   'differentCard',
   'pinNotSet',
-  'issueFailed',
 ];
 
 /**
@@ -115,7 +112,6 @@ const BLOCKS_BATCH: Record<CardStop, boolean> = {
   guarded: false,
   differentCard: false,
   pinNotSet: true,
-  issueFailed: false,
 };
 
 /** The batch can also end on something that is not one card's: unanswered rows. */
@@ -135,7 +131,7 @@ export function pinStateOf(
   if (outcome.stop === 'pinNotSet') {
     return 'notSet';
   }
-  if (outcome.ok || outcome.stop === 'issueFailed') {
+  if (outcome.ok) {
     return 'set';
   }
   return phaseIndex(outcome.phase) > phaseIndex('setPin') ? 'set' : 'unknown';
@@ -144,7 +140,7 @@ export function pinStateOf(
 /**
  * Whether a recorded card can be handed out. The registry's "programmed-only"
  * distinction (§ 5) is this predicate and nothing else: a `pinNotSet` card is
- * programmed and unspendable; an `issueFailed` card is programmed and empty.
+ * programmed and unspendable.
  */
 export function isSpendable(
   outcome: Pick<CardOutcome, 'ok' | 'stop' | 'pinState'>,
@@ -156,14 +152,6 @@ export function isSpendable(
 // The batch
 // ---------------------------------------------------------------------------
 
-/**
- * The top-up the batch issues, as sat amounts the sidecar splits into notes.
- * `null` is an install-only batch, the default.
- */
-export interface TopUpPlan {
-  readonly amounts: readonly number[];
-}
-
 export interface BatchConfig {
   /** The federation invite; the picker in Settings chose it. Never a PIN. */
   federation: string;
@@ -171,13 +159,11 @@ export interface BatchConfig {
   count: number;
   /** One PIN for the batch, or one generated per card: a policy, never a value. */
   pinPolicy: PinPolicy;
-  /** What each card receives. */
-  plan: TopUpPlan | null;
 }
 
 /** The outcome of one card's run, as the engine reports it. */
 export interface CardOutcome {
-  /** `true` only for a card installed, keyed, PIN-verified and issued. */
+  /** `true` only for a card installed, keyed and PIN-verified. */
   ok: boolean;
   /** Where the run stopped: `done` when it finished. */
   phase: CardPhase;
@@ -187,7 +173,10 @@ export interface CardOutcome {
   pinPolicy: PinPolicy;
   /** Whether the card's PIN is set and verified. */
   pinState: PinState;
-  /** Notes the card received, in sat. Empty unless `issue` ran. */
+  /**
+   * Notes the card received, in sat. Always empty: the provisioner loads no
+   * value (docs/OPS-PLAN.md § 6). Kept because the registry row carries it.
+   */
   notesIssued: readonly number[];
   /** The card's status word, when the card refused one. */
   sw?: number;
@@ -234,10 +223,8 @@ export interface BatchSummary {
   attempted: number;
   /** The batch's own denominator, so "ended early" is a visible difference. */
   target: number;
-  /** Installed, keyed, PIN-verified and issued. */
+  /** Installed, keyed and PIN-verified. */
   spendable: number;
-  /** Programmed and keyed but no value (`issueFailed`): recorded, not handed out. */
-  empty: number;
   /** Programmed but the PIN did not verify (`pinNotSet`): must be zero (§ 10). */
   unspendable: number;
   /** Stopped before the install completed. */
@@ -245,8 +232,6 @@ export interface BatchSummary {
   /** Registry writes outstanding. */
   pending: number;
   policy: PinPolicy;
-  /** Notes the whole batch issued, in sat. */
-  notesIssued: number;
 }
 
 /**
@@ -256,78 +241,6 @@ export interface BatchSummary {
 export interface CardResult extends CardOutcome {
   /** A successful run's card key. Absent when the run failed before KEY_SETUP. */
   pubkey?: readonly number[];
-}
-
-// ---------------------------------------------------------------------------
-// The plan preview (BatchSetup's fourth field)
-// ---------------------------------------------------------------------------
-
-/** Notes one card can hold: the applet has 8 slots. */
-export const MAX_NOTES_PER_CARD = 8;
-
-/**
- * The issue plan as BatchSetup previews it: the amounts, and the sums the
- * screen would otherwise have to compute. § 5 keeps this field because the
- * operator must see what the batch will actually put on each card before it
- * starts, not just "success" afterwards.
- */
-export interface PlanPreview {
-  /** `false` when the amounts are not a plan this card can hold. */
-  ok: boolean;
-  amounts: readonly number[];
-  /** What one card receives, in sat. */
-  perCard: number;
-  /** What the batch receives, in sat: `perCard × count`. */
-  batchTotal: number;
-  /** One line per note the sidecar will make, for the list the screen renders. */
-  lines: readonly string[];
-  /** The batch has nothing to issue: an install-only batch. */
-  installOnly: boolean;
-  /** Why the plan cannot be issued, or null. */
-  problem: string | null;
-}
-
-/**
- * The plan for a batch, from the batch's own top-up plan — which BatchSetup
- * builds from the runtime settings' sum. The lines are the notes the sidecar
- * will make of it (`plan::binary` of the msat amount), so the operator sees
- * what the batch will put on each card before it starts. A sum that splits
- * into more notes than the card has slots, or a non-positive or fractional
- * amount, is refused here, before the first card is touched.
- */
-export function planPreview(
-  config: Pick<BatchConfig, 'count' | 'plan'>,
-): PlanPreview {
-  const list = config.plan === null ? [] : [...config.plan.amounts];
-  const perCard = list.reduce((sum, n) => sum + n, 0);
-  const notes = list.flatMap(n => topupNotesMsat(n));
-  const base: PlanPreview = {
-    ok: true,
-    amounts: list,
-    perCard,
-    batchTotal: perCard * config.count,
-    lines: notes.map(msat => `${(msat / 1000).toLocaleString('en-US')} sat`),
-    installOnly: list.length === 0,
-    problem: null,
-  };
-  if (notes.length > MAX_NOTES_PER_CARD) {
-    return {
-      ...base,
-      ok: false,
-      problem: `${perCard.toLocaleString('en-US')} sat splits into ${notes.length} notes, more than the card's ${MAX_NOTES_PER_CARD} slots.`,
-    };
-  }
-  if (list.some(n => !Number.isSafeInteger(n) || n <= 0)) {
-    return {
-      ...base,
-      ok: false,
-      problem: 'Every amount must be a whole number of sat, greater than zero.',
-    };
-  }
-  if (!Number.isSafeInteger(config.count) || config.count < 1) {
-    return {...base, ok: false, problem: 'A batch is at least one card.'};
-  }
-  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,33 +309,26 @@ export function summarize(
   records: readonly RecordRow[],
 ): BatchSummary {
   let spendable = 0;
-  let empty = 0;
   let unspendable = 0;
   let pending = 0;
-  let notesIssued = 0;
   for (const r of records) {
     if (r.stop === 'pinNotSet') {
       unspendable++;
-    } else if (r.stop === 'issueFailed') {
-      empty++;
     } else if (isSpendable(r)) {
       spendable++;
     }
     if (r.pending) {
       pending++;
     }
-    notesIssued += r.notesIssued.reduce((sum, n) => sum + n, 0);
   }
   return {
     attempted: records.length,
     target: config.count,
     spendable,
-    empty,
     unspendable,
-    failed: records.length - spendable - empty - unspendable,
+    failed: records.length - spendable - unspendable,
     pending,
     policy: config.pinPolicy,
-    notesIssued,
   };
 }
 
@@ -455,7 +361,7 @@ export interface StoreApi {
     password: string,
     options?: {signal?: AbortSignal},
   ): Promise<{operatorId: number; token: string}>;
-  /** The batch record: federation, count, PIN policy name, plan, load sha (§ 4). */
+  /** The batch record: federation, count, PIN policy name, load sha (§ 4). */
   postBatch(config: BatchConfig): Promise<void>;
   /** One card row, with its PIN state and policy name — never a PIN value. */
   postCard(row: RecordRow): Promise<void>;
@@ -485,8 +391,6 @@ export interface StoreShape {
   batch: BatchView | null;
   /** The live loop, or null when no batch is running. */
   loop: LoopState | null;
-  /** The plan BatchSetup shows, from the runtime settings and the batch's count. */
-  planPreview(count: number): PlanPreview;
   /**
    * The one PIN slot (`pin.ts`'s `usePinReveal`), exposed so the loop and the
    * summary reach it without a second provider in their tree. The store hands
@@ -522,9 +426,7 @@ const OPENING_LOOP: LoopState = {
 };
 
 /**
- * The provider. The theme choice comes from `settings.tsx` so the app has one
- * theme decision; the batch machine itself reads nothing from settings except
- * the top-up amounts, through `planPreview`.
+ * The provider. The batch machine reads nothing from settings.
  *
  * `api` is the registry seam: absent in demo mode and in tests, where the batch
  * machine runs with its rows left pending, which is exactly what the summary's
@@ -541,7 +443,6 @@ export function StoreProvider({
   /** A session api.ts restored, when it has one. */
   initialSession?: Session | null;
 }) {
-  const settings = useSettings();
   const [session, setSession] = useState<Session | null>(initialSession);
   const [batch, setBatch] = useState<BatchState | null>(null);
   /**
@@ -772,15 +673,6 @@ export function StoreProvider({
     };
   }, [session, retrying, pendingKey]);
 
-  const previewOf = useCallback(
-    (count: number): PlanPreview =>
-      planPreview({
-        count,
-        plan: settings.topupSats > 0 ? {amounts: [settings.topupSats]} : null,
-      }),
-    [settings.topupSats],
-  );
-
   const view = useMemo<BatchView | null>(
     () => (batch ? viewOf(batch, actions) : null),
     [batch, actions],
@@ -796,7 +688,6 @@ export function StoreProvider({
       startBatch: actions.start,
       batch: view,
       loop: batch && batch.phase === 'running' ? batch.loop : null,
-      planPreview: previewOf,
       pinSlot,
     }),
     [
@@ -807,7 +698,6 @@ export function StoreProvider({
       view,
       batch,
       pinSlot,
-      previewOf,
     ],
   );
 
@@ -851,10 +741,13 @@ export function useLoop(): LoopState | null {
   return useStore().loop;
 }
 
-/** The card's screen id: the last bytes of its applet public key, hex. */
+/**
+ * The card's short id: the last 4 bytes of its slot-0 x-only key, lower-case
+ * hex, which is the registry's rule (`registry/src/index.ts`, `^[0-9a-f]{8}$`).
+ */
 export function shortIdOf(pubkey: readonly number[]): string {
   return pubkey
-    .slice(-2)
+    .slice(-4)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }

@@ -7,7 +7,7 @@
  *   cardkit version, the app identity. Frozen. A change here is a new build and
  *   a store review, because it means "this app installs different card
  *   software" or "this is a different app".
- * - Runtime (`Settings`): federation, registry endpoint, top-up amounts, theme.
+ * - Runtime (`Settings`): federation and registry endpoint.
  *   Persisted under one AsyncStorage key, read by a provider and written through
  *   a hook. These are operational decisions; freezing them would make a copy of
  *   the app's own config cost a review cycle.
@@ -126,14 +126,6 @@ export const REGISTRY_ENDPOINTS: readonly RegistryEndpoint[] = Object.freeze([
 ] as const);
 
 /**
- * The local sidecar (plan § 4, § 7), which keeps the wallet, the key setup and
- * the issue step on the operator's machine: available, `precheck`, `keySetup`,
- * `issue`. Fixed, loopback only, as the till keeps it; a LAN cleartext
- * exception is not defensible at review.
- */
-export const LOCAL_SIDECAR_ORIGIN = 'http://127.0.0.1:9877';
-
-/**
  * The federation, as an invite string the picker also accepts typed by hand
  * (plan § 5: a second federation is expected; a rebuild to switch is a trap).
  *
@@ -147,78 +139,26 @@ export const LOCAL_SIDECAR_ORIGIN = 'http://127.0.0.1:9877';
  */
 export const DEFAULT_FEDERATION = '';
 
-/**
- * The top-up per card, in satoshi. Zero is an install-only batch, which is
- * the default: like the Cashu provisioner, a fresh install keys and installs
- * cards and puts no money on them until the operator asks. The sidecar
- * (`glue.rs` `topup`, `cards.rs` `issue_plan`) splits whatever amount it is
- * given into power-of-two msat notes itself, so the operator types one sum,
- * not a note list.
- */
-export const DEFAULT_TOPUP_SATS = 0;
-
-/**
- * The applet has 8 slots (`tools/cardkit/gp/provision.ts`'s `checks` probe
- * exactly 0–7), and every issued note occupies one, so a sum the sidecar
- * would split into more than 8 notes cannot be held by any card this app
- * programs.
- */
-export const MAX_TOPUP_NOTES = 8;
-
-/**
- * The notes the sidecar makes of `sats`: the binary split of the amount in
- * msat, largest first, exactly as `plan::binary` does it. Empty for zero.
- */
-export function topupNotesMsat(sats: number): readonly number[] {
-  const notes: number[] = [];
-  let rest = sats * 1000;
-  for (let bit = 2 ** 50; bit >= 1 && rest > 0; bit /= 2) {
-    if (rest >= bit) {
-      notes.push(bit);
-      rest -= bit;
-    }
-  }
-  return notes;
-}
-
-/**
- * Whether the operator's sum is one the sidecar can put on a card: a whole,
- * non-negative number of sats whose notes fit the card's slots. Zero is valid
- * and means install only. Whether each note clears the federation's smallest
- * economical denomination is the sidecar's call, made when the batch starts.
- */
-export function isValidTopup(sats: number): boolean {
-  return (
-    Number.isSafeInteger(sats) &&
-    sats >= 0 &&
-    topupNotesMsat(sats).length <= MAX_TOPUP_NOTES
-  );
-}
-
 /** Everything the operator can change, and nothing else. */
 export interface Settings {
   /** The federation invite. Required; empty until the operator picks one. */
   federation: string;
   registryEndpoint: RegistryEndpoint;
-  /** Sats per card; 0 is install only. */
-  topupSats: number;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   federation: DEFAULT_FEDERATION,
   registryEndpoint: 'test',
-  topupSats: DEFAULT_TOPUP_SATS,
 } as const);
 
 /**
- * Whether the batch can start: a federation is chosen and the top-up is a sum
- * the card can hold. BatchSetup shows this as the enabled state of its start
- * button, so a batch never begins against a blank invite.
+ * Whether the batch can start: a federation is chosen. BatchSetup shows this as
+ * the enabled state of its start button, so a batch never begins against a
+ * blank invite. The provisioner loads no value (docs/OPS-PLAN.md § 6), so there
+ * is no amount to check.
  */
 export function settingsAreReady(settings: Settings): boolean {
-  return (
-    isInviteCode(settings.federation) && isValidTopup(settings.topupSats)
-  );
+  return isInviteCode(settings.federation);
 }
 
 /**
@@ -244,8 +184,7 @@ export const SETTINGS_KEY = 'prov.settings.v1';
 
 /**
  * Startup read. Every field is validated on the way in: storage is a place an
- * older build, a half-finished write or a person with a debugger writes, and a
- * malformed amount list must not reach the sidecar. A field that fails falls
+ * older build, a half-finished write or a person with a debugger writes. A field that fails falls
  * back to its default silently; the app never refuses to start over a setting.
  */
 export function parseSettings(raw: string | null): Settings {
@@ -271,12 +210,9 @@ export function parseSettings(raw: string | null): Settings {
   )
     ? (o.registryEndpoint as RegistryEndpoint)
     : DEFAULT_SETTINGS.registryEndpoint;
-  const topupSats =
-    typeof o.topupSats === 'number' && isValidTopup(o.topupSats)
-      ? o.topupSats
-      : DEFAULT_SETTINGS.topupSats;
-  // A stored `theme` from before the brand palette is ignored: there is one.
-  return {federation, registryEndpoint, topupSats};
+  // A stored `theme` from before the brand palette, or a `topupSats` from
+  // before the provisioner stopped loading value, is ignored.
+  return {federation, registryEndpoint};
 }
 
 /** What the rest of the app sees. */
@@ -285,7 +221,6 @@ export interface SettingsState extends Settings {
   loading: boolean;
   setFederation(invite: string): void;
   setRegistryEndpoint(endpoint: RegistryEndpoint): void;
-  setTopupSats(sats: number): void;
   /** One atomic write of everything; `set*` go through it. */
   update(patch: Partial<Settings>): void;
 }
@@ -360,14 +295,6 @@ export function SettingsProvider({
     (registryEndpoint: RegistryEndpoint) => update({registryEndpoint}),
     [update],
   );
-  const setTopupSats = useCallback(
-    (topupSats: number) => {
-      if (isValidTopup(topupSats)) {
-        update({topupSats});
-      }
-    },
-    [update],
-  );
 
   const value = useMemo<SettingsState>(
     () => ({
@@ -375,7 +302,6 @@ export function SettingsProvider({
       loading,
       setFederation,
       setRegistryEndpoint,
-      setTopupSats,
       update,
     }),
     [
@@ -383,7 +309,6 @@ export function SettingsProvider({
       loading,
       setFederation,
       setRegistryEndpoint,
-      setTopupSats,
       update,
     ],
   );

@@ -18,7 +18,6 @@
 import React from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
-import {maskedPin, usePinReveal} from '../pin';
 import {SUMMARY} from '../strings';
 import {type RecordRow, useBatch} from '../store';
 import {
@@ -44,7 +43,6 @@ export function BatchSummaryScreen({
   onClose: () => void;
 }) {
   const batch = useBatch();
-  const reveal = usePinReveal();
   const t = useTheme();
   const [pendingConfirm, setPendingConfirm] = React.useState(false);
 
@@ -53,11 +51,7 @@ export function BatchSummaryScreen({
   }
   const {summary, records, config, phase} = batch;
   const left = Math.max(0, config.count - records.length);
-  // The one generated PIN this batch may reveal: per-card policy only, and only
-  // until the batch ends.
-  const shown = config.pinPolicy === 'perCard' ? reveal.reveal() : null;
-
-  const stopped = summary.failed + summary.empty + summary.unspendable;
+  const stopped = summary.failed + summary.unspendable;
   const closing = summary.pending > 0 && pendingConfirm;
   return (
     <Screen title={SUMMARY.title} onBack={phase !== 'ended' ? onBack : undefined}>
@@ -70,19 +64,6 @@ export function BatchSummaryScreen({
           <Stat value={stopped} label={SUMMARY.stopped} tone={stopped > 0 ? 'danger' : 'ink'} />
           <Stat value={summary.pending} label={SUMMARY.pending} tone="ink" />
         </View>
-        {shown ? (
-          <View
-            style={[local.pinCard, {backgroundColor: t.card, borderColor: t.accent}]}
-            testID="summary-pin">
-            <View style={local.pinText}>
-              <Text style={[local.pinLabel, {color: t.ink}]}>{SUMMARY.pinTitle}</Text>
-              <Text style={[local.small, {color: t.dim}]}>{SUMMARY.pinBody}</Text>
-            </View>
-            <Text style={[local.pinValue, {color: t.accent}]} testID="summary-pin-value">
-              {maskedPin(shown.pin)}
-            </Text>
-          </View>
-        ) : null}
         <View style={local.section}>
           <SectionHeader help={SUMMARY.recordHelp} testID="summary-record-help">
             {SUMMARY.record}
@@ -210,17 +191,6 @@ const local = StyleSheet.create({
   statLabel: {fontFamily: FONT.medium, fontSize: 13},
   section: {gap: 10},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
-  pinCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
-    padding: 16,
-    borderRadius: 16,
-    borderWidth: 1.5,
-  },
-  pinText: {flex: 1, gap: 4},
-  pinLabel: {fontFamily: FONT.semibold, fontSize: 16},
-  pinValue: {fontFamily: FONT.tabular, fontSize: 22, letterSpacing: 4},
   row: {
     flexDirection: 'row',
     alignItems: 'center',

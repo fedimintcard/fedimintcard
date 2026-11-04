@@ -1,13 +1,13 @@
 /**
  * Settings: what the operator sets between batches. The federation (the same
- * picker as NEW BATCH), the top-up per card, the registry endpoint, the demo,
+ * picker as NEW BATCH), the registry endpoint, the demo,
  * the session, and About. Reasons sit behind (i) on each header; choices save
  * as they are made, and a short line at the foot confirms each save.
  *
  * There is no theme choice: the app has one brand palette (`theme.ts`).
  */
 import React, {useEffect, useState} from 'react';
-import {Pressable, ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
+import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {BrandTile} from '../BrandMark';
 import {FederationPicker} from '../FederationPicker';
@@ -15,11 +15,8 @@ import {
   APP_IDENTITY,
   EXPERIMENTAL_WARNING,
   isInviteCode,
-  isValidTopup,
   LOAD_LINE,
-  MAX_TOPUP_NOTES,
   REGISTRY_ENDPOINTS,
-  topupNotesMsat,
   useSettings,
   type RegistryEndpoint,
 } from '../settings';
@@ -27,7 +24,6 @@ import {SETTINGS} from '../strings';
 import {useStore} from '../store';
 import {
   Card,
-  Divider,
   EntryRow,
   FONT,
   PrimaryButton,
@@ -35,7 +31,6 @@ import {
   SectionHeader,
   Segmented,
   SecondaryButton,
-  styles,
   useTheme,
 } from '../ui';
 import {useFederation} from '../useFederation';
@@ -44,14 +39,6 @@ const REGISTRY_LABEL: Record<RegistryEndpoint, string> = {
   test: 'Test',
   production: 'Live',
 };
-
-/** Sums whose notes are all 8 sat or more: no note below a federation's floor. */
-const TOPUP_PRESETS: readonly number[] = [0, 1024, 2048, 4096];
-
-function parseAmount(text: string): number {
-  const digits = text.replace(/[,\s]/g, '');
-  return /^[0-9]+$/.test(digits) ? Number(digits) : NaN;
-}
 
 export function SettingsScreen({
   onBack,
@@ -63,10 +50,8 @@ export function SettingsScreen({
   const settings = useSettings();
   const app = useStore();
   const t = useTheme();
-  const s = styles(t);
   const fed = useFederation(settings.federation);
 
-  const [custom, setCustom] = useState('');
   const [saved, setSaved] = useState<string | null>(null);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   const running = app.batch?.phase === 'running';
@@ -79,20 +64,6 @@ export function SettingsScreen({
     const timer = setTimeout(() => setSaved(null), 2500);
     return () => clearTimeout(timer);
   }, [saved]);
-
-  const parsed = parseAmount(custom);
-  const customValid = custom.trim() !== '' && isValidTopup(parsed);
-  const isPreset = TOPUP_PRESETS.includes(settings.topupSats);
-  const notes = topupNotesMsat(settings.topupSats);
-
-  const saveTopup = (sats: number) => {
-    if (!isValidTopup(sats)) {
-      return;
-    }
-    settings.setTopupSats(sats);
-    setCustom('');
-    setSaved(SETTINGS.amountsSaved(sats));
-  };
 
   return (
     <Screen title={SETTINGS.title} onBack={onBack}>
@@ -113,76 +84,6 @@ export function SettingsScreen({
             }}
             testID="settings-federation"
           />
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader help={SETTINGS.topupHelp} testID="settings-topup-help">
-            {SETTINGS.topup}
-          </SectionHeader>
-          <Card>
-            <View style={local.chips}>
-              {TOPUP_PRESETS.map(sats => {
-                const on = settings.topupSats === sats;
-                return (
-                  <Pressable
-                    key={sats}
-                    onPress={() => saveTopup(sats)}
-                    accessibilityRole="radio"
-                    accessibilityState={{selected: on}}
-                    testID={`settings-topup-${sats}`}
-                    style={[
-                      local.chip,
-                      {borderColor: on ? t.accent : t.line},
-                      on && {backgroundColor: t.accent},
-                    ]}>
-                    <Text style={[local.chipText, {color: on ? t.onAccent : t.ink}]}>
-                      {sats === 0 ? SETTINGS.installOnly : sats.toLocaleString()}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-            <Divider />
-            <View style={local.customRow}>
-              <TextInput
-                value={custom}
-                onChangeText={setCustom}
-                placeholder={
-                  isPreset
-                    ? SETTINGS.customPlaceholder
-                    : `${settings.topupSats.toLocaleString()} sat`
-                }
-                placeholderTextColor={t.dim}
-                keyboardType="number-pad"
-                returnKeyType="done"
-                onSubmitEditing={() => customValid && saveTopup(parsed)}
-                style={[s.input, local.customInput]}
-                testID="settings-amounts"
-              />
-              <Pressable
-                onPress={() => saveTopup(parsed)}
-                disabled={!customValid}
-                accessibilityRole="button"
-                accessibilityState={{disabled: !customValid}}
-                style={[local.setBtn, {backgroundColor: customValid ? t.accent : t.raised}]}
-                testID="settings-amounts-save">
-                <Text style={[local.setText, {color: customValid ? t.onAccent : t.dim}]}>
-                  {SETTINGS.set}
-                </Text>
-              </Pressable>
-            </View>
-            <Text
-              style={[
-                local.small,
-                local.inset,
-                {color: custom.trim() !== '' && !customValid ? t.danger : t.dim},
-              ]}
-              testID="settings-amounts-total">
-              {custom.trim() !== '' && !customValid
-                ? SETTINGS.amountsProblem(MAX_TOPUP_NOTES)
-                : SETTINGS.amountsTotal(notes.length, settings.topupSats)}
-            </Text>
-          </Card>
         </View>
 
         <View style={local.section}>
@@ -300,26 +201,6 @@ const local = StyleSheet.create({
   scroll: {gap: 24, paddingTop: 4, paddingBottom: 40},
   section: {gap: 10},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
-  inset: {paddingHorizontal: 16, paddingBottom: 14},
-  chips: {flexDirection: 'row', gap: 6, padding: 14},
-  chip: {
-    flexGrow: 1,
-    alignItems: 'center',
-    borderWidth: 1.5,
-    borderRadius: 999,
-    paddingHorizontal: 6,
-    paddingVertical: 8,
-  },
-  chipText: {fontFamily: FONT.semibold, fontSize: 13, fontVariant: ['tabular-nums']},
-  customRow: {flexDirection: 'row', gap: 10, padding: 14, paddingBottom: 8},
-  customInput: {flex: 1, minHeight: 46},
-  setBtn: {
-    borderRadius: 12,
-    paddingHorizontal: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  setText: {fontFamily: FONT.semibold, fontSize: 15},
   registryRow: {
     flexDirection: 'row',
     alignItems: 'center',

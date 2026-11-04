@@ -1,6 +1,6 @@
 # Plan: a hosted ops service, and no laptop in the operator's loop
 
-Status: **accepted** (2026-11-04), against `main` @ `ea7c12f`. Nothing here is built.
+Status: **accepted** (2026-11-04), against `main` @ `ea7c12f`. **O1 is built** (§ 7); the rest is not.
 The owner's decisions are in § 9. This plan replaces § 4 of `PROVISIONER-PLAN.md` ("hosted
 registry, local wallet"); where the two disagree, this plan wins.
 
@@ -165,7 +165,10 @@ overwrite real notes. Two options, decided in O4:
 
 - Ops verifies each new note's BLS signature against the federation's public keys before
   marking it live. This needs the federation's keys in the Worker, but no holder account.
-- The holder proves they hold the card. The applet's `SIGN` signs any 32 bytes with a spend
+  **Recommended**, because it is the offline-friendly one: a signed note proves itself, so a
+  wallet can queue a load and upload it whenever it has a connection, and a till can check a
+  card's notes without asking ops.
+- The holder proves they hold the card, which needs the card in hand while ops is online. The applet's `SIGN` signs any 32 bytes with a spend
   key, so a challenge must never be something a till could submit as a transaction. That
   needs a domain-separated signing command in the applet. This is a larger change.
 
@@ -178,7 +181,7 @@ top-up: the quick picks and `Top-up` section from `ea7c12f`, `issue`, and the Se
 | Phase | Work | Done when |
 |---|---|---|
 | **O0** | Owner decisions in § 9 | **done** 2026-11-04 |
-| **O1** | Phone key setup and PIN (§ 4) in cardkit and `LoopScreen`; per-card PIN shown on the loop until the next tap, removed from the summary; registry rule for short id; `slot_pubkeys` on the card row; remove `issue`, `LocalClient` and the top-up UI | jest green with a fake card transceiver; **silicon**: one blank J3R180 finished on the Pixel and one on Max, with no Mac running, `GET_PUB` ×8 matching the registry row, `SIGN` refused before `VERIFY_PIN` (`6A94`) and accepted after |
+| **O1** | Phone key setup and PIN (§ 4) in `cardSetup.ts` and `LoopScreen`; a keyed card is never installed over (`probeApplet`); per-card PIN shown on the loop until the next tap, removed from the summary; registry rule for short id; decoded federation id; remove `issue`, `LocalClient`, the sidecar check and the top-up UI. `slot_pubkeys` on the card row moved to O2, which deploys the registry | jest green with a fake card transceiver; **silicon**: one blank J3R180 finished on the Pixel and one on Max, with no Mac running, `GET_PUB` ×8 matching the registry row, `SIGN` refused before `VERIFY_PIN` (`6A94`) and accepted after. **Pixel done 2026-11-04**: one tap finished a blank J3R180 (short id `2fe32d75`); on an ACR122U, 8 keys read back, `SIGN` → `6A94` before `VERIFY_PIN`, verifying signature after. Max and the keyed-card refusal on silicon still to run |
 | **O2** | Ops tables and routes (§ 5); operators as cashucard has them (§ 9, decision 5); till tokens; decoded federation id | vitest for each route, including 409 on a stale version and on a changed row; deployed to a staging Worker first |
 | **O3** | Till on ops: an HTTPS `StateStore` in the sidecar, keyed by short id; recovery of an open intent; holder PIN in `/v1/charge`, `CARD_PIN` out of the charge path | the sidecar's existing charge tests pass against a local `wrangler dev`; a charge killed between `SIGN` and outcome is recovered by a second till; two cards charged on one till |
 | **O4** | Holder loading (§ 6): the load routes, the trust choice, a reference loader in the sidecar CLI | a card provisioned on Max, loaded by the reference loader from a separate wallet, charged at a till with the holder typing the PIN; a load with a forged signature is refused |

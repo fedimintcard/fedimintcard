@@ -55,14 +55,14 @@ export function normalizeInvite(text: string): string | null {
   return null;
 }
 
-/** Whether `text` is a federation invite the sidecar can join. */
+/** Whether `text` is a federation invite: `fed11…` or `fedimint…`. */
 export function isInviteCode(text: string): boolean {
   return normalizeInvite(text) !== null;
 }
 
 /** What an invite says about its federation, decoded on the phone. */
 export interface InviteInfo {
-  /** The federation id, hex: what the sidecar's status reports too. */
+  /** The federation id, hex: what the registry's batch row records. */
   readonly federationId: string;
   /** Each guardian the invite names: its peer number and API address. */
   readonly guardians: readonly {peer: number; url: string}[];
@@ -133,7 +133,7 @@ const utf8 = (b: Uint8Array) =>
  * `InviteCode` decodes it: a Vec of parts, each a variant number and a
  * length-prefixed payload — 0 = Api {url, peer}, 1 = FederationId (32
  * bytes); others (an API secret, future parts) are skipped by their length.
- * The checksum is not verified: this is for display, and the sidecar parses
+ * The checksum is not verified: this is for display and the registry row, and a wallet parses
  * the invite for real. Null when the bytes do not read as an invite.
  */
 export function decodeInvite(text: string): InviteInfo | null {

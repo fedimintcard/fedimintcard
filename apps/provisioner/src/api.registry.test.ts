@@ -20,12 +20,18 @@ test('the adapter signs in, opens a batch, and posts a row at the registry shape
   expect(api.serviceUrl).toBe(origin);
   const s = await api.signIn('dread', 'pw');
   expect(s).toEqual({operatorId: 7, token: 'tok-1'});
-  await api.postBatch({federation: 'fed11qgqz', count: 1, pinPolicy: 'batch', plan: null});
+  // The invite scanned from a guardian UI on 2026-11-04 (federation.test.ts).
+  const invite =
+    'fed11qgqyj3mfwfhksw309uekyvesvenrzdpjx93xvdf4xcex2d33xajxycmzxf3nzdn9x9jxyctpxy6k2vnpv56nwvtpvsmxgepnx93kvvnzvscnjefn8qurxc3eqqqjp8wgs64nt3zuzc4j073a5mlr2cm4kp6t2jtv06d05kcu3elavy5g5h4kwl';
+  await api.postBatch({federation: invite, count: 1, pinPolicy: 'batch'});
   await api.postCard({
     id: 'C1', at: 1000, phase: 'done', ok: true, pinPolicy: 'batch',
     pinState: 'set', notesIssued: [1048, 524], pending: false,
   } as any);
-  console.log(JSON.stringify(seen, null, 0));
+  // The registry records the federation's id, never the invite text.
+  expect(seen[1].body.federation_id).toBe(
+    '9dc886ab35c45c162b27fa3da6fe356375b074b5496c7e9afa5b1c8e7fd61288',
+  );
   expect(seen[1].body.batch_id).toBeUndefined();
   expect(seen[2].body.batch_id).toBe(42);
   expect(seen[2].body.notes_issued).toBe(1572);
@@ -34,6 +40,6 @@ test('the adapter signs in, opens a batch, and posts a row at the registry shape
 
 test('a batch or a card before sign-in is refused, not sent', async () => {
   const api = new RegistryStoreApi(new RegistryClient({baseUrl: 'https://r.test', fetcher: async () => { throw new Error('sent'); }}), 'https://r.test');
-  await expect(api.postBatch({federation: 'f', count: 1, pinPolicy: 'batch', plan: null}))
+  await expect(api.postBatch({federation: 'f', count: 1, pinPolicy: 'batch'}))
     .rejects.toThrow(/before an operator signed in/);
 });

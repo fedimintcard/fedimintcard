@@ -11,8 +11,8 @@
  * Every state here is reachable on THIS card. Cashu's `hasValue` ("holds
  * value") and `oldVersion` ("old software") states are **not** ported: there is
  * no `GET_INFO` to read a holding from, and no second version to find — the
- * sweep is gated by the sidecar pre-check and the operator's Replace switch
- * (plan § 5, § 10), not by the card. A demo state that cannot happen is a
+ * sweep is gated by the loop's `probeApplet` (a keyed applet is never
+ * installed over), not by the card. A demo state that cannot happen is a
  * screen the operator will trust and the card will not honour. `foreign`
  * takes `hasValue`'s place: it is the stop that exercises the guard for real,
  * as a whitelisted-DELETE refusal.

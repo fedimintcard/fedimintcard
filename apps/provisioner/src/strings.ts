@@ -40,7 +40,7 @@ export const SETUP = {
   title: 'New batch',
   federation: 'Federation',
   federationHelp:
-    'The federation these cards join and draw their money from. Scan the invite QR from the federation\'s guardian or client page, or paste the invite text.\n\nThe phone checks the invite against the sidecar: when they name the same federation the screen shows its name; when they differ, cards would be loaded from the sidecar\'s federation, not this one, so fix that before starting.',
+    'The federation these cards are made for, recorded with the batch. Scan the invite QR from the federation\'s guardian or client page, or paste the invite text.\n\nThe card holds no money when it leaves here: the holder loads it from their own wallet.',
   emptyTitle: 'Add the federation',
   emptyBody: 'Scan its invite QR code, or paste the invite.',
   scanFederation: 'Scan invite QR',
@@ -50,39 +50,24 @@ export const SETUP = {
   customPlaceholder: 'fed11… or fedimint…',
   notInvite: 'That is not a federation invite. It starts with fed11 or fedimint.',
   useInvite: 'Use this invite',
-  sidecarMatch: 'Sidecar is on this federation',
-  sidecarMismatchShort: 'Sidecar is on a different federation',
-  sidecarMismatch:
-    'The sidecar is on a different federation. Cards would be loaded from the sidecar\'s federation, not this one.',
-  sidecarChecking: 'Checking the sidecar…',
-  sidecarOffline: 'Sidecar not reachable from this phone',
   count: 'Cards',
   countLabel: 'Cards in this batch',
   countHelp: (max: number) =>
     `How many cards you will program in this sitting, 1 to ${max}. The loop counts them off one tap at a time; you can end the batch early from the loop.`,
   pin: 'PIN',
   pinHelp:
-    'The card refuses to sign without its PIN.\n\nOne PIN for the batch: you type it once here and every card gets it. It is never stored or sent anywhere but the card.\n\nA PIN per card: each card gets a fresh PIN, shown once on the batch summary. Write each one down before the card is handed out.',
+    'The card refuses to sign without its PIN.\n\nOne PIN for the batch: you type it once here and every card gets it. It is never stored or sent anywhere but the card.\n\nA PIN per card: each card gets a fresh PIN, shown with the finished card until you start the next one. Write it down, or hand it over with the card, before you go on. It is not shown again.',
   pinPlaceholder: (max: number) => `4 to ${max} digits`,
-  perCardSub: 'Shown once on the summary. Write each one down.',
+  perCardSub: 'Shown with each finished card. Write it down before the next.',
   pinBatchShort: 'One for the batch',
   pinPerCardShort: 'One per card',
-  plan: 'Top-up',
-  topupHelp:
-    'What each card leaves with. Install only keys the card and puts no money on it; the holder funds it later.\n\nA top-up sum is split by the sidecar into notes, one per card slot, from the sidecar\'s wallet. Change it in Settings.',
-  topupLabel: 'Top-up',
-  topupChange: 'Change in Settings',
-  installOnly: 'Install only',
-  planPerCard: (total: string, notes: number) =>
-    `${total} sat per card · ${notes} ${notes === 1 ? 'note' : 'notes'}`,
-  batchTotal: 'Batch total',
   review: 'Review batch',
   reviewTitle: 'Review',
   reviewHeader: 'This batch',
   reviewHelp:
     'Check the batch before it starts. Starting records the batch with the registry and opens the card loop; nothing is written to a card until you hold one to the phone.',
-  reviewLine: (count: number, installOnly: boolean) =>
-    `Start opens the loop for ${count} ${count === 1 ? 'card' : 'cards'} and gets ready for card 1: have it in hand. ${installOnly ? 'Each card is installed and keyed with no money on it.' : 'Each card is installed, keyed and topped up.'}`,
+  reviewLine: (count: number) =>
+    `Start opens the loop for ${count} ${count === 1 ? 'card' : 'cards'} and gets ready for card 1: have it in hand. Each card is installed, keyed and given its PIN in one tap, with no money on it.`,
   edit: 'Edit batch',
   start: 'Start batch',
   startFailed: 'The batch could not start.',
@@ -103,13 +88,18 @@ export const LOOP = {
   programmed: (n: number) => `${n} programmed`,
   stopped: (n: number) => `${n} stopped`,
   programmedOne: 'Programmed',
-  cardRow: (n: number, id: string) => `Card ${n} · …${id}`,
+  cardRow: (n: number, id: string) => `Card ${n} · …${id.slice(-4).toUpperCase()}`,
   tap: 'Press Install, then hold the card to the phone.',
   tryNext: 'Set that card aside. Press Install when the next one is ready.',
   allDone: 'Every card in this batch has been tried. Open the summary.',
   stopping: 'Stopping after this step…',
   waitStopped: 'Stopped before a card was read. Press Install when ready.',
   install: (n: number) => `Install card ${n}`,
+  phaseKeys: 'Making the card\'s keys',
+  phasePin: 'Setting the PIN',
+  finished: (id: string) => `Done · …${id.slice(-4).toUpperCase()}`,
+  pinTitle: (n: number) => `Card ${n}\'s PIN`,
+  pinBody: 'Write it down or hand it over with the card. It goes when the next card starts, and is not shown again.',
   keepStill: 'Keep the card still…',
   waiting: 'Waiting for the card…',
   busy: 'Keep the card against the phone until this line says done.',
@@ -131,8 +121,7 @@ export const CALM = {
   wrongKeys: 'The card did not prove the manager keys this batch uses.',
   guarded: 'This card already holds something this app never removes.',
   differentCard: 'The key the card read back is not the one this batch expected.',
-  pinNotSet: 'The card took the PIN but did not confirm it.',
-  issueFailed: 'The card is programmed but the top-up did not go through.',
+  pinNotSet: 'The card was installed, but its keys or its PIN did not finish.',
   outboxPending: 'Some rows have not reached the registry yet. They retry on their own.',
 } as const;
 
@@ -144,7 +133,6 @@ export const STATE = {
   guarded: 'Use a blank card. This app never removes a card that already holds keys.',
   differentCard: 'Set this card aside; it was not issued to.',
   pinNotSet: 'This card is unspendable and must not be handed out. Set it aside.',
-  issueFailed: 'The card is empty; handing it out would promise value that is not there.',
   outboxPending: 'The card work is done; only the registry row waits.',
 } as const;
 
@@ -158,12 +146,10 @@ export const SUMMARY = {
   record: 'Cards',
   recordHelp:
     'Each card tried in this batch, in order, with the time its row was recorded. A hollow dot is a row still on its way to the registry; it retries on its own.',
-  cardRow: (n: number, id: string) => `Card ${n} · …${id}`,
+  cardRow: (n: number, id: string) => `Card ${n} · …${id.slice(-4).toUpperCase()}`,
   empty: 'No cards this batch yet.',
   notReached: (left: number) =>
     `${left} ${left === 1 ? 'card was' : 'cards were'} not attempted.`,
-  pinTitle: 'Last card\'s PIN',
-  pinBody: 'Shown once. It is not kept after the batch ends.',
   pendingRetry: 'Some rows have not reached the registry yet. They retry on their own.',
   pendingNote:
     'Some rows have not reached the registry. Closing now ends the batch; they keep retrying in the background.',
@@ -185,20 +171,6 @@ export const SETTINGS = {
   registryNow: (label: string) => `Recording to the ${label.toLowerCase()} registry.`,
   registryHelp:
     'Where batch and card rows are recorded after each card. Test and Live are the same service under two endpoints; use Test while rehearsing.',
-  topup: 'Top-up per card',
-  topupHelp:
-    'What each card leaves with. Install only keys the card and puts no money on it.\n\nThe sidecar splits a sum into notes, at most one per card slot (8). The quick picks split into notes of 8 sat or more; a sum with smaller notes can be refused by the federation when the batch runs.',
-  installOnly: 'Install only',
-  customPlaceholder: 'Other amount, sat',
-  set: 'Set',
-  amountsSaved: (sats: number) =>
-    sats === 0 ? 'Saved: install only.' : `Saved: ${sats.toLocaleString()} sat per card.`,
-  amountsTotal: (notes: number, sats: number) =>
-    sats === 0
-      ? 'Cards are installed and keyed with no money on them.'
-      : `${sats.toLocaleString()} sat per card, in ${notes} ${notes === 1 ? 'note' : 'notes'}.`,
-  amountsProblem: (most: number) =>
-    `Use a whole number of sats that splits into at most ${most} notes.`,
   about: 'About',
   cardSoftware: (load: string) => `Card software ${load}`,
   experimentalShort: 'Experimental software. Tap (i) on About before handing out cards.',

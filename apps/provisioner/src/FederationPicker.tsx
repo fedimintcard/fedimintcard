@@ -1,6 +1,6 @@
 /**
  * The federation field, shared by NEW BATCH and Settings: the chosen
- * federation as a card (name or short id, guardians, the sidecar check) with
+ * federation as a card (short id and guardians) with
  * "Scan new invite" and "Paste invite", or an empty state whose one loud
  * action is the scan. A scanned or pasted invite is handed to `onChoose`,
  * which saves it: choosing is the operator's decision, so there is no second
@@ -40,15 +40,6 @@ export function FederationPicker({
     onChoose(invite);
   };
 
-  const check =
-    fed.sidecar === 'match'
-      ? {text: SETUP.sidecarMatch, color: t.accent}
-      : fed.sidecar === 'mismatch'
-        ? {text: SETUP.sidecarMismatchShort, color: t.danger}
-        : fed.sidecar === 'checking'
-          ? {text: SETUP.sidecarChecking, color: t.dim}
-          : {text: SETUP.sidecarOffline, color: t.dim};
-
   return (
     <>
       {hasInvite ? (
@@ -63,14 +54,6 @@ export function FederationPicker({
             <Text style={[local.small, {color: t.dim}]} numberOfLines={1}>
               {fed.detail}
             </Text>
-            <View style={local.checkRow}>
-              <View style={[local.dot, {backgroundColor: check.color}]} />
-              <Text
-                style={[local.small, {color: check.color}]}
-                testID={`${testID}-check`}>
-                {check.text}
-              </Text>
-            </View>
           </View>
           <Divider />
           <View style={local.actions}>
@@ -156,8 +139,6 @@ const local = StyleSheet.create({
   body: {paddingHorizontal: 18, paddingVertical: 16, gap: 4},
   title: {fontFamily: FONT.semibold, fontSize: 20, letterSpacing: -0.3},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
-  checkRow: {flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6},
-  dot: {width: 8, height: 8, borderRadius: 4},
   actions: {flexDirection: 'row'},
   action: {flex: 1, alignItems: 'center', paddingVertical: 14},
   actionText: {fontFamily: FONT.semibold, fontSize: 15},

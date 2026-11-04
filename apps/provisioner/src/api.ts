@@ -1,48 +1,23 @@
 import {LOAD_FILE_SHA256} from './cardkit';
+import {decodeInvite} from './federation';
 
 /**
- * The two services the app talks to (docs/PROVISIONER-PLAN.md § 4), split by
- * what they touch, plus the registry outbox. Ported from cashucard
- * `apps/provisioner/src/api.ts`: the transport (timeout, typed errors, the
- * service's own reason strings surfaced verbatim) and the outbox are the same
- * design; the paths and the operation names are this repo's.
+ * The one service the app talks to (docs/OPS-PLAN.md § 3), plus the registry
+ * outbox. Ported from cashucard `apps/provisioner/src/api.ts`: the transport
+ * (timeout, typed errors, the service's own reason strings surfaced verbatim)
+ * and the outbox are the same design; the paths and the operation names are
+ * this repo's.
  *
  * **Hosted** (`RegistryClient`): operator sessions, batches and the idempotent
- * card rows. Paths are § 4's table — `POST /auth/operator/session`,
- * `POST /registry/batches`, `POST /registry/cards`,
- * `GET /registry/cards?batch_id=`. Cashu's `/provisioning/*` and `/keys/issue`
- * are NOT carried over: this app installs the applet from the phone and keys
- * the card through the sidecar, so the hosted service has no attempt, bind,
- * key-issuing or disposition surface to call.
+ * card rows. Paths are `POST /auth/operator/session`, `POST /registry/batches`,
+ * `POST /registry/cards`, `GET /registry/cards?batch_id=`. Cashu's
+ * `/provisioning/*` and `/keys/issue` are NOT carried over: this app installs
+ * the applet and keys the card from the phone, so the hosted service has no
+ * attempt, bind, key-issuing or disposition surface to call.
  *
- * **Local** (`LocalClient`): the sidecar over loopback. Paths and bodies are
- * read from `host/sidecar/src/` itself, not assumed:
- *
- *   GET  /v1/health            till.rs  router(): {"ok": true}
- *   GET  /v1/status            till.rs  status():  {federation_id, federation_name,
- *                                wallet_balance_msat, card_relay_ok, busy}
- *   POST /v1/card/balance      till.rs  card_balance(): no body ->
- *                                {ok, live_msat, notes[{slot, msat, status}], free_slots}
- *   POST /v1/cards/precheck    till.rs  cards_precheck(): no body -> {applet_present,
- *                                isd_open, keyed_slots[], live_msat, safe_to_replace,
- *                                kind, applet, empty_slots[], foreign_slots[], free_slots[]}
- *   POST /v1/cards/keySetup    till.rs  cards_key_setup(): {pin?} -> {keys[{slot,pubkey}],
- *                                short_id, pin_set, pin, generated[]}
- *   POST /v1/cards/issue       till.rs  cards_issue(): {amounts_msat[], client_ref} ->
- *                                {client_ref, txid, notes[{slot,msat}], live_msat}
- *
- * The three card routes live in `sidecar/src/cards.rs`, registered by
- * `till.rs` `router()` and run through the same single actor as a charge, so
- * one card is held at a time. Error codes come from `classify()`; the ones the
- * loop acts on are `no_card`, `relay_unreachable`, `busy`, `undecided`,
- * `card_error`, plus issue's own `ref_mismatch` and `card_holds_notes`.
- *
- * Errors mirror the sidecar's own vocabulary: every failure body is
- * `{"ok": false, "code": "...", "message": "..."}` (`Reply::fail`), where
- * `code` is exactly the string `classify()` returns — `bad_request`,
- * `no_card`, `relay_unreachable`, `card_error`, `insufficient`,
- * `no_exact_plan`, `declined`, `undecided`, `recovering`, `busy`, `internal`.
- * The client never invents one.
+ * There is no local client. The sidecar that keyed and loaded cards over a
+ * relay left the operator's loop: the phone keys the card in the install tap
+ * (`cardSetup.ts`), and the holder's wallet loads it (OPS-PLAN § 4, § 6).
  *
  * The bearer token is a 12 h secret held in memory only (the threat model's
  * confiscated-phone row assumes device loss of the token and nothing more); no
@@ -60,25 +35,13 @@ export type ServiceOperation =
   | 'post-card'
   | 'list-cards';
 
-/** The sidecar's own operations. */
-export type LocalOperation =
-  | 'health'
-  | 'status'
-  | 'balance'
-  | 'precheck'
-  | 'key-setup'
-  | 'issue';
-
 export class ApiServiceError extends Error {
   constructor(
     readonly reason: string,
     readonly status?: number,
-    /**
-     * The service's machine code, when it sent one. The sidecar always does
-     * (`code`); the registry sends `reason` only, so there it stays undefined.
-     */
+    /** The service's machine code, when it sent one; the registry sends `reason` only. */
     readonly code?: string,
-    readonly operation: ServiceOperation | LocalOperation | null = null,
+    readonly operation: ServiceOperation | null = null,
   ) {
     super(reason);
     this.name = 'ApiServiceError';
@@ -101,37 +64,9 @@ export class ApiCancelledError extends Error {
   }
 }
 
-/**
- * The sidecar's HTTP codes for failures the app must not present as a
- * transport problem: every one of them is a card or a federation answering,
- * not the wire. Kept as the strings `classify()` emits, so a new code the
- * sidecar adds shows up in a report verbatim instead of being mapped away.
- */
-export const LOCAL_CODES = [
-  'bad_request',
-  'no_card',
-  'relay_unreachable',
-  'card_error',
-  'insufficient',
-  'no_exact_plan',
-  'declined',
-  'undecided',
-  'recovering',
-  'busy',
-  'internal',
-] as const;
-
-export type LocalCode = (typeof LOCAL_CODES)[number];
-
 const TIMEOUT_MS = 10_000;
 // Deployed 600k PBKDF2 verification takes 8–12s; retain a bounded login.
 const SIGN_IN_TIMEOUT_MS = 30_000;
-// The issue step submits a transaction and waits for acceptance (glue.rs:
-// 90 s for acceptance, plus the fetch of each output), so it gets the longest
-// bounded budget in the app. A timeout here is not a failure that may be
-// retried with a fresh key: the notes may already be the federation's, so the
-// loop treats it as `undecided` and reconciles with `balance` first.
-const ISSUE_TIMEOUT_MS = 120_000;
 
 /** The transport, injectable so the tests never open a socket. */
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
@@ -149,7 +84,7 @@ interface CallOptions {
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
   /** The operation this request is; an error names it, never the path. */
-  readonly operation: ServiceOperation | LocalOperation;
+  readonly operation: ServiceOperation;
 }
 
 /** A parsed JSON body: an object, or `null` when the reply carried none. */
@@ -581,7 +516,9 @@ export class RegistryStoreApi {
   async postBatch(config: StoreBatchConfig): Promise<void> {
     const token = this.token();
     const batch = await this.client.createBatch(token, {
-      federation_id: config.federation,
+      // The federation's id, decoded from the invite on the phone; never the
+      // invite text, which also carries guardian addresses (OPS-PLAN § 9.4).
+      federation_id: decodeInvite(config.federation)?.federationId ?? config.federation,
       count: config.count,
       pin_policy: config.pinPolicy,
       load_sha256: LOAD_FILE_SHA256,
@@ -684,248 +621,4 @@ export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze(
 export function registryOrigin(endpoint: string): string | null {
   const origin = REGISTRY_ORIGINS[endpoint];
   return typeof origin === 'string' && origin !== '' ? origin : null;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Local sidecar (host/sidecar/src/till.rs, § 4).                             */
-/* ------------------------------------------------------------------------- */
-
-/** GET /v1/status — till.rs `status()`. */
-export interface SidecarStatus {
-  readonly federation_id: string;
-  readonly federation_name: string | null;
-  readonly wallet_balance_msat: number;
-  /** False means the phone's relay at :9876 is not answering (README: adb forward). */
-  readonly card_relay_ok: boolean;
-  /** A till job is in flight right now; a card command now is answered `busy`. */
-  readonly busy: boolean;
-}
-
-/** POST /v1/card/balance — till.rs `balance_reply()` and `status_str()`. */
-export interface CardBalance {
-  readonly live_msat: number;
-  readonly notes: readonly {
-    readonly slot: number;
-    readonly msat: number;
-    readonly status: 'live' | 'pending' | 'spent' | 'dead';
-  }[];
-  readonly free_slots: readonly number[];
-}
-
-/**
- * POST /v1/cards/precheck — read-only, nothing written. The protection
- * against wiping a used card is host-side (plan § 5, handoff § 5: the applet
- * has no GET_INFO, so cardkit cannot ask), and this reply is what the loop
- * shows before the sweep.
- */
-export interface CardPrecheck {
-  /** True when the applet answered SELECT with 0200; false when it answered 6A82. */
-  readonly applet_present: boolean;
-  /** The card manager (ISD) says it is there and unlocked for INSTALL. */
-  readonly isd_open: boolean;
-  /** Slots that hold a key: what the sweep would destroy. */
-  readonly keyed_slots: readonly number[];
-  /** Live notes, satoshi. Not zero plus a successful install means a replace. */
-  readonly live_msat: number;
-  /** False for a used card: the loop must ask before it sweeps. */
-  readonly safe_to_replace: boolean;
-}
-
-/** POST /v1/cards/keySetup — `card setup` then SET_PIN, one job, one card. */
-export interface KeySetupRequest {
-  /**
-   * The batch PIN, or the per-card one. Never logged, never stored, never in
-   * a registry body (§ 5 "PIN handling in the app"); the sidecar forwards it
-   * to the card as `41 SET_PIN` and keeps nothing.
-   */
-  readonly pin: string;
-  /** Replace the keys of a card the precheck said was used. The operator's explicit answer. */
-  readonly replace: boolean;
-}
-
-export interface KeySetupResult {
-  /** Slot, and the x-only public key `card_setup` generated into it, hex. */
-  readonly keys: readonly {readonly slot: number; readonly pubkey: string}[];
-  /**
-   * The card's short id, as the sidecar computed it from the keys it just
-   * generated. The app's own rule is `shortIdOf` in `store.tsx` (the last two
-   * bytes of the first slot's key); this field is what the sidecar reported
-   * for the same card, and the loop uses it only to label the run and key the
-   * one-time PIN reveal.
-   */
-  readonly short_id: string;
-  /** True only when SET_PIN answered 9000. */
-  readonly pin_set: boolean;
-}
-
-/** POST /v1/cards/issue — `CardWallet::topup` (glue.rs:452), one job, replay-safe. */
-export interface IssueRequest {
-  /** Notes to create, msat, as `card topup` takes them. The plan previews this exact list. */
-  readonly amounts_msat: readonly number[];
-  /**
-   * The idempotency key. A repeat with the same key returns the same result
-   * (the sidecar writes the `PendingTx` before it signs); a repeat with a
-   * different key for a spent card is a loss, so the key is minted once per
-   * tap and never reused for a second attempt.
-   */
-  readonly client_ref: string;
-}
-
-/**
- * A successful issue. An undecided one is not this shape: the sidecar answers
- * it as a 202 with code `undecided` (`undecided_reply`, till.rs:335), which
- * arrives as an `ApiServiceError` — the loop reads `code` and the summary
- * shows the notes as pending, never as issued.
- */
-export interface IssueResult {
-  readonly client_ref: string;
-  readonly txid: string;
-  readonly notes: readonly {readonly slot: number; readonly msat: number}[];
-  readonly live_msat: number;
-}
-
-/**
- * The sidecar, loopback only. No token: `till serve` says out loud that the
- * API has no authentication (till.rs:657) and the app reaches it on 127.0.0.1,
- * the same way the till does.
- */
-export class LocalClient extends HttpTransport {
-  /**
-   * The sidecar's failures keep their own `code`, so the loop can tell a
-   * pulled card (`no_card`) from a federation refusal (`insufficient`). A
-   * relay that is not there (`relay_unreachable`) is reported as
-   * `ApiUnreachableError` instead: nothing else can be tried until the cable
-   * or `adb forward` is back, and the operator's next move is the same.
-   */
-  private async sidecar(
-    method: 'GET' | 'POST',
-    path: string,
-    call: CallOptions,
-  ): Promise<Record<string, unknown>> {
-    try {
-      return method === 'GET'
-        ? await this.get(path, call)
-        : await this.post(path, call);
-    } catch (error) {
-      if (
-        error instanceof ApiServiceError &&
-        (error.code === 'relay_unreachable' || error.status === 502)
-      ) {
-        throw new ApiUnreachableError(error);
-      }
-      throw error;
-    }
-  }
-
-  /** GET /v1/health — the sign-in screen's "is the sidecar running" probe. */
-  async health(signal?: AbortSignal): Promise<boolean> {
-    const json = await this.sidecar('GET', '/v1/health', {
-      signal,
-      operation: 'health',
-    });
-    return json.ok === true;
-  }
-
-  /** GET /v1/status. */
-  async status(signal?: AbortSignal): Promise<SidecarStatus> {
-    const json = await this.sidecar('GET', '/v1/status', {
-      signal,
-      operation: 'status',
-    });
-    return {
-      federation_id: String(json.federation_id ?? ''),
-      federation_name:
-        typeof json.federation_name === 'string'
-          ? json.federation_name
-          : null,
-      wallet_balance_msat: Number(json.wallet_balance_msat ?? 0),
-      card_relay_ok: json.card_relay_ok === true,
-      busy: json.busy === true,
-    };
-  }
-
-  /** POST /v1/card/balance — reconcile; needs the card on the relay, no body. */
-  async balance(signal?: AbortSignal): Promise<CardBalance> {
-    const json = await this.sidecar('POST', '/v1/card/balance', {
-      signal,
-      operation: 'balance',
-    });
-    return {
-      live_msat: Number(json.live_msat ?? 0),
-      notes: Array.isArray(json.notes)
-        ? (json.notes as CardBalance['notes'])
-        : [],
-      free_slots: Array.isArray(json.free_slots)
-        ? (json.free_slots as number[])
-        : [],
-    };
-  }
-
-  /** POST /v1/cards/precheck — read-only; a used card is refused, never swept. */
-  async precheck(
-    replace: boolean,
-    signal?: AbortSignal,
-  ): Promise<CardPrecheck> {
-    const json = await this.sidecar('POST', '/v1/cards/precheck', {
-      body: {replace},
-      signal,
-      operation: 'precheck',
-    });
-    return {
-      applet_present: json.applet_present === true,
-      isd_open: json.isd_open === true,
-      keyed_slots: Array.isArray(json.keyed_slots)
-        ? (json.keyed_slots as number[])
-        : [],
-      live_msat: Number(json.live_msat ?? 0),
-      safe_to_replace: json.safe_to_replace === true,
-    };
-  }
-
-  /**
-   * POST /v1/cards/keySetup. The PIN goes in this body and nowhere else: the
-   * request is the only copy, and nothing here or in the caller logs it.
-   */
-  async keySetup(
-    request: KeySetupRequest,
-    signal?: AbortSignal,
-  ): Promise<KeySetupResult> {
-    const json = await this.sidecar('POST', '/v1/cards/keySetup', {
-      body: request,
-      signal,
-      operation: 'key-setup',
-    });
-    return {
-      keys: Array.isArray(json.keys)
-        ? (json.keys as KeySetupResult['keys'])
-        : [],
-      short_id: String(json.short_id ?? ''),
-      pin_set: json.pin_set === true,
-    };
-  }
-
-  /**
-   * POST /v1/cards/issue. The longest budget in the app, because it waits for
-   * a federation to accept a transaction. A 202 (`undecided`) is thrown as an
-   * `ApiServiceError` with that code, like any other service answer.
-   */
-  async issue(
-    request: IssueRequest,
-    signal?: AbortSignal,
-  ): Promise<IssueResult> {
-    const json = await this.sidecar('POST', '/v1/cards/issue', {
-      body: request,
-      timeoutMs: ISSUE_TIMEOUT_MS,
-      signal,
-      operation: 'issue',
-    });
-    return {
-      client_ref: String(json.client_ref ?? request.client_ref),
-      txid: String(json.txid ?? ''),
-      notes: Array.isArray(json.notes)
-        ? (json.notes as IssueResult['notes'])
-        : [],
-      live_msat: Number(json.live_msat ?? 0),
-    };
-  }
 }

@@ -1,10 +1,10 @@
 /**
  * S2. Batch setup, in two presses as the Cashu provisioner does it: the form
- * (federation, cards, PIN, top-up), then a review page whose one button
+ * (federation, cards, PIN), then a review page whose one button
  * starts the batch. Nothing reaches a card or the registry before that press.
  *
- * The federation is shown by name when the phone's sidecar vouches for it, by
- * short id otherwise, and never as the raw invite. The reasons behind each
+ * The federation is shown by its short id, decoded from the invite on the
+ * phone, never as the raw invite. The reasons behind each
  * field live in (i) panels on the section headers, not under the fields.
  *
  * The screen holds no card state. The PIN is a `PinDraft` from `pin.ts`, which
@@ -45,7 +45,6 @@ import {useStore} from '../store';
 import {
   Card,
   Divider,
-  EntryRow,
   FONT,
   GearButton,
   PrimaryButton,
@@ -95,12 +94,10 @@ export function BatchSetupScreen({
     countNumber <= MAX_COUNT;
 
   const pinReady = policy === 'perCard' || draft.valid;
-  const preview = app.planPreview(validCount ? countNumber : 1);
   const inviteReady = isInviteCode(federation);
   const ready =
     validCount &&
     pinReady &&
-    preview.ok &&
     settingsAreReady({...settings, federation: federation.trim()});
 
   // What the operator still has to do, one line, in screen order.
@@ -110,9 +107,7 @@ export function BatchSetupScreen({
       ? SETUP.needCount(MAX_COUNT)
       : !pinReady
         ? SETUP.needPin
-        : !preview.ok
-          ? preview.problem
-          : null;
+        : null;
 
   // A scanned or pasted invite is the batch's federation and the saved one:
   // choosing it is the operator's decision, as tapping a preset was.
@@ -136,17 +131,12 @@ export function BatchSetupScreen({
         federation: federation.trim(),
         count: countNumber,
         pinPolicy: policy,
-        plan: preview.installOnly ? null : {amounts: [...preview.amounts]},
       });
       onStart();
     } catch (e) {
       setStartFailed(e instanceof Error ? e.message : SETUP.startFailed);
     }
   };
-
-  const topupLine = preview.installOnly
-    ? SETUP.installOnly
-    : SETUP.planPerCard(preview.perCard.toLocaleString(), preview.lines.length);
 
   if (reviewing) {
     return (
@@ -171,26 +161,9 @@ export function BatchSetupScreen({
                 value={policy === 'batch' ? SETUP.pinBatchShort : SETUP.pinPerCardShort}
                 valueTone="ink"
               />
-              <Divider />
-              <ValueRow label={SETUP.topupLabel} value={topupLine} valueTone="ink" />
-              {!preview.installOnly ? (
-                <>
-                  <Divider />
-                  <ValueRow
-                    label={SETUP.batchTotal}
-                    value={`${preview.batchTotal.toLocaleString()} sat`}
-                    valueTone="accent"
-                  />
-                </>
-              ) : null}
             </Card>
-            {fed.sidecar === 'mismatch' ? (
-              <Text style={[local.warn, {color: t.danger}]} testID="review-mismatch">
-                {SETUP.sidecarMismatch}
-              </Text>
-            ) : null}
             <Text style={[local.small, {color: t.dim}]}>
-              {SETUP.reviewLine(countNumber, preview.installOnly)}
+              {SETUP.reviewLine(countNumber)}
             </Text>
           </View>
         </ScrollView>
@@ -302,38 +275,6 @@ export function BatchSetupScreen({
             </Card>
           </View>
 
-          <View style={local.section}>
-            <SectionHeader help={SETUP.topupHelp} testID="topup-help">
-              {SETUP.plan}
-            </SectionHeader>
-            <Card testID="plan-preview">
-              <EntryRow
-                title={topupLine}
-                subtitle={SETUP.topupChange}
-                onPress={onSettings}
-                testID="plan-settings"
-              />
-              {!preview.installOnly ? (
-                <>
-                  <Divider />
-                  <View style={local.notes}>
-                    {preview.lines.map((line, i) => (
-                      <Text
-                        key={`${line}-${i}`}
-                        style={[local.noteChip, {color: t.ink, borderColor: t.line}]}>
-                        {line}
-                      </Text>
-                    ))}
-                  </View>
-                </>
-              ) : null}
-              {preview.problem ? (
-                <Text style={[local.small, local.inset, {color: t.danger}]} testID="plan-problem">
-                  {preview.problem}
-                </Text>
-              ) : null}
-            </Card>
-          </View>
         </ScrollView>
         <View style={local.footer}>
           <PrimaryButton

@@ -9,35 +9,38 @@
  *   setPin → issue → done
  *
  * The first seven are cardkit's install over the phone's NFC session
- * (`session.ts` → `provision`). `keySetup` and `setPin` then run on the local
- * sidecar, which drives the card over the relay after the install session
- * closes: a freshly installed applet has eight empty slots, and only a host can
- * ask the card to generate its keys. `issue` hands the card its notes.
+ * (`session.ts` → `provision`). `keySetup` and `setPin` follow in the same
+ * session (`cardSetup.ts`): a freshly installed applet has eight empty slots,
+ * so the phone asks the card to generate its keys, then sets and verifies the
+ * PIN. No sidecar, no relay (docs/OPS-PLAN.md § 4). The provisioner loads no
+ * value; the holder's wallet does (§ 6).
  *
  * The screen computes no card state. Every outcome goes to
  * `actions.recordCard`, the only way card state enters the store; the counter,
  * the stop list and the acknowledgement gate come back from `useBatch()`.
  *
- * A per-card PIN is generated here and written to `pin.ts`'s reveal slot for
- * the summary's one showing; a batch PIN is read from the batch-PIN slot and
- * never copied. Neither value goes to the store, the registry or a log.
+ * A per-card PIN is generated here and written to `pin.ts`'s reveal slot. It
+ * is shown with the finished card until the next card's tap starts, as the
+ * Cashu provisioner shows it, and nowhere else. A batch PIN is read from the
+ * batch-PIN slot and never copied. Neither value goes to the store, the
+ * registry or a log.
  */
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {CardFigure} from '../CardFigure';
 
-import {LocalClient} from '../api';
 import {FEDIMINT_PLAN, provision} from '../cardkit';
+import {finishCard, probeApplet, type SetupResult} from '../cardSetup';
 import {generatePin, useBatchPin, usePinReveal} from '../pin';
-import {LOCAL_SIDECAR_ORIGIN} from '../settings';
-import {phaseMessage, withCard} from '../session';
+import {phaseMessage, setCardMessage, withCard} from '../session';
 import {CALM, LOOP, STATE} from '../strings';
 import {
   useLoop,
   type CardPhase,
   type CardStop,
   type RecordRow,
+  shortIdOf,
   useBatch,
 } from '../store';
 import {
@@ -60,7 +63,6 @@ export const STOP_NAMES: Record<CardStop, string> = {
   guarded: 'Card holds something',
   differentCard: 'Different card',
   pinNotSet: 'PIN not set',
-  issueFailed: 'Top-up failed',
 };
 
 /**
@@ -113,7 +115,9 @@ export function LoopScreen({
   const cancelled = useRef(false);
   // Ends the wait for a card: `withCard` cancels the NFC request on abort.
   const abort = useRef<AbortController | null>(null);
-  const api = useRef<LocalClient | null>(null);
+  // The last finished card's generated PIN, read from the reveal slot. Bumped
+  // to re-render when the slot changes, since the slot is a ref.
+  const [shownPin, setShownPin] = useState<{n: number; id: string; pin: string} | null>(null);
 
   // Read once, before any early return: a component that returns early must
   // not call fewer hooks on the next pass.
@@ -134,10 +138,10 @@ export function LoopScreen({
       setLine('Set the batch PIN before the first card.');
       return;
     }
-    const sidecar =
-      api.current ??
-      (api.current = new LocalClient({baseUrl: LOCAL_SIDECAR_ORIGIN}));
     cancelled.current = false;
+    // The previous card's PIN leaves the screen as this card's tap starts.
+    reveal.wipe();
+    setShownPin(null);
     const controller = new AbortController();
     abort.current = controller;
     // Set by the engine's first event: from then on a card is on the phone,
@@ -153,44 +157,86 @@ export function LoopScreen({
     // card's row must name the phase the engine actually reached.
     let phase: CardPhase = 'probe';
     let pubkey: readonly number[] | undefined;
+    const enter = (next: CardPhase, message: string) => {
+      phase = next;
+      actions.setLoop({phase: next, loadProgress: null});
+      setLine(message);
+      setCardMessage(message);
+    };
     try {
-      const {value: installed} = await withCard(
+      const {value: run} = await withCard(
         phaseMessage('probe'),
-        tx =>
-          provision(tx, FEDIMINT_PLAN, {
-            random: length =>
-              Array.from({length}, () => (Math.random() * 256) | 0),
-            now: Date.now,
-            onEvent: event => {
-              if (!touched) {
-                touched = true;
-                setWaiting(false);
-              }
-              if (cancelled.current) {
-                return;
-              }
-              if (event.type === 'phase') {
-                phase = foldedPhase(event.phase);
-                actions.setLoop({phase, loadProgress: null});
-                setLine(phaseMessage(event.phase));
-              } else if (event.type === 'block') {
-                phase = 'load';
-                actions.setLoop({
-                  phase,
-                  loadProgress: {index: event.index, of: event.of},
-                });
-                setLine(
-                  `Writing ${Math.round((event.index / event.of) * 100)}%`,
-                );
-              }
-            },
-          }),
+        async tx => {
+          // Before anything is written: a card that already has keys is never
+          // installed over, since the sweep would delete them with any value
+          // they hold; one with the applet but no keys skips the install.
+          const before = await probeApplet(tx);
+          if (!touched) {
+            touched = true;
+            setWaiting(false);
+          }
+          if (before === 'keyed') {
+            return {
+              installed: {
+                ok: false as const,
+                kind: 'guarded' as const,
+                sw: undefined,
+                reason: 'the card already has keys; this app never installs over them',
+              },
+              setup: null as SetupResult | null,
+            };
+          }
+          const installed =
+            before === 'unkeyed'
+              ? {ok: true as const}
+              : await provision(tx, FEDIMINT_PLAN, {
+                random: length =>
+                  Array.from({length}, () => (Math.random() * 256) | 0),
+                now: Date.now,
+                onEvent: event => {
+                  if (!touched) {
+                    touched = true;
+                    setWaiting(false);
+                  }
+                  if (cancelled.current) {
+                    return;
+                  }
+                  if (event.type === 'phase') {
+                    phase = foldedPhase(event.phase);
+                    actions.setLoop({phase, loadProgress: null});
+                    setLine(phaseMessage(event.phase));
+                  } else if (event.type === 'block') {
+                    phase = 'load';
+                    actions.setLoop({
+                      phase,
+                      loadProgress: {index: event.index, of: event.of},
+                    });
+                    setLine(
+                      `Writing ${Math.round((event.index / event.of) * 100)}%`,
+                    );
+                  }
+                },
+              });
+          if (!installed.ok || cancelled.current) {
+            return {installed, setup: null as SetupResult | null};
+          }
+          // The same session: the card is still on the phone.
+          const setup = await finishCard(tx, pin, step => {
+            if (step === 'keys') {
+              enter('keySetup', LOOP.phaseKeys);
+            } else if (step === 'setPin') {
+              enter('setPin', LOOP.phasePin);
+            }
+          });
+          return {installed, setup};
+        },
         Date.now,
         controller.signal,
       );
       if (cancelled.current) {
         throw new Error('CardSessionCancelled');
       }
+      const {installed, setup} = run;
       if (!installed.ok) {
         actions.recordCard({
           ok: false,
@@ -205,77 +251,39 @@ export function LoopScreen({
         setStopShown(installed.kind ?? 'refused');
         return;
       }
-
-      phase = 'keySetup';
-      actions.setLoop({phase, cardActive: false, loadProgress: null});
-      setLine('Setting up keys — keep the card against the phone');
-      // The PIN goes in this request body and nowhere else. The sidecar forwards
-      // it to the card as SET_PIN and keeps nothing.
-      const keyed = await sidecar.keySetup({pin, replace: false});
-      if (!keyed.pin_set) {
+      if (!setup || !setup.ok) {
+        // Installed, but no keys or no PIN: the card cannot be handed out.
+        const keysDone = setup !== null && setup.step !== 'select' && setup.step !== 'keys';
         actions.recordCard({
           ok: false,
-          phase: 'setPin',
+          phase: keysDone ? 'setPin' : 'keySetup',
           stop: 'pinNotSet',
           pinPolicy: policy,
           pinState: 'notSet',
           notesIssued: [],
-          reason: 'SET_PIN answered without 9000',
+          sw: setup?.sw ?? undefined,
+          reason: setup?.reason ?? 'key setup did not run',
         });
         setStopShown('pinNotSet');
         return;
       }
-      phase = 'setPin';
-      actions.setLoop({phase});
-      if (policy === 'perCard') {
-        // Shown once, on the summary, keyed by the row it belongs to.
-        reveal.grant(keyed.short_id, pin);
-      }
 
-      // The row's id comes from the card's key, so a key setup that reports no
-      // key cannot produce a record at all: stop rather than invent an id.
-      const first = keyed.keys[0];
-      if (!first) {
-        actions.recordCard({
-          ok: false,
-          phase: 'keySetup',
-          stop: 'refused',
-          pinPolicy: policy,
-          pinState: 'notSet',
-          notesIssued: [],
-          reason: 'key setup reported no card key',
-        });
-        setStopShown('refused');
-        return;
-      }
-      pubkey = Array.from(
-        {length: first.pubkey.length / 2},
-        (_, i) => parseInt(first.pubkey.slice(i * 2, i * 2 + 2), 16),
-      );
-
-      phase = 'issue';
-      actions.setLoop({phase});
-      setLine('Loading notes onto the card');
-      let notes: number[] = [];
-      if (config.plan && config.plan.amounts.length > 0) {
-        // One key per tap, minted here and never reused for a second attempt:
-        // a repeat with the same key returns the same result.
-        const issued = await sidecar.issue({
-          amounts_msat: config.plan.amounts.map((n: number) => n * 1000),
-          client_ref: `${keyed.short_id}:${Date.now()}`,
-        });
-        notes = issued.notes.map(n => Math.floor(n.msat / 1000));
-      }
+      pubkey = setup.keys[0];
+      const id = shortIdOf(pubkey);
       phase = 'done';
       actions.recordCard({
         ok: true,
         phase,
         pinPolicy: policy,
         pinState: 'set',
-        notesIssued: notes,
+        notesIssued: [],
         pubkey,
       });
-      setLine(`Done · ${keyed.short_id.slice(-4)}`);
+      if (policy === 'perCard') {
+        reveal.grant(id, pin);
+        setShownPin({n: batch.records.length + 1, id, pin});
+      }
+      setLine(LOOP.finished(id));
     } catch (e) {
       // Stopped while waiting, before any card answered: no card was tried, so
       // nothing is recorded and the batch's count is untouched.
@@ -285,22 +293,19 @@ export function LoopScreen({
       }
       // A cancelled run is still a card's outcome (`pulled`), and the store
       // refuses a failed record that names no stop: every branch here names one.
-      // `keySetup` and `setPin` are one step to the operator: a thrown
-      // key setup is a card whose PIN is not on it.
-      const stop: CardStop =
-        phase === 'keySetup' || phase === 'setPin'
-          ? 'pinNotSet'
-          : phase === 'issue'
-          ? 'issueFailed'
-          : 'pulled';
+      // `keySetup` and `setPin` are one step to the operator: a card that left
+      // during either has no PIN the batch can rely on.
+      // Widened back: `phase` is assigned inside callbacks TS cannot follow.
+      const reached = phase as CardPhase;
+      const keying = reached === 'keySetup' || reached === 'setPin';
+      const stop: CardStop = keying ? 'pinNotSet' : 'pulled';
       try {
         actions.recordCard({
           ok: false,
-          phase,
+          phase: reached,
           stop,
           pinPolicy: policy,
-          pinState:
-            phase === 'keySetup' || phase === 'setPin' ? 'notSet' : 'unknown',
+          pinState: keying ? 'notSet' : 'unknown',
           notesIssued: [],
           pubkey,
           reason:
@@ -316,9 +321,11 @@ export function LoopScreen({
       setBusy(false);
       setWaiting(false);
       actions.setLoop({cardActive: false, loadProgress: null});
-      reveal.wipe();
     }
   }, [actions, batch, batchPin, blockedBy, busy, config, reveal]);
+
+  // The shown PIN never outlives the screen.
+  useEffect(() => () => reveal.wipe(), [reveal]);
 
   // Once, on the first render after START: arm card 1 without a third press.
   const armed = useRef(false);
@@ -355,7 +362,7 @@ export function LoopScreen({
   const left = Math.max(0, config.count - records.length);
   const cardNumber = Math.min(records.length + 1, config.count);
   const finished = left === 0;
-  const stoppedCount = summary.failed + summary.empty + summary.unspendable;
+  const stoppedCount = summary.failed + summary.unspendable;
   // One status line under the card: the live phase while a card is on the
   // phone, the instruction otherwise. Never the same sentence twice.
   const status = busy
@@ -422,6 +429,23 @@ export function LoopScreen({
             {status}
           </Text>
         </View>
+
+        {shownPin && !busy ? (
+          <View
+            style={[local.pinCard, {backgroundColor: t.card, borderColor: t.accent}]}
+            testID="loop-pin">
+            <View style={local.pinText}>
+              <Text style={[local.pinLabel, {color: t.ink}]}>{LOOP.pinTitle(shownPin.n)}</Text>
+              <Text style={[local.small, local.left, {color: t.dim}]}>{LOOP.pinBody}</Text>
+            </View>
+            <Text
+              style={[local.pinValue, {color: t.accent}]}
+              selectable={false}
+              testID="loop-pin-value">
+              {shownPin.pin}
+            </Text>
+          </View>
+        ) : null}
 
         {blockedBy ? (
           <StopPanel
@@ -573,6 +597,16 @@ function RecordLine({row, n}: {row: RecordRow; n: number}) {
 }
 
 const local = StyleSheet.create({
+  pinCard: {
+    gap: 10,
+    borderWidth: 1.5,
+    borderRadius: 16,
+    padding: 16,
+  },
+  pinText: {gap: 4},
+  left: {textAlign: 'left'},
+  pinLabel: {fontFamily: FONT.semibold, fontSize: 16},
+  pinValue: {fontFamily: FONT.tabular, fontSize: 34, letterSpacing: 8},
   scroll: {gap: 18, paddingBottom: 20, flexGrow: 1},
   section: {gap: 10},
   head: {alignItems: 'stretch', gap: 10, marginTop: 2},
