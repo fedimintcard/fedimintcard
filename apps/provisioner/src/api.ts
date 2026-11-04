@@ -34,7 +34,8 @@ export type ServiceOperation =
   | 'sign-out'
   | 'create-batch'
   | 'post-card'
-  | 'list-cards';
+  | 'list-cards'
+  | 'list-federations';
 
 export class ApiServiceError extends Error {
   constructor(
@@ -391,6 +392,28 @@ export class RegistryClient extends HttpTransport {
     ) as StoredCard;
   }
 
+  /**
+   * GET /registry/federations — names the operator's tills read from each
+   * federation's config. The phone cannot ask the guardians itself: an invite
+   * may name only an iroh node (OPS-PLAN § 7, O3 design).
+   */
+  async federationNames(token: string): Promise<Record<string, string>> {
+    const json = await this.get('/registry/federations', {
+      token,
+      operation: 'list-federations',
+    });
+    const names: Record<string, string> = {};
+    if (Array.isArray(json.federations)) {
+      for (const f of json.federations as unknown[]) {
+        const r = f as {federation_id?: unknown; name?: unknown};
+        if (typeof r?.federation_id === 'string' && typeof r.name === 'string') {
+          names[r.federation_id] = r.name;
+        }
+      }
+    }
+    return names;
+  }
+
   /** GET /registry/cards?batch_id= — the summary's refresh. */
   async listCards(token: string, batchId: number): Promise<StoredCard[]> {
     const json = await this.get(
@@ -535,6 +558,11 @@ export class RegistryStoreApi {
     if (token !== null) {
       await this.client.signOut(token);
     }
+  }
+
+  /** Federation names by decoded id, as the operator's tills reported them. */
+  async federationNames(): Promise<Record<string, string>> {
+    return this.client.federationNames(this.token());
   }
 
   /** Open the batch once; a card row cannot be posted before it. */

@@ -379,6 +379,8 @@ export interface StoreApi {
   ): Promise<readonly RecordRow[]>;
   /** Revokes the session on the service; best effort, never blocks sign-out. */
   signOut?(): Promise<void>;
+  /** Federation names by decoded id, from the operator's tills. */
+  federationNames?(): Promise<Record<string, string>>;
 }
 
 export interface StoreShape {
@@ -391,6 +393,8 @@ export interface StoreShape {
     options?: {signal?: AbortSignal},
   ): Promise<void>;
   signOut(): void;
+  /** Federation names by decoded id, read after sign-in; empty until then. */
+  federationNames: Readonly<Record<string, string>>;
   /**
    * Start a batch. Exposed on the store as well as on `batch.actions` because
    * `batch` is null until a batch starts: BatchSetup has to call this before
@@ -453,6 +457,7 @@ export function StoreProvider({
   initialSession?: Session | null;
 }) {
   const [session, setSession] = useState<Session | null>(initialSession);
+  const [federationNames, setFederationNames] = useState<Readonly<Record<string, string>>>({});
   const [batch, setBatch] = useState<BatchState | null>(null);
   /**
    * The one PIN slot (see `pin.ts`). The store reads no PIN from it: it only
@@ -495,6 +500,24 @@ export function StoreProvider({
     setBatch(null);
     setSession(null);
   }, [pinSlot, batchPin]);
+
+  // Names come from the registry, once per session; a failure leaves the short
+  // id on screen, which is what the operator saw before any till reported one.
+  const signedIn = session !== null;
+  useEffect(() => {
+    if (!signedIn) {
+      setFederationNames({});
+      return;
+    }
+    let live = true;
+    apiRef.current
+      ?.federationNames?.()
+      .then(names => live && setFederationNames(names))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [signedIn]);
 
   const recordCard = useCallback((result: CardResult): void => {
     const live = batchRef.current;
@@ -705,6 +728,7 @@ export function StoreProvider({
       serviceUrl: apiRef.current?.serviceUrl ?? '',
       signIn,
       signOut,
+      federationNames,
       startBatch: actions.start,
       batch: view,
       loop: batch && batch.phase === 'running' ? batch.loop : null,
@@ -714,6 +738,7 @@ export function StoreProvider({
       session,
       signIn,
       signOut,
+      federationNames,
       actions,
       view,
       batch,
@@ -750,6 +775,12 @@ export function useStore(): StoreShape {
   }
   return s;
 }
+
+/** Federation names, or none outside a provider (component tests). */
+export function useFederationNames(): Readonly<Record<string, string>> {
+  return useContext(Ctx)?.federationNames ?? NO_NAMES;
+}
+const NO_NAMES: Readonly<Record<string, string>> = {};
 
 /** The open batch, or null. Every screen that reads card state goes through this. */
 export function useBatch(): BatchView | null {

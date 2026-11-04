@@ -81,3 +81,19 @@ test('a finished card carries its eight slot keys; sign-out revokes the token on
   expect(out?.auth).toBe('Bearer op_tok');
   await expect(api.postBatch({federation: 'x', count: 1, pinPolicy: 'batch'})).rejects.toThrow(/before an operator signed in/);
 });
+
+test('federation names come from the registry by decoded id; malformed rows are skipped', async () => {
+  const origin = 'https://registry.test';
+  const fed = '9d'.repeat(32);
+  const fetcher = async (url: string) => {
+    const path = String(url).replace(origin, '');
+    if (path === '/auth/operator/session') return post({operator_id: 1, token: 'op_tok'});
+    if (path === '/registry/federations') {
+      return post({federations: [{federation_id: fed, name: 'Island Bitcoin'}, {federation_id: 7}]});
+    }
+    throw new Error('unexpected ' + path);
+  };
+  const api = new RegistryStoreApi(new RegistryClient({baseUrl: origin, fetcher}), origin);
+  await api.signIn('dread', 'pw');
+  expect(await api.federationNames()).toEqual({[fed]: 'Island Bitcoin'});
+});

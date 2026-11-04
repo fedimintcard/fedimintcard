@@ -55,3 +55,12 @@ describe('decodeInvite', () => {
     expect(guardianLabel('wss://api.example.org/')).toBe('api.example.org');
   });
 });
+
+describe('describeFederation', () => {
+  const {describeFederation} = require('./useFederation') as typeof import('./useFederation');
+  it('reads as the reported name, or the short id until a till reports one', () => {
+    const info = decodeInvite(SCANNED);
+    expect(describeFederation(info, 'Island Bitcoin').title).toBe('Island Bitcoin');
+    expect(describeFederation(info).title).toBe('Federation 9dc8 86ab');
+  });
+});
