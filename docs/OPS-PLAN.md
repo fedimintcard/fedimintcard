@@ -1,8 +1,8 @@
 # Plan: a hosted ops service, and no laptop in the operator's loop
 
-Status: **proposed** (2026-11-04), against `main` @ `ea7c12f`. Nothing here is built.
-It changes § 4 of `PROVISIONER-PLAN.md` ("hosted registry, local wallet"). Where the two
-disagree, this plan is the newer intent once the owner accepts it (§ 9).
+Status: **accepted** (2026-11-04), against `main` @ `ea7c12f`. Nothing here is built.
+The owner's decisions are in § 9. This plan replaces § 4 of `PROVISIONER-PLAN.md` ("hosted
+registry, local wallet"); where the two disagree, this plan wins.
 
 ## 1. Why
 
@@ -79,8 +79,15 @@ The loop's phases become `probe → selectIsd → auth → sweep → load → in
 keySetup → setPin → done`. The `issue` phase and `LocalClient` leave the app. The phone needs
 no sidecar, so Max and any iPhone become provisioning phones.
 
-The per-card PIN question in `DEMO-HANDOFF.md` stays open (§ 9, decision 3). Moving the
-PIN to the phone does not answer it.
+**Showing a per-card PIN, as cashucard does** (§ 9, decision 3). The PIN the phone generated
+is shown on the loop screen with the finished card, and stays there until the next card's tap
+starts (cashucard `LoopScreen.tsx:407-412`, `PROVISIONER-APP.md:127-129`). The operator writes
+it down or hands it over with the card. It is never on the summary, never sent to ops, never
+exported. This replaces today's behaviour, where the summary masks the PIN and keeps only the
+last card's (`BatchSummaryScreen.tsx:58`, `pin.ts`'s reveal slot). Generation stays as it is
+here: `generatePin` uses the platform's secure random and refuses weak PINs (`pin.ts:156`),
+which is stronger than cashucard's `Math.random()` 4-digit PIN. A batch PIN is typed by the
+operator and, unlike cashucard's `pin_batch` column, is not stored in ops.
 
 ## 5. Ops: the registry Worker grows card state
 
@@ -118,11 +125,12 @@ a double spend whatever ops says.
 
 **Auth fixes that ride along**
 
-- Till tokens are stored and revocable. Operator tokens stay as they are.
-- `passwordMatches` (`index.ts:264`) says it hashes both sides, but compares the hex of the
-  raw bytes, so the length leaks. Hash with SHA-256 first.
+- Till tokens are stored and revocable.
+- Operator accounts and sessions follow cashucard (§ 9, decision 5). That retires
+  `passwordMatches` (`index.ts:264`), which says it hashes both sides but compares the hex of
+  the raw bytes, so the password's length leaks.
 - `batches.federation_id` takes the decoded federation id (`decodeInvite` in the app), not the
-  whole invite. That is decision 4 in § 9, already flagged in `DEMO-HANDOFF.md`.
+  whole invite (§ 9, decision 4).
 
 ## 6. The till, and where value comes from
 
@@ -132,27 +140,48 @@ keyed by short id, which the till reads from the card (`GET_PUB` slot 0). The ch
 `glue.rs` stays. Only where it loads and saves changes. The till can then charge any card the
 operator provisioned.
 
-**Value.** The provisioner stops loading value; install-only is already the default
-(`7254d43`). cashucard does the same. The first load moves to something that already has a
-funded federation client:
+**The holder's PIN at the till** (§ 9, decision 6). `/v1/charge` takes the PIN in its body
+from the holder, typed on the till's screen, and the till sends `VERIFY_PIN` in the selection
+that signs, as it already does (`703780e`). `CARD_PIN` in the environment
+(`host/card/src/lib.rs`) is removed outside tests. The PIN is never logged, stored or sent to
+ops. Wrong PINs report the tries left (`63 CX`); a blocked card (`69 83`) is a stop.
 
-- **At a till (recommended).** A "load card" action on the till, reusing `issue`
-  (`cards.rs`, `CardWallet::topup`) against ops state. The merchant takes cash or Lightning
-  and loads the card from the till's own wallet, as with a gift card.
-- **From a holder's wallet.** Later, a Fedimint wallet app that writes to ops. Not in scope.
+**Value comes from the holder's wallet** (§ 9, decision 2), as cashucard leaves loading to
+holder apps. The provisioner stops loading value; install-only is already the default
+(`7254d43`). A Fedimint wallet loads a card the way the sidecar's `issue` does today
+(`cards.rs`, `CardWallet::topup`): it spends its own notes into outputs whose nonces are the
+card's free slot keys, holds the blinding keys until the federation signs, and records the
+new notes against the card. In this shape that record goes to ops:
 
-This removes the top-up quick picks and the `Top-up` section that `ea7c12f` added to the
-provisioner.
+| Route | Who | Does |
+|---|---|---|
+| `GET /cards/:short_id/slots` | holder wallet | the free slot keys to load into, and `version` |
+| `POST /cards/:short_id/load` | holder wallet | the pending notes with their blinding keys, before submitting; version-checked |
+| `POST /cards/:short_id/load/outcome` | holder wallet | the federation's signatures; the notes become live |
+
+**Open design item: how ops trusts a load.** A wrong record can't steal anything, because
+only the card can spend. But a bogus load could make a card show money it doesn't have, or
+overwrite real notes. Two options, decided in O4:
+
+- Ops verifies each new note's BLS signature against the federation's public keys before
+  marking it live. This needs the federation's keys in the Worker, but no holder account.
+- The holder proves they hold the card. The applet's `SIGN` signs any 32 bytes with a spend
+  key, so a challenge must never be something a till could submit as a transaction. That
+  needs a domain-separated signing command in the applet. This is a larger change.
+
+The wallet app itself is not in this plan (§ 10). This plan delivers the ops routes, a
+reference loader in the sidecar's CLI that uses them, and the removal of the provisioner's
+top-up: the quick picks and `Top-up` section from `ea7c12f`, `issue`, and the Settings value.
 
 ## 7. Phases
 
 | Phase | Work | Done when |
 |---|---|---|
-| **O0** | Owner decisions in § 9 | answered here |
-| **O1** | Phone key setup and PIN (§ 4) in cardkit and `LoopScreen`; registry rule for short id; `slot_pubkeys` on the card row; remove `issue`, `LocalClient` and the top-up UI | jest green with a fake card transceiver; **silicon**: one blank J3R180 finished on the Pixel and one on Max, with no Mac running, `GET_PUB` ×8 matching the registry row, `SIGN` refused before `VERIFY_PIN` (`6A94`) and accepted after |
-| **O2** | Ops tables and routes (§ 5); till tokens; password hash fix; decoded federation id | vitest for each route, including 409 on a stale version and on a changed row; deployed to a staging Worker first |
-| **O3** | Till on ops: an HTTPS `StateStore` in the sidecar, keyed by short id; recovery of an open intent | the sidecar's existing charge tests pass against a local `wrangler dev`; a charge killed between `SIGN` and outcome is recovered by a second till; two cards charged on one till |
-| **O4** | Load at a till (§ 6) | a card provisioned on Max, loaded at a till, charged at another till |
+| **O0** | Owner decisions in § 9 | **done** 2026-11-04 |
+| **O1** | Phone key setup and PIN (§ 4) in cardkit and `LoopScreen`; per-card PIN shown on the loop until the next tap, removed from the summary; registry rule for short id; `slot_pubkeys` on the card row; remove `issue`, `LocalClient` and the top-up UI | jest green with a fake card transceiver; **silicon**: one blank J3R180 finished on the Pixel and one on Max, with no Mac running, `GET_PUB` ×8 matching the registry row, `SIGN` refused before `VERIFY_PIN` (`6A94`) and accepted after |
+| **O2** | Ops tables and routes (§ 5); operators as cashucard has them (§ 9, decision 5); till tokens; decoded federation id | vitest for each route, including 409 on a stale version and on a changed row; deployed to a staging Worker first |
+| **O3** | Till on ops: an HTTPS `StateStore` in the sidecar, keyed by short id; recovery of an open intent; holder PIN in `/v1/charge`, `CARD_PIN` out of the charge path | the sidecar's existing charge tests pass against a local `wrangler dev`; a charge killed between `SIGN` and outcome is recovered by a second till; two cards charged on one till |
+| **O4** | Holder loading (§ 6): the load routes, the trust choice, a reference loader in the sidecar CLI | a card provisioned on Max, loaded by the reference loader from a separate wallet, charged at a till with the holder typing the PIN; a load with a forged signature is refused |
 | **O5** | Docs and store forms | `PROVISIONER-PLAN.md` § 4 rewritten; App Store privacy and Play data-safety forms name the card state ops holds; `android-relay` dropped from the operator setup |
 
 O1 stands alone and removes the laptop from provisioning. O2 and O3 move the till.
@@ -171,22 +200,31 @@ O1 stands alone and removes the laptop from provisioning. O2 and O3 move the til
   nightly encrypted R2 backup is the model.
 - **iOS session length.** Install plus key setup must fit one reader session. O1 measures it.
 
-## 9. Decisions for the owner
+## 9. Decisions (owner, 2026-11-04)
 
-1. **Accept this shape?** Ops on Cloudflare holds card state; no wallet is hosted.
-2. **Where first value comes from:** load at a till (recommended), or a holder wallet.
-3. **Per-card PINs:** today the summary masks the generated PIN and keeps only the last one,
-   so holders cannot learn it. Decide when a PIN may be shown, or drop per-card PINs.
-4. **Federation id in the registry:** send the decoded id (recommended).
-5. **Tenancy:** fedimintcard.org has one operator today. Serving several operators or
-   federations needs operator accounts and per-operator data. Alternatively, each operator
-   deploys the same Worker on their own Cloudflare account.
-6. **Holder PIN at the till:** the till reads the PIN from `CARD_PIN` in its environment
-   (`host/card/src/lib.rs`). A real till asks the holder. This is outside this plan, but it
-   blocks a real charge.
+1. **Shape: accepted.** Ops on Cloudflare holds card state; no wallet is hosted.
+2. **First value comes from the holder's wallet** (§ 6), not from the provisioner or a till.
+3. **Per-card PINs as cashucard shows them** (§ 4): on the loop screen with the finished
+   card until the next tap, nowhere else.
+4. **The registry stores the decoded federation id**, not the invite text.
+5. **Operators as cashucard has them**, in one shared deployment
+   (cashucard `ops/src/db.ts:22-37`, `operator-setup.ts`, `pwhash.ts`, `auth.ts`):
+   - an `operators` table with a unique name and a password hash (PBKDF2-SHA256 on Workers);
+   - operators created only by a setup command injected at deploy (`bootstrap`, `recover`,
+     with a nonce so a command applies once), never over HTTP;
+   - 12-hour sessions stored as a hash, sign-out, revocation of an operator's sessions, and a
+     login attempt budget;
+   - the batch records the operator who created it.
+
+   This replaces the single `OPERATOR_PASSWORD` secret and the stateless HMAC token, and with
+   it the length leak in `passwordMatches` (`index.ts:264`). One addition beyond cashucard,
+   because this ops holds balances and cashucard's does not: an operator's batch list and
+   card lookups are limited to their own batches. cashucard records `operator_id` but does
+   not filter on it (its `OPS-THREAT-MODEL.md:36` lists this as not implemented).
+6. **The holder types the PIN at the till** (§ 6).
 
 ## 10. Non-goals
 
 - Moving notes onto the card (shape C). That is the long-term answer to § 8's first two risks.
-- A holder wallet app.
+- A holder wallet app. This plan gives it the ops routes and a reference loader.
 - Hosting any operator's or merchant's wallet.
