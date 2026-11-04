@@ -474,6 +474,38 @@ describe('card state', () => {
     expect(res.status).toBe(200);
   });
 
+  it('takes the signed bytes once for an open charge; a repeat replays, other bytes are 409', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, till.token, intent(0));
+    const signed = {txid: txid(7), tx_hex: 'cd'.repeat(120)};
+    expect((await post(`/cards/${shortId}/submitted`, till.token, signed)).status).toBe(200);
+    expect((await post(`/cards/${shortId}/submitted`, till.token, signed)).status).toBe(200);
+    expect((await post(`/cards/${shortId}/submitted`, till.token, {...signed, tx_hex: 'ef'.repeat(120)})).status).toBe(409);
+    const s = (await (await get(`/cards/${shortId}/state`, till.token)).json()) as {
+      open_txs: {txid: string; signed_hex: string | null}[];
+    };
+    expect(s.open_txs).toEqual([expect.objectContaining({txid: txid(7), signed_hex: signed.tx_hex})]);
+    expect((await post(`/cards/${shortId}/submitted`, token, signed)).status).toBe(403);
+    expect((await post(`/cards/${shortId}/submitted`, till.token, {...signed, txid: txid(8)})).status).toBe(404);
+  });
+
+  it('refuses signed bytes for a charge another till already recorded rejected', async () => {
+    const token = await signIn();
+    const first = await newTill(token, 'first');
+    const second = await newTill(token, 'second');
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, first.token, intent(0));
+    const open = (await (await get(`/cards/${shortId}/state`, second.token)).json()) as {
+      open_txs: {signed_hex: string | null}[];
+    };
+    expect(open.open_txs[0]!.signed_hex).toBeNull();
+    await post(`/cards/${shortId}/outcome`, second.token, {txid: txid(7), accepted: false});
+    const late = await post(`/cards/${shortId}/submitted`, first.token, {txid: txid(7), tx_hex: 'cd'.repeat(120)});
+    expect(late.status).toBe(409);
+  });
+
   it('renews a spent slot’s key, never one that backs a note, and only from the key on record', async () => {
     const token = await signIn();
     const till = await newTill(token);
@@ -493,6 +525,32 @@ describe('card state', () => {
     // The provisioning row still re-posts cleanly: it is compared as provisioned.
     const batchId = ((await (await get('/registry/batches', token)).json()) as {batches: {batch_id: number}[]}).batches[0]!.batch_id;
     expect((await post('/registry/cards', token, card({batch_id: batchId}))).status).toBe(200);
+  });
+});
+
+describe('federation names', () => {
+  it('a till reports the name; its operator reads it, another operator does not', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    expect((await post('/federations', till.token, {federation_id: FED, name: '  Island Bitcoin  '})).status).toBe(200);
+    expect((await post('/federations', till.token, {federation_id: FED, name: 'Island Bitcoin Fed'})).status).toBe(200);
+    const res = await get('/registry/federations', token);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as {federations: unknown[]}).federations).toEqual([
+      expect.objectContaining({federation_id: FED, name: 'Island Bitcoin Fed'}),
+    ]);
+    await hook('/test/operator', {name: 'other', password: PASSWORD});
+    const other = await signIn('other');
+    expect(((await (await get('/registry/federations', other)).json()) as {federations: unknown[]}).federations).toEqual([]);
+  });
+
+  it('only a till reports a name, and only for a decoded id with a real name', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    expect((await post('/federations', token, {federation_id: FED, name: 'x'})).status).toBe(403);
+    expect((await post('/federations', till.token, {federation_id: 'fed11abc', name: 'x'})).status).toBe(400);
+    expect((await post('/federations', till.token, {federation_id: FED, name: '   '})).status).toBe(400);
+    expect((await get('/registry/federations', till.token)).status).toBe(403);
   });
 });
 

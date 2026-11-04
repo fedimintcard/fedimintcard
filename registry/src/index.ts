@@ -19,10 +19,13 @@
  *              POST /registry/batches            GET /registry/batches
  *              POST /registry/cards              GET /registry/cards?batch_id=
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
+ *              GET  /registry/federations        names tills reported
  *   operator   GET  /cards/:short_id/state
  *   or till
- *   till       POST /cards/:short_id/intent      the charge, before the card signs
+ *   till       POST /cards/:short_id/intent      the charge, unsigned, before the card signs
+ *              POST /cards/:short_id/submitted   the signed bytes, before the till sends them
  *              POST /cards/:short_id/outcome     the federation's answer
+ *              POST /federations                 {federation_id, name} from the federation's config
  *              PUT  /cards/:short_id/slots/:n    a renewed slot key
  *
  * An operator, and that operator's tills, see only their own batches and
@@ -50,10 +53,13 @@ import {
   createBatch,
   listBatches,
   listCards,
+  listFederationNames,
   NotFound,
   postCard,
+  putFederationName,
   recordIntent,
   recordOutcome,
+  recordSubmitted,
   renewSlot,
 } from './cards';
 import {migrate} from './db';
@@ -155,6 +161,14 @@ export class Registry {
       return this.cardRoute(request, caller, card[1]!, card[2] ?? '', now);
     }
 
+    if (path === '/federations' && method === 'POST') {
+      if (caller.kind !== 'till') return fail(403, 'only a till reports a federation name');
+      const body = await objectBody(request);
+      if (!body) return fail(400, 'expected {federation_id, name}');
+      putFederationName(sql, caller.till.operator_id, body, now);
+      return json(200, {ok: true});
+    }
+
     if (caller.kind !== 'operator') {
       return fail(403, 'a till token cannot do that');
     }
@@ -181,6 +195,9 @@ export class Registry {
       const body = await objectBody(request);
       if (!body) return fail(400, 'the card row must be an object');
       return json(200, {ok: true, stored: postCard(storage, op, body, now)});
+    }
+    if (path === '/registry/federations' && method === 'GET') {
+      return json(200, {ok: true, federations: listFederationNames(sql, op)});
     }
     if (path === '/tills') {
       if (method === 'GET') return json(200, {ok: true, tills: listTills(storage, op)});
@@ -231,6 +248,9 @@ export class Registry {
     if (rest === '/intent' && method === 'POST') {
       return json(200, {ok: true, ...recordIntent(storage, shortId, caller.till.till_id, body, now)});
     }
+    if (rest === '/submitted' && method === 'POST') {
+      return json(200, {ok: true, ...recordSubmitted(storage, shortId, body)});
+    }
     if (rest === '/outcome' && method === 'POST') {
       return json(200, {ok: true, ...recordOutcome(storage, shortId, body, now)});
     }
@@ -251,7 +271,7 @@ export class Registry {
     if (path === '/test/reset') {
       for (const table of [
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
-        'tills', 'sessions', 'login_attempt_budget',
+        'tills', 'sessions', 'login_attempt_budget', 'federations',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }

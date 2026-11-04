@@ -189,6 +189,28 @@ top-up: the quick picks and `Top-up` section from `ea7c12f`, `issue`, and the Se
 
 O1 stands alone and removes the laptop from provisioning. O2 and O3 move the till.
 
+### O3 design (2026-11-04)
+
+- **The intent carries the unsigned transaction.** A fedimint txid hashes inputs, outputs and the
+  nonce, not the signatures (`fedimint-core` `Transaction::tx_hash_from_parts`), so the txid is
+  fixed before the card signs. O2 asked for the signed bytes at intent time, which no till can
+  have; the route now takes the unsigned encoding.
+- **One more write: `submitted`.** After the card signs and before the till sends, the till posts
+  the signed bytes (`POST /cards/{id}/submitted`). This is the sidecar's `submitted` flag moved to
+  ops. A charge left open with no signed bytes never left its till, so the next till records it
+  rejected. One with signed bytes may be in the federation, so the next till resubmits those bytes
+  (idempotent) and records whatever the federation answers. A till never re-signs another till's
+  charge: the holder at the second till did not agree to it.
+- **What stays on the till.** The till's own outputs (`host_pending`: the merchant's note secrets)
+  and its sales ledger stay in its data directory. Only the till that made a charge can collect its
+  own output, as today. The card side (slots, notes, open charge) comes from ops on every tap and
+  goes back through intent, submitted, outcome and slot renewals.
+- **Holder PIN.** `/v1/charge` takes `pin`; `CARD_PIN` stays for the CLI and tests only.
+- **Federation name.** A till reads `federation_name` from the federation's config and posts it
+  (`POST /federations`), scoped to its operator; the provisioner shows it
+  (`GET /registry/federations`) and falls back to "Federation 9dc8 86ab". The phone cannot ask the
+  guardians itself: the invite's only guardian address is an iroh node.
+
 ## 8. Risks
 
 - **Tills depend on ops.** If ops is down, no card can be charged. A cashucard till needs only

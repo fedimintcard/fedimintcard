@@ -10,8 +10,9 @@
  * needs the card. The secret keys of a till's own outputs never come here.
  *
  * Writes follow the sidecar's write-ahead order (`glue.rs` `sign_and_submit`):
- * a till records its intent before the card signs, and the outcome after the
- * federation answers. Every write names the card `version` it read, and a
+ * a till records its intent (the unsigned transaction; a txid does not cover
+ * signatures) before the card signs, the signed bytes before it sends them,
+ * and the outcome after the federation answers. Every write names the card `version` it read, and a
  * stale one is a 409, so two tills cannot both write against the same notes.
  * The federation's spent set stops a double spend whatever this says.
  */
@@ -24,7 +25,7 @@ import {
 } from './http';
 
 export const SLOTS = 8;
-/** A signed transaction's consensus encoding, hex; a charge's is a few KB. */
+/** A transaction's consensus encoding, hex; a charge's is a few KB. */
 const MAX_TX_HEX = 64 * 1024;
 
 export class Conflict extends Error {}
@@ -369,7 +370,7 @@ export function cardState(sql: Sql, shortId: string) {
     }));
   const open = sql
     .exec(
-      "SELECT txid, till_id, client_ref, body, created_at FROM card_txs WHERE short_id = ? AND status = 'open'",
+      "SELECT txid, till_id, client_ref, body, signed_hex, created_at FROM card_txs WHERE short_id = ? AND status = 'open'",
       shortId,
     )
     .toArray()
@@ -377,6 +378,8 @@ export function cardState(sql: Sql, shortId: string) {
       txid: String(r.txid),
       till_id: Number(r.till_id),
       client_ref: String(r.client_ref),
+      // Null: the charge never left its till, so it can be recorded rejected.
+      signed_hex: r.signed_hex === null ? null : String(r.signed_hex),
       created_at: Number(r.created_at),
       ...(JSON.parse(String(r.body)) as {tx_hex: string; inputs: string[]; change: ChangeOut[]}),
     }));
@@ -411,7 +414,7 @@ function parseIntent(r: Record<string, unknown>) {
     r.tx_hex.length % 2 !== 0 ||
     !/^[0-9a-f]*$/.test(r.tx_hex)
   ) {
-    throw new BadRequest('tx_hex must be the signed transaction, lower-case hex');
+    throw new BadRequest('tx_hex must be the unsigned transaction, lower-case hex');
   }
   if (!Array.isArray(r.inputs) || r.inputs.length === 0 || !r.inputs.every(n => isHex(n, 33))) {
     throw new BadRequest('inputs must be the spent notes’ nonces, 33 bytes hex each');
@@ -642,6 +645,96 @@ export function recordOutcome(
     );
     return {version: bump(sql, shortId), replayed: false};
   });
+}
+
+/**
+ * The signed bytes of an open charge, posted after the card signs and before
+ * the till sends them. A till sends only after this succeeds; a charge
+ * resolved meanwhile (another till recorded it rejected) is a 409, and the
+ * till must not send. Repeating the same bytes answers 200.
+ */
+export function recordSubmitted(
+  storage: DurableObjectStorage,
+  shortId: string,
+  r: Record<string, unknown>,
+): {version: number; replayed: boolean} {
+  if (!isHex(r.txid, 32)) {
+    throw new BadRequest('txid must be 32 bytes, hex');
+  }
+  if (
+    typeof r.tx_hex !== 'string' ||
+    r.tx_hex.length === 0 ||
+    r.tx_hex.length > MAX_TX_HEX ||
+    r.tx_hex.length % 2 !== 0 ||
+    !/^[0-9a-f]*$/.test(r.tx_hex)
+  ) {
+    throw new BadRequest('tx_hex must be the signed transaction, lower-case hex');
+  }
+  const sql = storage.sql;
+  return storage.transactionSync(() => {
+    const tx = sql
+      .exec('SELECT short_id, status, signed_hex FROM card_txs WHERE txid = ?', r.txid)
+      .toArray()[0] as {short_id: string; status: string; signed_hex: string | null} | undefined;
+    if (!tx || tx.short_id !== shortId) {
+      throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
+    }
+    if (tx.signed_hex !== null) {
+      if (tx.signed_hex === r.tx_hex) {
+        return {version: versionOf(sql, shortId), replayed: true};
+      }
+      throw new Conflict(`charge ${String(r.txid)} already has other signed bytes`);
+    }
+    if (tx.status !== 'open') {
+      throw new Conflict(`charge ${String(r.txid)} is already resolved; do not send it`);
+    }
+    sql.exec('UPDATE card_txs SET signed_hex = ? WHERE txid = ?', r.tx_hex, r.txid);
+    return {version: bump(sql, shortId), replayed: false};
+  });
+}
+
+/* ------------------------------------------------------------------------- */
+/* Federation names                                                          */
+/* ------------------------------------------------------------------------- */
+
+/** A name a till read from the federation's config, kept per operator. */
+export function putFederationName(
+  sql: Sql,
+  operatorId: number,
+  r: Record<string, unknown>,
+  now: number,
+): void {
+  if (!isHex(r.federation_id, 32)) {
+    throw new BadRequest('federation_id must be the decoded federation id, 32 bytes hex');
+  }
+  const name = typeof r.name === 'string' ? r.name.trim() : '';
+  if (name === '' || name.length > 128) {
+    throw new BadRequest('name must be 1 to 128 characters');
+  }
+  sql.exec(
+    `INSERT INTO federations (operator_id, federation_id, name, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (operator_id, federation_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`,
+    operatorId,
+    r.federation_id,
+    name,
+    now,
+  );
+}
+
+export function listFederationNames(
+  sql: Sql,
+  operatorId: number,
+): {federation_id: string; name: string; updated_at: number}[] {
+  return sql
+    .exec(
+      'SELECT federation_id, name, updated_at FROM federations WHERE operator_id = ? ORDER BY federation_id',
+      operatorId,
+    )
+    .toArray()
+    .map(r => ({
+      federation_id: String(r.federation_id),
+      name: String(r.name),
+      updated_at: Number(r.updated_at),
+    }));
 }
 
 /**

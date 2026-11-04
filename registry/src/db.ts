@@ -102,6 +102,18 @@ export const MIGRATIONS: readonly string[] = [
     resolved_at   INTEGER
   );
   `,
+  // v3 (OPS-PLAN O3): the signed bytes a till is about to send, and the
+  // federation names tills read from the federation's config.
+  `
+  ALTER TABLE card_txs ADD COLUMN signed_hex TEXT;
+  CREATE TABLE federations (
+    operator_id   INTEGER NOT NULL,
+    federation_id TEXT    NOT NULL,
+    name          TEXT    NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (operator_id, federation_id)
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */
