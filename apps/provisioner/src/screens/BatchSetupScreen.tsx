@@ -1,25 +1,20 @@
 /**
- * S2. Batch setup: the federation, the count, the PIN policy and the top-up
- * plan, in that order, then START BATCH.
+ * S2. Batch setup, in two presses as the Cashu provisioner does it: the form
+ * (federation, cards, PIN, top-up), then a review page whose one button
+ * starts the batch. Nothing reaches a card or the registry before that press.
  *
- * Ported from cashucard's `BatchSetupScreen` with plan § 5's trim applied
- * literally. Kept: the federation picker (grid, custom invite, failure
- * banner), the count, the PIN policy radio with its required batch PIN, and the
- * plan preview. Dropped:
- *
- * - `dailyUsd` / `noPinUsd`: limits are shape C, which this applet does not
- *   have; a field the card cannot enforce is a promise the app cannot keep.
- * - the card design chip: there is no equivalent in this repo.
- * - the installation-only review branch: this app has one shape (B), and the
- *   operator's review of what will be written is the plan preview.
+ * The federation is shown by name when the phone's sidecar vouches for it, by
+ * short id otherwise, and never as the raw invite. The reasons behind each
+ * field live in (i) panels on the section headers, not under the fields.
  *
  * The screen holds no card state. The PIN is a `PinDraft` from `pin.ts`, which
  * lives in this component's state and in nothing else; the store receives the
  * *policy*, never the value.
  */
 import React, {useState} from 'react';
-import {ScanInviteSheet} from '../ScanInvite';
 import {
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -36,10 +31,9 @@ import {
   useBatchPin,
   usePinDraft,
 } from '../pin';
+import {FederationPicker} from '../FederationPicker';
 import {
   DEFAULT_FEDERATION,
-  federationLabel,
-  federationOptions,
   isInviteCode,
   LOAD_LINE,
   MAX_COUNT,
@@ -50,17 +44,20 @@ import {SETUP} from '../strings';
 import {useStore} from '../store';
 import {
   Card,
-  Dim,
   Divider,
   EntryRow,
   FONT,
+  GearButton,
   PrimaryButton,
   Screen,
   SecondaryButton,
   SectionHeader,
   styles,
   useTheme,
+  ValueRow,
+  type Theme,
 } from '../ui';
+import {useFederation} from '../useFederation';
 
 export function BatchSetupScreen({
   onStart,
@@ -80,15 +77,15 @@ export function BatchSetupScreen({
   const [federation, setFederation] = useState<string>(
     settings.federation || DEFAULT_FEDERATION,
   );
-  const [customOpen, setCustomOpen] = useState(false);
-  const [scanning, setScanning] = useState(false);
   const [count, setCount] = useState('1');
   const [policy, setPolicy] = useState<PinPolicy>('batch');
+  const [reviewing, setReviewing] = useState(false);
   const draft = usePinDraft();
   // The batch PIN crosses to the loop through `pin.ts`'s provider slot, never
   // through the store: `BatchConfig` has no field for a value (§ 5).
   const batchPin = useBatchPin();
   const [startFailed, setStartFailed] = useState<string | null>(null);
+  const fed = useFederation(federation);
 
   const countNumber = Number(count);
   const validCount =
@@ -97,29 +94,32 @@ export function BatchSetupScreen({
     countNumber >= 1 &&
     countNumber <= MAX_COUNT;
 
-  const pinProblemText = policy === 'batch' ? draft.problem : null;
   const pinReady = policy === 'perCard' || draft.valid;
-  // The saved invite first, then every preset: a typed custom invite stays
-  // visible and selected instead of vanishing when a preset is tapped.
-  const options = federationOptions(federation);
   const preview = app.planPreview(validCount ? countNumber : 1);
-  // One rule for "a batch can start", shared with Settings: an invite that is
-  // an invite the sidecar can parse and a top-up the card can hold.
   const inviteReady = isInviteCode(federation);
-
-  // A scanned invite is the batch's federation and the saved one: the scan is
-  // the operator's choice, the same as tapping a preset.
-  const scanned = (found: string) => {
-    setScanning(false);
-    setFederation(found);
-    settings.setFederation(found);
-    setCustomOpen(true);
-  };
   const ready =
     validCount &&
     pinReady &&
     preview.ok &&
     settingsAreReady({...settings, federation: federation.trim()});
+
+  // What the operator still has to do, one line, in screen order.
+  const missing = !inviteReady
+    ? SETUP.needFederation
+    : !validCount
+      ? SETUP.needCount(MAX_COUNT)
+      : !pinReady
+        ? SETUP.needPin
+        : !preview.ok
+          ? preview.problem
+          : null;
+
+  // A scanned or pasted invite is the batch's federation and the saved one:
+  // choosing it is the operator's decision, as tapping a preset was.
+  const choose = (invite: string) => {
+    setFederation(invite);
+    settings.setFederation(invite);
+  };
 
   const start = () => {
     if (!ready) {
@@ -136,301 +136,280 @@ export function BatchSetupScreen({
         federation: federation.trim(),
         count: countNumber,
         pinPolicy: policy,
-        plan: {amounts: [...preview.amounts]},
+        plan: preview.installOnly ? null : {amounts: [...preview.amounts]},
       });
       onStart();
     } catch (e) {
-      setStartFailed(e instanceof Error ? e.message : 'The batch could not start.');
+      setStartFailed(e instanceof Error ? e.message : SETUP.startFailed);
     }
   };
 
-  return (
-    <Screen
-      title={SETUP.title}
-      onBack={onSettings}
-      onStop={onStop}
-      headerRight={
-        <Pressable
-          onPress={onSettings}
-          hitSlop={12}
-          testID="settings"
-          accessibilityRole="button"
-          accessibilityLabel="Settings">
-          <Text style={[s.back, {color: t.dim}]}>Settings</Text>
-        </Pressable>
-      }>
-      <ScrollView contentContainerStyle={local.scroll} testID="setup-scroll">
-        {!inviteReady ? (
-          <Text style={s.failed} testID="federation-failed">
-            {SETUP.federationFailed}
-          </Text>
-        ) : null}
+  const topupLine = preview.installOnly
+    ? SETUP.installOnly
+    : SETUP.planPerCard(preview.perCard.toLocaleString(), preview.lines.length);
 
-        <View style={local.section}>
-          <SectionHeader>{SETUP.federation}</SectionHeader>
-          <Card>
-            <View style={local.grid}>
-              {options.map((f, i) => {
-                const on = federation === f.invite;
-                return (
-                  <Pressable
-                    key={f.invite}
-                    onPress={() => {
-                      setFederation(f.invite);
-                      setCustomOpen(false);
-                      settings.setFederation(f.invite);
-                    }}
-                    testID={`federation-${f.invite}`}
-                    accessibilityRole="radio"
-                    accessibilityState={{selected: on}}
-                    style={[
-                      local.gridCell,
-                      i % 2 === 1 && local.gridCellEdgeR,
-                      i >= options.length - 2 && local.gridCellEdgeB,
-                      on && {backgroundColor: t.accent},
-                    ]}>
-                    <Text
-                      numberOfLines={1}
-                      adjustsFontSizeToFit
-                      minimumFontScale={0.8}
-                      style={[
-                        local.gridLabel,
-                        {color: on ? '#fff' : t.ink},
-                      ]}>
-                      {federationLabel(f)}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-              <Pressable
-                onPress={() => setCustomOpen(v => !v)}
-                testID="federation-custom"
-                accessibilityRole="radio"
-                accessibilityState={{selected: customOpen}}
-                style={[
-                  local.gridCell,
-                  {backgroundColor: customOpen ? t.accent : 'transparent'},
-                ]}>
-                <Text
-                  style={[
-                    local.gridLabel,
-                    {color: customOpen ? '#fff' : t.ink},
-                  ]}>
-                  {SETUP.customFederation}
-                </Text>
-              </Pressable>
-            </View>
-            {customOpen ? (
-              <>
-                <Divider />
-                <TextInput
-                  value={federation}
-                  onChangeText={setFederation}
-                  placeholder={SETUP.customPlaceholder}
-                  placeholderTextColor={t.dim}
-                  keyboardType="url"
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  style={[s.input, local.customInput]}
-                  testID="federation-custom-input"
-                />
-              </>
-            ) : null}
-            <Divider />
-            <View style={local.fieldRow}>
-              <SecondaryButton
-                title={SETUP.scanFederation}
-                onPress={() => setScanning(true)}
-                testID="federation-scan"
+  if (reviewing) {
+    return (
+      <Screen title={SETUP.reviewTitle} onBack={() => setReviewing(false)} onStop={onStop}>
+        <ScrollView contentContainerStyle={local.scroll} testID="review-scroll">
+          <View style={local.section}>
+            <SectionHeader help={SETUP.reviewHelp} testID="review-help">
+              {SETUP.reviewHeader}
+            </SectionHeader>
+            <Card testID="review-card">
+              <ValueRow label={SETUP.federation} value={fed.title} valueTone="ink" />
+              <Divider />
+              <ValueRow
+                label={SETUP.countLabel}
+                value={String(countNumber)}
+                valueTone="ink"
+                testID="review-count"
               />
-            </View>
-          </Card>
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader>{SETUP.count}</SectionHeader>
-          <Card>
-            <View style={local.fieldRow}>
-              <Text style={local.fieldLabel}>{SETUP.count}</Text>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Decrease cards in batch"
-                accessibilityState={{
-                  disabled: !validCount || countNumber <= 1,
-                }}
-                disabled={!validCount || countNumber <= 1}
-                onPress={() => setCount(String(countNumber - 1))}
-                style={[
-                  local.countStep,
-                  (!validCount || countNumber <= 1) && local.countStepOff,
-                ]}
-                testID="batch-count-decrement">
-                <Text style={local.countStepText}>−</Text>
-              </Pressable>
-              <TextInput
-                value={count}
-                onChangeText={v => setCount(digitsOnly(v))}
-                keyboardType="number-pad"
-                selectTextOnFocus
-                accessibilityLabel="Cards in batch"
-                style={[local.fieldInput, local.countInput]}
-                testID="batch-count"
+              <Divider />
+              <ValueRow
+                label={SETUP.pin}
+                value={policy === 'batch' ? SETUP.pinBatchShort : SETUP.pinPerCardShort}
+                valueTone="ink"
               />
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Increase cards in batch"
-                accessibilityState={{disabled: countNumber >= MAX_COUNT}}
-                disabled={countNumber >= MAX_COUNT}
-                onPress={() =>
-                  setCount(String(validCount ? countNumber + 1 : 1))
-                }
-                style={[
-                  local.countStep,
-                  countNumber >= MAX_COUNT && local.countStepOff,
-                ]}
-                testID="batch-count-increment">
-                <Text style={local.countStepText}>+</Text>
-              </Pressable>
-            </View>
-            {!validCount ? (
-              <Text style={local.fieldError}>
-                {`${SETUP.countRange} (1–${MAX_COUNT} here.)`}
+              <Divider />
+              <ValueRow label={SETUP.topupLabel} value={topupLine} valueTone="ink" />
+              {!preview.installOnly ? (
+                <>
+                  <Divider />
+                  <ValueRow
+                    label={SETUP.batchTotal}
+                    value={`${preview.batchTotal.toLocaleString()} sat`}
+                    valueTone="accent"
+                  />
+                </>
+              ) : null}
+            </Card>
+            {fed.sidecar === 'mismatch' ? (
+              <Text style={[local.warn, {color: t.danger}]} testID="review-mismatch">
+                {SETUP.sidecarMismatch}
               </Text>
             ) : null}
-          </Card>
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader>{SETUP.pin}</SectionHeader>
-          <Card>
-            <PolicyRow
-              label={PIN_POLICY_LABEL.batch}
-              on={policy === 'batch'}
-              onPress={() => setPolicy('batch')}
-              testID="pin-batch"
-            />
-            <Divider />
-            <PolicyRow
-              label={PIN_POLICY_LABEL.perCard}
-              on={policy === 'perCard'}
-              onPress={() => setPolicy('perCard')}
-              testID="pin-perCard"
-            />
-            {policy === 'batch' ? (
-              <>
-                <Divider />
-                <TextInput
-                  value={draft.value ?? ''}
-                  onChangeText={v => draft.set(v)}
-                  placeholder={`4–${PIN_MAX} digits`}
-                  placeholderTextColor={t.dim}
-                  keyboardType="number-pad"
-                  secureTextEntry
-                  textContentType="none"
-                  autoComplete="off"
-                  maxLength={PIN_MAX}
-                  style={[s.input, local.pinInput]}
-                  testID="pin-batch-input"
-                />
-                {pinProblemText ? (
-                  <Text style={local.fieldError} testID="pin-batch-problem">
-                    {pinProblemText}
-                  </Text>
-                ) : null}
-              </>
-            ) : (
-              <View style={local.pinNote}>
-                <Dim>
-                  Each card gets a fresh PIN, shown once on the summary. The
-                  operator writes it down before the card is handed out.
-                </Dim>
-              </View>
-            )}
-          </Card>
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader>{SETUP.plan}</SectionHeader>
-          <Card testID="plan-preview">
-            {preview.installOnly ? (
-              <View style={local.fieldRow}>
-                <Dim>{SETUP.planNone}</Dim>
-              </View>
-            ) : (
-              <>
-                <View style={local.fieldRow}>
-                  <Text style={local.fieldLabel}>
-                    {SETUP.planPerCard(
-                      preview.perCard.toLocaleString(),
-                      preview.lines.length,
-                    )}
-                  </Text>
-                </View>
-                <Divider />
-                {preview.lines.map((line, i) => (
-                  <React.Fragment key={`${line}-${i}`}>
-                    {i > 0 ? <Divider /> : null}
-                    <View style={local.noteRow}>
-                      <Text style={local.noteIndex}>{i + 1}</Text>
-                      <Text style={local.noteAmount}>{line}</Text>
-                    </View>
-                  </React.Fragment>
-                ))}
-                <Divider />
-                <View style={local.fieldRow}>
-                  <Text style={local.fieldLabel}>Batch total</Text>
-                  <Text style={local.fieldValue}>
-                    {`${preview.batchTotal.toLocaleString()} sat`}
-                  </Text>
-                </View>
-              </>
-            )}
-            {preview.problem ? (
-              <Text style={local.fieldError} testID="plan-problem">
-                {preview.problem}
-              </Text>
-            ) : null}
-          </Card>
-          <EntryRow
-            title="Change the amounts"
-            subtitle="Top-up amounts are a setting, not a batch field."
-            onPress={onSettings}
-            testID="plan-settings"
+            <Text style={[local.small, {color: t.dim}]}>
+              {SETUP.reviewLine(countNumber, preview.installOnly)}
+            </Text>
+          </View>
+        </ScrollView>
+        <View style={local.footer}>
+          <PrimaryButton title={SETUP.start} onPress={start} testID="start-batch" />
+          <SecondaryButton
+            title={SETUP.edit}
+            onPress={() => setReviewing(false)}
+            testID="edit-batch"
           />
+          {startFailed ? (
+            <Text style={s.failed} testID="start-failed">
+              {startFailed}
+            </Text>
+          ) : null}
         </View>
-      </ScrollView>
+      </Screen>
+    );
+  }
 
-      <View style={local.footer}>
-        <PrimaryButton
-          title={SETUP.start}
-          disabled={!ready}
-          onPress={start}
-          testID="start-batch"
-        />
-        <Text style={local.buildLine}>{SETUP.buildLine(LOAD_LINE)}</Text>
-        {startFailed ? (
-          <Text style={s.failed} testID="start-failed">
-            {startFailed}
+  return (
+    <KeyboardAvoidingView
+      style={local.grow}
+      enabled={Platform.OS === 'ios'}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <Screen
+        title={SETUP.title}
+        onStop={onStop}
+        headerRight={<GearButton onPress={onSettings} />}>
+        <ScrollView
+          contentContainerStyle={local.scroll}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          testID="setup-scroll">
+          <View style={local.section}>
+            <SectionHeader help={SETUP.federationHelp} testID="federation-help">
+              {SETUP.federation}
+            </SectionHeader>
+            <FederationPicker
+              fed={fed}
+              hasInvite={inviteReady}
+              onChoose={choose}
+            />
+          </View>
+
+          <View style={local.section}>
+            <SectionHeader help={SETUP.countHelp(MAX_COUNT)} testID="count-help">
+              {SETUP.count}
+            </SectionHeader>
+            <Card>
+              <View style={local.fieldRow}>
+                <Text style={[local.fieldLabel, {color: t.ink}]}>{SETUP.countLabel}</Text>
+                <Stepper
+                  t={t}
+                  value={count}
+                  valid={validCount}
+                  onChange={v => setCount(digitsOnly(v))}
+                  onStep={d =>
+                    setCount(String(validCount ? Math.min(MAX_COUNT, Math.max(1, countNumber + d)) : 1))
+                  }
+                  min={countNumber <= 1}
+                  max={countNumber >= MAX_COUNT}
+                />
+              </View>
+            </Card>
+          </View>
+
+          <View style={local.section}>
+            <SectionHeader help={SETUP.pinHelp} testID="pin-help">
+              {SETUP.pin}
+            </SectionHeader>
+            <Card>
+              <PolicyRow
+                label={PIN_POLICY_LABEL.batch}
+                on={policy === 'batch'}
+                onPress={() => setPolicy('batch')}
+                testID="pin-batch"
+              />
+              {policy === 'batch' ? (
+                <View style={local.pinBox}>
+                  <TextInput
+                    value={draft.value ?? ''}
+                    onChangeText={v => draft.set(v)}
+                    placeholder={SETUP.pinPlaceholder(PIN_MAX)}
+                    placeholderTextColor={t.dim}
+                    keyboardType="number-pad"
+                    secureTextEntry
+                    textContentType="none"
+                    autoComplete="off"
+                    maxLength={PIN_MAX}
+                    style={[s.input, local.pinInput, draft.value ? local.pinSpaced : null]}
+                    testID="pin-batch-input"
+                  />
+                  {draft.value && draft.problem ? (
+                    <Text style={[local.small, {color: t.danger}]} testID="pin-batch-problem">
+                      {draft.problem}
+                    </Text>
+                  ) : null}
+                </View>
+              ) : null}
+              <Divider />
+              <PolicyRow
+                label={PIN_POLICY_LABEL.perCard}
+                sub={policy === 'perCard' ? SETUP.perCardSub : undefined}
+                on={policy === 'perCard'}
+                onPress={() => setPolicy('perCard')}
+                testID="pin-perCard"
+              />
+            </Card>
+          </View>
+
+          <View style={local.section}>
+            <SectionHeader help={SETUP.topupHelp} testID="topup-help">
+              {SETUP.plan}
+            </SectionHeader>
+            <Card testID="plan-preview">
+              <EntryRow
+                title={topupLine}
+                subtitle={SETUP.topupChange}
+                onPress={onSettings}
+                testID="plan-settings"
+              />
+              {!preview.installOnly ? (
+                <>
+                  <Divider />
+                  <View style={local.notes}>
+                    {preview.lines.map((line, i) => (
+                      <Text
+                        key={`${line}-${i}`}
+                        style={[local.noteChip, {color: t.ink, borderColor: t.line}]}>
+                        {line}
+                      </Text>
+                    ))}
+                  </View>
+                </>
+              ) : null}
+              {preview.problem ? (
+                <Text style={[local.small, local.inset, {color: t.danger}]} testID="plan-problem">
+                  {preview.problem}
+                </Text>
+              ) : null}
+            </Card>
+          </View>
+        </ScrollView>
+        <View style={local.footer}>
+          <PrimaryButton
+            title={SETUP.review}
+            disabled={!ready}
+            onPress={() => {
+              setStartFailed(null);
+              setReviewing(true);
+            }}
+            testID="review-batch"
+          />
+          <Text style={[local.small, local.center, {color: t.dim}]} testID="setup-missing">
+            {missing ?? SETUP.buildLine(LOAD_LINE)}
           </Text>
-        ) : null}
-      </View>
-      <ScanInviteSheet
-        visible={scanning}
-        onClose={() => setScanning(false)}
-        onInvite={scanned}
-      />
-    </Screen>
+        </View>
+      </Screen>
+    </KeyboardAvoidingView>
   );
 }
 
-/** One radio row of the PIN policy: a dot in a ring, the label. */
+function Stepper({
+  t,
+  value,
+  valid,
+  onChange,
+  onStep,
+  min,
+  max,
+}: {
+  t: Theme;
+  value: string;
+  valid: boolean;
+  onChange: (v: string) => void;
+  onStep: (delta: number) => void;
+  min: boolean;
+  max: boolean;
+}) {
+  const step = (delta: number, off: boolean, label: string, id: string) => (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{disabled: off}}
+      disabled={off}
+      onPress={() => onStep(delta)}
+      hitSlop={6}
+      style={[local.step, {borderColor: t.line, backgroundColor: t.bg}, off && local.off]}
+      testID={id}>
+      <Text style={[local.stepText, {color: t.ink}]}>{delta < 0 ? '−' : '+'}</Text>
+    </Pressable>
+  );
+  return (
+    <View style={local.stepper}>
+      {step(-1, !valid || min, 'Fewer cards', 'batch-count-decrement')}
+      <TextInput
+        value={value}
+        onChangeText={onChange}
+        keyboardType="number-pad"
+        selectTextOnFocus
+        accessibilityLabel="Cards in batch"
+        style={[local.countInput, {color: valid ? t.ink : t.danger}]}
+        testID="batch-count"
+      />
+      {step(1, max, 'More cards', 'batch-count-increment')}
+    </View>
+  );
+}
+
 function PolicyRow({
   label,
+  sub,
   on,
   onPress,
   testID,
 }: {
   label: string;
+  sub?: string;
   on: boolean;
   onPress: () => void;
   testID: string;
@@ -443,117 +422,82 @@ function PolicyRow({
       testID={testID}
       accessibilityRole="radio"
       accessibilityState={{selected: on}}>
-      <View
-        style={[
-          local.radio,
-          {borderColor: on ? t.accent : t.line},
-          on && {backgroundColor: t.accent},
-        ]}>
-        {on ? <View style={[local.radioDot, {backgroundColor: t.bg}]} /> : null}
+      <View style={[local.radio, {borderColor: on ? t.accent : t.dim}]}>
+        {on ? <View style={[local.radioDot, {backgroundColor: t.accent}]} /> : null}
       </View>
-      <Text style={[local.fieldLabel, {color: t.ink}]}>{label}</Text>
+      <View style={local.grow}>
+        <Text style={[local.fieldLabel, {color: t.ink}]}>{label}</Text>
+        {sub ? <Text style={[local.small, {color: t.dim}]}>{sub}</Text> : null}
+      </View>
     </Pressable>
   );
 }
 
 const local = StyleSheet.create({
-  scroll: {gap: 20, paddingBottom: 24},
-  section: {gap: 8},
-  grid: {flexDirection: 'row', flexWrap: 'wrap'},
-  gridCell: {
-    width: '50%',
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    alignItems: 'flex-start',
-    justifyContent: 'center',
-  },
-  gridCellEdgeR: {borderRightWidth: StyleSheet.hairlineWidth},
-  gridCellEdgeB: {borderBottomWidth: StyleSheet.hairlineWidth},
-  gridLabel: {fontFamily: FONT.medium, fontSize: 15},
-  customInput: {borderWidth: 0, borderRadius: 0, backgroundColor: 'transparent'},
+  grow: {flex: 1},
+  scroll: {gap: 24, paddingTop: 4, paddingBottom: 24},
+  section: {gap: 10},
+  center: {textAlign: 'center'},
+  inset: {paddingHorizontal: 18, paddingBottom: 14},
+  small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
+  warn: {fontFamily: FONT.medium, fontSize: 14, lineHeight: 20},
   fieldRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 13,
+    justifyContent: 'space-between',
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    minHeight: 60,
   },
-  fieldLabel: {flex: 1, fontFamily: FONT.medium, fontSize: 16},
-  fieldValue: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
-    fontSize: 15,
-  },
-  fieldInput: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
-    fontSize: 16,
-    textAlign: 'center',
-    minWidth: 44,
-  },
-  countInput: {minWidth: 56},
-  countStep: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+  fieldLabel: {fontFamily: FONT.medium, fontSize: 16},
+  stepper: {flexDirection: 'row', alignItems: 'center', gap: 6},
+  step: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     borderWidth: 1.5,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  countStepOff: {opacity: 0.35},
-  countStepText: {fontFamily: FONT.medium, fontSize: 20, lineHeight: 24},
-  fieldError: {
-    paddingHorizontal: 14,
-    paddingBottom: 12,
-    fontFamily: FONT.regular,
-    fontSize: 13,
+  stepText: {fontFamily: FONT.medium, fontSize: 22, lineHeight: 26},
+  off: {opacity: 0.35},
+  countInput: {
+    minWidth: 52,
+    textAlign: 'center',
+    fontFamily: FONT.semibold,
+    fontSize: 22,
+    fontVariant: ['tabular-nums'],
+    paddingVertical: 4,
   },
   policyRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
+    gap: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 15,
   },
   radio: {
     width: 22,
     height: 22,
     borderRadius: 11,
-    borderWidth: 1.5,
+    borderWidth: 2,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  radioDot: {width: 8, height: 8, borderRadius: 4},
-  pinInput: {
-    borderWidth: 0,
-    borderRadius: 0,
-    backgroundColor: 'transparent',
-    letterSpacing: 6,
-  },
-  pinNote: {paddingHorizontal: 16, paddingBottom: 14},
-  noteRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 11,
-  },
-  noteIndex: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
+  radioDot: {width: 10, height: 10, borderRadius: 5},
+  pinBox: {paddingHorizontal: 18, paddingBottom: 14, gap: 6},
+  pinInput: {fontSize: 16, minHeight: 50},
+  pinSpaced: {fontSize: 20, letterSpacing: 6},
+  notes: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, padding: 14},
+  noteChip: {
+    fontFamily: FONT.medium,
     fontSize: 13,
-    width: 18,
-    color: 'rgba(128,128,128,0.9)',
-  },
-  noteAmount: {
-    fontFamily: FONT.tabular,
     fontVariant: ['tabular-nums'],
-    fontSize: 15,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    overflow: 'hidden',
   },
-  footer: {paddingTop: 10, paddingBottom: 8, gap: 8},
-  buildLine: {
-    fontFamily: FONT.regular,
-    fontSize: 12,
-    textAlign: 'center',
-  },
+  footer: {gap: 10, paddingBottom: 8, paddingTop: 4},
 });

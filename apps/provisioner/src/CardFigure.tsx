@@ -5,19 +5,23 @@
  * revealed left to right as the write's blocks land — the sweep is the run's
  * real block count, never an animation.
  *
- * The card is an NXP J3R180: a black face, the chip at the left, and the eight
- * note slots drawn along the bottom so the figure says what the card is holding
+ * The face is the app icon's navy with its gold chip and the name, and the
+ * eight note slots along the bottom, so the figure says what the card can hold
  * as well as how far the write has got.
  */
 import React from 'react';
 import {StyleSheet, View} from 'react-native';
 import Svg, {
+  ClipPath,
   Defs,
   G,
+  Line,
   LinearGradient,
+  Polygon,
   Rect,
   Stop,
   Text as SvgText,
+  TSpan,
 } from 'react-native-svg';
 
 import {FONT, useTheme, type Theme} from './ui';
@@ -28,75 +32,81 @@ const H = W / (85.6 / 53.98);
 
 export type FigureState = 'idle' | 'running' | 'done' | 'stop' | 'danger';
 
-/** The card's face, at full ink. */
-function Face({t}: {t: Theme}) {
+/** The chip, from the app icon (`assets/icon/icon.svg`): gold, with the mark cut in. */
+const SPOKES: readonly [number, number, number, number][] = [
+  [230, 186, 230, 128],
+  [264.4, 202.6, 365, 120],
+  [195.6, 202.6, 95, 120],
+  [272.9, 239.8, 370, 262],
+  [187.1, 239.8, 90, 262],
+  [249.1, 269.6, 283, 340],
+  [210.9, 269.6, 177, 340],
+];
+const HEPTAGON =
+  '230,186 264.4,202.6 272.9,239.8 249.1,269.6 210.9,269.6 187.1,239.8 195.6,202.6';
+const CHIP_W = 42;
+const CHIP_SCALE = CHIP_W / 269;
+
+/** The card's face, at full ink: the icon's navy, its gold chip, the name. */
+function Face({id}: {id: string}) {
   return (
     <G>
       <Defs>
-        <LinearGradient id="face" x1="0" y1="0" x2="1" y2="1">
-          <Stop offset="0" stopColor={t.dark ? '#131316' : '#101014'} />
-          <Stop offset="1" stopColor={t.dark ? '#050506' : '#000000'} />
+        <LinearGradient id={`${id}-face`} x1="0" y1="0" x2="1" y2="1">
+          <Stop offset="0" stopColor="#24428E" />
+          <Stop offset="1" stopColor="#12214A" />
         </LinearGradient>
+        <LinearGradient id={`${id}-gold`} x1="0" y1="0" x2="1" y2="1">
+          <Stop offset="0" stopColor="#E1CF89" />
+          <Stop offset="1" stopColor="#AF9244" />
+        </LinearGradient>
+        <ClipPath id={`${id}-chip`}>
+          <Rect x="95" y="128" width="269" height="203" rx="30" />
+        </ClipPath>
       </Defs>
-      <Rect width={W} height={H} rx={16} fill="url(#face)" />
+      <Rect width={W} height={H} rx={16} fill={`url(#${id}-face)`} />
 
-      {/* the chip: contact pads, so the face reads as a card and not a ticket */}
-      <Rect x={22} y={54} width={38} height={30} rx={5} fill="#C9A227" opacity={0.92} />
-      <Rect x={22} y={54} width={38} height={30} rx={5} fill="none" stroke="#8A6E12" strokeWidth={1} />
-      <Rect x={22} y={66.5} width={38} height={1} fill="#8A6E12" opacity={0.7} />
-      <Rect x={34} y={54} width={1} height={30} fill="#8A6E12" opacity={0.7} />
-      <Rect x={47} y={54} width={1} height={30} fill="#8A6E12" opacity={0.7} />
+      {/* the name, top left, in the icon's gold */}
+      <SvgText
+        x={22}
+        y={34}
+        fontSize={17}
+        fill="#E1CF89"
+        fontFamily={FONT.bold}
+        letterSpacing={0.2}>
+        Fedimint
+        <TSpan fill="#EEF1F8" fontFamily={FONT.medium}>
+          {' card'}
+        </TSpan>
+      </SvgText>
 
-      {/* the federation's mark: the lightning bolt the brand uses */}
-      <G transform="translate(150 34)">
-        <Rect width={56} height={56} rx={28} fill={t.accent} opacity={0.16} />
-        <Rect
-          width={56}
-          height={56}
-          rx={28}
-          fill="none"
-          stroke={t.accent}
-          strokeWidth={1.5}
-          opacity={0.55}
-        />
-        <SvgText
-          x={28}
-          y={41}
-          fontSize={30}
-          textAnchor="middle"
-          fill={t.accent}
-          fontFamily={FONT.semibold}>
-          ⚡
-        </SvgText>
+      {/* the chip: the icon's own, so the card and the app are one object */}
+      <G
+        transform={`translate(${22 - 95 * CHIP_SCALE} ${56 - 128 * CHIP_SCALE}) scale(${CHIP_SCALE})`}>
+        <Rect x="95" y="128" width="269" height="203" rx="30" fill={`url(#${id}-gold)`} />
+        <G clipPath={`url(#${id}-chip)`} fill="none" stroke="#24418C" strokeWidth={9}>
+          {SPOKES.map(([x1, y1, x2, y2], k) => (
+            <Line key={k} x1={x1} y1={y1} x2={x2} y2={y2} />
+          ))}
+          <Polygon points={HEPTAGON} />
+        </G>
       </G>
 
-      {/* the eight slots, along the base */}
-      <G transform={`translate(22 ${H - 34})`}>
-        {Array.from({length: 8}, (_, i) => (
+      {/* the eight note slots, along the base */}
+      <G transform={`translate(22 ${H - 26})`}>
+        {Array.from({length: 8}, (_, k) => (
           <Rect
-            key={i}
-            x={i * 11}
+            key={k}
+            x={k * 12}
             y={0}
-            width={7}
+            width={8}
             height={4}
             rx={2}
-            fill={t.ink}
-            opacity={0.22}
+            fill="#EEF1F8"
+            opacity={0.35}
           />
         ))}
       </G>
-
-      {/* the card's own name, under the chip */}
-      <SvgText
-        x={22}
-        y={H - 46}
-        fontSize={13}
-        fill={t.ink}
-        opacity={0.85}
-        fontFamily={FONT.semibold}
-        letterSpacing={2.4}>
-        FEDIMINT
-      </SvgText>
     </G>
   );
 }
@@ -111,7 +121,8 @@ export function CardFigure({
 }) {
   const t = useTheme();
   const s = styles(t);
-  const ghost = fill < 1 ? 0.22 : 1;
+  // The blank card is the same face, faded: visible on navy, plainly unwritten.
+  const ghost = fill < 1 ? 0.38 : 1;
   const border =
     state === 'danger'
       ? t.danger
@@ -129,14 +140,14 @@ export function CardFigure({
       {/* the unwritten card: the face at ghost opacity */}
       <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
         <G opacity={ghost}>
-          <Face t={t} />
+          <Face id="ghost" />
         </G>
       </Svg>
       {/* the written sweep: the same face at full ink, clipped to the write */}
       {swept > 0 ? (
         <View style={[s.sweep, {width: W * swept, height: H}]}>
           <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
-            <Face t={t} />
+            <Face id="ink" />
           </Svg>
         </View>
       ) : null}
@@ -150,7 +161,7 @@ const styles = (t: Theme) =>
       borderRadius: 16,
       overflow: 'hidden',
       borderWidth: 2,
-      backgroundColor: t.card,
+      backgroundColor: t.bg,
       alignSelf: 'center',
     },
     sweep: {position: 'absolute', left: 0, top: 0, overflow: 'hidden'},

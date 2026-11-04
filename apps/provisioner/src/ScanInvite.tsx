@@ -130,7 +130,7 @@ export function ScanInviteSheet({
 }
 
 const local = StyleSheet.create({
-  root: {flex: 1, backgroundColor: '#000'},
+  root: {flex: 1, backgroundColor: '#0B1530'},
   overlay: {
     ...StyleSheet.absoluteFillObject,
     paddingHorizontal: 24,
@@ -157,9 +157,9 @@ const local = StyleSheet.create({
     height: 240,
     borderRadius: 24,
     borderWidth: 3,
-    borderColor: 'rgba(255,255,255,0.9)',
+    borderColor: '#E1CF89',
   },
   spacer: {flex: 1},
   bottom: {alignSelf: 'stretch', gap: 12},
-  cancel: {backgroundColor: 'rgba(255,255,255,0.92)', borderRadius: 14},
+  cancel: {backgroundColor: 'rgba(11,21,48,0.88)', borderRadius: 14},
 });

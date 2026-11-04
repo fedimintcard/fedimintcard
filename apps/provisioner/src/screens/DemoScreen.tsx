@@ -27,31 +27,37 @@ import {
   type DemoStateId,
   type DemoStop,
 } from '../demo/runDemo';
+import {CardFigure} from '../CardFigure';
+import {phaseMessage} from '../session';
 import type {CardStop} from '../store';
+import {CALM, STATE} from '../strings';
 import {STOP_NAMES} from './LoopScreen';
 import {
   Card,
-  Dim,
+  Divider,
   EntryRow,
+  FONT,
   PrimaryButton,
   Screen,
-  styles,
+  SecondaryButton,
+  SectionHeader,
   useTheme,
 } from '../ui';
 
 const COPY = {
   title: 'Demo',
-  sub: 'Install, key and load a simulated card. No reader, no network, nothing recorded.',
-  run: 'RUN THIS DEMO',
-  running: 'Running…',
-  again: 'RUN AGAIN',
-  result: 'Result',
+  intro: 'Pick a scenario. Each one runs the real install engine against a simulated card.',
+  help:
+    'The demo programs a simulated card with the same engine the loop uses on a real one: no reader, no network, and nothing recorded to the registry. Each scenario is a situation an operator meets at the table, and ends in the words the loop would show.',
+  badge: 'Simulated card',
+  starting: 'Starting…',
   programmed: 'Card programmed',
-  stopped: 'Stopped',
+  programmedBody: 'Installed, keyed and checked. On a real card this is where the next one goes on.',
+  stopped: 'Card stopped',
   noCard: 'Nothing was sent to a card.',
-  apdus: 'APDUs exchanged',
-  back: 'BACK TO THE LIST',
-  card: 'SIMULATED CARD',
+  apdus: (n: number) => `${n} card commands exchanged`,
+  again: 'Run again',
+  back: 'Back to the scenarios',
 } as const;
 
 /** A finished run, or null before the first tap. */
@@ -83,19 +89,35 @@ function cardStop(stop: DemoStop): CardStop {
 
 export function DemoScreen({onBack}: {onBack: () => void}) {
   const t = useTheme();
-  const s = styles(t);
   const [selected, setSelected] = useState<DemoStateId | null>(null);
   const [outcome, setOutcome] = useState<Outcome>(null);
   const [busy, setBusy] = useState(false);
+  const [line, setLine] = useState<string>(COPY.starting);
+  const [fill, setFill] = useState(0);
 
   const run = useCallback(async (state: DemoStateId) => {
     setBusy(true);
     setOutcome(null);
+    setFill(0);
+    setLine(COPY.starting);
     try {
       // `speed` is left at 1: the demo runs in about ten seconds and the wait
-      // is the engine's own work, not an animation's.
-      const result = await runDemo(state);
+      // is the engine's own work, not an animation's. The figure and the line
+      // follow the engine's events exactly as the loop's do.
+      const result = await runDemo(state, {
+        onEvent: event => {
+          if (event.type === 'phase') {
+            setLine(phaseMessage(event.phase));
+          } else if (event.type === 'block') {
+            setFill(event.index / Math.max(1, event.of));
+            setLine(`Writing ${Math.round((event.index / event.of) * 100)}%`);
+          }
+        },
+      });
       setOutcome({state, run: result});
+      if (stopFor(result) === 'ok') {
+        setFill(1);
+      }
     } finally {
       setBusy(false);
     }
@@ -105,20 +127,24 @@ export function DemoScreen({onBack}: {onBack: () => void}) {
     return (
       <Screen title={COPY.title} onBack={onBack}>
         <ScrollView contentContainerStyle={local.scroll} testID="demo-states">
-          <Text style={s.note}>{COPY.sub}</Text>
+          <SectionHeader help={COPY.help} testID="demo-help">
+            {COPY.badge}
+          </SectionHeader>
+          <Text style={[local.intro, {color: t.dim}]}>{COPY.intro}</Text>
           <Card>
-            {DEMO_STATES.map(state => (
-              <EntryRow
-                key={state.id}
-                title={state.name}
-                subtitle={state.sub}
-                testID={`demo-state-${state.id}`}
-                onPress={() => {
-                  setSelected(state.id);
-                  setOutcome(null);
-                  void run(state.id);
-                }}
-              />
+            {DEMO_STATES.map((state, k) => (
+              <React.Fragment key={state.id}>
+                {k > 0 ? <Divider /> : null}
+                <EntryRow
+                  title={state.name}
+                  subtitle={state.sub}
+                  testID={`demo-state-${state.id}`}
+                  onPress={() => {
+                    setSelected(state.id);
+                    void run(state.id);
+                  }}
+                />
+              </React.Fragment>
             ))}
           </Card>
         </ScrollView>
@@ -129,73 +155,107 @@ export function DemoScreen({onBack}: {onBack: () => void}) {
   const state = DEMO_STATES.find(d => d.id === selected);
   const stop = outcome ? stopFor(outcome.run) : null;
   const shown = outcome?.run.result ?? null;
+  const loopStop = stop && stop !== 'ok' ? cardStop(stop) : null;
+  const figureState = busy ? 'running' : stop === 'ok' ? 'done' : stop ? 'danger' : 'idle';
+  const leave = () => {
+    if (busy) {
+      return;
+    }
+    setSelected(null);
+    setOutcome(null);
+  };
 
   return (
-    <Screen
-      title={state?.name ?? COPY.title}
-      onBack={() => {
-        setSelected(null);
-        setOutcome(null);
-      }}>
+    <Screen title={COPY.title} onBack={busy ? undefined : leave}>
       <ScrollView contentContainerStyle={local.scroll} testID="demo-result">
-        <Text style={s.note}>{state?.sub}</Text>
-
-        {busy ? (
-          <Text style={s.note} testID="demo-running">
-            {COPY.running}
+        <View style={local.head}>
+          <Text style={[local.badge, {color: t.accent, borderColor: t.accent}]}>
+            {COPY.badge}
           </Text>
-        ) : null}
-
-        {outcome && stop ? (
-          <Card>
-            <View style={local.field}>
-              <Dim>{COPY.card}</Dim>
-              <Text style={s.rowLabel}>{COPY.result}</Text>
-            </View>
-            <View style={local.field}>
-              <Dim>{stop === 'ok' ? COPY.programmed : COPY.stopped}</Dim>
-              <Text
-                style={[
-                  s.rowLabel,
-                  stop === 'ok' ? {color: t.accent} : s.failed,
-                ]}
-                testID="demo-stop">
-                {stop === 'ok'
-                  ? COPY.programmed
-                  : STOP_NAMES[cardStop(stop)]}
-              </Text>
-            </View>
-            {outcome.run.sessionError ? (
-              <View style={local.field}>
-                <Dim testID="demo-session-error">
-                  {outcome.run.sessionError}
-                </Dim>
-                <Text style={s.note}>{COPY.noCard}</Text>
-              </View>
-            ) : null}
-            {shown ? (
-              <View style={local.field}>
-                <Dim>{COPY.apdus}</Dim>
-                <Text testID="demo-apdu-count">{String(shown.apdus.length)}</Text>
-              </View>
-            ) : null}
-          </Card>
-        ) : null}
-
-        <View style={local.field}>
-          <PrimaryButton
-            title={outcome ? COPY.again : COPY.run}
-            disabled={busy}
-            onPress={() => void run(selected)}
-            testID="demo-run"
-          />
+          <Text style={[local.name, {color: t.ink}]}>{state?.name}</Text>
+          <Text style={[local.intro, {color: t.dim}]}>{state?.sub}</Text>
         </View>
+        <View style={local.figure}>
+          <CardFigure fill={fill} state={figureState} />
+          <Text
+            style={[local.line, {color: t.ink}]}
+            accessibilityLiveRegion="polite"
+            testID="demo-running">
+            {busy || !outcome ? line : ''}
+          </Text>
+        </View>
+        {outcome && stop === 'ok' ? (
+          <View
+            style={[local.panel, {backgroundColor: t.card, borderColor: t.accent}]}
+            testID="demo-stop">
+            <Text style={[local.panelTitle, {color: t.accent}]}>{COPY.programmed}</Text>
+            <Text style={[local.body, {color: t.ink}]}>{COPY.programmedBody}</Text>
+            {shown ? (
+              <Text style={[local.body, {color: t.dim}]} testID="demo-apdu-count">
+                {COPY.apdus(shown.apdus.length)}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
+        {outcome && loopStop ? (
+          <View
+            style={[local.panel, {backgroundColor: t.card, borderColor: t.danger}]}
+            testID="demo-stop">
+            <Text style={[local.eyebrow, {color: t.danger}]}>{COPY.stopped}</Text>
+            <Text style={[local.panelTitle, {color: t.ink}]}>{STOP_NAMES[loopStop]}</Text>
+            {outcome.run.sessionError ? (
+              <Text style={[local.body, {color: t.ink}]} testID="demo-session-error">
+                {`${outcome.run.sessionError} ${COPY.noCard}`}
+              </Text>
+            ) : (
+              <>
+                <Text style={[local.body, {color: t.ink}]}>{CALM[loopStop]}</Text>
+                <Text style={[local.body, {color: t.dim}]}>{STATE[loopStop]}</Text>
+              </>
+            )}
+            {shown ? (
+              <Text style={[local.body, {color: t.dim}]} testID="demo-apdu-count">
+                {COPY.apdus(shown.apdus.length)}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
       </ScrollView>
+      <View style={local.footer}>
+        <PrimaryButton
+          title={busy ? line : COPY.again}
+          disabled={busy}
+          onPress={() => void run(selected)}
+          testID="demo-run"
+        />
+        <SecondaryButton title={COPY.back} disabled={busy} onPress={leave} testID="demo-back" />
+      </View>
     </Screen>
   );
 }
 
 const local = StyleSheet.create({
-  scroll: {padding: 16, gap: 16},
-  field: {gap: 4},
+  scroll: {gap: 18, paddingTop: 4, paddingBottom: 20, flexGrow: 1},
+  intro: {fontFamily: FONT.regular, fontSize: 14, lineHeight: 20},
+  head: {gap: 6},
+  badge: {
+    alignSelf: 'flex-start',
+    fontFamily: FONT.semibold,
+    fontSize: 11,
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    overflow: 'hidden',
+  },
+  name: {fontFamily: FONT.semibold, fontSize: 24, letterSpacing: -0.4},
+  figure: {alignItems: 'center', gap: 14, flex: 1, justifyContent: 'center', marginVertical: 8},
+  line: {fontFamily: FONT.medium, fontSize: 18, textAlign: 'center', minHeight: 26},
+  panel: {borderRadius: 16, borderWidth: 1.5, padding: 16, gap: 6},
+  eyebrow: {fontFamily: FONT.semibold, fontSize: 12, letterSpacing: 1.2, textTransform: 'uppercase'},
+  panelTitle: {fontFamily: FONT.semibold, fontSize: 19},
+  body: {fontFamily: FONT.regular, fontSize: 15, lineHeight: 21},
+  footer: {gap: 10, paddingBottom: 8, paddingTop: 6},
 });

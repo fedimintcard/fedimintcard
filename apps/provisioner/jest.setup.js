@@ -45,6 +45,14 @@ jest.mock('react-native-svg', () => {
     Circle: make('Circle'),
     Rect: make('Rect'),
     G: make('G'),
+    Line: make('Line'),
+    Polygon: make('Polygon'),
+    Defs: make('Defs'),
+    ClipPath: make('ClipPath'),
+    LinearGradient: make('LinearGradient'),
+    Stop: make('Stop'),
+    Text: make('Text'),
+    TSpan: make('TSpan'),
   };
 });
 

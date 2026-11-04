@@ -23,13 +23,12 @@ import {SUMMARY} from '../strings';
 import {type RecordRow, useBatch} from '../store';
 import {
   Card,
-  Dim,
+  Divider,
   FONT,
   PrimaryButton,
   Screen,
   SectionHeader,
   SecondaryButton,
-  styles,
   useTheme,
 } from '../ui';
 
@@ -47,7 +46,6 @@ export function BatchSummaryScreen({
   const batch = useBatch();
   const reveal = usePinReveal();
   const t = useTheme();
-  const s = styles(t);
   const [pendingConfirm, setPendingConfirm] = React.useState(false);
 
   if (!batch) {
@@ -59,73 +57,70 @@ export function BatchSummaryScreen({
   // until the batch ends.
   const shown = config.pinPolicy === 'perCard' ? reveal.reveal() : null;
 
+  const stopped = summary.failed + summary.empty + summary.unspendable;
+  const closing = summary.pending > 0 && pendingConfirm;
   return (
-    <Screen title={SUMMARY.title} onBack={onBack}>
+    <Screen title={SUMMARY.title} onBack={phase !== 'ended' ? onBack : undefined}>
       <ScrollView contentContainerStyle={local.scroll} testID="summary-scroll">
+        <Text style={[local.headline, {color: t.ink}]} accessibilityRole="header">
+          {SUMMARY.headline(summary.spendable, config.count)}
+        </Text>
         <View style={local.stats}>
-          <Stat value={summary.spendable} label={SUMMARY.programmed} accent />
-          <Stat
-            value={summary.failed + summary.empty + summary.unspendable}
-            label={SUMMARY.stopped}
-          />
-          <Stat value={summary.pending} label={SUMMARY.pending} />
+          <Stat value={summary.spendable} label={SUMMARY.programmed} tone="accent" />
+          <Stat value={stopped} label={SUMMARY.stopped} tone={stopped > 0 ? 'danger' : 'ink'} />
+          <Stat value={summary.pending} label={SUMMARY.pending} tone="ink" />
         </View>
-
         {shown ? (
-          <Card testID="summary-pin">
-            <View style={local.pinRow}>
-              <View style={local.pinText}>
-                <Text style={[local.pinLabel, {color: t.ink}]}>
-                  The last card&apos;s PIN
-                </Text>
-                <Dim>
-                  Write it down before the card is handed out. It is shown once
-                  and is not kept after the batch ends.
-                </Dim>
-              </View>
-              <Text style={[local.pinValue, {color: t.ink}]} testID="summary-pin-value">
-                {maskedPin(shown.pin)}
-              </Text>
+          <View
+            style={[local.pinCard, {backgroundColor: t.card, borderColor: t.accent}]}
+            testID="summary-pin">
+            <View style={local.pinText}>
+              <Text style={[local.pinLabel, {color: t.ink}]}>{SUMMARY.pinTitle}</Text>
+              <Text style={[local.small, {color: t.dim}]}>{SUMMARY.pinBody}</Text>
             </View>
-          </Card>
+            <Text style={[local.pinValue, {color: t.accent}]} testID="summary-pin-value">
+              {maskedPin(shown.pin)}
+            </Text>
+          </View>
         ) : null}
-
         <View style={local.section}>
-          <SectionHeader>{SUMMARY.record}</SectionHeader>
+          <SectionHeader help={SUMMARY.recordHelp} testID="summary-record-help">
+            {SUMMARY.record}
+          </SectionHeader>
           <Card>
             {records.length === 0 ? (
               <View style={local.emptyRow}>
-                <Text style={s.note}>{SUMMARY.empty}</Text>
+                <Text style={[local.small, {color: t.dim}]}>{SUMMARY.empty}</Text>
               </View>
             ) : (
               records.map((r, i) => (
                 <React.Fragment key={r.id}>
-                  {i > 0 ? <View style={[local.divider, {backgroundColor: t.line}]} /> : null}
-                  <Row row={r} />
+                  {i > 0 ? <Divider /> : null}
+                  <Row row={r} n={i + 1} />
                 </React.Fragment>
               ))
             )}
           </Card>
-          {summary.pending > 0 ? (
-            <Text style={s.note} testID="summary-pending-note">
-              {SUMMARY.pendingNote}
-            </Text>
-          ) : null}
           {left > 0 ? (
-            <Text style={s.note} testID="summary-not-reached">
+            <Text style={[local.small, {color: t.dim}]} testID="summary-not-reached">
               {SUMMARY.notReached(left)}
             </Text>
           ) : null}
         </View>
       </ScrollView>
-
       <View style={local.footer}>
+        {closing ? (
+          <Text style={[local.small, {color: t.danger}]} testID="close-pending-note">
+            {SUMMARY.pendingNote}
+          </Text>
+        ) : summary.pending > 0 ? (
+          <Text style={[local.small, {color: t.dim}]} testID="summary-pending-note">
+            {SUMMARY.pendingRetry}
+          </Text>
+        ) : null}
         <PrimaryButton
-          title={
-            summary.pending > 0 && !pendingConfirm
-              ? 'CLOSE BATCH'
-              : SUMMARY.close
-          }
+          title={closing ? SUMMARY.closeAnyway : SUMMARY.close}
+          danger={closing}
           testID="close-batch"
           onPress={() => {
             // Pending rows re-post on their own; ending a batch with pending
@@ -138,16 +133,11 @@ export function BatchSummaryScreen({
             onClose();
           }}
         />
-        {pendingConfirm ? (
-          <Text style={s.note} testID="close-pending-note">
-            {SUMMARY.pendingNote}
-          </Text>
-        ) : null}
         {/* Back to the batch is only honest while it still accepts cards: once
             ended, its numbers are frozen and its PIN slot is wiped. */}
-        {phase === 'summary' ? (
+        {phase !== 'ended' ? (
           <SecondaryButton
-            title={SUMMARY.backToLoop}
+            title={left > 0 ? SUMMARY.backToLoop : SUMMARY.backToCards}
             testID="summary-back"
             onPress={onBack}
           />
@@ -157,110 +147,91 @@ export function BatchSummaryScreen({
   );
 }
 
-/** One figure of the header: the number over its name. */
+/** One figure of the header: the number over its name, in a tile. */
 function Stat({
   value,
   label,
-  accent,
+  tone,
 }: {
   value: number;
   label: string;
-  accent?: boolean;
+  tone: 'accent' | 'danger' | 'ink';
 }) {
   const t = useTheme();
+  const color = tone === 'accent' ? t.accent : tone === 'danger' ? t.danger : t.ink;
   return (
-    <View style={local.stat}>
+    <View style={[local.stat, {backgroundColor: t.card, borderColor: t.line}]}>
+      <Text style={[local.statFigure, {color}]}>{value}</Text>
       <Text
-        style={[
-          local.statFigure,
-          {color: accent ? t.accent : t.ink},
-        ]}>
-        {value}
+        style={[local.statLabel, {color: t.dim}]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.75}>
+        {label}
       </Text>
-      <Text style={[local.statLabel, {color: t.dim}]}>{label}</Text>
     </View>
   );
 }
 
-/** One record row: a state dot, the short id, the time, and a pending flag. */
-function Row({row}: {row: RecordRow}) {
+/** One record row: a state dot, the card's number and short id, the time, and a pending flag. */
+function Row({row, n}: {row: RecordRow; n: number}) {
   const t = useTheme();
-  const pendingStyle = {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    borderWidth: 1.5,
-    borderColor: t.accent,
-  };
   return (
     <View style={local.row}>
       <View
         style={[
+          local.dot,
           row.pending
-            ? pendingStyle
-            : {width: 8, height: 8, borderRadius: 4, backgroundColor: row.ok ? t.accent : t.danger},
+            ? {borderWidth: 1.5, borderColor: t.accent}
+            : {backgroundColor: row.ok ? t.accent : t.danger},
         ]}
       />
-      <Text style={[local.rowId, {color: t.ink}]}>{`…${row.id}`}</Text>
-      <Text style={[local.rowAt, {color: t.dim}]}>{timeOf(row.at)}</Text>
-      {row.pending ? (
-        <Text style={[local.rowPending, {color: t.dim}]}>
-          {SUMMARY.pending}
-        </Text>
-      ) : null}
+      <Text style={[local.rowId, {color: t.ink}]}>{SUMMARY.cardRow(n, row.id)}</Text>
+      <Text style={[local.rowAt, {color: row.pending ? t.accent : t.dim}]}>
+        {row.pending ? SUMMARY.pending : timeOf(row.at)}
+      </Text>
     </View>
   );
 }
 
 const local = StyleSheet.create({
-  scroll: {gap: 20, paddingBottom: 24, flexGrow: 1},
+  scroll: {gap: 20, paddingTop: 4, paddingBottom: 24, flexGrow: 1},
+  headline: {fontFamily: FONT.semibold, fontSize: 24, letterSpacing: -0.4},
   stats: {flexDirection: 'row', gap: 10},
   stat: {
     flex: 1,
-    paddingVertical: 14,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 16,
+    paddingHorizontal: 12,
     gap: 2,
   },
-  statFigure: {
-    fontFamily: FONT.semibold,
-    fontSize: 30,
-    fontVariant: ['tabular-nums'],
-  },
-  statLabel: {fontFamily: FONT.regular, fontSize: 13},
-  section: {gap: 8},
-  pinRow: {
+  statFigure: {fontFamily: FONT.semibold, fontSize: 32, fontVariant: ['tabular-nums']},
+  statLabel: {fontFamily: FONT.medium, fontSize: 13},
+  section: {gap: 10},
+  small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
+  pinCard: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 14,
     padding: 16,
+    borderRadius: 16,
+    borderWidth: 1.5,
   },
   pinText: {flex: 1, gap: 4},
-  pinLabel: {fontFamily: FONT.medium, fontSize: 16},
-  pinValue: {
-    fontFamily: FONT.tabular,
-    fontSize: 20,
-    letterSpacing: 4,
-  },
-  divider: {height: StyleSheet.hairlineWidth},
+  pinLabel: {fontFamily: FONT.semibold, fontSize: 16},
+  pinValue: {fontFamily: FONT.tabular, fontSize: 22, letterSpacing: 4},
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    minHeight: 44,
+    paddingVertical: 13,
+    minHeight: 46,
   },
-  rowId: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
-    fontSize: 15,
-    flex: 1,
-  },
-  rowAt: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
-    fontSize: 13,
-  },
-  rowPending: {fontFamily: FONT.medium, fontSize: 12},
+  dot: {width: 9, height: 9, borderRadius: 5},
+  rowId: {fontFamily: FONT.medium, fontSize: 15, flex: 1},
+  rowAt: {fontFamily: FONT.tabular, fontVariant: ['tabular-nums'], fontSize: 13},
   emptyRow: {paddingHorizontal: 16, paddingVertical: 14},
-  footer: {gap: 10, paddingBottom: 4, paddingTop: 8},
+  footer: {gap: 10, paddingBottom: 8, paddingTop: 8},
 });

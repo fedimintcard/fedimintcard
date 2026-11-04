@@ -1,53 +1,35 @@
 /**
- * S5. Settings: the operator's runtime surface, and nothing else.
+ * Settings: what the operator sets between batches. The federation (the same
+ * picker as NEW BATCH), the top-up per card, the registry endpoint, the demo,
+ * the session, and About. Reasons sit behind (i) on each header; choices save
+ * as they are made, and a short line at the foot confirms each save.
  *
- * Ported from cashucard's `SettingsScreen` and cut to plan § 5's line target.
- * What survives is what the operator genuinely varies at runtime — the
- * federation, the registry endpoint, the top-up amounts and the theme — plus
- * sign-out and one About block that says which build this is.
- *
- * Cut, and why:
- * - the provisioning-scope block and its help popover: this app has one service
- *   and one operator account, so the scope label would always read the same;
- * - the card-tools list (check a card, read identity, reset, bench): those
- *   screens are not ported (§ 5), and a row that opens nothing is a dead end;
- * - the CAP pin line: this build loads one applet and has one load file.
- *
- * Build-time constants are shown, never edited: they render as plain rows with
- * no control, which is the honest rendering of a frozen value.
- *
- * The federation is stored as the invite *string* (`Settings.federation`), not
- * a `{invite,label}` object, so `federationOptions(saved)` is what turns the
- * saved invite back into a pickable row — a typed custom invite therefore stays
- * visible and selected instead of vanishing the moment a preset is tapped.
+ * There is no theme choice: the app has one brand palette (`theme.ts`).
  */
-import React, {useState} from 'react';
-import {ScanInviteSheet} from '../ScanInvite';
-import {ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
+import React, {useEffect, useState} from 'react';
+import {Pressable, ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
 
+import {BrandTile} from '../BrandMark';
+import {FederationPicker} from '../FederationPicker';
 import {
   APP_IDENTITY,
   EXPERIMENTAL_WARNING,
-  federationLabel,
-  federationOptions,
   isInviteCode,
   isValidTopup,
   LOAD_LINE,
   MAX_TOPUP_NOTES,
-  normalizeInvite,
   REGISTRY_ENDPOINTS,
   topupNotesMsat,
   useSettings,
   type RegistryEndpoint,
-  type ThemeChoice,
 } from '../settings';
-import {SETTINGS, SETUP} from '../strings';
+import {SETTINGS} from '../strings';
 import {useStore} from '../store';
 import {
   Card,
-  Dim,
   Divider,
   EntryRow,
+  FONT,
   PrimaryButton,
   Screen,
   SectionHeader,
@@ -56,21 +38,16 @@ import {
   styles,
   useTheme,
 } from '../ui';
+import {useFederation} from '../useFederation';
 
-/** The registry endpoints, as the operator's words: `production` is "Live". */
 const REGISTRY_LABEL: Record<RegistryEndpoint, string> = {
   test: 'Test',
   production: 'Live',
 };
 
-const THEME_LABEL: Record<ThemeChoice, string> = {
-  system: 'System',
-  dark: 'Dark',
-  light: 'Light',
-};
+/** Sums whose notes are all 8 sat or more: no note below a federation's floor. */
+const TOPUP_PRESETS: readonly number[] = [0, 1024, 2048, 4096];
 
-/** "1048, 524, 262" → [1048, 524, 262]; anything else is dropped, not coerced. */
-/** The sum the operator typed; NaN for anything that is not digits. */
 function parseAmount(text: string): number {
   const digits = text.replace(/[,\s]/g, '');
   return /^[0-9]+$/.test(digits) ? Number(digits) : NaN;
@@ -87,170 +64,145 @@ export function SettingsScreen({
   const app = useStore();
   const t = useTheme();
   const s = styles(t);
+  const fed = useFederation(settings.federation);
 
-  const [invite, setInvite] = useState(settings.federation);
-  const [amounts, setAmounts] = useState(String(settings.topupSats));
+  const [custom, setCustom] = useState('');
   const [saved, setSaved] = useState<string | null>(null);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
-  const [scanning, setScanning] = useState(false);
-
-  const parsed = parseAmount(amounts);
-  const amountsValid = isValidTopup(parsed);
-  const inviteValid = isInviteCode(invite);
-  // Nothing to save when the field already holds what is stored: a scan saves
-  // on its own, so the button says so instead of sitting live and doing nothing.
-  const inviteStored = normalizeInvite(invite) === settings.federation;
-  const amountsStored = parsed === settings.topupSats;
   const running = app.batch?.phase === 'running';
 
-  const saveFederation = () => {
-    const normalized = normalizeInvite(invite);
-    if (normalized === null) {
+  // The confirmation line fades after a moment; the saved value is on screen.
+  useEffect(() => {
+    if (!saved) {
       return;
     }
-    settings.setFederation(normalized);
-    setInvite(normalized);
-    setSaved(SETTINGS.federationSaved);
-  };
+    const timer = setTimeout(() => setSaved(null), 2500);
+    return () => clearTimeout(timer);
+  }, [saved]);
 
-  // A scanned invite is saved at once: the scan is the operator's choice.
-  const scanned = (found: string) => {
-    setScanning(false);
-    settings.setFederation(found);
-    setInvite(found);
-    setSaved(SETTINGS.federationSaved);
-  };
+  const parsed = parseAmount(custom);
+  const customValid = custom.trim() !== '' && isValidTopup(parsed);
+  const isPreset = TOPUP_PRESETS.includes(settings.topupSats);
+  const notes = topupNotesMsat(settings.topupSats);
 
-  const saveAmounts = () => {
-    if (!isValidTopup(parsed)) {
+  const saveTopup = (sats: number) => {
+    if (!isValidTopup(sats)) {
       return;
     }
-    settings.setTopupSats(parsed);
-    setSaved(SETTINGS.amountsSaved(parsed));
+    settings.setTopupSats(sats);
+    setCustom('');
+    setSaved(SETTINGS.amountsSaved(sats));
   };
 
   return (
     <Screen title={SETTINGS.title} onBack={onBack}>
-      <ScrollView contentContainerStyle={local.scroll} testID="settings-scroll">
+      <ScrollView
+        contentContainerStyle={local.scroll}
+        keyboardShouldPersistTaps="handled"
+        testID="settings-scroll">
         <View style={local.section}>
-          <SectionHeader>{SETTINGS.federation}</SectionHeader>
-          <Card>
-            {federationOptions(settings.federation).map(f => (
-              <React.Fragment key={f.invite}>
-                <EntryRow
-                  title={federationLabel(f)}
-                  subtitle={f.invite}
-                  onPress={() => {
-                    settings.setFederation(f.invite);
-                    setInvite(f.invite);
-                    setSaved(SETTINGS.federationSaved);
-                  }}
-                  testID={`settings-federation-${f.invite}`}
-                />
-                <Divider />
-              </React.Fragment>
-            ))}
-            <View style={local.field}>
-              <TextInput
-                value={invite}
-                onChangeText={setInvite}
-                placeholder={SETUP.customPlaceholder}
-                placeholderTextColor={t.dim}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="url"
-                style={s.input}
-                testID="settings-federation-input"
-              />
-              {inviteValid ? null : (
-                <Text style={s.failed} testID="settings-federation-problem">
-                  {SETTINGS.inviteProblem}
-                </Text>
-              )}
-              <SecondaryButton
-                title={SETTINGS.scanFederation}
-                onPress={() => setScanning(true)}
-                testID="settings-federation-scan"
-              />
-              <SecondaryButton
-                title={
-                  inviteValid && inviteStored
-                    ? SETTINGS.saved
-                    : SETTINGS.saveFederation
-                }
-                onPress={saveFederation}
-                disabled={!inviteValid || inviteStored}
-                testID="settings-federation-save"
-              />
-            </View>
-          </Card>
-          <Text style={s.note}>{SETTINGS.federationHelp}</Text>
+          <SectionHeader help={SETTINGS.federationHelp} testID="settings-federation-help">
+            {SETTINGS.federation}
+          </SectionHeader>
+          <FederationPicker
+            fed={fed}
+            hasInvite={isInviteCode(settings.federation)}
+            onChoose={invite => {
+              settings.setFederation(invite);
+              setSaved(SETTINGS.federationSaved);
+            }}
+            testID="settings-federation"
+          />
         </View>
 
         <View style={local.section}>
-          <SectionHeader>{SETTINGS.registry}</SectionHeader>
+          <SectionHeader help={SETTINGS.topupHelp} testID="settings-topup-help">
+            {SETTINGS.topup}
+          </SectionHeader>
           <Card>
-            <View style={local.field}>
+            <View style={local.chips}>
+              {TOPUP_PRESETS.map(sats => {
+                const on = settings.topupSats === sats;
+                return (
+                  <Pressable
+                    key={sats}
+                    onPress={() => saveTopup(sats)}
+                    accessibilityRole="radio"
+                    accessibilityState={{selected: on}}
+                    testID={`settings-topup-${sats}`}
+                    style={[
+                      local.chip,
+                      {borderColor: on ? t.accent : t.line},
+                      on && {backgroundColor: t.accent},
+                    ]}>
+                    <Text style={[local.chipText, {color: on ? t.onAccent : t.ink}]}>
+                      {sats === 0 ? SETTINGS.installOnly : sats.toLocaleString()}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Divider />
+            <View style={local.customRow}>
+              <TextInput
+                value={custom}
+                onChangeText={setCustom}
+                placeholder={
+                  isPreset
+                    ? SETTINGS.customPlaceholder
+                    : `${settings.topupSats.toLocaleString()} sat`
+                }
+                placeholderTextColor={t.dim}
+                keyboardType="number-pad"
+                returnKeyType="done"
+                onSubmitEditing={() => customValid && saveTopup(parsed)}
+                style={[s.input, local.customInput]}
+                testID="settings-amounts"
+              />
+              <Pressable
+                onPress={() => saveTopup(parsed)}
+                disabled={!customValid}
+                accessibilityRole="button"
+                accessibilityState={{disabled: !customValid}}
+                style={[local.setBtn, {backgroundColor: customValid ? t.accent : t.raised}]}
+                testID="settings-amounts-save">
+                <Text style={[local.setText, {color: customValid ? t.onAccent : t.dim}]}>
+                  {SETTINGS.set}
+                </Text>
+              </Pressable>
+            </View>
+            <Text
+              style={[
+                local.small,
+                local.inset,
+                {color: custom.trim() !== '' && !customValid ? t.danger : t.dim},
+              ]}
+              testID="settings-amounts-total">
+              {custom.trim() !== '' && !customValid
+                ? SETTINGS.amountsProblem(MAX_TOPUP_NOTES)
+                : SETTINGS.amountsTotal(notes.length, settings.topupSats)}
+            </Text>
+          </Card>
+        </View>
+
+        <View style={local.section}>
+          <SectionHeader help={SETTINGS.registryHelp} testID="settings-registry-help">
+            {SETTINGS.registry}
+          </SectionHeader>
+          <Card>
+            <View style={local.registryRow}>
+              <Text style={[local.small, local.grow, {color: t.dim}]}>
+                {SETTINGS.registryNow(REGISTRY_LABEL[settings.registryEndpoint])}
+              </Text>
               <Segmented<RegistryEndpoint>
                 options={REGISTRY_ENDPOINTS}
                 value={settings.registryEndpoint}
-                labelOf={endpoint => REGISTRY_LABEL[endpoint]}
-                onChange={settings.setRegistryEndpoint}
-                testIDOf={endpoint => `settings-registry-${endpoint}`}
-              />
-              <Dim testID="settings-registry-current">
-                {SETTINGS.registryNow(REGISTRY_LABEL[settings.registryEndpoint])}
-              </Dim>
-            </View>
-          </Card>
-          <Text style={s.note}>{SETTINGS.registryHelp}</Text>
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader>{SETTINGS.topup}</SectionHeader>
-          <Card>
-            <View style={local.field}>
-              <TextInput
-                value={amounts}
-                onChangeText={setAmounts}
-                keyboardType="number-pad"
-                style={s.input}
-                testID="settings-amounts"
-              />
-              {amountsValid ? (
-                <Dim testID="settings-amounts-total">
-                  {SETTINGS.amountsTotal(topupNotesMsat(parsed).length, parsed)}
-                </Dim>
-              ) : (
-                <Text style={s.failed} testID="settings-amounts-problem">
-                  {SETTINGS.amountsProblem(MAX_TOPUP_NOTES)}
-                </Text>
-              )}
-              <SecondaryButton
-                title={
-                  amountsValid && amountsStored
-                    ? SETTINGS.saved
-                    : SETTINGS.saveAmounts
-                }
-                onPress={saveAmounts}
-                disabled={!amountsValid || amountsStored}
-                testID="settings-amounts-save"
-              />
-            </View>
-          </Card>
-          <Text style={s.note}>{SETTINGS.topupHelp}</Text>
-        </View>
-
-        <View style={local.section}>
-          <SectionHeader>{SETTINGS.theme}</SectionHeader>
-          <Card>
-            <View style={local.field}>
-              <Segmented<ThemeChoice>
-                options={['system', 'dark', 'light']}
-                value={settings.theme}
-                labelOf={choice => THEME_LABEL[choice]}
-                onChange={settings.setTheme}
-                testIDOf={choice => `theme-${choice}`}
+                labelOf={e => REGISTRY_LABEL[e]}
+                onChange={e => {
+                  settings.setRegistryEndpoint(e);
+                  setSaved(SETTINGS.registryNow(REGISTRY_LABEL[e]));
+                }}
+                testIDOf={e => `settings-registry-${e}`}
               />
             </View>
           </Card>
@@ -259,7 +211,9 @@ export function SettingsScreen({
         {/* Above Session on purpose: a reviewer reaches this before signing in
             to anything, which is the point of the demo (plan § 7, 2.1). */}
         <View style={local.section}>
-          <SectionHeader>{SETTINGS.demo}</SectionHeader>
+          <SectionHeader help={SETTINGS.demoHelp} testID="settings-demo-help">
+            {SETTINGS.demo}
+          </SectionHeader>
           <Card>
             <EntryRow
               title={SETTINGS.demoTitle}
@@ -269,7 +223,6 @@ export function SettingsScreen({
               testID="settings-demo-entry"
             />
           </Card>
-          <Text style={s.note}>{SETTINGS.demoHelp}</Text>
         </View>
 
         <View style={local.section}>
@@ -286,9 +239,10 @@ export function SettingsScreen({
               testID="settings-sign-out-entry"
             />
             {confirmSignOut ? (
-              <View style={local.field}>
+              <View style={local.confirm}>
                 <PrimaryButton
                   title={SETTINGS.signOut}
+                  danger
                   onPress={() => {
                     setConfirmSignOut(false);
                     app.signOut();
@@ -306,40 +260,85 @@ export function SettingsScreen({
         </View>
 
         <View style={local.section}>
-          <SectionHeader>{SETTINGS.about}</SectionHeader>
+          <SectionHeader help={EXPERIMENTAL_WARNING} testID="settings-about-help">
+            {SETTINGS.about}
+          </SectionHeader>
           <Card>
             <View style={local.about}>
-              <Dim>{APP_IDENTITY.reactNativeName}</Dim>
-              <Dim testID="settings-load-line">{LOAD_LINE}</Dim>
-              <Dim testID="settings-identity">
-                {APP_IDENTITY.androidApplicationId}
-              </Dim>
+              <BrandTile size={44} />
+              <View style={local.grow}>
+                <Text style={[local.aboutName, {color: t.ink}]}>{SETTINGS.appName}</Text>
+                <Text style={[local.small, {color: t.dim}]} testID="settings-load-line">
+                  {SETTINGS.cardSoftware(LOAD_LINE)}
+                </Text>
+                <Text style={[local.small, {color: t.dim}]} testID="settings-identity">
+                  {APP_IDENTITY.androidApplicationId}
+                </Text>
+              </View>
             </View>
           </Card>
-          <Text style={s.note}>{EXPERIMENTAL_WARNING}</Text>
+          <Text style={[local.small, {color: t.dim}]}>{SETTINGS.experimentalShort}</Text>
         </View>
       </ScrollView>
 
       {saved ? (
-        <Text
-          style={s.note}
-          testID="settings-saved"
-          accessibilityLiveRegion="polite">
-          {saved}
-        </Text>
+        <View style={[local.toast, {backgroundColor: t.raised, borderColor: t.line}]}>
+          <Text
+            style={[local.toastText, {color: t.ink}]}
+            testID="settings-saved"
+            accessibilityLiveRegion="polite">
+            {saved}
+          </Text>
+        </View>
       ) : null}
-      <ScanInviteSheet
-        visible={scanning}
-        onClose={() => setScanning(false)}
-        onInvite={scanned}
-      />
     </Screen>
   );
 }
 
 const local = StyleSheet.create({
-  scroll: {gap: 22, paddingBottom: 32},
-  section: {gap: 8},
-  field: {padding: 14, gap: 10},
-  about: {paddingVertical: 20, alignItems: 'center', gap: 4},
+  grow: {flex: 1},
+  scroll: {gap: 24, paddingTop: 4, paddingBottom: 40},
+  section: {gap: 10},
+  small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
+  inset: {paddingHorizontal: 16, paddingBottom: 14},
+  chips: {flexDirection: 'row', gap: 6, padding: 14},
+  chip: {
+    flexGrow: 1,
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderRadius: 999,
+    paddingHorizontal: 6,
+    paddingVertical: 8,
+  },
+  chipText: {fontFamily: FONT.semibold, fontSize: 13, fontVariant: ['tabular-nums']},
+  customRow: {flexDirection: 'row', gap: 10, padding: 14, paddingBottom: 8},
+  customInput: {flex: 1, minHeight: 46},
+  setBtn: {
+    borderRadius: 12,
+    paddingHorizontal: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  setText: {fontFamily: FONT.semibold, fontSize: 15},
+  registryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  confirm: {padding: 14, gap: 10},
+  about: {flexDirection: 'row', alignItems: 'center', gap: 14, padding: 16},
+  aboutName: {fontFamily: FONT.semibold, fontSize: 16},
+  toast: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  toastText: {fontFamily: FONT.medium, fontSize: 14, textAlign: 'center'},
 });

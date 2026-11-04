@@ -36,6 +36,9 @@ type Route = 'home' | 'settings' | 'summary' | 'demo';
 function Navigator(): React.JSX.Element {
   const {batch, signedIn} = useStore();
   const [route, setRoute] = React.useState<Route>('home');
+  // Set by START on the review page: the loop arms card 1 as it opens, so a
+  // reviewed batch reaches its first card in two presses (as Cashu's does).
+  const [armFirst, setArmFirst] = React.useState(false);
   const phase = batch?.phase ?? 'idle';
 
   // The demo is deliberately ahead of the sign-in gate: App Review opens a
@@ -50,7 +53,9 @@ function Navigator(): React.JSX.Element {
   }
   // A batch owns the screen from START until CLOSE: a torn install is never
   // navigated away from, and the loop's stops are the only way out.
-  if (route === 'summary' && phase === 'summary') {
+  // The summary opens from the loop at any point: when every card is tried,
+  // and when the operator ends the batch early. Closing it ends the batch.
+  if (route === 'summary' && (phase === 'summary' || phase === 'running')) {
     return (
       <BatchSummaryScreen
         onBack={() => setRoute('home')}
@@ -58,14 +63,9 @@ function Navigator(): React.JSX.Element {
       />
     );
   }
-  if (phase === 'running' || phase === 'summary') {
-    return (
-      <LoopScreen
-        onSummary={() => setRoute('summary')}
-        onSettings={() => setRoute('settings')}
-      />
-    );
-  }
+  // Settings opens over a running batch from the loop's gear, which the loop
+  // hides while a card is on the phone; Back returns to the loop. Settings
+  // itself refuses the demo and sign-out while a batch runs.
   if (route === 'settings') {
     return (
       <SettingsScreen
@@ -74,9 +74,19 @@ function Navigator(): React.JSX.Element {
       />
     );
   }
+  if (phase === 'running' || phase === 'summary') {
+    return (
+      <LoopScreen
+        armFirst={armFirst}
+        onArmed={() => setArmFirst(false)}
+        onSummary={() => setRoute('summary')}
+        onSettings={() => setRoute('settings')}
+      />
+    );
+  }
   return (
     <BatchSetupScreen
-      onStart={() => {}}
+      onStart={() => setArmFirst(true)}
       onSettings={() => setRoute('settings')}
     />
   );

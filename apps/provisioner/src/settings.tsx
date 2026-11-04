@@ -111,7 +111,6 @@ export const EXPERIMENTAL_WARNING =
 /* Runtime settings. Persisted, editable in Settings.                         */
 /* ------------------------------------------------------------------------- */
 
-export type ThemeChoice = 'system' | 'dark' | 'light';
 export type RegistryEndpoint = 'test' | 'production';
 
 /**
@@ -203,14 +202,12 @@ export interface Settings {
   registryEndpoint: RegistryEndpoint;
   /** Sats per card; 0 is install only. */
   topupSats: number;
-  theme: ThemeChoice;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   federation: DEFAULT_FEDERATION,
   registryEndpoint: 'test',
   topupSats: DEFAULT_TOPUP_SATS,
-  theme: 'system',
 } as const);
 
 /**
@@ -278,11 +275,8 @@ export function parseSettings(raw: string | null): Settings {
     typeof o.topupSats === 'number' && isValidTopup(o.topupSats)
       ? o.topupSats
       : DEFAULT_SETTINGS.topupSats;
-  const theme =
-    o.theme === 'system' || o.theme === 'dark' || o.theme === 'light'
-      ? o.theme
-      : DEFAULT_SETTINGS.theme;
-  return {federation, registryEndpoint, topupSats, theme};
+  // A stored `theme` from before the brand palette is ignored: there is one.
+  return {federation, registryEndpoint, topupSats};
 }
 
 /** What the rest of the app sees. */
@@ -292,7 +286,6 @@ export interface SettingsState extends Settings {
   setFederation(invite: string): void;
   setRegistryEndpoint(endpoint: RegistryEndpoint): void;
   setTopupSats(sats: number): void;
-  setTheme(theme: ThemeChoice): void;
   /** One atomic write of everything; `set*` go through it. */
   update(patch: Partial<Settings>): void;
 }
@@ -375,10 +368,6 @@ export function SettingsProvider({
     },
     [update],
   );
-  const setTheme = useCallback(
-    (theme: ThemeChoice) => update({theme}),
-    [update],
-  );
 
   const value = useMemo<SettingsState>(
     () => ({
@@ -387,7 +376,6 @@ export function SettingsProvider({
       setFederation,
       setRegistryEndpoint,
       setTopupSats,
-      setTheme,
       update,
     }),
     [
@@ -396,7 +384,6 @@ export function SettingsProvider({
       setFederation,
       setRegistryEndpoint,
       setTopupSats,
-      setTheme,
       update,
     ],
   );

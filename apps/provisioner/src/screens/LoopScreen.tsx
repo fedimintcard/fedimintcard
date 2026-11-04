@@ -22,7 +22,7 @@
  * the summary's one showing; a batch PIN is read from the batch-PIN slot and
  * never copied. Neither value goes to the store, the registry or a log.
  */
-import React, {useCallback, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {CardFigure} from '../CardFigure';
@@ -32,7 +32,7 @@ import {FEDIMINT_PLAN, provision} from '../cardkit';
 import {generatePin, useBatchPin, usePinReveal} from '../pin';
 import {LOCAL_SIDECAR_ORIGIN} from '../settings';
 import {phaseMessage, withCard} from '../session';
-import {LOOP} from '../strings';
+import {CALM, LOOP, STATE} from '../strings';
 import {
   useLoop,
   type CardPhase,
@@ -42,13 +42,13 @@ import {
 } from '../store';
 import {
   Card,
-  Dim,
+  Divider,
   FONT,
+  GearButton,
   PrimaryButton,
   Screen,
   SectionHeader,
   SecondaryButton,
-  styles,
   useTheme,
 } from '../ui';
 
@@ -88,9 +88,14 @@ function foldedPhase(phase: string): CardPhase {
 }
 
 export function LoopScreen({
+  armFirst = false,
+  onArmed,
   onSummary,
   onSettings,
 }: {
+  /** Arm card 1 on open: the review page's START already said "go". */
+  armFirst?: boolean;
+  onArmed?: () => void;
   onSummary: () => void;
   onSettings: () => void;
 }) {
@@ -99,12 +104,15 @@ export function LoopScreen({
   const batchPin = useBatchPin();
   const reveal = usePinReveal();
   const t = useTheme();
-  const s = styles(t);
 
   const [busy, setBusy] = useState(false);
+  // True from Install until the card first answers.
+  const [waiting, setWaiting] = useState(false);
   const [line, setLine] = useState<string | null>(null);
   const [stopShown, setStopShown] = useState<CardStop | null>(null);
   const cancelled = useRef(false);
+  // Ends the wait for a card: `withCard` cancels the NFC request on abort.
+  const abort = useRef<AbortController | null>(null);
   const api = useRef<LocalClient | null>(null);
 
   // Read once, before any early return: a component that returns early must
@@ -130,6 +138,12 @@ export function LoopScreen({
       api.current ??
       (api.current = new LocalClient({baseUrl: LOCAL_SIDECAR_ORIGIN}));
     cancelled.current = false;
+    const controller = new AbortController();
+    abort.current = controller;
+    // Set by the engine's first event: from then on a card is on the phone,
+    // and a stop is that card's outcome. Before it, nothing was touched.
+    let touched = false;
+    setWaiting(true);
     setBusy(true);
     setStopShown(null);
     actions.setLoop({phase: 'probe', cardActive: true, loadProgress: null});
@@ -148,6 +162,10 @@ export function LoopScreen({
               Array.from({length}, () => (Math.random() * 256) | 0),
             now: Date.now,
             onEvent: event => {
+              if (!touched) {
+                touched = true;
+                setWaiting(false);
+              }
               if (cancelled.current) {
                 return;
               }
@@ -167,6 +185,8 @@ export function LoopScreen({
               }
             },
           }),
+        Date.now,
+        controller.signal,
       );
       if (cancelled.current) {
         throw new Error('CardSessionCancelled');
@@ -257,6 +277,12 @@ export function LoopScreen({
       });
       setLine(`Done · ${keyed.short_id.slice(-4)}`);
     } catch (e) {
+      // Stopped while waiting, before any card answered: no card was tried, so
+      // nothing is recorded and the batch's count is untouched.
+      if (cancelled.current && !touched) {
+        setLine(LOOP.waitStopped);
+        return;
+      }
       // A cancelled run is still a card's outcome (`pulled`), and the store
       // refuses a failed record that names no stop: every branch here names one.
       // `keySetup` and `setPin` are one step to the operator: a thrown
@@ -288,10 +314,22 @@ export function LoopScreen({
       setStopShown(stop);
     } finally {
       setBusy(false);
+      setWaiting(false);
       actions.setLoop({cardActive: false, loadProgress: null});
       reveal.wipe();
     }
   }, [actions, batch, batchPin, blockedBy, busy, config, reveal]);
+
+  // Once, on the first render after START: arm card 1 without a third press.
+  const armed = useRef(false);
+  useEffect(() => {
+    if (!armFirst || armed.current || !batch || batch.records.length > 0) {
+      return;
+    }
+    armed.current = true;
+    onArmed?.();
+    void runCard();
+  }, [armFirst, batch, onArmed, runCard]);
 
   if (!batch || !config || !actions) {
     return null;
@@ -314,20 +352,30 @@ export function LoopScreen({
       : busy
         ? 'running'
         : 'idle';
-  const phaseLine = loop?.phase ? phaseMessage(loop.phase) : LOOP.tap;
-  const nextLine = LOOP.tap;
   const left = Math.max(0, config.count - records.length);
   const cardNumber = Math.min(records.length + 1, config.count);
+  const finished = left === 0;
+  const stoppedCount = summary.failed + summary.empty + summary.unspendable;
+  // One status line under the card: the live phase while a card is on the
+  // phone, the instruction otherwise. Never the same sentence twice.
+  const status = busy
+    ? line ?? (loop?.phase ? phaseMessage(loop.phase) : LOOP.tap)
+    : finished
+      ? LOOP.allDone
+      : stopShown
+        ? LOOP.tryNext
+        : line ?? LOOP.tap;
 
   return (
     <Screen
       title={LOOP.title}
-      onBack={onSettings}
+      headerRight={busy ? undefined : <GearButton onPress={onSettings} />}
       onStop={
         busy
           ? () => {
               cancelled.current = true;
-              setLine('Stopping…');
+              abort.current?.abort();
+              setLine(LOOP.stopping);
             }
           : undefined
       }>
@@ -335,7 +383,7 @@ export function LoopScreen({
         {/* The counter is the screen's headline: the batch's own denominator,
             with the run's real progress under it. */}
         <View style={local.head}>
-          <Text testID="counter" style={local.counter}>
+          <Text testID="counter" style={[local.counter, {color: t.ink}]}>
             {LOOP.of(records.length, config.count)}
           </Text>
           <View style={[local.track, {backgroundColor: t.line}]}>
@@ -351,11 +399,10 @@ export function LoopScreen({
               ]}
             />
           </View>
-          <Dim>
-            {`${summary.spendable} spendable · ${summary.failed +
-              summary.empty +
-              summary.unspendable} stopped`}
-          </Dim>
+          <View style={local.tally}>
+            <Tally color={t.accent} label={LOOP.programmed(summary.spendable)} />
+            <Tally color={stoppedCount > 0 ? t.danger : t.dim} label={LOOP.stopped(stoppedCount)} />
+          </View>
         </View>
 
         {/* The card itself, filling as the write's blocks land. The sweep is
@@ -363,172 +410,224 @@ export function LoopScreen({
             timed estimate, so a slow card looks slow. */}
         <View style={local.figureWrap}>
           <CardFigure fill={figureFill} state={figureState} />
+          {!finished ? (
+            <Text style={[local.cardNumber, {color: t.dim}]}>
+              {LOOP.next(cardNumber, config.count)}
+            </Text>
+          ) : null}
           <Text
             style={[local.phase, {color: t.ink}]}
-            accessibilityLiveRegion="polite">
-            {busy ? line ?? phaseLine : nextLine}
+            accessibilityLiveRegion="polite"
+            testID="loop-status">
+            {status}
           </Text>
         </View>
 
         {blockedBy ? (
-          <Card testID="loop-blocked">
-            <View style={local.panel}>
-              <Text style={[local.panelTitle, {color: t.danger}]}>
-                Batch paused
-              </Text>
-              <Dim>{STOP_NAMES[blockedBy]} holds this batch until you say.</Dim>
-              <PrimaryButton
-                title="ACKNOWLEDGE AND CONTINUE"
-                testID="acknowledge-stop"
-                onPress={() => actions.acknowledgeStop(blockedBy)}
-              />
-            </View>
-          </Card>
-        ) : (
-          <>
-            <Card testID="loop-card">
-              <View style={local.panel}>
-                <Text style={[local.cardNumber, {color: t.ink}]}>
-                  {LOOP.next(cardNumber, config.count)}
-                </Text>
-                <Dim>{line ?? LOOP.tap}</Dim>
-              </View>
-            </Card>
-
-            {stopShown ? (
-              <Card testID="loop-stop">
-                <View style={local.panel}>
-                  <Text style={[local.panelTitle, {color: t.danger}]}>
-                    Card stopped
-                  </Text>
-                  <Dim>{STOP_NAMES[stopShown]}</Dim>
-                </View>
-              </Card>
-            ) : null}
-
+          <StopPanel
+            title={LOOP.paused}
+            name={STOP_NAMES[blockedBy]}
+            what={CALM[blockedBy]}
+            now={STATE[blockedBy]}
+            testID="loop-blocked">
             <PrimaryButton
-              title={busy ? 'KEEP THE CARD STILL…' : LOOP.install}
-              onPress={() => {
-                void runCard();
-              }}
-              disabled={busy}
-              testID="install-card"
+              title={LOOP.acknowledge}
+              testID="acknowledge-stop"
+              onPress={() => actions.acknowledgeStop(blockedBy)}
             />
-            {busy ? (
-              <Text style={s.note} accessibilityLiveRegion="polite">
-                {LOOP.busy}
-              </Text>
-            ) : null}
-          </>
-        )}
+          </StopPanel>
+        ) : stopShown ? (
+          <StopPanel
+            title={LOOP.cardStopped}
+            name={STOP_NAMES[stopShown]}
+            what={CALM[stopShown]}
+            now={STATE[stopShown]}
+            testID="loop-stop"
+          />
+        ) : null}
 
-        <SectionHeader>Stops</SectionHeader>
-        <Card testID="loop-stops">
-          {stops.length === 0 ? (
-            <View style={local.panel}>
-              <Dim>No stops yet.</Dim>
-            </View>
-          ) : (
-            stops.map(stop => (
-              <View key={stop.kind} style={local.row}>
-                <View
-                  style={[
-                    local.dot,
-                    {backgroundColor: stop.blocksBatch ? t.danger : t.dim},
-                  ]}
-                />
-                <Text style={[local.rowLabel, {color: t.ink}]}>
-                  {STOP_NAMES[stop.kind]}
-                </Text>
-                <Text style={[local.count, {color: t.dim}]}>
-                  {String(stop.cards)}
-                </Text>
-              </View>
-            ))
-          )}
-        </Card>
+        {records.length > 0 ? (
+          <View style={local.section}>
+            <SectionHeader>{LOOP.thisBatch}</SectionHeader>
+            <Card testID="loop-record">
+              {records.map((row, k) => (
+                <React.Fragment key={row.id}>
+                  {k > 0 ? <Divider /> : null}
+                  <RecordLine row={row} n={k + 1} />
+                </React.Fragment>
+              ))}
+            </Card>
+          </View>
+        ) : null}
 
-        <SectionHeader>Cards this batch</SectionHeader>
-        <Card testID="loop-record">
-          {records.length === 0 ? (
-            <View style={local.panel}>
-              <Dim>No cards this batch yet.</Dim>
-            </View>
-          ) : (
-            records.map(row => <RecordLine key={row.id} row={row} />)
-          )}
-        </Card>
+        {stops.length > 0 ? (
+          <View style={local.section}>
+            <SectionHeader>{LOOP.stops}</SectionHeader>
+            <Card testID="loop-stops">
+              {stops.map((stop, k) => (
+                <React.Fragment key={stop.kind}>
+                  {k > 0 ? <Divider /> : null}
+                  <View style={local.row}>
+                    <View
+                      style={[
+                        local.dot,
+                        {backgroundColor: stop.blocksBatch ? t.danger : t.dim},
+                      ]}
+                    />
+                    <Text style={[local.rowLabel, {color: t.ink}]}>
+                      {STOP_NAMES[stop.kind]}
+                    </Text>
+                    <Text style={[local.count, {color: t.dim}]}>{String(stop.cards)}</Text>
+                  </View>
+                </React.Fragment>
+              ))}
+            </Card>
+          </View>
+        ) : null}
       </ScrollView>
 
       <View style={local.footer}>
+        {!finished && !blockedBy ? (
+          <PrimaryButton
+            title={busy ? (waiting ? LOOP.waiting : LOOP.keepStill) : LOOP.install(cardNumber)}
+            onPress={() => {
+              void runCard();
+            }}
+            disabled={busy}
+            testID="install-card"
+          />
+        ) : null}
         {/* Opening the summary does not end the batch: the summary's own
-            CLOSE BATCH does, once the operator has read the numbers. */}
-        <SecondaryButton
-          title={left === 0 ? LOOP.summary : LOOP.end}
-          onPress={onSummary}
-          testID="end-batch"
-        />
-        <Text style={s.note}>{LOOP.ended(left)}</Text>
+            Close batch does, once the operator has read the numbers. */}
+        {finished ? (
+          <PrimaryButton title={LOOP.summary} onPress={onSummary} testID="end-batch" />
+        ) : (
+          <SecondaryButton
+            title={LOOP.end}
+            onPress={onSummary}
+            disabled={busy}
+            testID="end-batch"
+          />
+        )}
+        {!finished && records.length > 0 && !busy ? (
+          <Text style={[local.small, {color: t.dim}]}>{LOOP.ended(left)}</Text>
+        ) : null}
       </View>
     </Screen>
   );
 }
 
-/** One card's row: its short id, and how it ended. */
-function RecordLine({row}: {row: RecordRow}) {
+function Tally({color, label}: {color: string; label: string}) {
+  const t = useTheme();
+  return (
+    <View style={local.tallyItem}>
+      <View style={[local.dot, {backgroundColor: color}]} />
+      <Text style={[local.small, {color: t.dim}]}>{label}</Text>
+    </View>
+  );
+}
+
+/** A stop, said the way the app's rule says it: what happened, what the card is now. */
+function StopPanel({
+  title,
+  name,
+  what,
+  now,
+  testID,
+  children,
+}: {
+  title: string;
+  name: string;
+  what: string;
+  now: string;
+  testID: string;
+  children?: React.ReactNode;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      style={[local.stop, {backgroundColor: t.card, borderColor: t.danger}]}
+      testID={testID}
+      accessibilityLiveRegion="assertive">
+      <Text style={[local.stopEyebrow, {color: t.danger}]}>{title}</Text>
+      <Text style={[local.stopName, {color: t.ink}]}>{name}</Text>
+      <Text style={[local.stopBody, {color: t.ink}]}>{what}</Text>
+      <Text style={[local.stopBody, {color: t.dim}]}>{now}</Text>
+      {children}
+    </View>
+  );
+}
+
+/** One card's row: its number, its short id, and how it ended. */
+function RecordLine({row, n}: {row: RecordRow; n: number}) {
   const t = useTheme();
   return (
     <View style={local.row}>
-      <View
-        style={[local.dot, {backgroundColor: row.ok ? t.accent : t.danger}]}
-      />
-      <Text style={[local.rowLabel, {color: t.ink}]}>{`…${row.id}`}</Text>
-      <Text style={[local.count, {color: t.dim}]}>
-        {row.ok ? 'programmed' : STOP_NAMES[row.stop ?? 'refused']}
+      <View style={[local.dot, {backgroundColor: row.ok ? t.accent : t.danger}]} />
+      <Text style={[local.rowLabel, {color: t.ink}]}>{LOOP.cardRow(n, row.id)}</Text>
+      <Text style={[local.count, {color: row.ok ? t.accent : t.danger}]}>
+        {row.ok ? LOOP.programmedOne : STOP_NAMES[row.stop ?? 'refused']}
       </Text>
     </View>
   );
 }
 
 const local = StyleSheet.create({
-  scroll: {gap: 14, paddingBottom: 24, flexGrow: 1},
-  head: {alignItems: 'center', gap: 10, marginTop: 4},
+  scroll: {gap: 18, paddingBottom: 20, flexGrow: 1},
+  section: {gap: 10},
+  head: {alignItems: 'stretch', gap: 10, marginTop: 2},
   counter: {
-    fontFamily: FONT.tabular,
+    fontFamily: FONT.semibold,
     fontVariant: ['tabular-nums'],
-    fontSize: 44,
-    letterSpacing: 0.5,
+    fontSize: 46,
+    letterSpacing: -1,
     textAlign: 'center',
   },
-  figureWrap: {alignItems: 'center', gap: 14, marginVertical: 12, flex: 1, justifyContent: 'center'},
+  track: {height: 6, borderRadius: 3, overflow: 'hidden'},
+  fill: {height: '100%', borderRadius: 3},
+  tally: {flexDirection: 'row', justifyContent: 'center', gap: 18},
+  tallyItem: {flexDirection: 'row', alignItems: 'center', gap: 6},
+  figureWrap: {
+    alignItems: 'center',
+    gap: 8,
+    marginVertical: 8,
+    flex: 1,
+    justifyContent: 'center',
+  },
+  cardNumber: {
+    fontFamily: FONT.semibold,
+    fontSize: 13,
+    letterSpacing: 1.6,
+    textTransform: 'uppercase',
+    marginTop: 10,
+  },
   phase: {
     fontFamily: FONT.medium,
-    fontSize: 17,
+    fontSize: 18,
+    lineHeight: 25,
     textAlign: 'center',
-    letterSpacing: 0.3,
-    minHeight: 24,
-    paddingHorizontal: 8,
+    minHeight: 50,
+    paddingHorizontal: 12,
   },
-  progress: {gap: 8},
-  progressText: {fontFamily: FONT.semibold, fontSize: 22},
-  track: {height: 4, borderRadius: 2, overflow: 'hidden'},
-  fill: {height: '100%'},
-  panel: {padding: 16, gap: 10},
-  panelTitle: {fontFamily: FONT.semibold, fontSize: 18},
-  cardNumber: {fontFamily: FONT.semibold, fontSize: 20},
+  stop: {borderRadius: 16, borderWidth: 1.5, padding: 16, gap: 6},
+  stopEyebrow: {
+    fontFamily: FONT.semibold,
+    fontSize: 12,
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+  },
+  stopName: {fontFamily: FONT.semibold, fontSize: 19, marginBottom: 2},
+  stopBody: {fontFamily: FONT.regular, fontSize: 15, lineHeight: 21},
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingVertical: 13,
   },
   dot: {width: 8, height: 8, borderRadius: 4},
-  rowLabel: {flex: 1, fontFamily: FONT.regular, fontSize: 14},
-  count: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
-    fontSize: 13,
-  },
-  footer: {paddingTop: 10, paddingBottom: 8, gap: 8},
+  rowLabel: {flex: 1, fontFamily: FONT.medium, fontSize: 15},
+  count: {fontFamily: FONT.medium, fontSize: 14},
+  small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19, textAlign: 'center'},
+  footer: {paddingTop: 10, paddingBottom: 8, gap: 10},
 });

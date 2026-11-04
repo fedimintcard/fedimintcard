@@ -1,102 +1,19 @@
 /**
- * The shared pieces of the five screens, in the design language the plan's
- * trimmed surface keeps: section headers in small caps, one raised card per
- * group, hairline dividers, the accent only where a choice is live.
- *
- * Every colour comes from a token (`theme.ts`); nothing here draws its own.
- * The theme is read from `settings.tsx`, not from the phone's scheme alone:
- * the operator's theme choice is a runtime setting (plan § 5) and the two
- * classes of setting stay apart.
+ * The shared pieces of the operator screens, on the brand tokens in
+ * `theme.ts`: section headers in small caps (with tap-to-read help where a
+ * reason is worth one tap), one raised card per group, hairline dividers, the
+ * gold accent only where a choice is live.
  */
 import React from 'react';
-import {
-  Pressable,
-  StatusBar,
-  StyleSheet,
-  Text,
-  useColorScheme,
-  View,
-} from 'react-native';
+import {BackHandler, Pressable, StatusBar, StyleSheet, Text, View} from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 
-import {useSettings, type ThemeChoice} from './settings';
+import GearSvg from './assets/gear.svg';
+import {InfoButton} from './InfoHelp';
+import {FONT, useTheme, type Theme} from './theme';
 
-export interface Theme {
-  dark: boolean;
-  /** Screen background. */
-  bg: string;
-  /** Raised surface: rows, the batch card, inputs. */
-  card: string;
-  /** Primary text. */
-  ink: string;
-  /** Secondary text. */
-  dim: string;
-  /** The one strong color; the success state and the progress fill. */
-  accent: string;
-  /** Danger stripe and its ink. */
-  danger: string;
-  /** Hairlines between rows. */
-  line: string;
-}
-
-export const DARK: Theme = {
-  dark: true,
-  bg: '#050505',
-  card: '#1C1C1E',
-  ink: '#FFFFFF',
-  dim: 'rgba(255,255,255,0.6)',
-  accent: '#3AB54A',
-  danger: '#E5484D',
-  line: 'rgba(255,255,255,0.12)',
-};
-
-export const LIGHT: Theme = {
-  dark: false,
-  bg: '#FAFAF8',
-  card: '#F7F7F5',
-  ink: '#0B0B0B',
-  dim: 'rgba(11,11,11,0.6)',
-  accent: '#3AB54A',
-  danger: '#D13438',
-  line: 'rgba(11,11,11,0.12)',
-};
-
-/** The operator's choice, resolved against the phone's own scheme. */
-export function resolveTheme(
-  choice: ThemeChoice,
-  system: 'light' | 'dark' | null | undefined,
-): Theme {
-  if (choice === 'dark') {
-    return DARK;
-  }
-  if (choice === 'light') {
-    return LIGHT;
-  }
-  return system === 'light' ? LIGHT : DARK;
-}
-
-/**
- * Figtree is the brand face; tabular figures wherever a number moves. The
- * bundle ships the fonts (see `App.tsx`'s font registration); a missing face
- * falls back to the platform's, which is ugly but never wrong.
- */
-export const FONT = {
-  regular: 'Figtree-Regular',
-  medium: 'Figtree-Medium',
-  semibold: 'Figtree-SemiBold',
-  /** Growing counters and ids: monospaced digits. */
-  tabular: 'Figtree-SemiBold',
-} as const;
-
-/**
- * The theme the screens draw with: the operator's choice, and for `system` the
- * phone's own scheme. `useColorScheme` is the only platform read here.
- */
-export function useTheme(): Theme {
-  const {theme} = useSettings();
-  const system = useColorScheme();
-  return resolveTheme(theme, system);
-}
+export {BRAND, FONT, useTheme, type Theme} from './theme';
+export {HelpHeading, InfoButton} from './InfoHelp';
 
 export function Screen({
   title,
@@ -114,9 +31,18 @@ export function Screen({
   const t = useTheme();
   const s = styles(t);
   const exit = onStop ?? onBack;
+  // Android's back gesture does what the header's exit does, never more: a
+  // screen without an exit swallows it rather than leaving the app mid-batch.
+  React.useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      exit?.();
+      return true;
+    });
+    return () => sub.remove();
+  }, [exit]);
   return (
     <SafeAreaView style={s.screen}>
-      <StatusBar barStyle={t.dark ? 'light-content' : 'dark-content'} />
+      <StatusBar barStyle="light-content" backgroundColor={t.bg} />
       {title || exit || headerRight ? (
         <View style={s.header}>
           {exit ? (
@@ -142,10 +68,85 @@ export function Screen({
   );
 }
 
-/** Section header in small caps: the one heading style the screens share. */
-export function SectionHeader({children}: {children: React.ReactNode}) {
+/**
+ * Section header in small caps: the one heading style the screens share. With
+ * `help`, an (i) beside it opens the reason in a panel instead of a paragraph.
+ */
+export function SectionHeader({
+  children,
+  help,
+  testID,
+}: {
+  children: string;
+  help?: string;
+  testID?: string;
+}) {
   const s = styles(useTheme());
-  return <Text style={s.sectionHeader}>{children}</Text>;
+  if (!help) {
+    return (
+      <Text style={s.sectionHeader} accessibilityRole="header">
+        {children}
+      </Text>
+    );
+  }
+  return (
+    <View style={s.sectionRow}>
+      <Text style={[s.sectionHeader, s.sectionGrow]} accessibilityRole="header">
+        {children}
+      </Text>
+      <InfoButton title={children} testID={testID ?? `help-${children}`}>
+        {help}
+      </InfoButton>
+    </View>
+  );
+}
+
+/** The settings gear for a header's right slot. */
+export function GearButton({onPress, testID}: {onPress: () => void; testID?: string}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={12}
+      testID={testID ?? 'settings'}
+      style={{padding: 6}}
+      accessibilityRole="button"
+      accessibilityLabel="Settings">
+      <GearSvg width={24} height={24} color={t.dim} />
+    </Pressable>
+  );
+}
+
+/** A label and its value on one line, inside a Card. */
+export function ValueRow({
+  label,
+  value,
+  testID,
+  valueTone,
+}: {
+  label: string;
+  value: string;
+  testID?: string;
+  valueTone?: 'ink' | 'dim' | 'accent' | 'danger';
+}) {
+  const t = useTheme();
+  const s = styles(t);
+  const color =
+    valueTone === 'accent'
+      ? t.accent
+      : valueTone === 'danger'
+        ? t.danger
+        : valueTone === 'ink'
+          ? t.ink
+          : t.dim;
+  return (
+    <View style={s.row} testID={testID}>
+      <Text style={[s.rowLabel, s.rowFixed]}>{label}</Text>
+      <Text style={[s.rowValue, s.rowGrow, s.rowRight, {color}]} numberOfLines={1}>
+        {value}
+      </Text>
+    </View>
+  );
 }
 
 /** The raised card a group of rows sits in. */
@@ -213,8 +214,20 @@ export function PrimaryButton({
       accessibilityState={{disabled: !!disabled}}
       disabled={disabled}
       onPress={onPress}
-      style={[s.primary, danger && s.primaryDanger, disabled && s.primaryDisabled]}>
-      <Text style={s.primaryText}>{title}</Text>
+      style={({pressed}) => [
+        s.primary,
+        danger && s.primaryDanger,
+        pressed && !disabled && s.pressed,
+        disabled && s.primaryDisabled,
+      ]}>
+      <Text
+        style={[
+          s.primaryText,
+          danger && s.primaryDangerText,
+          disabled && s.primaryTextDisabled,
+        ]}>
+        {title}
+      </Text>
     </Pressable>
   );
 }
@@ -240,7 +253,11 @@ export function SecondaryButton({
       accessibilityState={{disabled: !!disabled}}
       disabled={disabled}
       onPress={onPress}
-      style={[s.secondary, disabled && s.primaryDisabled]}>
+      style={({pressed}) => [
+        s.secondary,
+        pressed && !disabled && s.secondaryPressed,
+        disabled && s.secondaryDisabled,
+      ]}>
       <Text style={s.secondaryText}>{title}</Text>
     </Pressable>
   );
@@ -268,7 +285,7 @@ export function EntryRow({
       disabled={disabled}
       accessibilityRole="button"
       accessibilityState={{disabled: !!disabled}}
-      style={s.row}>
+      style={({pressed}) => [s.row, pressed && s.secondaryPressed]}>
       <View style={s.rowLabelCol}>
         <Text style={s.rowLabel}>{title}</Text>
         {subtitle ? <Text style={s.rowSub}>{subtitle}</Text> : null}
@@ -361,6 +378,14 @@ export const styles = (t: Theme) =>
     titleWrap: {flex: 1, minWidth: 0, alignItems: 'center'},
     back: {color: t.accent, fontFamily: FONT.medium, fontSize: 16},
     body: {flex: 1, paddingHorizontal: 16, gap: 12},
+    sectionRow: {flexDirection: 'row', alignItems: 'center', marginBottom: -8},
+    sectionGrow: {flex: 1},
+    rowGrow: {flex: 1},
+    rowFixed: {flexShrink: 0},
+    rowRight: {textAlign: 'right'},
+    pressed: {opacity: 0.85},
+    secondaryPressed: {backgroundColor: t.raised},
+    primaryDangerText: {color: t.onDanger},
     sectionHeader: {
       color: t.dim,
       fontFamily: FONT.semibold,
@@ -368,7 +393,13 @@ export const styles = (t: Theme) =>
       letterSpacing: 1.2,
       textTransform: 'uppercase',
     },
-    card: {backgroundColor: t.card, borderRadius: 16, overflow: 'hidden'},
+    card: {
+      backgroundColor: t.card,
+      borderRadius: 16,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: t.line,
+      overflow: 'hidden',
+    },
     divider: {height: StyleSheet.hairlineWidth, backgroundColor: t.line},
     primary: {
       backgroundColor: t.accent,
@@ -377,9 +408,11 @@ export const styles = (t: Theme) =>
       alignItems: 'center',
     },
     primaryDanger: {backgroundColor: t.danger},
-    primaryDisabled: {opacity: 0.35},
+    primaryDisabled: {backgroundColor: t.raised, opacity: 0.9},
+    primaryTextDisabled: {color: t.dim},
+    secondaryDisabled: {opacity: 0.4},
     primaryText: {
-      color: '#fff',
+      color: t.onAccent,
       fontFamily: FONT.semibold,
       fontSize: 17,
       letterSpacing: 0.4,
@@ -419,15 +452,17 @@ export const styles = (t: Theme) =>
     pill: {
       flexDirection: 'row',
       backgroundColor: t.bg,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: t.line,
       borderRadius: 12,
       padding: 3,
       gap: 2,
       alignSelf: 'flex-start',
     },
     pillItem: {paddingHorizontal: 16, paddingVertical: 7, borderRadius: 10},
-    pillItemOn: {backgroundColor: t.ink},
+    pillItemOn: {backgroundColor: t.accent},
     pillText: {color: t.dim, fontFamily: FONT.medium, fontSize: 14},
-    pillTextOn: {color: t.bg, fontFamily: FONT.semibold, fontSize: 14},
+    pillTextOn: {color: t.onAccent, fontFamily: FONT.semibold, fontSize: 14},
     input: {
       color: t.ink,
       fontFamily: FONT.regular,

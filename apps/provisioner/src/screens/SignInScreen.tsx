@@ -4,13 +4,16 @@
  * Ported from cashucard's `SignInScreen` with the `env` split dropped: this app
  * has one service (the hosted registry, plan § 4), so there is no factory/issued
  * branch to select and no scope label to show. The load line names the build the
- * operator is holding, which is the only thing worth stating before sign-in.
+ * operator is holding; it lives in the (i) panel beside the heading, as the
+ * Cashu provisioner's sign-in keeps its build line.
  */
 import React, {useEffect, useRef, useState} from 'react';
 import {
+  ActivityIndicator,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -22,11 +25,12 @@ import {LOCAL_SESSION_ENABLED, LOCAL_SESSION_LABEL} from '../localSession';
 import {LOAD_LINE} from '../settings';
 import {SIGNIN} from '../strings';
 import {useStore} from '../store';
+import {BrandLockup} from '../BrandMark';
 import {
   Card,
   EntryRow,
   FONT,
-  PrimaryButton,
+  InfoButton,
   Screen,
   signInReason,
   styles,
@@ -41,6 +45,8 @@ export function SignInScreen({onDemo}: {onDemo?: () => void} = {}) {
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [failed, setFailed] = useState<string | null>(null);
+  const [focused, setFocused] = useState<'name' | 'password' | null>(null);
+  const focusRing = {borderColor: t.accent, backgroundColor: t.raised};
   const [busy, setBusy] = useState(false);
   const [stopped, setStopped] = useState(false);
   const passwordInput = useRef<TextInput>(null);
@@ -106,97 +112,137 @@ export function SignInScreen({onDemo}: {onDemo?: () => void} = {}) {
           contentContainerStyle={local.center}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag">
-          <Text style={[local.wordmark, {color: t.ink}]}>{'Fedimint'}</Text>
-          <Text style={[local.wordmark, {color: t.ink}]}>{'card'}</Text>
-          <Text style={[local.loadSha, {color: t.dim}]}>{LOAD_LINE}</Text>
-          <Text style={[local.tagline, {color: t.dim}]}>{SIGNIN.tagline}</Text>
-          {LOCAL_SESSION_ENABLED && __DEV__ ? (
-            // A fake session must never look like a real one: this line is
-            // what stops a walked-through batch from being read as registered.
-            <Text
-              style={[local.tagline, {color: t.dim}]}
-              accessibilityLiveRegion="polite"
-              testID="local-session-label">
-              {LOCAL_SESSION_LABEL}
-            </Text>
-          ) : null}
+          <BrandLockup size={52} />
+          <View style={local.intro}>
+            <Text style={[local.eyebrow, {color: t.dim}]}>{SIGNIN.eyebrow}</Text>
+            <View style={local.headingRow}>
+              <Text
+                style={[local.heading, {color: t.ink}]}
+                accessibilityRole="header">
+                {SIGNIN.heading}
+              </Text>
+              <InfoButton title={SIGNIN.helpTitle} testID="sign-in-help">
+                {SIGNIN.help(LOAD_LINE)}
+              </InfoButton>
+            </View>
+            {LOCAL_SESSION_ENABLED && __DEV__ ? (
+              // A fake session must never look like a real one: this line is
+              // what stops a walked-through batch from being read as registered.
+              <Text
+                style={[local.devLabel, {color: t.danger, borderColor: t.danger}]}
+                accessibilityLiveRegion="polite"
+                testID="local-session-label">
+                {LOCAL_SESSION_LABEL}
+              </Text>
+            ) : null}
+          </View>
           <View style={local.form}>
-            <TextInput
-              value={name}
-              onChangeText={setName}
-              placeholder={SIGNIN.namePlaceholder}
-              placeholderTextColor={t.dim}
-              autoCapitalize="none"
-              autoCorrect={false}
-              editable={!busy}
-              style={s.input}
-              returnKeyType="next"
-              blurOnSubmit={false}
-              onSubmitEditing={() => passwordInput.current?.focus()}
-              autoComplete="username"
-              textContentType="username"
-              accessibilityLabel="Operator name"
-              testID="sign-in-name"
-            />
-            <TextInput
-              ref={passwordInput}
-              value={password}
-              onChangeText={setPassword}
-              placeholder={SIGNIN.passwordPlaceholder}
-              placeholderTextColor={t.dim}
-              autoCapitalize="none"
-              autoCorrect={false}
-              secureTextEntry
-              editable={!busy}
-              style={s.input}
-              returnKeyType="go"
-              onSubmitEditing={() => {
-                void attempt();
-              }}
-              autoComplete="current-password"
-              textContentType="password"
-              accessibilityLabel="Password"
-              testID="sign-in-password"
-            />
+            <View style={local.field}>
+              <Text style={[local.label, {color: t.ink}]}>{SIGNIN.nameLabel}</Text>
+              <TextInput
+                value={name}
+                onChangeText={setName}
+                placeholder={SIGNIN.namePlaceholder}
+                placeholderTextColor={t.dim}
+                autoCapitalize="none"
+                autoCorrect={false}
+                editable={!busy}
+                style={[s.input, local.input, focused === 'name' && focusRing]}
+                onFocus={() => setFocused('name')}
+                onBlur={() => setFocused(null)}
+                returnKeyType="next"
+                blurOnSubmit={false}
+                onSubmitEditing={() => passwordInput.current?.focus()}
+                autoComplete="username"
+                textContentType="username"
+                accessibilityLabel="Operator name"
+                testID="sign-in-name"
+              />
+            </View>
+            <View style={local.field}>
+              <Text style={[local.label, {color: t.ink}]}>
+                {SIGNIN.passwordLabel}
+              </Text>
+              <TextInput
+                ref={passwordInput}
+                value={password}
+                onChangeText={setPassword}
+                placeholder={SIGNIN.passwordPlaceholder}
+                placeholderTextColor={t.dim}
+                autoCapitalize="none"
+                autoCorrect={false}
+                secureTextEntry
+                editable={!busy}
+                style={[s.input, local.input, focused === 'password' && focusRing]}
+                onFocus={() => setFocused('password')}
+                onBlur={() => setFocused(null)}
+                returnKeyType="go"
+                onSubmitEditing={() => {
+                  void attempt();
+                }}
+                autoComplete="current-password"
+                textContentType="password"
+                accessibilityLabel="Password"
+                testID="sign-in-password"
+              />
+            </View>
+            {failed ? (
+              <Text
+                style={[local.status, {color: t.danger}]}
+                accessibilityLiveRegion="assertive"
+                testID="sign-in-failed">
+                {failed}
+              </Text>
+            ) : busy || stopped ? (
+              <Text
+                style={[local.status, {color: t.dim}]}
+                accessibilityLiveRegion="polite">
+                {stopped ? SIGNIN.stopped : SIGNIN.checking}
+              </Text>
+            ) : null}
           </View>
         </ScrollView>
         <View style={local.footer}>
-          <PrimaryButton
-            title={busy ? SIGNIN.signingIn : SIGNIN.button}
+          <Pressable
+            testID="sign-in"
+            accessibilityRole="button"
+            accessibilityLabel={busy ? SIGNIN.signingIn : SIGNIN.button}
+            accessibilityState={{disabled: !ready, busy}}
+            disabled={!ready}
             onPress={() => {
               void attempt();
             }}
-            disabled={!ready}
-            testID="sign-in"
-          />
-          {failed ? (
-            <Text style={s.failed} testID="sign-in-failed">
-              {failed}
+            style={({pressed}) => [
+              local.submit,
+              {backgroundColor: ready || busy ? t.accent : t.raised},
+              pressed && local.pressed,
+            ]}>
+            <Text
+              style={[local.submitText, {color: ready || busy ? t.onAccent : t.dim}]}>
+              {busy ? SIGNIN.signingIn : SIGNIN.button}
             </Text>
-          ) : (
-            <Text style={s.note} accessibilityLiveRegion="polite">
-              {stopped
-                ? 'Sign-in stopped.'
-                : busy
-                ? 'Checking your account… Keep this screen open.'
-                : SIGNIN.note}
-            </Text>
-          )}
+            {busy ? (
+              <ActivityIndicator color={t.onAccent} />
+            ) : (
+              <Text
+                style={[local.submitArrow, {color: ready ? t.onAccent : t.dim}]}>
+                →
+              </Text>
+            )}
+          </Pressable>
           {/* No account, no card, no registry — the reviewer's way in
               (plan § 7, Guideline 2.1). A row, not a button: it opens a
               screen, and the demo chooser draws its own entries this way. */}
           {onDemo ? (
-            <View style={local.demo}>
-              <Card>
-                <EntryRow
-                  title={SIGNIN.demo}
-                  subtitle={SIGNIN.demoSub}
-                  onPress={onDemo}
-                  disabled={busy}
-                  testID="sign-in-demo"
-                />
-              </Card>
-            </View>
+            <Card>
+              <EntryRow
+                title={SIGNIN.demo}
+                subtitle={SIGNIN.demoSub}
+                onPress={onDemo}
+                disabled={busy}
+                testID="sign-in-demo"
+              />
+            </Card>
           ) : null}
         </View>
       </Screen>
@@ -209,31 +255,61 @@ const local = StyleSheet.create({
   center: {
     flexGrow: 1,
     justifyContent: 'center',
-    alignItems: 'center',
-    gap: 14,
-    paddingHorizontal: 24,
-    paddingVertical: 16,
+    width: '100%',
+    maxWidth: 440,
+    alignSelf: 'center',
+    gap: 30,
+    paddingHorizontal: 4,
+    paddingTop: 28,
+    paddingBottom: 16,
   },
-  wordmark: {
+  intro: {gap: 8},
+  eyebrow: {
     fontFamily: FONT.semibold,
-    fontSize: 34,
-    textAlign: 'center',
-    lineHeight: 38,
-  },
-  loadSha: {
-    fontFamily: FONT.tabular,
-    fontVariant: ['tabular-nums'],
     fontSize: 12,
-    letterSpacing: 0.4,
+    letterSpacing: 2,
+    textTransform: 'uppercase',
   },
-  tagline: {
-    fontFamily: FONT.regular,
-    fontSize: 15,
-    lineHeight: 21,
-    textAlign: 'center',
-    maxWidth: 280,
+  headingRow: {flexDirection: 'row', alignItems: 'center', gap: 8},
+  heading: {
+    flex: 1,
+    fontFamily: FONT.semibold,
+    fontSize: 36,
+    lineHeight: 44,
+    letterSpacing: -1.2,
   },
-  form: {alignSelf: 'stretch', gap: 10, paddingHorizontal: 8},
-  footer: {gap: 12, paddingBottom: 8},
-  demo: {marginTop: 4},
+  devLabel: {
+    alignSelf: 'flex-start',
+    fontFamily: FONT.semibold,
+    fontSize: 11,
+    letterSpacing: 1,
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    overflow: 'hidden',
+  },
+  form: {gap: 18},
+  field: {gap: 8},
+  label: {fontFamily: FONT.medium, fontSize: 13},
+  input: {minHeight: 54, borderRadius: 12, paddingHorizontal: 15},
+  status: {fontFamily: FONT.regular, fontSize: 14, lineHeight: 20},
+  footer: {
+    width: '100%',
+    maxWidth: 440,
+    alignSelf: 'center',
+    gap: 12,
+    paddingBottom: 10,
+  },
+  submit: {
+    minHeight: 58,
+    paddingHorizontal: 22,
+    borderRadius: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  submitText: {fontFamily: FONT.semibold, fontSize: 17},
+  submitArrow: {fontFamily: FONT.medium, fontSize: 24, marginTop: -2},
+  pressed: {opacity: 0.85},
 });

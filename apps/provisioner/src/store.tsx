@@ -42,7 +42,7 @@ import {
   type PinPolicy,
   type PinRevealContext,
 } from './pin';
-import {topupNotesMsat, useSettings, type ThemeChoice} from './settings';
+import {topupNotesMsat, useSettings} from './settings';
 
 // ---------------------------------------------------------------------------
 // The card path: phases and stops
@@ -469,8 +469,6 @@ export interface StoreApi {
 export interface StoreShape {
   signedIn: boolean;
   session: Session | null;
-  theme: ThemeChoice;
-  setTheme(theme: ThemeChoice): void;
   serviceUrl: string;
   signIn(
     name: string,
@@ -792,8 +790,6 @@ export function StoreProvider({
     () => ({
       signedIn: session !== null,
       session,
-      theme: settings.theme,
-      setTheme: settings.setTheme,
       serviceUrl: apiRef.current?.serviceUrl ?? '',
       signIn,
       signOut,
@@ -805,8 +801,6 @@ export function StoreProvider({
     }),
     [
       session,
-      settings.theme,
-      settings.setTheme,
       signIn,
       signOut,
       actions,
