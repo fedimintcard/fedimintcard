@@ -184,6 +184,9 @@ pub struct BalanceReport {
     pub unresolved: Vec<String>,
 }
 
+/// Bound on how many renewal rounds a spend may make before giving up on finding a plan.
+const RENEW_ROUNDS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub struct SpendReport {
     /// The federation accepted this transaction: the money has moved.
@@ -1221,16 +1224,23 @@ impl CardWallet {
             let plan = plan::solve(&amounts, price_msat, me.store.state.free_slots().len(), &fee, min_denom)?;
             Ok((live, plan))
         };
-        let (live, plan) = match attempt(self) {
-            Ok(r) => r,
-            Err(e) if matches!(e.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoExactPlan { .. })) => {
-                // More slots may be free once spent keys are renewed.
-                if self.renew_spent_slots().await?.is_empty() {
-                    return Err(e);
+        // A card can hold several slots whose keys are spent but not yet renewed, and renewing
+        // them is what makes room for change. Renew until it stops returning slots, then plan once
+        // more: a sale refused for want of a slot is a customer turned away at the counter, so it
+        // is worth the extra round trips rather than trusting a single pass.
+        let mut renewed = 0usize;
+        let (live, plan) = loop {
+            match attempt(self) {
+                Ok(r) => break r,
+                Err(e) if matches!(e.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoExactPlan { .. })) => {
+                    let freed = self.renew_spent_slots().await?;
+                    if freed.is_empty() || renewed >= RENEW_ROUNDS {
+                        return Err(e);
+                    }
+                    renewed += 1;
                 }
-                attempt(self)?
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
         let inputs: Vec<NoteRec> = plan.inputs.iter().map(|&i| live[i].clone()).collect();
         let amounts: Vec<u64> = plan.till.iter().chain(&plan.change).copied().collect();

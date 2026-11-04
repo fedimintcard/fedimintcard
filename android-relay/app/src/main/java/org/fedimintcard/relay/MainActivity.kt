@@ -123,6 +123,11 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     private fun dispatch(e: PosEvent) {
+        if (e is PosEvent.CardBalanceOpened) {
+            ui.openCardBalance()
+            readCardBalance()
+            return
+        }
         val before = flow.state
         val refBefore = flow.unresolvedRef
         val effects = flow.dispatch(e)
@@ -184,6 +189,17 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         }.start()
     }
 
+    /**
+     * Reads the card. The till serialises this against charges, so a read during a sale is refused
+     * with "busy" rather than interleaved — the reply lands on the same screen.
+     */
+    private fun readCardBalance() {
+        Thread {
+            val r = client.cardBalance()
+            runOnUiThread { ui.showCardBalance(r) }
+        }.start()
+    }
+
     private fun pollNow() {
         if (flow.state is PosState.Signing || pollInFlight) return
         pollInFlight = true
@@ -210,6 +226,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        if (ui.closeCardBalance()) return
         if (ui.closeRelay()) return
         val ev = flow.systemBack()
         if (ev != null) dispatch(ev)

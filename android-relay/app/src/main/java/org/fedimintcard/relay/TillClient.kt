@@ -71,10 +71,21 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
         is TillResult.Ok -> parseSales(r.value.body)
     }
 
+    /**
+     * Reads the card. Long timeout on purpose: the till must reach the card over the relay and
+     * reconcile every note against the federation before it can answer.
+     */
+    fun cardBalance(): TillResult<CardBalance> =
+        when (val r = call("POST", "/v1/card/balance", "", CARD_BALANCE_READ_MS)) {
+            is TillResult.Err -> r
+            is TillResult.Ok -> parseCardBalance(r.value.status, r.value.body)
+        }
+
     companion object {
         const val CONNECT_MS = 3_000
         const val QUICK_READ_MS = 10_000
         const val CHARGE_READ_MS = 125_000 // contract: at least 120 s
+        const val CARD_BALANCE_READ_MS = 60_000
     }
 }
 
@@ -196,6 +207,26 @@ internal fun parseSales(body: String): TillResult<SalesList> = try {
         )
     }
     TillResult.Ok(SalesList(o.optL("count", rows.size.toLong()), o.reqLong("total_price_msat"), o.reqLong("total_received_msat"), rows))
+} catch (e: JSONException) {
+    TillResult.Err(TillError.BadResponse(e.message ?: "bad json"))
+}
+
+/** `{"ok":true,"live_msat":N,"notes":[{"slot","msat","status"}],"free_slots":[..]}`. */
+internal fun parseCardBalance(httpStatus: Int, body: String): TillResult<CardBalance> = try {
+    val o = JSONObject(body)
+    if (!o.optBoolean("ok", false)) {
+        // A card error or a missing card is a normal answer from this route, not a parse failure.
+        TillResult.Err(TillError.BadResponse(if (o.isNull("detail")) o.optString("error", "card unreadable") else o.optString("detail")))
+    } else {
+        val a = o.optJSONArray("notes")
+        val rows = if (a == null) emptyList() else (0 until a.length()).map {
+            val n = a.getJSONObject(it)
+            CardNote(n.reqLong("slot").toInt(), n.reqLong("msat"), n.optString("status", ""))
+        }
+        val f = o.optJSONArray("free_slots")
+        val free = if (f == null) emptyList() else (0 until f.length()).map { f.getInt(it) }
+        TillResult.Ok(CardBalance(o.optL("live_msat"), rows, free))
+    }
 } catch (e: JSONException) {
     TillResult.Err(TillError.BadResponse(e.message ?: "bad json"))
 }

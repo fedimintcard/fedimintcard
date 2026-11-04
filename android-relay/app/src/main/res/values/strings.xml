@@ -10,6 +10,8 @@
     <string name="check_sales">Check sales</string>
     <string name="new_sale">New sale</string>
     <string name="relay_title">Card relay</string>
+    <string name="card_balance">Card</string>
+    <string name="card_balance_reading">Card balance: hold on phone, then tap here</string>
     <plurals name="sales_count">
         <item quantity="one">%d sale</item>
         <item quantity="other">%d sales</item>

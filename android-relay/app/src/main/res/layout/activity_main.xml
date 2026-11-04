@@ -39,6 +39,15 @@
             android:textSize="22sp" android:singleLine="true" android:ellipsize="end" />
         <TextView android:id="@+id/balance_line" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:gravity="start" android:textSize="14sp" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <TextView android:id="@+id/card_balance_line" style="@style/Body" android:layout_width="0dp"
+                android:layout_weight="1" android:layout_height="wrap_content" android:gravity="start"
+                android:textSize="14sp" android:text="@string/card_balance_reading" />
+            <Button android:id="@+id/btn_card_balance" style="@style/GhostButton" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:minWidth="0dp" android:paddingStart="8dp"
+                android:paddingEnd="8dp" android:text="@string/card_balance" />
+        </LinearLayout>
         <TextView android:id="@+id/amount_text" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" android:gravity="center" />
         <GridLayout android:id="@+id/keypad" android:layout_width="match_parent" android:layout_height="0dp"
@@ -135,6 +144,24 @@
                 android:textColor="@color/gold_hi" android:textSize="16sp" />
         </LinearLayout>
         <ListView android:id="@+id/sales_list" android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:divider="@null" android:dividerHeight="0dp"
+            android:clipToPadding="false" android:paddingTop="8dp" />
+    </LinearLayout>
+
+    <!-- card balance: what the card itself holds, read off the card -->
+    <LinearLayout android:id="@+id/screen_card_balance" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:orientation="vertical" android:padding="16dp" android:visibility="gone">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <Button android:id="@+id/btn_card_balance_back" style="@style/GhostButton" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="@string/back" />
+            <TextView android:id="@+id/card_balance_total" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:gravity="end" android:fontFamily="@font/figtree_extrabold"
+                android:textColor="@color/gold_hi" android:textSize="16sp" />
+        </LinearLayout>
+        <TextView android:id="@+id/card_balance_slots" style="@style/Body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:textSize="14sp" />
+        <ListView android:id="@+id/card_notes_list" android:layout_width="match_parent" android:layout_height="0dp"
             android:layout_weight="1" android:divider="@null" android:dividerHeight="0dp"
             android:clipToPadding="false" android:paddingTop="8dp" />
     </LinearLayout>

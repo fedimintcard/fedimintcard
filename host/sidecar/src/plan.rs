@@ -311,15 +311,10 @@ fn solve_with(
     let flat = flat_fee(fee);
     let mut budget = BUDGET;
     let mut best: Option<(usize, usize, u64, Vec<usize>)> = None; // (change notes, inputs, overpay, indices)
-    let mut first_feasible_size: Option<usize> = None;
-
+    // Every input size is searched, not just the sizes up to the first fitted one: a price the
+    // small sizes cannot pay must still find its plan among the larger ones, and a sale refused
+    // for lack of a plan is a customer turned away at the counter. `budget` bounds the work.
     'sizes: for size in 1..=n {
-        if let Some(s) = first_feasible_size {
-            // One size beyond the first feasible one is enough: more inputs rarely help.
-            if size > s + 1 {
-                break;
-            }
-        }
         // Enumerate combinations of `size` notes with Gosper's hack.
         let mut mask: u32 = (1u32 << size) - 1;
         while mask < (1u32 << n) {
@@ -333,10 +328,12 @@ fn solve_with(
                         if budget == 0 {
                             break 'sizes;
                         }
-                        let cap = match &best {
-                            Some((cc, ..)) => (*cc).min(free_slots),
-                            None => free_slots,
-                        };
+                        // `free_slots` is a hard ceiling, never a tuning knob: change needing more
+                        // slots than the card has cannot be signed at all. Among plans that fit,
+                        // fewer change notes still wins, so once one exists only a strictly smaller
+                        // one is worth finding — but the ceiling itself is always `free_slots`.
+                        let cap = best.as_ref().map_or(free_slots, |(cc, ..)| cc.saturating_sub(1));
+
                         budget = budget.saturating_sub(1 + if flat.is_some() { 0 } else { 64 });
                         let Some(change) = min_notes(r, cap, fee, min_denom) else { continue };
                         let cand = (change.len(), size, *o);
@@ -345,7 +342,6 @@ fn solve_with(
                             Some((cc, ni, ov, _)) => cand < (*cc, *ni, *ov),
                         };
                         if better {
-                            first_feasible_size.get_or_insert(size);
                             best = Some((change.len(), size, *o, idx.clone()));
                         }
                     }

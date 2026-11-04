@@ -10,6 +10,16 @@ data class TillStatus(
 
 data class Note(val slot: Int, val msat: Long)
 
+/** One card slot's contents, from `POST /v1/card/balance`. */
+data class CardNote(val slot: Int, val msat: Long, val status: String)
+
+/** What the card holds, read off the card itself rather than the till's wallet. */
+data class CardBalance(
+    val liveMsat: Long,
+    val notes: List<CardNote>,
+    val freeSlots: List<Int>,
+)
+
 data class ChargeReceipt(
     val saleId: Long,
     val txid: String,

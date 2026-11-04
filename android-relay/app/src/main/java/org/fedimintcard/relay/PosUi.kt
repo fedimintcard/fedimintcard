@@ -23,11 +23,16 @@ import java.util.Locale
 class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, private val onKey: (Int?) -> Unit) {
     private fun <T : View> v(id: Int): T = act.findViewById(id)
 
-    private val screens = listOf(R.id.screen_amount, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_relay)
+    private val screens = listOf(R.id.screen_amount, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay)
     private val dot: View = v(R.id.dot)
     private val cardChip: TextView = v(R.id.card_chip)
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
+    private val cardBalanceLine: TextView = v(R.id.card_balance_line)
+    private val cardBalanceTotal: TextView = v(R.id.card_balance_total)
+    private val cardBalanceSlots: TextView = v(R.id.card_balance_slots)
+    private val cardNotesList: ListView = v(R.id.card_notes_list)
+    private val cardNotesAdapter = CardNotesAdapter()
     private val amountText: TextView = v(R.id.amount_text)
     private val charge: Button = v(R.id.btn_charge)
     private val tapAmount: TextView = v(R.id.tap_amount)
@@ -49,6 +54,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     val relayInfo: TextView = v(R.id.relay_info)
 
     private var relayOpen = false
+    private var cardBalanceOpen = false
     private var last: PosState = PosState.Entering
     private var lastPad = ""
     private var elapsedS = 0
@@ -59,6 +65,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
 
     init {
         salesList.adapter = salesAdapter
+        cardNotesList.adapter = cardNotesAdapter
         val digits = listOf(R.id.key_0, R.id.key_1, R.id.key_2, R.id.key_3, R.id.key_4, R.id.key_5, R.id.key_6, R.id.key_7, R.id.key_8, R.id.key_9)
         digits.forEachIndexed { d, id -> v<View>(id).setOnClickListener { onKey(d) } }
         v<View>(R.id.key_c).setOnClickListener { onKey(-1) }
@@ -79,6 +86,8 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         v<View>(R.id.btn_sales_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
         v<View>(R.id.btn_new_sale).setOnClickListener { onEvent(PosEvent.NewSalePressed) }
         v<View>(R.id.btn_relay_back).setOnClickListener { relayOpen = false; show() }
+        v<View>(R.id.btn_card_balance).setOnClickListener { onEvent(PosEvent.CardBalanceOpened) }
+        v<View>(R.id.btn_card_balance_back).setOnClickListener { cardBalanceOpen = false; show() }
     }
 
     fun onSettings(handler: () -> Unit) {
@@ -172,6 +181,35 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         }
     }
 
+    /** The card-balance screen is an overlay the back button closes before the state machine sees it. */
+    fun closeCardBalance(): Boolean { if (!cardBalanceOpen) return false; cardBalanceOpen = false; show(); return true }
+
+    fun openCardBalance() { cardBalanceOpen = true; cardBalanceTotal.text = "Reading card…"; cardBalanceSlots.text = ""; cardNotesAdapter.rows = emptyList(); show() }
+
+    /**
+     * Renders a card read. [r] is null while the read is in flight. A failed read keeps the last
+     * figure off screen rather than showing a stale one beside a fresh error.
+     */
+    fun showCardBalance(r: TillResult<CardBalance>?) {
+        when (r) {
+            null -> { cardBalanceTotal.text = "Reading card…"; cardBalanceSlots.text = ""; cardNotesAdapter.rows = emptyList() }
+            is TillResult.Ok -> {
+                val b = r.value
+                cardBalanceTotal.text = "${formatSats(b.liveMsat)} sats"
+                val live = b.notes.count { it.status == "live" }
+                cardBalanceSlots.text = "$live of ${b.notes.size + b.freeSlots.size} slots live · free slots: " +
+                    if (b.freeSlots.isEmpty()) "none" else b.freeSlots.joinToString(", ")
+                cardNotesAdapter.rows = b.notes
+                cardBalanceLine.text = "Card balance: ${formatSats(b.liveMsat)} sats"
+            }
+            is TillResult.Err -> {
+                cardBalanceTotal.text = "Card unreadable"
+                cardBalanceSlots.text = cardBalanceErrorCopy(r.error)
+                cardNotesAdapter.rows = emptyList()
+            }
+        }
+    }
+
     fun closeRelay(): Boolean { if (!relayOpen) return false; relayOpen = false; show(); return true }
     fun destroy() { pulser.cancel() }
 
@@ -179,6 +217,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
 
     private fun show() {
         val target = when {
+            cardBalanceOpen -> R.id.screen_card_balance
             relayOpen -> R.id.screen_relay
             else -> when (last) {
                 PosState.Entering -> R.id.screen_amount
@@ -211,6 +250,22 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
             }.show()
     }
 
+    private inner class CardNotesAdapter : BaseAdapter() {
+        var rows: List<CardNote> = emptyList()
+            set(x) { field = x; notifyDataSetChanged() }
+        override fun getCount() = rows.size
+        override fun getItem(i: Int) = rows[i]
+        override fun getItemId(i: Int) = rows[i].slot.toLong()
+        override fun getView(i: Int, convert: View?, parent: ViewGroup): View {
+            val row = convert ?: LayoutInflater.from(act).inflate(R.layout.row_card_note, parent, false)
+            val n = rows[i]
+            row.findViewById<TextView>(R.id.row_slot).text = "slot ${n.slot}"
+            row.findViewById<TextView>(R.id.row_note_amount).text = "${formatSats(n.msat)} sats"
+            row.findViewById<TextView>(R.id.row_note_status).text = n.status
+            return row
+        }
+    }
+
     private inner class SalesAdapter : BaseAdapter() {
         var rows: List<Sale> = emptyList()
             set(x) { field = x; notifyDataSetChanged() }
@@ -228,6 +283,16 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
             return row
         }
     }
+}
+
+/** Why a card read failed, in words a cashier can act on. */
+fun cardBalanceErrorCopy(e: TillError): String = when (e) {
+    is TillError.Unreachable -> "Till service unreachable — check adb reverse tcp:9877 tcp:9877"
+    is TillError.Timeout -> "The till did not answer in time"
+    is TillError.Interrupted -> "The read was interrupted"
+    is TillError.BadResponse ->
+        if (e.detail.contains("no card", true) || e.detail.contains("card relay", true)) "No card on the phone — hold the card to it, then read again"
+        else e.detail
 }
 
 /** Title and detail copy for a charge error. */

@@ -38,6 +38,8 @@ sealed class PosEvent {
     object BackPressed : PosEvent()
     object AbandonPressed : PosEvent()
     object SalesOpened : PosEvent()
+    /** The card-balance screen was opened. It is an overlay: it does not change [PosFlow.state]. */
+    object CardBalanceOpened : PosEvent()
     /** The sales poll found a row carrying the unresolved sale's client_ref. */
     data class SaleFound(val sale: Sale) : PosEvent()
 }
