@@ -94,6 +94,7 @@ export const LOOP = {
   allDone: 'Every card in this batch has been tried. Open the summary.',
   stopping: 'Stopping after this step…',
   waitStopped: 'Stopped before a card was read. Press Install when ready.',
+  noCard: 'No card was read before the scan closed. Press Install when ready.',
   install: (n: number) => `Install card ${n}`,
   phaseKeys: 'Making the card\'s keys',
   phasePin: 'Setting the PIN',

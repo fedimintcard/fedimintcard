@@ -285,10 +285,11 @@ export function LoopScreen({
       }
       setLine(LOOP.finished(id));
     } catch (e) {
-      // Stopped while waiting, before any card answered: no card was tried, so
+      // No card answered: stopped while waiting, or iOS closed its scan
+      // sheet (about a minute) before a card arrived. No card was tried, so
       // nothing is recorded and the batch's count is untouched.
-      if (cancelled.current && !touched) {
-        setLine(LOOP.waitStopped);
+      if (!touched) {
+        setLine(cancelled.current ? LOOP.waitStopped : LOOP.noCard);
         return;
       }
       // A cancelled run is still a card's outcome (`pulled`), and the store
@@ -361,6 +362,10 @@ export function LoopScreen({
         : 'idle';
   const left = Math.max(0, config.count - records.length);
   const cardNumber = Math.min(records.length + 1, config.count);
+  // The card the figure is about: the one on the phone while a run is going,
+  // otherwise the last one tried, so its result line reads under its own
+  // number (not "Card 3 of 3" above card 2's "Done"). Before any card, card 1.
+  const figureCard = busy || records.length === 0 ? cardNumber : records.length;
   const finished = left === 0;
   const stoppedCount = summary.failed + summary.unspendable;
   // One status line under the card: the live phase while a card is on the
@@ -417,11 +422,9 @@ export function LoopScreen({
             timed estimate, so a slow card looks slow. */}
         <View style={local.figureWrap}>
           <CardFigure fill={figureFill} state={figureState} />
-          {!finished ? (
-            <Text style={[local.cardNumber, {color: t.dim}]}>
-              {LOOP.next(cardNumber, config.count)}
-            </Text>
-          ) : null}
+          <Text style={[local.cardNumber, {color: t.dim}]}>
+            {LOOP.next(figureCard, config.count)}
+          </Text>
           <Text
             style={[local.phase, {color: t.ink}]}
             accessibilityLiveRegion="polite"
