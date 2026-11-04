@@ -53,3 +53,20 @@ jest.mock(
   'react-native-safe-area-context',
   () => require('react-native-safe-area-context/jest/mock').default,
 );
+
+// The camera is native. The scanner sheet is mounted closed in every test, so
+// a View in the Camera's place and a device-less phone are enough.
+jest.mock('react-native-vision-camera', () => {
+  const React = require('react');
+  const {View} = require('react-native');
+  return {
+    Camera: (props: Record<string, unknown>) =>
+      React.createElement(View, props, props.children),
+    useCameraDevice: () => undefined,
+    useCameraPermission: () => ({
+      hasPermission: false,
+      requestPermission: () => Promise.resolve(false),
+    }),
+    useCodeScanner: (scanner: unknown) => scanner,
+  };
+});

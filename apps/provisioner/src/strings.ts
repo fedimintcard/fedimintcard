@@ -37,7 +37,8 @@ export const SETUP = {
   federationEmpty:
     'No federation invites are known. Enter the invite below, or set one in Settings.',
   customFederation: 'Custom',
-  customPlaceholder: 'fedimint://…',
+  customPlaceholder: 'fed11… or fedimint…',
+  scanFederation: 'SCAN QR',
   pin: 'PIN',
   count: 'Cards in the batch',
   countRange: 'Enter a whole number from 1 to the batch maximum.',
@@ -114,21 +115,28 @@ export const SETTINGS = {
   federationHelp:
     'Which federation this batch joins. One value for the batch; change it here between batches.',
   federationSaved: 'Federation saved for the next batch.',
-  inviteProblem: 'A federation invite starts with fedimint://.',
+  inviteProblem:
+    'A federation invite starts with fed11 or fedimint. Scan its QR code or paste it.',
   saveFederation: 'SAVE FEDERATION',
+  scanFederation: 'SCAN QR',
   registry: 'Registry endpoint',
   registryNow: (label: string) => `Recording to the ${label.toLowerCase()} registry.`,
   registryHelp:
     'Where batch and card rows are recorded. Test and live are the same service under two endpoints.',
-  topup: 'Top-up amounts',
+  topup: 'Top-up per card',
   topupHelp:
-    'The sats each card receives, one note per amount, largest first. The sidecar previews this plan before a batch starts.',
-  amountsSaved: (sats: number) => `Saved: ${sats.toLocaleString()} sat per card.`,
+    'The sats each card leaves with. 0 installs and keys the card and puts nothing on it. The sidecar splits a sum into notes and previews them before a batch starts.',
+  amountsSaved: (sats: number) =>
+    sats === 0
+      ? 'Saved: install only, no top-up.'
+      : `Saved: ${sats.toLocaleString()} sat per card.`,
   amountsTotal: (notes: number, sats: number) =>
-    `${notes} ${notes === 1 ? 'note' : 'notes'} · ${sats.toLocaleString()} sat per card`,
+    sats === 0
+      ? 'Install only, no top-up'
+      : `${sats.toLocaleString()} sat in ${notes} ${notes === 1 ? 'note' : 'notes'} per card`,
   amountsProblem: (most: number) =>
-    `Use 1–${most} whole sat amounts, each greater than zero.`,
-  saveAmounts: 'SAVE AMOUNTS',
+    `Use a whole number of sats that splits into at most ${most} notes.`,
+  saveAmounts: 'SAVE TOP-UP',
   theme: 'Theme',
   themeSystem: 'System',
   themeDark: 'Dark',
@@ -147,3 +155,18 @@ export const SETTINGS = {
   signOutBlocked: 'A batch is running. End or leave it before signing out.',
   keepSession: 'KEEP SESSION',
 } as const;
+
+/**
+ * The invite scanner, a sheet over Settings and NEW BATCH rather than a sixth
+ * screen: it exists only to fill their federation field.
+ */
+export const SCAN = {
+  title: 'Scan a federation invite',
+  hint: "Point the camera at the federation's QR code.",
+  notInvite: 'That QR code is not a federation invite.',
+  noPermission: 'The camera is off for this app. Allow it to scan an invite.',
+  allow: 'ALLOW CAMERA',
+  openSettings: 'OPEN SETTINGS',
+  noCamera: 'This phone has no camera the app can use. Paste the invite instead.',
+  cancel: 'CANCEL',
+};

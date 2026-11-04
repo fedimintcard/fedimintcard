@@ -18,6 +18,7 @@
  * *policy*, never the value.
  */
 import React, {useState} from 'react';
+import {ScanInviteSheet} from '../ScanInvite';
 import {
   Pressable,
   ScrollView,
@@ -39,6 +40,7 @@ import {
   DEFAULT_FEDERATION,
   federationLabel,
   federationOptions,
+  isInviteCode,
   LOAD_LINE,
   MAX_COUNT,
   settingsAreReady,
@@ -54,6 +56,7 @@ import {
   FONT,
   PrimaryButton,
   Screen,
+  SecondaryButton,
   SectionHeader,
   styles,
   useTheme,
@@ -78,6 +81,7 @@ export function BatchSetupScreen({
     settings.federation || DEFAULT_FEDERATION,
   );
   const [customOpen, setCustomOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [count, setCount] = useState('1');
   const [policy, setPolicy] = useState<PinPolicy>('batch');
   const draft = usePinDraft();
@@ -100,8 +104,17 @@ export function BatchSetupScreen({
   const options = federationOptions(federation);
   const preview = app.planPreview(validCount ? countNumber : 1);
   // One rule for "a batch can start", shared with Settings: an invite that is
-  // a `fedimint://` URL and amounts the sidecar can realise exactly.
-  const inviteReady = federation.trim().startsWith('fedimint://');
+  // an invite the sidecar can parse and a top-up the card can hold.
+  const inviteReady = isInviteCode(federation);
+
+  // A scanned invite is the batch's federation and the saved one: the scan is
+  // the operator's choice, the same as tapping a preset.
+  const scanned = (found: string) => {
+    setScanning(false);
+    setFederation(found);
+    settings.setFederation(found);
+    setCustomOpen(true);
+  };
   const ready =
     validCount &&
     pinReady &&
@@ -223,6 +236,14 @@ export function BatchSetupScreen({
                 />
               </>
             ) : null}
+            <Divider />
+            <View style={local.fieldRow}>
+              <SecondaryButton
+                title={SETUP.scanFederation}
+                onPress={() => setScanning(true)}
+                testID="federation-scan"
+              />
+            </View>
           </Card>
         </View>
 
@@ -341,7 +362,7 @@ export function BatchSetupScreen({
                   <Text style={local.fieldLabel}>
                     {SETUP.planPerCard(
                       preview.perCard.toLocaleString(),
-                      preview.amounts.length,
+                      preview.lines.length,
                     )}
                   </Text>
                 </View>
@@ -393,6 +414,11 @@ export function BatchSetupScreen({
           </Text>
         ) : null}
       </View>
+      <ScanInviteSheet
+        visible={scanning}
+        onClose={() => setScanning(false)}
+        onInvite={scanned}
+      />
     </Screen>
   );
 }

@@ -42,7 +42,7 @@ import {
   type PinPolicy,
   type PinRevealContext,
 } from './pin';
-import {useSettings, type ThemeChoice} from './settings';
+import {topupNotesMsat, useSettings, type ThemeChoice} from './settings';
 
 // ---------------------------------------------------------------------------
 // The card path: phases and stops
@@ -157,8 +157,8 @@ export function isSpendable(
 // ---------------------------------------------------------------------------
 
 /**
- * The top-up the batch issues, as sat amounts: one entry per note the card
- * receives. `null` is an install-only batch — a real choice, not a default.
+ * The top-up the batch issues, as sat amounts the sidecar splits into notes.
+ * `null` is an install-only batch, the default.
  */
 export interface TopUpPlan {
   readonly amounts: readonly number[];
@@ -279,7 +279,7 @@ export interface PlanPreview {
   perCard: number;
   /** What the batch receives, in sat: `perCard × count`. */
   batchTotal: number;
-  /** One line per note, for the list the screen renders. */
+  /** One line per note the sidecar will make, for the list the screen renders. */
   lines: readonly string[];
   /** The batch has nothing to issue: an install-only batch. */
   installOnly: boolean;
@@ -289,29 +289,32 @@ export interface PlanPreview {
 
 /**
  * The plan for a batch, from the batch's own top-up plan — which BatchSetup
- * builds from the runtime settings' amounts. A plan naming more notes than the
- * card has slots, or a non-positive or fractional amount, is refused here,
- * before the first card is touched, with the reason the screen shows.
+ * builds from the runtime settings' sum. The lines are the notes the sidecar
+ * will make of it (`plan::binary` of the msat amount), so the operator sees
+ * what the batch will put on each card before it starts. A sum that splits
+ * into more notes than the card has slots, or a non-positive or fractional
+ * amount, is refused here, before the first card is touched.
  */
 export function planPreview(
   config: Pick<BatchConfig, 'count' | 'plan'>,
 ): PlanPreview {
   const list = config.plan === null ? [] : [...config.plan.amounts];
   const perCard = list.reduce((sum, n) => sum + n, 0);
+  const notes = list.flatMap(n => topupNotesMsat(n));
   const base: PlanPreview = {
     ok: true,
     amounts: list,
     perCard,
     batchTotal: perCard * config.count,
-    lines: list.map(n => `${n.toLocaleString('en-US')} sat`),
+    lines: notes.map(msat => `${(msat / 1000).toLocaleString('en-US')} sat`),
     installOnly: list.length === 0,
     problem: null,
   };
-  if (list.length > MAX_NOTES_PER_CARD) {
+  if (notes.length > MAX_NOTES_PER_CARD) {
     return {
       ...base,
       ok: false,
-      problem: `${list.length} notes is more than the card's ${MAX_NOTES_PER_CARD} slots.`,
+      problem: `${perCard.toLocaleString('en-US')} sat splits into ${notes.length} notes, more than the card's ${MAX_NOTES_PER_CARD} slots.`,
     };
   }
   if (list.some(n => !Number.isSafeInteger(n) || n <= 0)) {
@@ -773,7 +776,10 @@ export function StoreProvider({
 
   const previewOf = useCallback(
     (count: number): PlanPreview =>
-      planPreview({count, plan: {amounts: settings.topupSats}}),
+      planPreview({
+        count,
+        plan: settings.topupSats > 0 ? {amounts: [settings.topupSats]} : null,
+      }),
     [settings.topupSats],
   );
 

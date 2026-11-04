@@ -64,7 +64,7 @@ display name is deliberately identical on both platforms.
 
 The build-time constants the app shows (AIDs, load-file sha256, cardkit version,
 identity) are frozen in `src/settings.tsx`; runtime settings (federation,
-registry endpoint, top-up amounts, theme) are editable in Settings and persisted
+registry endpoint, top-up per card, theme) are editable in Settings and persisted
 under `prov.settings.v1`.
 
 ## Layout

@@ -20,7 +20,7 @@ test('the adapter signs in, opens a batch, and posts a row at the registry shape
   expect(api.serviceUrl).toBe(origin);
   const s = await api.signIn('dread', 'pw');
   expect(s).toEqual({operatorId: 7, token: 'tok-1'});
-  await api.postBatch({federation: 'fedimint://x', count: 1, pinPolicy: 'batch', plan: null});
+  await api.postBatch({federation: 'fed11qgqz', count: 1, pinPolicy: 'batch', plan: null});
   await api.postCard({
     id: 'C1', at: 1000, phase: 'done', ok: true, pinPolicy: 'batch',
     pinState: 'set', notesIssued: [1048, 524], pending: false,

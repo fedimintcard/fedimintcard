@@ -149,48 +149,51 @@ export const LOCAL_SIDECAR_ORIGIN = 'http://127.0.0.1:9877';
 export const DEFAULT_FEDERATION = '';
 
 /**
- * Top-up amounts: the notes `issue` asks for, in satoshi, largest first. The
- * demo starts from 2,000 sats of ecash and funds four notes (docs/DEMO.md:
- * `card topup 1048576 524288 262144 131072` msat = 1,048,576 + 524,288 +
- * 262,144 + 131,072 msat). The sidecar's `plan.rs` previews this plan and
- * refuses one it cannot make exact (plan § 5), so the app shows the plan the
- * server will honour, not a sum it guessed.
+ * The top-up per card, in satoshi. Zero is an install-only batch, which is
+ * the default: like the Cashu provisioner, a fresh install keys and installs
+ * cards and puts no money on them until the operator asks. The sidecar
+ * (`glue.rs` `topup`, `cards.rs` `issue_plan`) splits whatever amount it is
+ * given into power-of-two msat notes itself, so the operator types one sum,
+ * not a note list.
  */
-export const DEFAULT_TOPUP_SATS: readonly number[] = Object.freeze(
-  [1048, 524, 262, 131] as const,
-);
+export const DEFAULT_TOPUP_SATS = 0;
 
 /**
  * The applet has 8 slots (`tools/cardkit/gp/provision.ts`'s `checks` probe
- * exactly 0–7), and every issued note occupies one, so a plan of more than 8
- * notes cannot be held by any card this app programs.
+ * exactly 0–7), and every issued note occupies one, so a sum the sidecar
+ * would split into more than 8 notes cannot be held by any card this app
+ * programs.
  */
 export const MAX_TOPUP_NOTES = 8;
 
 /**
- * Whether the operator's amounts are one the sidecar can realise: whole sats,
- * positive, no more notes than the card has slots, and (from `plan.rs`) powers
- * of two msat — the mint's denominations — listed largest first. The batch
- * preview shows what the sidecar will honour, so the client refuses the same
- * shapes `plan.rs` would.
+ * The notes the sidecar makes of `sats`: the binary split of the amount in
+ * msat, largest first, exactly as `plan::binary` does it. Empty for zero.
  */
-export function isValidTopup(amounts: readonly number[]): boolean {
-  return (
-    amounts.length > 0 &&
-    amounts.length <= MAX_TOPUP_NOTES &&
-    amounts.every(
-      (n, i) =>
-        Number.isInteger(n) &&
-        n > 0 &&
-        (n & (n - 1)) === 0 && // a power of two, as plan.rs's denominations are
-        (i === 0 || n < amounts[i - 1]),
-    )
-  );
+export function topupNotesMsat(sats: number): readonly number[] {
+  const notes: number[] = [];
+  let rest = sats * 1000;
+  for (let bit = 2 ** 50; bit >= 1 && rest > 0; bit /= 2) {
+    if (rest >= bit) {
+      notes.push(bit);
+      rest -= bit;
+    }
+  }
+  return notes;
 }
 
-/** The total the BatchSetup preview shows above the per-note list. */
-export function topupTotal(amounts: readonly number[]): number {
-  return amounts.reduce((sum, n) => sum + n, 0);
+/**
+ * Whether the operator's sum is one the sidecar can put on a card: a whole,
+ * non-negative number of sats whose notes fit the card's slots. Zero is valid
+ * and means install only. Whether each note clears the federation's smallest
+ * economical denomination is the sidecar's call, made when the batch starts.
+ */
+export function isValidTopup(sats: number): boolean {
+  return (
+    Number.isSafeInteger(sats) &&
+    sats >= 0 &&
+    topupNotesMsat(sats).length <= MAX_TOPUP_NOTES
+  );
 }
 
 /** Everything the operator can change, and nothing else. */
@@ -198,7 +201,8 @@ export interface Settings {
   /** The federation invite. Required; empty until the operator picks one. */
   federation: string;
   registryEndpoint: RegistryEndpoint;
-  topupSats: readonly number[];
+  /** Sats per card; 0 is install only. */
+  topupSats: number;
   theme: ThemeChoice;
 }
 
@@ -210,14 +214,13 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
 } as const);
 
 /**
- * Whether the batch can start: a federation is chosen and the amounts are one
- * the sidecar's `plan.rs` can make exact. BatchSetup shows this as the enabled
- * state of its start button, so a batch never begins against a blank invite.
+ * Whether the batch can start: a federation is chosen and the top-up is a sum
+ * the card can hold. BatchSetup shows this as the enabled state of its start
+ * button, so a batch never begins against a blank invite.
  */
 export function settingsAreReady(settings: Settings): boolean {
   return (
-    settings.federation.startsWith('fedimint://') &&
-    isValidTopup(settings.topupSats)
+    isInviteCode(settings.federation) && isValidTopup(settings.topupSats)
   );
 }
 
@@ -228,7 +231,15 @@ export function settingsAreReady(settings: Settings): boolean {
 export const MAX_COUNT = 50;
 
 /** The picker's presets, their framing and their names live in `federation.ts`. */
-export {federationLabel, federationOptions, KNOWN_FEDERATIONS} from './federation';
+import {isInviteCode, normalizeInvite} from './federation';
+
+export {
+  federationLabel,
+  federationOptions,
+  isInviteCode,
+  KNOWN_FEDERATIONS,
+  normalizeInvite,
+} from './federation';
 export type {Federation} from './federation';
 
 /** The one AsyncStorage key. Bumping the suffix discards older shapes. */
@@ -255,8 +266,8 @@ export function parseSettings(raw: string | null): Settings {
   }
   const o = json as Record<string, unknown>;
   const federation =
-    typeof o.federation === 'string' && o.federation.startsWith('fedimint://')
-      ? o.federation
+    typeof o.federation === 'string' && isInviteCode(o.federation)
+      ? (normalizeInvite(o.federation) as string)
       : DEFAULT_SETTINGS.federation;
   const registryEndpoint = REGISTRY_ENDPOINTS.includes(
     o.registryEndpoint as RegistryEndpoint,
@@ -264,10 +275,8 @@ export function parseSettings(raw: string | null): Settings {
     ? (o.registryEndpoint as RegistryEndpoint)
     : DEFAULT_SETTINGS.registryEndpoint;
   const topupSats =
-    Array.isArray(o.topupSats) &&
-    o.topupSats.every(n => typeof n === 'number') &&
-    isValidTopup(o.topupSats as number[])
-      ? [...(o.topupSats as number[])]
+    typeof o.topupSats === 'number' && isValidTopup(o.topupSats)
+      ? o.topupSats
       : DEFAULT_SETTINGS.topupSats;
   const theme =
     o.theme === 'system' || o.theme === 'dark' || o.theme === 'light'
@@ -282,7 +291,7 @@ export interface SettingsState extends Settings {
   loading: boolean;
   setFederation(invite: string): void;
   setRegistryEndpoint(endpoint: RegistryEndpoint): void;
-  setTopupSats(amounts: readonly number[]): void;
+  setTopupSats(sats: number): void;
   setTheme(theme: ThemeChoice): void;
   /** One atomic write of everything; `set*` go through it. */
   update(patch: Partial<Settings>): void;
@@ -359,9 +368,9 @@ export function SettingsProvider({
     [update],
   );
   const setTopupSats = useCallback(
-    (topupSats: readonly number[]) => {
+    (topupSats: number) => {
       if (isValidTopup(topupSats)) {
-        update({topupSats: [...topupSats]});
+        update({topupSats});
       }
     },
     [update],

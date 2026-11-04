@@ -22,6 +22,7 @@
  * visible and selected instead of vanishing the moment a preset is tapped.
  */
 import React, {useState} from 'react';
+import {ScanInviteSheet} from '../ScanInvite';
 import {ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
 
 import {
@@ -29,16 +30,18 @@ import {
   EXPERIMENTAL_WARNING,
   federationLabel,
   federationOptions,
+  isInviteCode,
   isValidTopup,
   LOAD_LINE,
   MAX_TOPUP_NOTES,
+  normalizeInvite,
   REGISTRY_ENDPOINTS,
-  topupTotal,
+  topupNotesMsat,
   useSettings,
   type RegistryEndpoint,
   type ThemeChoice,
 } from '../settings';
-import {SETTINGS} from '../strings';
+import {SETTINGS, SETUP} from '../strings';
 import {useStore} from '../store';
 import {
   Card,
@@ -67,12 +70,10 @@ const THEME_LABEL: Record<ThemeChoice, string> = {
 };
 
 /** "1048, 524, 262" → [1048, 524, 262]; anything else is dropped, not coerced. */
-function parseAmounts(text: string): readonly number[] {
-  return text
-    .split(/[^0-9]+/)
-    .filter(part => part.length > 0)
-    .map(Number)
-    .filter(n => Number.isSafeInteger(n) && n > 0);
+/** The sum the operator typed; NaN for anything that is not digits. */
+function parseAmount(text: string): number {
+  const digits = text.replace(/[,\s]/g, '');
+  return /^[0-9]+$/.test(digits) ? Number(digits) : NaN;
 }
 
 export function SettingsScreen({
@@ -88,22 +89,31 @@ export function SettingsScreen({
   const s = styles(t);
 
   const [invite, setInvite] = useState(settings.federation);
-  const [amounts, setAmounts] = useState(settings.topupSats.join(', '));
+  const [amounts, setAmounts] = useState(String(settings.topupSats));
   const [saved, setSaved] = useState<string | null>(null);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
-  const parsed = parseAmounts(amounts);
+  const parsed = parseAmount(amounts);
   const amountsValid = isValidTopup(parsed);
-  const inviteValid = invite.trim().startsWith('fedimint://');
+  const inviteValid = isInviteCode(invite);
   const running = app.batch?.phase === 'running';
 
   const saveFederation = () => {
-    const trimmed = invite.trim();
-    if (!trimmed.startsWith('fedimint://')) {
+    const normalized = normalizeInvite(invite);
+    if (normalized === null) {
       return;
     }
-    settings.setFederation(trimmed);
-    setInvite(trimmed);
+    settings.setFederation(normalized);
+    setInvite(normalized);
+    setSaved(SETTINGS.federationSaved);
+  };
+
+  // A scanned invite is saved at once: the scan is the operator's choice.
+  const scanned = (found: string) => {
+    setScanning(false);
+    settings.setFederation(found);
+    setInvite(found);
     setSaved(SETTINGS.federationSaved);
   };
 
@@ -112,7 +122,7 @@ export function SettingsScreen({
       return;
     }
     settings.setTopupSats(parsed);
-    setSaved(SETTINGS.amountsSaved(topupTotal(parsed)));
+    setSaved(SETTINGS.amountsSaved(parsed));
   };
 
   return (
@@ -140,7 +150,7 @@ export function SettingsScreen({
               <TextInput
                 value={invite}
                 onChangeText={setInvite}
-                placeholder="fedimint://…"
+                placeholder={SETUP.customPlaceholder}
                 placeholderTextColor={t.dim}
                 autoCapitalize="none"
                 autoCorrect={false}
@@ -153,6 +163,11 @@ export function SettingsScreen({
                   {SETTINGS.inviteProblem}
                 </Text>
               )}
+              <SecondaryButton
+                title={SETTINGS.scanFederation}
+                onPress={() => setScanning(true)}
+                testID="settings-federation-scan"
+              />
               <SecondaryButton
                 title={SETTINGS.saveFederation}
                 onPress={saveFederation}
@@ -190,13 +205,13 @@ export function SettingsScreen({
               <TextInput
                 value={amounts}
                 onChangeText={setAmounts}
-                keyboardType="numbers-and-punctuation"
+                keyboardType="number-pad"
                 style={s.input}
                 testID="settings-amounts"
               />
               {amountsValid ? (
                 <Dim testID="settings-amounts-total">
-                  {SETTINGS.amountsTotal(parsed.length, topupTotal(parsed))}
+                  {SETTINGS.amountsTotal(topupNotesMsat(parsed).length, parsed)}
                 </Dim>
               ) : (
                 <Text style={s.failed} testID="settings-amounts-problem">
@@ -301,6 +316,11 @@ export function SettingsScreen({
           {saved}
         </Text>
       ) : null}
+      <ScanInviteSheet
+        visible={scanning}
+        onClose={() => setScanning(false)}
+        onInvite={scanned}
+      />
     </Screen>
   );
 }

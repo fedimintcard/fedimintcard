@@ -36,6 +36,30 @@ export function federationOptions(saved: string): readonly Federation[] {
   return [{invite: saved, label: saved}, ...rest];
 }
 
+/**
+ * The invite as the sidecar's `InviteCode::from_str` (fedimint-core
+ * `invite_code.rs`) will take it, or null. Two encodings exist: bech32m with
+ * the human-readable part `fed1` (so the string opens `fed11…`), and the
+ * newer `fedimint` prefix over RFC 4648 base32hex. Both are case-insensitive
+ * and the parser lowercases, so this does too; surrounding whitespace, as a
+ * QR code or a paste may carry, is dropped. There is no `fedimint://` form.
+ */
+export function normalizeInvite(text: string): string | null {
+  const s = text.trim().toLowerCase();
+  if (/^fed11[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,}$/.test(s)) {
+    return s;
+  }
+  if (/^fedimint[0-9a-v]{6,}$/.test(s)) {
+    return s;
+  }
+  return null;
+}
+
+/** Whether `text` is a federation invite the sidecar can join. */
+export function isInviteCode(text: string): boolean {
+  return normalizeInvite(text) !== null;
+}
+
 /** What the picker and the summary print for a federation. */
 export function federationLabel(federation: Federation): string {
   return federation.label || federation.invite;

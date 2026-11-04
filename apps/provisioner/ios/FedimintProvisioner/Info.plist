@@ -28,6 +28,8 @@
 	<true/>
 	<key>NFCReaderUsageDescription</key>
 	<string>Installs the Fedimint card applet on a card held to the phone.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scans a federation's invite QR code.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
