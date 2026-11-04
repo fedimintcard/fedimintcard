@@ -7,6 +7,10 @@
 name = "fedimintcard-registry"
 main = "src/index.ts"
 compatibility_date = "2025-10-01"
+# Production answers only on registry.fedimintcard.org (a custom domain set in
+# the dashboard); staging has no domain, so it keeps its workers.dev URL.
+workers_dev = false
+preview_urls = false
 
 # Operators are created by a setup command, a secret, never over HTTP
 # (src/auth.ts). It is applied once per nonce when the object starts:
@@ -30,6 +34,7 @@ new_sqlite_classes = ["Registry"]
 #   npx wrangler secret put OPERATOR_SETUP --env staging
 [env.staging]
 name = "fedimintcard-registry-staging"
+workers_dev = true
 
 [[env.staging.durable_objects.bindings]]
 name = "REGISTRY"
