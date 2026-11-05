@@ -1,5 +1,6 @@
 import {CARD_AID} from './cardkit';
-import {finishCard, pinApdu, keyApdu, probeApplet, selectApdu, SLOT_COUNT} from './cardSetup';
+import {FakeGpCard} from './testing/fakeGpCard';
+import {finishCard, pinApdu, keyApdu, probeApplet, probeCard, selectApdu, SLOT_COUNT} from './cardSetup';
 import {shortIdOf} from './store';
 
 /**
@@ -118,4 +119,18 @@ test('probeApplet tells a blank card, an unkeyed applet and a keyed one apart', 
   expect(await probeApplet(async () => [0x6a, 0x82])).toBe('none');
   expect(await probeApplet(applet().tx)).toBe('unkeyed');
   expect(await probeApplet(applet({preset: {0: Array(32).fill(1)}}).tx)).toBe('keyed');
+});
+
+test('a re-key is refused by a card with a PIN, and probeCard reads the PIN state without a try', async () => {
+  const card = new FakeGpCard().withFinishedApplet('2468');
+  const before = card.applet!.slots.map(s => s!.join(','));
+  const probe = await probeCard(card.transceive);
+  expect(probe).toEqual(expect.objectContaining({kind: 'keyed', pin: 'set'}));
+  const r = await finishCard(card.transceive, '135790', undefined, {rekey: true});
+  expect(r).toEqual(expect.objectContaining({ok: false, step: 'keys', sw: 0x6a94}));
+  expect(card.applet!.slots.map(s => s!.join(','))).toEqual(before);
+  expect(card.applet!.tries).toBe(3);
+  expect(await probeCard(new FakeGpCard().withLiftedApplet(2).transceive)).toEqual(
+    expect.objectContaining({kind: 'keyed', pin: 'notSet'}),
+  );
 });

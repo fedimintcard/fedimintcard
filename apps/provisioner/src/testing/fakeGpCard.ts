@@ -124,6 +124,28 @@ export class FakeGpCard {
     return this;
   }
 
+  /**
+   * The Fedimint applet as a lifted install tap leaves it: the card manager
+   * on `keys` (the card's own, after the rotation), the first `keyed` slots
+   * generated, and the PIN `pin` (null: not set).
+   */
+  withLiftedApplet(keyed: number, pin: string | null = null): this {
+    this.packages.add(PKG);
+    this.instances.set(OPENER, {pkg: PKG, module: OPENER});
+    const applet: AppletState = {
+      slots: new Array(8).fill(null),
+      pin,
+      tries: 3,
+      blocked: false,
+      verified: false,
+    };
+    for (let slot = 0; slot < keyed; slot++) {
+      applet.slots[slot] = this.newKey(slot);
+    }
+    this.instances.set(CARD, {pkg: PKG, module: CARD, applet});
+    return this;
+  }
+
   /** The Fedimint applet as a finished card has it: eight keys and a PIN. */
   withFinishedApplet(pin = '2468'): this {
     this.packages.add(PKG);
@@ -479,12 +501,28 @@ export class FakeGpCard {
     switch (ins) {
       case 0x11:
         return a.slots[p1] ? ok(a.slots[p1]!) : sw(0x6985);
-      case 0x10:
+      case 0x10: {
+        // P2 = 01 overwrites a used slot, which once a PIN is set takes a
+        // verified PIN (FedimintCardApplet.genKey); an empty slot is made either way.
+        const p2 = apdu[3];
+        if (p2 !== 0x00 && p2 !== 0x01) {
+          return sw(0x6b00);
+        }
         if (a.slots[p1]) {
-          return sw(0x6985);
+          if (p2 !== 0x01) {
+            return sw(0x6985);
+          }
+          if (a.blocked) {
+            return sw(0x6983);
+          }
+          if (a.pin !== null && !a.verified) {
+            return sw(0x6a94);
+          }
+          a.slots[p1] = null;
         }
         a.slots[p1] = this.newKey(p1);
         return ok(a.slots[p1]!);
+      }
       case 0x41:
         if (a.blocked) {
           return sw(0x6983);

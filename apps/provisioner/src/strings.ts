@@ -91,6 +91,13 @@ export const LOOP = {
   cardRow: (n: number, id: string) => `Card ${n} · …${id.slice(-4).toUpperCase()}`,
   tap: 'Press Install, then hold the card to the phone.',
   tryNext: 'Set that card aside. Press Install when the next one is ready.',
+  /** A tap lifted while the card's keys or PIN were written: the same card finishes it. */
+  sameCard: 'Hold the same card to the phone and press Finish to complete it.',
+  finishCard: (n: number) => `Finish card ${n}`,
+  heldTitle: 'Card not finished',
+  heldName: 'Tap the same card again',
+  heldWhat: 'The card left the phone while its keys or its PIN were being written.',
+  heldNow: 'Nothing is lost and it did not use up a place in this batch. Hold the same card to the phone again to finish it.',
   allDone: 'Every card in this batch has been tried. Open the summary.',
   stopping: 'Stopping after this step…',
   waitStopped: 'Stopped before a card was read. Press Install when ready.',
@@ -124,6 +131,7 @@ export const CALM = {
   differentCard: 'The key the card read back is not the one this batch expected.',
   pinNotSet: 'The card was installed, but its keys or its PIN did not finish.',
   noManagerKeys: 'Ops did not answer this card\'s manager keys, so nothing was written.',
+  needsReset: 'The card has a PIN this phone cannot prove, so it was not finished.',
   outboxPending: 'Some rows have not reached the registry yet. They retry on their own.',
 } as const;
 
@@ -134,8 +142,9 @@ export const STATE = {
   wrongKeys: 'No further attempt until this stop is acknowledged, so a locked card is not driven further.',
   guarded: 'Use a blank card. This app never removes a card that already holds keys.',
   differentCard: 'Set this card aside; it was not issued to.',
-  pinNotSet: 'This card is unspendable and must not be handed out. Set it aside.',
+  pinNotSet: 'Do not hand this card out. Settings → Reset a card takes it back to blank; then install it again.',
   noManagerKeys: 'The card is unchanged. Check the connection, or whose card it is, and tap it again.',
+  needsReset: 'Do not hand this card out. Settings → Reset a card takes it back to blank; then install it again.',
   outboxPending: 'The card work is done; only the registry row waits.',
 } as const;
 

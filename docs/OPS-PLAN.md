@@ -217,6 +217,19 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   checked offline against both) → PUT KEY in place (version 01 kept) and a fresh login under the
   new set → GEN_KEY ×8, SET_PIN, VERIFY_PIN. The card row carries `chip`. Deploy needs
   `wrangler secret put CARD_MANAGER_MASTER` on staging and production first.
+  A tap lifted during GEN_KEY ×8, SET_PIN or VERIFY_PIN (found on silicon 2026-11-04: the card left
+  on its own keys, keyed, with no PIN, and refused by every later tap) keeps the batch's place and
+  is finished by tapping the same card again, in this batch or a later one: the probe reads slot 0
+  and the PIN's state without a try; with no PIN, ops' `POST /registry/resume-check {chip,
+  short_id}` must show nothing under that id and no other open card on the chip, one INITIALIZE
+  UPDATE must prove the card's own keys, and then all eight slots are generated again (GEN_KEY
+  P2 `01`, which the applet allows only while no PIN is set), a fresh PIN set and verified. The
+  new row names the old short id as `supersedes`; ops closes that row (`cards.replaced_by`) in the
+  same transaction, refusing if it holds value, has its PIN set or is another operator's or chip's,
+  and the old id answers 410 like a reset id. A PIN that was set but whose answer was lost is
+  verified once with the PIN the phone still holds in memory for that chip, and the keys are kept;
+  without it the tap stops `needsReset` (no try spent) for Settings → Reset a card. Ops takes no
+  load or till charge for a row whose PIN is not set (409).
 - [ ] **Reset in the provisioner.** Settings → Reset a card: read slot 0, ask ops for the card
   (another operator's or an unknown card is refused); refuse while ops shows a live or pending
   note, an open charge or an open load; the holder's PIN is required as consent, because ops cannot

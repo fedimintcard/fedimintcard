@@ -401,6 +401,47 @@ export function usePinReveal(): PinRevealContext {
 }
 
 /**
+ * The PIN the loop sent to a card whose tap was lifted after `SET_PIN` went
+ * out, so the same card's next tap can prove it with one `VERIFY_PIN`
+ * (`installTap.ts`, `attemptedPin`). One card at a time, keyed by its chip.
+ *
+ * Held in the loop's component ref and nowhere else: never the store, never
+ * storage, never a log. It is wiped when that card finishes or stops for
+ * good, when the batch ends, and when the loop unmounts; a card tapped after
+ * that, in this batch or a later one, cannot be proved and goes to Settings →
+ * Reset a card.
+ */
+export interface AttemptedPin {
+  remember(chip: string, pin: string): void;
+  /** The PIN sent to this chip, or null. */
+  forChip(chip: string): string | null;
+  wipe(): void;
+}
+
+export function useAttemptedPin(): AttemptedPin {
+  const ref = useRef<{chip: string; pin: string} | null>(null);
+  useEffect(
+    () => () => {
+      ref.current = null;
+    },
+    [],
+  );
+  return useMemo<AttemptedPin>(
+    () => ({
+      remember(chip: string, pin: string): void {
+        ref.current = {chip, pin: digitsOnly(pin).slice(0, PIN_MAX)};
+      },
+      forChip: (chip: string) =>
+        ref.current !== null && ref.current.chip === chip ? ref.current.pin : null,
+      wipe(): void {
+        ref.current = null;
+      },
+    }),
+    [],
+  );
+}
+
+/**
  * A blur that clears the field. `TextInput`'s `onBlur` is the hardware
  * keyboard dismissal, not the screen leaving; the screen-leave path is
  * `usePinDraft`'s unmount and the screen's own `clear()`.

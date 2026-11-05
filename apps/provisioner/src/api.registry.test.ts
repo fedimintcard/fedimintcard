@@ -141,3 +141,35 @@ test('O5: manager keys are checked before they reach a card; a reset completion 
   await api.postCard({id: '1f2e3d4c', at: 1, phase: 'done', ok: true, pinPolicy: 'batch', pinState: 'set', notesIssued: [], pending: true, slotKeys, chip} as any);
   expect(seen.at(-1)!.body.chip).toBe(chip);
 });
+
+test('O5 resume: the check is read strictly, and a resumed row names the short id it supersedes', async () => {
+  const seen: {path: string; body: any}[] = [];
+  const origin = 'https://registry.test';
+  const chip = 'cplc-v1:4790d3213041093363205547';
+  let check: Record<string, unknown> = {ok: true, short_id: '0a0b0c0d', chip, known: false, resumable: true, reasons: []};
+  const fetcher = async (url: string, init?: RequestInit) => {
+    const path = String(url).replace(origin, '');
+    seen.push({path, body: init?.body ? JSON.parse(String(init.body)) : undefined});
+    if (path === '/auth/operator/session') return post({operator_id: 1, token: 'op_tok'});
+    if (path === '/registry/resume-check') return post(check);
+    if (path === '/registry/batches') return post({batch: {batch_id: 9}});
+    if (path === '/registry/cards') return post({stored: {}});
+    throw new Error('unexpected ' + path);
+  };
+  const api = new RegistryStoreApi(new RegistryClient({baseUrl: origin, fetcher}), origin);
+  await api.signIn('dread', 'pw');
+  expect(await api.resumeCheck(chip, '0a0b0c0d')).toEqual({short_id: '0a0b0c0d', chip, known: false, resumable: true, reasons: []});
+  expect(seen.at(-1)!.body).toEqual({chip, short_id: '0a0b0c0d'});
+  // an answer for another card, or one without a verdict, is never read as resumable
+  check = {...check, short_id: '99999999'};
+  await expect(api.resumeCheck(chip, '0a0b0c0d')).rejects.toThrow(/malformed/);
+  check = {ok: true, short_id: '0a0b0c0d', chip, reasons: []};
+  await expect(api.resumeCheck(chip, '0a0b0c0d')).rejects.toThrow(/malformed/);
+
+  const slotKeys = Array.from({length: 8}, (_, i) => String(i).repeat(64));
+  await api.postBatch({federation: 'f', count: 1, pinPolicy: 'batch'});
+  await api.postCard({id: '1f2e3d4c', at: 1, phase: 'done', ok: true, pinPolicy: 'batch', pinState: 'set', notesIssued: [], pending: true, slotKeys, chip, supersedes: '0a0b0c0d'} as any);
+  expect(seen.at(-1)!.body.supersedes).toBe('0a0b0c0d');
+  await api.postCard({id: '2f2e3d4c', at: 2, phase: 'done', ok: true, pinPolicy: 'batch', pinState: 'set', notesIssued: [], pending: true, slotKeys, chip} as any);
+  expect('supersedes' in seen.at(-1)!.body).toBe(false);
+});

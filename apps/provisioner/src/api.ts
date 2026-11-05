@@ -6,6 +6,7 @@ import type {
   ResetCheck,
   ResetCompletion,
   ResetRecorded,
+  ResumeCheck,
 } from './ops';
 
 /**
@@ -48,6 +49,7 @@ export type ServiceOperation =
   | 'list-cards'
   | 'list-federations'
   | 'manager-keys'
+  | 'resume-check'
   | 'reset-check'
   | 'complete-reset';
 
@@ -293,6 +295,11 @@ export interface CardRegistryRow {
    * manager keys on. Absent on a row from before O5.
    */
   readonly chip?: string;
+  /**
+   * The short id the card answered before a resume tap re-keyed it (OPS-PLAN
+   * O5); ops closes that row in the same transaction. Absent on every other row.
+   */
+  readonly supersedes?: string;
 }
 
 export interface OperatorSession {
@@ -470,6 +477,31 @@ export class RegistryClient extends HttpTransport {
       enc: json.enc as string,
       mac: json.mac as string,
       dek: json.dek as string,
+    };
+  }
+
+  /**
+   * POST /registry/resume-check — whether a card an install tap left keyed
+   * with no PIN may be finished. A reply that does not add up is never read
+   * as "resumable".
+   */
+  async resumeCheck(token: string, chip: string, shortId: string): Promise<ResumeCheck> {
+    const json = await this.post('/registry/resume-check', {
+      token,
+      body: {chip, short_id: shortId},
+      operation: 'resume-check',
+    });
+    if (json.short_id !== shortId || json.chip !== chip || typeof json.resumable !== 'boolean') {
+      throw new ApiServiceError('the resume check is malformed', 200, undefined, 'resume-check');
+    }
+    return {
+      short_id: shortId,
+      chip,
+      known: json.known === true,
+      resumable: json.resumable,
+      reasons: Array.isArray(json.reasons)
+        ? json.reasons.filter((r): r is string => typeof r === 'string')
+        : [],
     };
   }
 
@@ -709,6 +741,10 @@ export class RegistryStoreApi implements CardOps {
     return this.client.resetCheck(this.token(), shortId);
   }
 
+  resumeCheck(chip: string, shortId: string): Promise<ResumeCheck> {
+    return this.client.resumeCheck(this.token(), chip, shortId);
+  }
+
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {
     return this.client.completeReset(this.token(), completion);
   }
@@ -792,6 +828,7 @@ export class RegistryStoreApi implements CardOps {
         ? {slot_pubkeys: [...row.slotKeys]}
         : {}),
       ...(row.chip ? {chip: row.chip} : {}),
+      ...(row.supersedes && row.supersedes !== row.id ? {supersedes: row.supersedes} : {}),
     };
   }
 }

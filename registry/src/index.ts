@@ -24,6 +24,8 @@
  *              POST /registry/manager-keys       {chip, short_id?} -> the card's escrowed GP keys (managerKeys.ts)
  *              GET  /registry/cards/:id/reset-check   POST /registry/cards/:id/reset   (reset.ts)
  *                                                the reset's completion: card factory, chip's escrow released
+ *              POST /registry/resume-check       {chip, short_id}: may a lifted install be finished (resume.ts);
+ *                                                the finished row then names `supersedes`, closing the old one
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
@@ -84,7 +86,8 @@ import {
 } from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
 import {issueManagerKeys} from './managerKeys';
-import {completeReset, resetCheck, wasReset} from './reset';
+import {completeReset, resetCheck} from './reset';
+import {closedReason, closeSuperseded, parseSupersedes, pinIsSet, resumeCheck} from './resume';
 
 export interface Env {
   readonly REGISTRY: DurableObjectNamespace;
@@ -255,7 +258,19 @@ export class Registry {
       if (method !== 'POST') return fail(405, 'use GET or POST');
       const body = await objectBody(request);
       if (!body) return fail(400, 'the card row must be an object');
-      return json(200, {ok: true, stored: postCard(storage, op, body, now)});
+      // A resumed card names the short id it answered before; that row is
+      // closed in the same transaction, or nothing is stored (resume.ts).
+      const supersedes = parseSupersedes(body);
+      const stored = postCard(storage, op, body, now, card => {
+        if (supersedes !== null) closeSuperseded(sql, op, card, supersedes);
+      });
+      return json(200, {ok: true, stored});
+    }
+    if (path === '/registry/resume-check') {
+      if (method !== 'POST') return fail(405, 'use POST');
+      const body = await objectBody(request);
+      if (!body) return fail(400, 'expected {chip, short_id}');
+      return json(200, {ok: true, ...resumeCheck(sql, op, body)});
     }
     if (path === '/registry/manager-keys') {
       if (method !== 'POST') return fail(405, 'use POST');
@@ -334,9 +349,18 @@ export class Registry {
     if (caller.kind !== 'till') {
       return fail(403, 'only a till records charges and slot keys');
     }
-    if (wasReset(storage.sql, shortId)) {
+    const closed = closedReason(storage.sql, shortId);
+    if (closed?.reset) {
       // Its slot keys were deleted with the applet: nothing new may land under them.
       return fail(410, `card ${shortId} was reset; it takes no more charges`);
+    }
+    if (closed) {
+      // Its slot keys were replaced on the card when it was finished.
+      return fail(410, `card ${shortId} was finished as ${closed.replacedBy}; it takes no more charges`);
+    }
+    if (!pinIsSet(storage.sql, shortId)) {
+      // Nothing may be spent from it, so nothing may be put on it.
+      return fail(409, `card ${shortId} has no PIN set; it takes no charges or loads`);
     }
     const body = await objectBody(request);
     if (!body) return fail(400, 'expected a JSON object');
@@ -365,9 +389,18 @@ export class Registry {
     if (cardOwner(storage.sql, shortId) === null) {
       return fail(404, `no card ${shortId}`);
     }
-    if (wasReset(storage.sql, shortId)) {
+    const closed = closedReason(storage.sql, shortId);
+    if (closed?.reset) {
       // A load under deleted keys could never be spent: the card is blank now.
       return fail(410, `card ${shortId} was reset; load the card's new id`);
+    }
+    if (closed) {
+      // The card was finished under new keys: these are gone from it.
+      return fail(410, `card ${shortId} was finished as ${closed.replacedBy}; load that id`);
+    }
+    if (!pinIsSet(storage.sql, shortId)) {
+      // A card with no PIN is one the provisioner did not finish: nothing may be loaded on it.
+      return fail(409, `card ${shortId} has no PIN set; it takes no loads`);
     }
     expireLoads(storage, shortId, now);
     const method = request.method;

@@ -88,10 +88,20 @@ export function nextPhase(phase: CardPhase): CardPhase {
 /**
  * Cardkit's four stops are carried over unchanged — `StopKind` is imported,
  * never redefined — and the rest are this card's: two from § 5's "Stops"
- * table, and `noManagerKeys` (OPS-PLAN O5), when ops did not answer the
- * card's own keys and nothing was written.
+ * table, `noManagerKeys` (OPS-PLAN O5), when ops did not answer the card's
+ * own keys and nothing was written, and `needsReset`, a keyed card with a PIN
+ * this phone cannot prove, which only Settings → Reset a card recovers.
+ *
+ * A tap lifted while the card's keys or PIN were being written is not a stop
+ * at all: the loop keeps the batch's place for the same card's next tap,
+ * which finishes it (`installTap.ts`, `holdsPlace`).
  */
-export type CardStop = StopKind | 'differentCard' | 'pinNotSet' | 'noManagerKeys';
+export type CardStop =
+  | StopKind
+  | 'differentCard'
+  | 'pinNotSet'
+  | 'noManagerKeys'
+  | 'needsReset';
 
 /** Every stop, in § 5's table order. */
 export const CARD_STOPS: readonly CardStop[] = [
@@ -102,6 +112,7 @@ export const CARD_STOPS: readonly CardStop[] = [
   'differentCard',
   'pinNotSet',
   'noManagerKeys',
+  'needsReset',
 ];
 
 /**
@@ -119,6 +130,8 @@ const BLOCKS_BATCH: Record<CardStop, boolean> = {
   pinNotSet: true,
   // nothing was written: the next tap asks ops again
   noManagerKeys: false,
+  // nothing more was tried against the PIN: the card waits for a reset
+  needsReset: false,
 };
 
 /** The batch can also end on something that is not one card's: unanswered rows. */
@@ -206,6 +219,8 @@ export interface RecordRow extends CardOutcome {
    * The registry keeps them so a till can find the card's notes (OPS-PLAN § 5).
    */
   slotKeys?: readonly string[];
+  /** The short id this card answered before a resume tap re-keyed it. */
+  supersedes?: string;
 }
 
 /** The loop's live view: the next card's number and what the card is doing. */
@@ -257,6 +272,11 @@ export interface CardResult extends CardOutcome {
   pubkey?: readonly number[];
   /** All eight slot keys, slot 0 first, from a finished key setup. */
   slotKeys?: readonly (readonly number[])[];
+  /**
+   * The short id the card answered before a resume tap re-keyed it; the
+   * registry closes that row when this one is posted (OPS-PLAN O5).
+   */
+  supersedes?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +777,8 @@ export function StoreProvider({
     return {
       managerKeys: (chip, shortId) =>
         apiRef.current?.managerKeys?.(chip, shortId) ?? missing('the card-manager keys'),
+      resumeCheck: (chip, shortId) =>
+        apiRef.current?.resumeCheck?.(chip, shortId) ?? missing('the resume check'),
       resetCheck: shortId =>
         apiRef.current?.resetCheck?.(shortId) ?? missing('the reset check'),
       completeReset: completion =>

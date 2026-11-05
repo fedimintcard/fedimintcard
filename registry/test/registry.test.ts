@@ -1273,6 +1273,136 @@ describe('O5: reset in the provisioner', () => {
   });
 });
 
+describe('O5: finishing a card lifted after its rotation', () => {
+  const CHIP = 'cplc-v1:4790d3213041093363205547';
+  const OLD = '0a0b0c0d';
+  const NEW = '1e1f2021';
+
+  const other = async () => {
+    await hook('/test/operator', {name: 'other', password: 'another long password'});
+    return signIn('other', 'another long password');
+  };
+  const resumeCheck = async (token: string, shortId = OLD, chip = CHIP) => {
+    const res = await post('/registry/resume-check', token, {chip, short_id: shortId});
+    expect(res.status).toBe(200);
+    return (await res.json()) as {known: boolean; resumable: boolean; reasons: string[]; live_notes: number};
+  };
+  /** A row an older build could have posted: the card stopped with its PIN not set. */
+  async function stoppedRow(token: string, shortId = OLD) {
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId, chip: CHIP, pin_set: false}))).status).toBe(200);
+    return batchId;
+  }
+  const finished = (batchId: number, over: Partial<Record<string, unknown>> = {}) =>
+    card({short_id: NEW, batch_id: batchId, chip: CHIP, supersedes: OLD, ...over});
+  const replacedBy = async (shortId: string) => {
+    let out: unknown;
+    await runInDurableObject(stub(), async (_i, state) => {
+      out = (state.storage.sql.exec('SELECT replaced_by FROM cards WHERE short_id = ?', shortId).one() as {replaced_by: unknown}).replaced_by;
+    });
+    return out;
+  };
+
+  it('a card ops has no row for may be finished; the post stores the new card and nothing for the old id', async () => {
+    const token = await signIn();
+    expect(await resumeCheck(token)).toEqual(expect.objectContaining({known: false, resumable: true, reasons: []}));
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, finished(batchId))).status).toBe(200);
+    expect((await get(`/cards/${OLD}/slots`, null)).status).toBe(404);
+    expect((await get(`/cards/${NEW}/slots`, null)).status).toBe(200);
+  });
+
+  it('closes the stopped row in the same transaction: the old id answers 410, and a repeat changes nothing', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    await stoppedRow(token);
+    expect(await resumeCheck(token)).toEqual(expect.objectContaining({known: true, resumable: true, reasons: []}));
+    const batchId = await newBatch(token);
+    const res = await post('/registry/cards', token, finished(batchId));
+    expect(res.status).toBe(200);
+    expect(await replacedBy(OLD)).toBe(NEW);
+    expect((await get(`/cards/${OLD}/slots`, null)).status).toBe(410);
+    expect((await post(`/cards/${OLD}/load`, null, {version: 0, txid: txid(41), notes: []})).status).toBe(410);
+    expect((await post(`/cards/${OLD}/intent`, till.token, intent(0))).status).toBe(410);
+    // The new card is an ordinary one.
+    expect((await get(`/cards/${NEW}/slots`, null)).status).toBe(200);
+    // An outbox retry: the same row, the old one already closed by it.
+    expect((await post('/registry/cards', token, finished(batchId))).status).toBe(200);
+    expect(await replacedBy(OLD)).toBe(NEW);
+    // The old id is closed for good: a check on it, or another card naming it, is refused.
+    const again = await resumeCheck(token);
+    expect(again.resumable).toBe(false);
+    expect((await post('/registry/cards', token, card({short_id: '2a2b2c2d', batch_id: batchId, chip: CHIP, supersedes: OLD}))).status).toBe(409);
+    // A reset check on the old id says why it is closed.
+    const reset = (await (await get(`/registry/cards/${OLD}/reset-check`, token)).json()) as {resettable: boolean; reasons: string[]};
+    expect(reset.resettable).toBe(false);
+    expect(reset.reasons[0]).toContain(NEW);
+  });
+
+  it('refuses while the old row holds value, and stores nothing', async () => {
+    const token = await signIn();
+    await stoppedRow(token);
+    await hook('/test/note', {short_id: OLD, nonce: nonce(7), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+    const c = await resumeCheck(token);
+    expect(c).toEqual(expect.objectContaining({resumable: false, live_notes: 1}));
+    expect(c.reasons).toEqual(['1 live note, 1024000 msat']);
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, finished(batchId))).status).toBe(409);
+    expect((await get(`/cards/${NEW}/slots`, null)).status).toBe(404);
+    expect(await replacedBy(OLD)).toBeNull();
+  });
+
+  it('refuses another operator’s row, a row with its PIN set, or one on another chip', async () => {
+    const token = await signIn();
+    const them = await other();
+    await stoppedRow(them);
+    const c = await resumeCheck(token);
+    expect(c.resumable).toBe(false);
+    expect(c.reasons[0]).toContain('another operator');
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, finished(batchId))).status).toBe(409);
+    expect(await replacedBy(OLD)).toBeNull();
+
+    // This operator's row, but finished (PIN set): never closed by a resume.
+    const pinned = '3a3b3c3d';
+    expect((await post('/registry/cards', token, card({short_id: pinned, batch_id: batchId, chip: 'cplc-v1:' + '2'.repeat(24)}))).status).toBe(200);
+    expect((await resumeCheck(token, pinned, 'cplc-v1:' + '2'.repeat(24))).reasons).toEqual([`ops records card ${pinned} with its PIN set`]);
+    expect((await post('/registry/cards', token, card({short_id: NEW, batch_id: batchId, chip: 'cplc-v1:' + '2'.repeat(24), supersedes: pinned}))).status).toBe(409);
+
+    // A stopped row of this operator's, on another chip than the one being finished.
+    await stoppedRow(token, '4a4b4c4d');
+    expect((await resumeCheck(token, '4a4b4c4d', 'cplc-v1:' + '3'.repeat(24))).reasons).toContain('ops recorded card 4a4b4c4d on another chip');
+  });
+
+  it('refuses a malformed supersedes, one naming the card itself, or a finished row without its chip or PIN', async () => {
+    const token = await signIn();
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, finished(batchId, {supersedes: 'XYZ'}))).status).toBe(400);
+    expect((await post('/registry/cards', token, finished(batchId, {supersedes: NEW}))).status).toBe(400);
+    expect((await post('/registry/cards', token, finished(batchId, {chip: undefined}))).status).toBe(400);
+    expect((await post('/registry/cards', token, finished(batchId, {pin_set: false}))).status).toBe(400);
+    expect((await post('/registry/resume-check', token, {chip: 'nope', short_id: OLD})).status).toBe(400);
+    const till = await newTill(token);
+    expect((await post('/registry/resume-check', till.token, {chip: CHIP, short_id: OLD})).status).toBe(403);
+  });
+
+  it('a row whose PIN is not set takes no load and no charge', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    await stoppedRow(token);
+    expect((await get(`/cards/${OLD}/slots`, null)).status).toBe(409);
+    const load = {version: 0, txid: txid(42), notes: [{slot: 1, amount_msat: 1_000, nonce: '02' + slots(OLD)[1]!, blinding_key: 'e'.repeat(64), out_idx: 0}]};
+    const res = await post(`/cards/${OLD}/load`, null, load);
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('no PIN set');
+    expect((await post(`/cards/${OLD}/intent`, till.token, intent(0))).status).toBe(409);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM holder_loads').one()).toEqual({n: 0});
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM notes').one()).toEqual({n: 0});
+    });
+  });
+});
+
 describe('migrations', () => {
   it('adopts the first deployment’s tables and rows, and gives its batches to operator 1', async () => {
     const legacy = env.REGISTRY.get(env.REGISTRY.idFromName('legacy-upgrade'));

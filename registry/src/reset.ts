@@ -65,7 +65,7 @@ export interface ResetCheck extends CardHoldings {
   readonly reset_at: number | null;
 }
 
-function holdings(sql: Sql, shortId: string): CardHoldings {
+export function holdings(sql: Sql, shortId: string): CardHoldings {
   const notes = (status: string) =>
     sql
       .exec(
@@ -100,6 +100,30 @@ export function resetCheck(sql: Sql, shortId: string): ResetCheck {
   if (card.reset_at !== null) {
     reasons.push('already reset: the card is blank, on its factory keys');
   }
+  if (card.replaced_by !== null) {
+    reasons.push(`closed: the card was finished as ${card.replaced_by}; reset that id instead`);
+  }
+  reasons.push(...holdingReasons(held));
+  const empty = isEmpty(held);
+  return {
+    short_id: shortId,
+    chip: card.chip,
+    ...held,
+    empty,
+    resettable: empty && card.reset_at === null && card.replaced_by === null,
+    reasons,
+    reset_at: card.reset_at,
+  };
+}
+
+/** Nothing ops can see under the short id: no note live or pending, nothing open. */
+export function isEmpty(held: CardHoldings): boolean {
+  return held.live_notes === 0 && held.pending_notes === 0 && held.open_charges === 0 && held.open_loads === 0;
+}
+
+/** What ops holds under a short id, one line each; empty when it holds nothing. */
+export function holdingReasons(held: CardHoldings): string[] {
+  const reasons: string[] = [];
   if (held.live_notes > 0) {
     reasons.push(`${plural(held.live_notes, 'live note', 'live notes')}, ${held.live_msat} msat`);
   }
@@ -112,17 +136,7 @@ export function resetCheck(sql: Sql, shortId: string): ResetCheck {
   if (held.open_loads > 0) {
     reasons.push(`${plural(held.open_loads, 'open load', 'open loads')} from a holder’s wallet`);
   }
-  const empty =
-    held.live_notes === 0 && held.pending_notes === 0 && held.open_charges === 0 && held.open_loads === 0;
-  return {
-    short_id: shortId,
-    chip: card.chip,
-    ...held,
-    empty,
-    resettable: empty && card.reset_at === null,
-    reasons,
-    reset_at: card.reset_at,
-  };
+  return reasons;
 }
 
 /** Whether the card was reset: its short id takes no more value. */

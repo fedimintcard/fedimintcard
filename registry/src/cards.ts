@@ -110,7 +110,7 @@ export function listBatches(sql: Sql, operatorId: number): RegistryBatch[] {
     }));
 }
 
-function batchOwner(sql: Sql, batchId: number): number | null {
+export function batchOwner(sql: Sql, batchId: number): number | null {
   const row = sql
     .exec('SELECT operator_id FROM batches WHERE batch_id = ?', batchId)
     .toArray()[0] as {operator_id: number} | undefined;
@@ -153,6 +153,11 @@ export interface StoredCard extends CardBody {
   readonly received_at: number;
   /** When the provisioner took the card back to factory (`reset.ts`); its short id takes nothing new after. */
   readonly reset_at: number | null;
+  /**
+   * The short id the card was finished under when a resume tap re-keyed it
+   * (`resume.ts`); this short id takes nothing new after.
+   */
+  readonly replaced_by: string | null;
 }
 
 /**
@@ -233,6 +238,8 @@ export function storedCard(sql: Sql, shortId: string): StoredCard | null {
     chip: row.chip === null || row.chip === undefined ? null : String(row.chip),
     received_at: Number(row.received_at),
     reset_at: row.reset_at === null || row.reset_at === undefined ? null : Number(row.reset_at),
+    replaced_by:
+      row.replaced_by === null || row.replaced_by === undefined ? null : String(row.replaced_by),
   };
 }
 
@@ -262,6 +269,11 @@ export function postCard(
   operatorId: number,
   r: Record<string, unknown>,
   now: number,
+  /**
+   * Runs in the same transaction, before the row is written: a resumed card
+   * closes the row it supersedes here (`resume.ts`), and a throw stores nothing.
+   */
+  alongside?: (card: CardBody) => void,
 ): StoredCard {
   const card = parseCard(r);
   const sql = storage.sql;
@@ -269,7 +281,10 @@ export function postCard(
   if (owner !== operatorId) {
     throw new NotFound(`no batch ${card.batch_id} for this operator`);
   }
-  return storage.transactionSync(() => insertCard(sql, operatorId, card, now));
+  return storage.transactionSync(() => {
+    alongside?.(card);
+    return insertCard(sql, operatorId, card, now);
+  });
 }
 
 /**
@@ -316,7 +331,7 @@ export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: nu
   if (card.chip !== null) {
     linkChip(sql, card.chip, card.short_id, operatorId);
   }
-  return {...card, received_at: now, reset_at: null};
+  return {...card, received_at: now, reset_at: null, replaced_by: null};
 }
 
 export function listCards(

@@ -53,32 +53,25 @@ import {
   INS_VERIFY_PIN,
   keyApdu,
   pinApdu,
+  pinStatusApdu,
   selectApdu,
   SW_BLOCKED,
   SW_CONDITIONS,
   SW_OK,
+  SW_PIN_NOT_SET,
+  SW_WRONG_LENGTH,
+  type PinStatus,
 } from './cardSetup';
 import {chipAndKeys, forget} from './installTap';
 import type {CardOps, ResetCheck, ResetCompletion, ResetRecorded} from './ops';
 import {shortIdOf} from './store';
 
-/** VERIFY_PIN: no PIN was ever set on this applet. */
-export const SW_PIN_NOT_SET = 0x6984;
-/** VERIFY_PIN refused for its length, before any try is spent: a PIN is set and not blocked. */
-export const SW_WRONG_LENGTH = 0x6700;
-
-/** What the applet's PIN is, read without spending a try. */
-export type PinStatus = 'set' | 'blocked' | 'notSet';
-
-/**
- * VERIFY_PIN with three bytes, shorter than any PIN. The applet answers a
- * blocked card `69 83` and an unset PIN `69 84` before it reads the data, and
- * refuses the length (`67 00`) before it spends a try
- * (FedimintCardApplet.verifyPin), so this tells the three apart for free.
- */
-export function pinStatusApdu(): number[] {
-  return [0xb0, INS_VERIFY_PIN, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00];
-}
+export {
+  pinStatusApdu,
+  SW_PIN_NOT_SET,
+  SW_WRONG_LENGTH,
+  type PinStatus,
+} from './cardSetup';
 
 /* ------------------------------------------------------------------------- */
 /* The journal and the outbox                                                */

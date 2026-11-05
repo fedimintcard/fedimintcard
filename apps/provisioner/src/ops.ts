@@ -61,9 +61,25 @@ export interface ResetRecorded {
   readonly stranded_notes: number;
 }
 
+/**
+ * `POST /registry/resume-check`: whether a card an install tap left keyed
+ * with no PIN may be finished. `short_id` is the one the card answers now;
+ * ops usually has no row for it (only finished cards are posted).
+ */
+export interface ResumeCheck {
+  readonly short_id: string;
+  readonly chip: string;
+  /** Ops has a row under this short id. */
+  readonly known: boolean;
+  readonly resumable: boolean;
+  /** Why not, in ops' words, one line each. */
+  readonly reasons: readonly string[];
+}
+
 /** The ops calls a card's lifecycle needs; each needs a signed-in operator. */
 export interface CardOps {
   managerKeys(chip: string, shortId?: string): Promise<ManagerKeysReply>;
+  resumeCheck(chip: string, shortId: string): Promise<ResumeCheck>;
   resetCheck(shortId: string): Promise<ResetCheck>;
   completeReset(completion: ResetCompletion): Promise<ResetRecorded>;
 }

@@ -22,6 +22,12 @@
  * `actions.recordCard`, the only way card state enters the store; the counter,
  * the stop list and the acknowledgement gate come back from `useBatch()`.
  *
+ * A tap lifted while the card's keys or PIN were being written is not
+ * recorded: the batch keeps its place, and the same card's next tap (in this
+ * batch or a later one) resumes it (`installTap.ts`, `holdsPlace`). The PIN
+ * such a tap sent is kept in `useAttemptedPin`'s ref for that chip, so the
+ * next tap can prove a PIN whose answer was lost.
+ *
  * A per-card PIN is generated here and written to `pin.ts`'s reveal slot. It
  * is shown with the finished card until the next card's tap starts, as the
  * Cashu provisioner shows it, and nowhere else. A batch PIN is read from the
@@ -33,8 +39,8 @@ import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {CardFigure} from '../CardFigure';
 
-import {installTap} from '../installTap';
-import {generatePin, useBatchPin, usePinReveal} from '../pin';
+import {holdsPlace, installTap} from '../installTap';
+import {generatePin, useAttemptedPin, useBatchPin, usePinReveal} from '../pin';
 import {phaseMessage, setCardMessage, withCard} from '../session';
 import {CALM, LOOP, STATE} from '../strings';
 import {
@@ -67,6 +73,7 @@ export const STOP_NAMES: Record<CardStop, string> = {
   differentCard: 'Different card',
   pinNotSet: 'PIN not set',
   noManagerKeys: 'No manager keys',
+  needsReset: 'Needs a reset',
 };
 
 /**
@@ -129,6 +136,9 @@ export function LoopScreen({
   const [waiting, setWaiting] = useState(false);
   const [line, setLine] = useState<string | null>(null);
   const [stopShown, setStopShown] = useState<CardStop | null>(null);
+  // A tap that kept the batch's place for the same card: what to say about it.
+  const [held, setHeld] = useState<{kind?: CardStop; reason?: string} | null>(null);
+  const attempted = useAttemptedPin();
   const cancelled = useRef(false);
   // Ends the wait for a card: `withCard` cancels the NFC request on abort.
   const abort = useRef<AbortController | null>(null);
@@ -168,6 +178,7 @@ export function LoopScreen({
     setWaiting(true);
     setBusy(true);
     setStopShown(null);
+    setHeld(null);
     actions.setLoop({phase: 'probe', cardActive: true, loadProgress: null});
     setLine(phaseMessage('probe'));
 
@@ -175,6 +186,22 @@ export function LoopScreen({
     // card's row must name the phase the engine actually reached.
     let phase: CardPhase = 'probe';
     let pubkey: readonly number[] | undefined;
+    // The chip, once read; whether this tap's PIN went to it; whether it is a resume.
+    let chipSeen: string | undefined;
+    let pinSent = false;
+    let resuming = false;
+    // A lost tap whose PIN went out keeps it for the same card's next tap.
+    const keepAttempt = () => {
+      if (pinSent && chipSeen !== undefined) {
+        attempted.remember(chipSeen, pin);
+      }
+    };
+    // A card that finished or stopped for good drops the PIN kept for it.
+    const dropAttempt = () => {
+      if (chipSeen !== undefined && attempted.forChip(chipSeen) !== null) {
+        attempted.wipe();
+      }
+    };
     const enter = (next: CardPhase, message: string) => {
       phase = next;
       actions.setLoop({phase: next, loadProgress: null});
@@ -191,6 +218,14 @@ export function LoopScreen({
           return installTap(tx, {
             pin,
             managerKeys: chip => ops.managerKeys(chip),
+            resumeCheck: (chip, shortId) => ops.resumeCheck(chip, shortId),
+            attemptedPin: chip => attempted.forChip(chip),
+            onChip: chip => {
+              chipSeen = chip;
+            },
+            onResume: () => {
+              resuming = true;
+            },
             random: length =>
               Array.from({length}, () => (Math.random() * 256) | 0),
             now: Date.now,
@@ -219,6 +254,9 @@ export function LoopScreen({
               }
             },
             onSetupStep: step => {
+              if (step === 'setPin') {
+                pinSent = true;
+              }
               if (step === 'keys') {
                 enter('keySetup', LOOP.phaseKeys);
               } else if (step === 'setPin') {
@@ -234,7 +272,19 @@ export function LoopScreen({
         throw new Error('CardSessionCancelled');
       }
       const {installed, setup, chip} = run;
+      if (holdsPlace({lost: false, result: run})) {
+        // Nothing recorded: the same card's next tap finishes it.
+        keepAttempt();
+        setHeld(
+          installed.ok
+            ? {reason: setup && !setup.ok ? setup.reason : undefined}
+            : {kind: installed.kind, reason: installed.reason},
+        );
+        setLine(LOOP.sameCard);
+        return;
+      }
       if (!installed.ok) {
+        dropAttempt();
         actions.recordCard({
           ok: false,
           phase: foldedPhase(installed.phase),
@@ -250,7 +300,8 @@ export function LoopScreen({
         return;
       }
       if (!setup || !setup.ok) {
-        // Installed, but no keys or no PIN: the card cannot be handed out.
+        // Installed, but its PIN refused: the card cannot be handed out.
+        dropAttempt();
         const keysDone = setup !== null && setup.step !== 'select' && setup.step !== 'keys';
         actions.recordCard({
           ok: false,
@@ -269,6 +320,9 @@ export function LoopScreen({
 
       pubkey = setup.keys[0];
       const id = shortIdOf(pubkey);
+      // The PIN on the card: this tap's, or the one a lifted tap sent it.
+      const cardPin = run.finishedWithAttemptedPin && chip ? attempted.forChip(chip) : pin;
+      dropAttempt();
       phase = 'done';
       actions.recordCard({
         ok: true,
@@ -279,10 +333,12 @@ export function LoopScreen({
         pubkey,
         slotKeys: setup.keys,
         chip,
+        supersedes:
+          run.resumedFrom !== undefined && run.resumedFrom !== id ? run.resumedFrom : undefined,
       });
-      if (policy === 'perCard') {
-        reveal.grant(id, pin);
-        setShownPin({n: batch.records.length + 1, id, pin});
+      if (policy === 'perCard' && cardPin !== null) {
+        reveal.grant(id, cardPin);
+        setShownPin({n: batch.records.length + 1, id, pin: cardPin});
       }
       setLine(LOOP.finished(id));
     } catch (e) {
@@ -293,21 +349,28 @@ export function LoopScreen({
         setLine(cancelled.current ? LOOP.waitStopped : LOOP.noCard);
         return;
       }
+      // Widened back: `phase` and the flags are assigned inside callbacks TS
+      // cannot follow.
+      const reached = phase as CardPhase;
+      if (holdsPlace({lost: true, phase: reached, resuming: resuming as boolean})) {
+        // Lost while its keys or PIN were written, or while it was resumed:
+        // the card is ours and finishes on its next tap, so the batch keeps
+        // its place and nothing is recorded.
+        keepAttempt();
+        setHeld({});
+        setLine(LOOP.sameCard);
+        return;
+      }
       // A cancelled run is still a card's outcome (`pulled`), and the store
       // refuses a failed record that names no stop: every branch here names one.
-      // `keySetup` and `setPin` are one step to the operator: a card that left
-      // during either has no PIN the batch can rely on.
-      // Widened back: `phase` is assigned inside callbacks TS cannot follow.
-      const reached = phase as CardPhase;
-      const keying = reached === 'keySetup' || reached === 'setPin';
-      const stop: CardStop = keying ? 'pinNotSet' : 'pulled';
+      const stop: CardStop = 'pulled';
       try {
         actions.recordCard({
           ok: false,
           phase: reached,
           stop,
           pinPolicy: policy,
-          pinState: keying ? 'notSet' : 'unknown',
+          pinState: 'unknown',
           notesIssued: [],
           pubkey,
           reason:
@@ -324,10 +387,19 @@ export function LoopScreen({
       setWaiting(false);
       actions.setLoop({cardActive: false, loadProgress: null});
     }
-  }, [actions, batch, batchPin, blockedBy, busy, config, ops, reveal]);
+  }, [actions, attempted, batch, batchPin, blockedBy, busy, config, ops, reveal]);
 
   // The shown PIN never outlives the screen.
   useEffect(() => () => reveal.wipe(), [reveal]);
+
+  // A PIN kept for a lifted card never outlives its batch.
+  const running = batch?.phase === 'running';
+  useEffect(() => {
+    if (!running) {
+      attempted.wipe();
+      setHeld(null);
+    }
+  }, [running, attempted]);
 
   // Once, on the first render after START: arm card 1 without a third press.
   const armed = useRef(false);
@@ -354,7 +426,7 @@ export function LoopScreen({
       : loop?.loadProgress
         ? loop.loadProgress.index / Math.max(1, loop.loadProgress.of)
         : 0;
-  const figureState = stopShown
+  const figureState = stopShown || held
     ? 'danger'
     : !busy && records.length > 0 && records[records.length - 1]?.ok
       ? 'done'
@@ -375,9 +447,11 @@ export function LoopScreen({
     ? line ?? (loop?.phase ? phaseMessage(loop.phase) : LOOP.tap)
     : finished
       ? LOOP.allDone
-      : stopShown
-        ? LOOP.tryNext
-        : line ?? LOOP.tap;
+      : held
+        ? LOOP.sameCard
+        : stopShown
+          ? LOOP.tryNext
+          : line ?? LOOP.tap;
 
   return (
     <Screen
@@ -464,6 +538,18 @@ export function LoopScreen({
               onPress={() => actions.acknowledgeStop(blockedBy)}
             />
           </StopPanel>
+        ) : held ? (
+          <StopPanel
+            title={LOOP.heldTitle}
+            name={LOOP.heldName}
+            what={
+              held.kind === 'noManagerKeys'
+                ? stopWhat(held.kind, held.reason)
+                : LOOP.heldWhat
+            }
+            now={LOOP.heldNow}
+            testID="loop-held"
+          />
         ) : stopShown ? (
           <StopPanel
             title={LOOP.cardStopped}
@@ -517,7 +603,15 @@ export function LoopScreen({
       <View style={local.footer}>
         {!finished && !blockedBy ? (
           <PrimaryButton
-            title={busy ? (waiting ? LOOP.waiting : LOOP.keepStill) : LOOP.install(cardNumber)}
+            title={
+              busy
+                ? waiting
+                  ? LOOP.waiting
+                  : LOOP.keepStill
+                : held
+                  ? LOOP.finishCard(cardNumber)
+                  : LOOP.install(cardNumber)
+            }
             onPress={() => {
               void runCard();
             }}
