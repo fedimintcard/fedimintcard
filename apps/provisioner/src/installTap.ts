@@ -195,7 +195,7 @@ export async function chipAndKeys(
  * card's own keys if it is still on the factory set, then keys and PINs the
  * card. `before` is what `probeApplet` found; a keyed card never gets here.
  */
-export async function installRotateFinish(
+async function installRotateFinish(
   tx: Transceiver,
   before: 'none' | 'unkeyed',
   own: KeySet,

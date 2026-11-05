@@ -151,9 +151,8 @@ export interface CardBody {
 
 export interface StoredCard extends CardBody {
   readonly received_at: number;
-  /** When the card was reset in the provisioner, and the short id it carries since. */
+  /** When the provisioner took the card back to factory (`reset.ts`); its short id takes nothing new after. */
   readonly reset_at: number | null;
-  readonly replaced_by: string | null;
 }
 
 /**
@@ -234,7 +233,6 @@ export function storedCard(sql: Sql, shortId: string): StoredCard | null {
     chip: row.chip === null || row.chip === undefined ? null : String(row.chip),
     received_at: Number(row.received_at),
     reset_at: row.reset_at === null || row.reset_at === undefined ? null : Number(row.reset_at),
-    replaced_by: row.replaced_by === null || row.replaced_by === undefined ? null : String(row.replaced_by),
   };
 }
 
@@ -318,7 +316,7 @@ export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: nu
   if (card.chip !== null) {
     linkChip(sql, card.chip, card.short_id, operatorId);
   }
-  return {...card, received_at: now, reset_at: null, replaced_by: null};
+  return {...card, received_at: now, reset_at: null};
 }
 
 export function listCards(

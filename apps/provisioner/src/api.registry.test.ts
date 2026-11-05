@@ -98,7 +98,7 @@ test('federation names come from the registry by decoded id; malformed rows are 
   expect(await api.federationNames()).toEqual({[fed]: 'Island Bitcoin'});
 });
 
-test('O5: manager keys are checked before they reach a card; a reset and a card row carry the chip', async () => {
+test('O5: manager keys are checked before they reach a card; a reset completion and a card row carry the chip', async () => {
   const seen: {path: string; body: any}[] = [];
   const origin = 'https://registry.test';
   const chip = 'cplc-v1:4790d3213041093363205547';
@@ -110,9 +110,9 @@ test('O5: manager keys are checked before they reach a card; a reset and a card 
     if (path === '/registry/manager-keys') return post({ok: true, ...keys});
     if (path === '/registry/cards/0a0b0c0d/reset-check') {
       return post({ok: true, short_id: '0a0b0c0d', chip, empty: false, resettable: false, reasons: ['1 live note, 1000 msat'],
-        live_notes: 1, live_msat: 1000, pending_notes: 0, pending_msat: 0, open_charges: 0, open_loads: 0, replaced_by: null});
+        live_notes: 1, live_msat: 1000, pending_notes: 0, pending_msat: 0, open_charges: 0, open_loads: 0});
     }
-    if (path === '/registry/cards/0a0b0c0d/reset') return post({ok: true, stranded: {live_notes: 1, pending_notes: 0}});
+    if (path === '/registry/cards/0a0b0c0d/reset') return post({ok: true, released: true, stranded: {live_notes: 1, pending_notes: 0}});
     if (path === '/registry/batches') return post({batch: {batch_id: 9}});
     if (path === '/registry/cards') return post({stored: {}});
     throw new Error('unexpected ' + path);
@@ -129,15 +129,14 @@ test('O5: manager keys are checked before they reach a card; a reset and a card 
   const check = await api.resetCheck('0a0b0c0d');
   expect(check).toEqual(expect.objectContaining({resettable: false, live_notes: 1, reasons: ['1 live note, 1000 msat']}));
 
-  const slotKeys = Array.from({length: 8}, (_, i) => String(i).repeat(64));
-  const recorded = await api.recordReset('0a0b0c0d', {short_id: '1f2e3d4c', installed_at: 5, slot_pubkeys: slotKeys, chip});
-  expect(recorded).toEqual({old_short_id: '0a0b0c0d', short_id: '1f2e3d4c', stranded_notes: 1});
+  const completion = {short_id: '0a0b0c0d', chip, gp_key_version: 1, manager_keys: 'factory', package: 'absent', verified_at: 5} as const;
+  const recorded = await api.completeReset(completion);
+  expect(recorded).toEqual({short_id: '0a0b0c0d', released: true, stranded_notes: 1});
   const body = seen.find(x => x.path.endsWith('/reset'))!.body;
-  expect(body).toEqual(expect.objectContaining({short_id: '1f2e3d4c', pin_set: true, pin_policy: 'perCard', notes_issued: 0, chip}));
-  expect(Object.keys(body).sort()).toEqual(
-    ['chip', 'installed_at', 'load_sha256', 'notes_issued', 'pin_policy', 'pin_set', 'short_id', 'slot_pubkeys'],
-  );
+  // the proof and nothing else: no keys, no PIN, no new card row
+  expect(body).toEqual(completion);
 
+  const slotKeys = Array.from({length: 8}, (_, i) => String(i).repeat(64));
   await api.postBatch({federation: 'f', count: 1, pinPolicy: 'batch'});
   await api.postCard({id: '1f2e3d4c', at: 1, phase: 'done', ok: true, pinPolicy: 'batch', pinState: 'set', notesIssued: [], pending: true, slotKeys, chip} as any);
   expect(seen.at(-1)!.body.chip).toBe(chip);

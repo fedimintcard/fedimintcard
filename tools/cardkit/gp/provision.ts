@@ -251,23 +251,23 @@ export interface RotateResult extends RunResult<RotatePhase> {
   rotated?: boolean;
 }
 
-/** A refusal of this module's own, before the card is touched further. */
-class Guard extends Error {
+/** A refusal of this module's own, before the card is touched further. Shared with gp/reset.ts. */
+export class Guard extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'Guard';
   }
 }
 
-function expectOk(reply: Reply, ins: number): Reply {
+export function expectOk(reply: Reply, ins: number): Reply {
   if (reply.sw !== 0x9000) {
     throw new CardError(reply.sw, ins);
   }
   return reply;
 }
 
-/** The bookkeeping of one run: the phase, the clock, the records, the events. */
-class Run<P extends string> {
+/** The bookkeeping of one run: the phase, the clock, the records, the events. Shared with gp/reset.ts. */
+export class Run<P extends string> {
   phase: P;
   readonly records: ApduRecord[] = [];
   readonly timings: PhaseTiming[] = [];

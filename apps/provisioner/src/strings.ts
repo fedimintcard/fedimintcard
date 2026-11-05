@@ -190,10 +190,10 @@ export const SETTINGS = {
   keepSession: 'Stay signed in',
   cards: 'Cards',
   resetTitle: 'Reset a card',
-  resetSub: 'Wipe an empty card and set it up again, with a new PIN',
+  resetSub: 'Take an empty card back to its factory state',
   resetBlocked: 'A batch is running. End it before resetting a card.',
   cardsHelp:
-    'Reset a card that is empty: the card is wiped, set up again with new keys and a new PIN, and comes back as a new card. Ops must show nothing on it, and the holder types their PIN to agree.',
+    'Reset a card that is empty: the Fedimint applet is deleted and the card goes back to the chip maker\'s keys, blank. Ops must show nothing on it, and the holder types their PIN to agree. To use it again, tap it in a new batch.',
 } as const;
 
 /** Settings → Reset a card (OPS-PLAN O5). */
@@ -202,7 +202,7 @@ export const RESET = {
   intro:
     'Hold the card to the phone. The app reads which card it is and asks ops whether it may be reset. Nothing is changed by this tap.',
   help:
-    'A reset deletes the card\'s applet and installs it again: the card gets new keys, a new short id and a new PIN, and ops links the old record to the new one. Value on the card would be lost, so ops refuses while it shows a live or pending note, an open charge or an open load. Ops cannot see a load made around it, so the holder\'s PIN is the consent. Other applets on the chip are never touched.',
+    'A reset deletes the card\'s Fedimint applet and puts the card back on the chip maker\'s keys, then logs in with those keys to prove it. The card is blank afterwards: ops marks the old record reset and frees the chip, and a new batch can install it again. Value on the card would be lost, so ops refuses while it shows a live or pending note, an open charge or an open load. Ops cannot see a load made around it, so the holder\'s PIN is the consent. Other applets on the chip are never touched.',
   read: 'Read the card',
   reading: 'Hold the card to the phone…',
   card: 'Card',
@@ -229,17 +229,19 @@ export const RESET = {
     check: 'Asking ops',
     consent: 'Checking the holder\'s PIN',
     chip: 'Reading the chip',
-    install: 'Wiping and installing — keep the card still',
-    rotate: 'Locking the card to its own keys',
-    keys: 'Making the card\'s keys',
-    pin: 'Setting the new PIN',
+    erase: 'Deleting the applet — keep the card still',
+    restore: 'Putting back the factory keys',
+    prove: 'Checking the card is blank',
   } as const,
-  doneTitle: (id: string) => `Reset · now …${id.slice(-4).toUpperCase()}`,
-  newPin: 'The card\'s new PIN',
-  newPinBody: 'Write it down or hand it over with the card. It is not shown again.',
-  recorded: 'Ops has the new card and links the old one to it.',
-  notRecorded: 'The card is finished, but ops has not recorded it yet. Record it before closing.',
-  record: 'Record now',
+  doneTitle: (id: string) => `Card …${id.slice(-4).toUpperCase()} is reset`,
+  doneBody:
+    'The card is blank and back on its factory keys. To use it again, tap it in a new batch: it gets its keys back from ops and a new short id.',
+  recorded: 'Ops has the reset: the old record is closed and the chip is free.',
+  notRecorded:
+    'Ops has not been told yet. The card itself is finished; this phone keeps the record and sends it when ops answers, at the latest the next time you open Reset a card.',
+  waiting: (n: number) =>
+    `${n} finished ${n === 1 ? 'reset is' : 'resets are'} waiting to be sent to ops.`,
+  record: 'Send to ops now',
   stranded: (n: number) =>
     `Ops still held ${n} ${n === 1 ? 'note' : 'notes'} under the old card. They cannot be spent now.`,
   done: 'Done',
@@ -250,7 +252,7 @@ export const RESET = {
   finish: 'Finish the reset',
   forget: 'Forget the unfinished reset',
   forgetConfirm:
-    'Only if the card is lost or was reset elsewhere: a wiped card cannot be finished without this record.',
+    'Only if the card is lost or was reset elsewhere: a card part way through cannot be finished without this record.',
   noCard: 'No card was read before the scan closed.',
   notYours: 'Ops has no such card for this operator: it is unknown, or another operator\'s.',
   stops: {
@@ -261,15 +263,13 @@ export const RESET = {
     pinRequired: 'The holder\'s PIN is needed',
     journal: 'The reset could not be saved on this phone; nothing was changed',
     otherOperator: 'Another operator\'s reset is unfinished on this phone',
-    recordPending: 'Only the record is left',
     pulled: 'The card left the phone',
     refused: 'The card refused',
     wrongKeys: 'Neither the factory keys nor the card\'s own keys work',
-    guarded: 'The card refused',
+    guarded: 'The reset stopped to keep the card safe',
     noManagerKeys: 'Ops did not answer the card\'s manager keys',
-    notFinished: 'The card\'s keys or PIN did not finish',
   },
-  resumable: 'The card may be wiped now. Hold the same card to the phone to finish.',
+  resumable: 'The card may be part way through. Hold the same card to the phone to finish.',
   untouched: 'The card is unchanged.',
   identify: {
     noApplet: 'This card has no Fedimint applet: there is nothing to reset. A blank card goes through a batch.',

@@ -10,8 +10,9 @@
  *   Worker secret, 32 bytes hex), salt `fedimintcard/card-manager/v<version>`,
  *   info `gp-enc`|`gp-mac`|`gp-dek` followed by the chip id, 16 bytes each:
  *   the SCP02 3DES keys the J3R180 takes. The chip id is the card's CPLC
- *   (`tools/cardkit/gp/identity.ts`), written by the chip maker, so a card
- *   keeps the same set across a reset; its short id does not survive one.
+ *   (`tools/cardkit/gp/identity.ts`), written by the chip maker, so a chip
+ *   reinstalled after a reset gets the same set again; its short id does not
+ *   survive the reset.
  * - **Escrow.** The derived bytes are stored with the chip, the operator who
  *   first asked, the key version and when. A repeat for the same chip answers
  *   the stored set, so a phone that lost the answer (or the card's PUT KEY
@@ -21,6 +22,10 @@
  *   operator gets a 409 that says so and no keys. Not a 404: the caller is
  *   holding the chip, so its existence is no secret, and "no such chip" would
  *   send them looking for a bug instead of the card's owner.
+ * - **Release.** A completed reset (`reset.ts`) proves the card is back on the
+ *   factory keys and deletes the chip's row in the same transaction, so the
+ *   chip is nobody's: the next operator to ask owns it, and gets the same
+ *   bytes again from the same master.
  * - **No master, no keys.** Without the secret this route answers 503 and
  *   nothing else changes, so a deployment can run without it until its first
  *   card is rotated.

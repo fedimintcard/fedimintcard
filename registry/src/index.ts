@@ -23,6 +23,7 @@
  *              POST /registry/cards              GET /registry/cards?batch_id=
  *              POST /registry/manager-keys       {chip, short_id?} -> the card's escrowed GP keys (managerKeys.ts)
  *              GET  /registry/cards/:id/reset-check   POST /registry/cards/:id/reset   (reset.ts)
+ *                                                the reset's completion: card factory, chip's escrow released
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
@@ -83,7 +84,7 @@ import {
 } from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
 import {issueManagerKeys} from './managerKeys';
-import {recordReset, resetCheck, wasReset} from './reset';
+import {completeReset, resetCheck, wasReset} from './reset';
 
 export interface Env {
   readonly REGISTRY: DurableObjectNamespace;
@@ -277,8 +278,8 @@ export class Registry {
       }
       if (method !== 'POST') return fail(405, 'use POST');
       const body = await objectBody(request);
-      if (!body) return fail(400, 'the new card row must be an object');
-      return json(200, {ok: true, ...recordReset(storage, op, shortId, body, now)});
+      if (!body) return fail(400, 'the completion must be an object');
+      return json(200, {ok: true, ...completeReset(storage, op, shortId, body, now)});
     }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.
@@ -365,7 +366,7 @@ export class Registry {
       return fail(404, `no card ${shortId}`);
     }
     if (wasReset(storage.sql, shortId)) {
-      // A load under deleted keys could never be spent. The new short id is not said here.
+      // A load under deleted keys could never be spent: the card is blank now.
       return fail(410, `card ${shortId} was reset; load the card's new id`);
     }
     expireLoads(storage, shortId, now);
@@ -395,7 +396,7 @@ export class Registry {
       for (const table of [
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
-        'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys',
+        'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys', 'card_resets',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }

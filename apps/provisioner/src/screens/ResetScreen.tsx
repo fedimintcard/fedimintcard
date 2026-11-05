@@ -1,25 +1,29 @@
 /**
  * Settings → Reset a card (OPS-PLAN O5). Two taps: the first reads which card
  * it is and asks ops whether it may go; the second, once the holder has typed
- * their PIN (or the operator has confirmed the blocked-PIN warning), wipes and
- * sets the card up again. The card logic is `reset.ts`; this screen holds the
- * holder's PIN for that one tap, shows the new PIN once, and keeps nothing.
+ * their PIN (or the operator has confirmed the blocked-PIN warning), takes the
+ * card back to factory: applet deleted, factory keys, both proved. The card
+ * logic is `reset.ts`; this screen holds the holder's PIN for that one tap and
+ * keeps nothing.
  *
- * An unfinished reset (the journal, `reset.ts`) is offered first: a wiped card
- * cannot be told from a blank one by anything on it, so only the journal can
- * finish it.
+ * An unfinished reset (the journal, `reset.ts`) is offered first: a card part
+ * way through has no applet to say which card it was, so only the journal can
+ * finish it. Finished resets ops has not acknowledged (the outbox) are sent
+ * when the screen opens and after each reset, and on the operator's button;
+ * they never block the operator, since the card itself is done.
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
 
-import type {ResetCardRow, ResetCheck} from '../ops';
-import {generatePin, PIN_MAX, usePinDraft} from '../pin';
+import type {ResetCheck} from '../ops';
+import {PIN_MAX, usePinDraft} from '../pin';
 import {
   clearJournal,
+  flushOutbox,
   identifyCard,
   readJournal,
-  recordReset,
+  readOutbox,
   resetTap,
   type JournalStorage,
   type PinStatus,
@@ -48,14 +52,7 @@ const journal: JournalStorage = AsyncStorage;
 type Step =
   | {kind: 'start'}
   | {kind: 'review'; shortId: string; pin: PinStatus; check: ResetCheck}
-  | {
-      kind: 'done';
-      oldId: string;
-      card: ResetCardRow;
-      pin: string | null;
-      recorded: boolean;
-      stranded: number;
-    };
+  | {kind: 'done'; oldId: string; recorded: boolean; stranded: number};
 
 /** One line for a stop, and whether the card may now be wiped. */
 function stopLine(stop: ResetStop): string {
@@ -82,6 +79,8 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
   const holderPin = usePinDraft();
   const [step, setStep] = useState<Step>({kind: 'start'});
   const [saved, setSaved] = useState<ResetJournal | null>(null);
+  /** This operator's finished resets ops has not acknowledged. */
+  const [waiting, setWaiting] = useState(0);
   const [busy, setBusy] = useState(false);
   const [line, setLine] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -92,10 +91,46 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
 
   const reload = useCallback(async () => {
     setSaved(await readJournal(journal).catch(() => null));
-  }, []);
+    const outbox = await readOutbox(journal).catch(() => []);
+    setWaiting(outbox.filter(p => p.operator_id === operatorId).length);
+  }, [operatorId]);
+
+  /**
+   * Sends the outbox to ops. Answers whether `oldId` (when given) is now
+   * recorded, and what ops still held under it.
+   */
+  const send = useCallback(
+    async (oldId?: string): Promise<{recorded: boolean; stranded: number}> => {
+      const flushed = await flushOutbox(ops, journal, operatorId).catch(e => ({
+        recorded: [],
+        failed: {
+          short_id: '',
+          reason: e instanceof Error ? e.message : String(e),
+        },
+        left: [],
+      }));
+      await reload();
+      if (flushed.failed) {
+        setProblem(flushed.failed.reason);
+      }
+      const mine = flushed.recorded.find(r => r.short_id === oldId);
+      return {
+        recorded: oldId !== undefined && mine !== undefined,
+        stranded: mine?.stranded_notes ?? 0,
+      };
+    },
+    [ops, operatorId, reload],
+  );
+
   useEffect(() => {
-    void reload();
-  }, [reload]);
+    void reload().then(async () => {
+      // A completion left from an earlier visit goes to ops now; the card needs nothing.
+      const outbox = await readOutbox(journal).catch(() => []);
+      if (outbox.some(p => p.operator_id === operatorId)) {
+        await send();
+      }
+    });
+  }, [reload, send, operatorId]);
   // Leaving the screen ends any tap and drops the holder's PIN.
   useEffect(
     () => () => {
@@ -140,39 +175,20 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
     }
   };
 
-  /** Ops' record of a finished card; the journal goes once ops has it. */
-  const record = async (
-    oldId: string,
-    row: ResetCardRow,
-    pin: string | null,
-  ) => {
+  /** The operator's retry from the done step: the outbox again. */
+  const record = async (oldId: string) => {
+    setBusy(true);
+    setProblem(null);
     try {
-      const done = await recordReset(ops, journal, oldId, row);
-      setStep({
-        kind: 'done',
-        oldId,
-        card: row,
-        pin,
-        recorded: true,
-        stranded: done.stranded_notes,
-      });
-    } catch (e) {
-      setStep({
-        kind: 'done',
-        oldId,
-        card: row,
-        pin,
-        recorded: false,
-        stranded: 0,
-      });
-      setProblem(e instanceof Error ? e.message : String(e));
+      const sent = await send(oldId);
+      setStep({kind: 'done', oldId, ...sent});
+    } finally {
+      setBusy(false);
     }
-    await reload();
   };
 
   /** Tap 2, or the tap that finishes a journalled reset (`expected` null). */
   const reset = async (expected: string | null) => {
-    const newPin = generatePin();
     setBusy(true);
     setProblem(null);
     setLine(RESET.resetting);
@@ -186,7 +202,6 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
               ? holderPin.value
               : null,
           blockedConfirmed,
-          newPin,
           ops,
           journal,
           random: n => Array.from({length: n}, () => (Math.random() * 256) | 0),
@@ -196,7 +211,10 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
       );
       holderPin.wipe();
       if (r.ok) {
-        await record(saved?.old_short_id ?? expected ?? '', r.card, newPin);
+        setLine(RESET.phase.check);
+        const oldId = r.completion.short_id;
+        const sent = await send(oldId);
+        setStep({kind: 'done', oldId, ...sent});
         return;
       }
       if (r.stop.kind === 'pinRequired' && saved) {
@@ -252,17 +270,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
                 ? RESET.unfinished(saved.old_short_id)
                 : RESET.unfinishedOther}
             </Text>
-            {ownJournal && saved.stage === 'recording' && saved.card ? (
-              <PrimaryButton
-                title={RESET.record}
-                disabled={busy}
-                onPress={() =>
-                  void record(saved.old_short_id, saved.card!, null)
-                }
-                testID="reset-record"
-              />
-            ) : null}
-            {ownJournal && saved.stage === 'erasing' ? (
+            {ownJournal ? (
               <PrimaryButton
                 title={RESET.finish}
                 disabled={busy}
@@ -293,6 +301,23 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
                 testID="reset-forget"
               />
             )}
+          </View>
+        ) : null}
+
+        {waiting > 0 && step.kind !== 'done' ? (
+          <View style={local.section} testID="reset-waiting">
+            <Text style={[local.body, {color: t.dim}]}>
+              {RESET.waiting(waiting)}
+            </Text>
+            <SecondaryButton
+              title={RESET.record}
+              disabled={busy}
+              onPress={() => {
+                setProblem(null);
+                void send();
+              }}
+              testID="reset-record"
+            />
           </View>
         ) : null}
 
@@ -411,28 +436,9 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         {step.kind === 'done' ? (
           <View style={local.section} testID="reset-done">
             <Text style={[local.title, {color: t.ink}]}>
-              {RESET.doneTitle(step.card.short_id)}
+              {RESET.doneTitle(step.oldId)}
             </Text>
-            {step.pin ? (
-              <View
-                style={[
-                  local.panel,
-                  {backgroundColor: t.card, borderColor: t.accent},
-                ]}
-                testID="reset-new-pin">
-                <Text style={[local.label, {color: t.ink}]}>
-                  {RESET.newPin}
-                </Text>
-                <Text style={[local.small, {color: t.dim}]}>
-                  {RESET.newPinBody}
-                </Text>
-                <Text
-                  style={[local.pinValue, {color: t.accent}]}
-                  selectable={false}>
-                  {step.pin}
-                </Text>
-              </View>
-            ) : null}
+            <Text style={[local.body, {color: t.ink}]}>{RESET.doneBody}</Text>
             <Text
               style={[local.body, {color: step.recorded ? t.dim : t.danger}]}>
               {step.recorded ? RESET.recorded : RESET.notRecorded}
@@ -446,7 +452,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
               <PrimaryButton
                 title={RESET.record}
                 disabled={busy}
-                onPress={() => void record(step.oldId, step.card, step.pin)}
+                onPress={() => void record(step.oldId)}
                 testID="reset-record-again"
               />
             ) : null}
@@ -484,7 +490,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         {step.kind === 'done' ? (
           <PrimaryButton
             title={RESET.another}
-            disabled={busy || !step.recorded}
+            disabled={busy}
             onPress={() => setStep({kind: 'start'})}
             testID="reset-another"
           />
@@ -499,7 +505,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         {step.kind === 'done' ? (
           <SecondaryButton
             title={RESET.done}
-            disabled={!step.recorded}
+            disabled={busy}
             onPress={leave}
             testID="reset-close"
           />
@@ -520,11 +526,9 @@ const local = StyleSheet.create({
     textTransform: 'uppercase',
   },
   title: {fontFamily: FONT.semibold, fontSize: 19},
-  label: {fontFamily: FONT.semibold, fontSize: 16},
   body: {fontFamily: FONT.regular, fontSize: 15, lineHeight: 21},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
   pinInput: {fontSize: 20, letterSpacing: 6, minHeight: 50},
-  pinValue: {fontFamily: FONT.tabular, fontSize: 34, letterSpacing: 8},
   phase: {
     fontFamily: FONT.medium,
     fontSize: 17,

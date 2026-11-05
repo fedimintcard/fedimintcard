@@ -759,8 +759,8 @@ export function StoreProvider({
         apiRef.current?.managerKeys?.(chip, shortId) ?? missing('the card-manager keys'),
       resetCheck: shortId =>
         apiRef.current?.resetCheck?.(shortId) ?? missing('the reset check'),
-      recordReset: (oldShortId, card) =>
-        apiRef.current?.recordReset?.(oldShortId, card) ?? missing('recording a reset'),
+      completeReset: completion =>
+        apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };
   }, []);
 

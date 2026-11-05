@@ -20,5 +20,6 @@ export {
 export * from './gp/scp02';
 export * from './gp/identity';
 export * from './gp/provision';
+export * from './gp/reset';
 export {FEDIMINT_LOAD_FILE} from './gp/load-file';
 export type {LoadFileAsset} from './gp/provision';

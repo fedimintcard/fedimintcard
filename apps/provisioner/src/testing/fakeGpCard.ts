@@ -13,7 +13,8 @@
  * What it keeps that the demo's card does not: the card manager's keys and
  * their version (PUT KEY changes them), failed EXTERNAL AUTHENTICATEs (counted;
  * a card manager locks at its limit), CPLC, other packages (a Cashu applet on
- * the same chip), and the applet's slots and PIN with its tries.
+ * the same chip) and GET STATUS over them, and the applet's slots and PIN with
+ * its tries.
  *
  * `pull` loses the card at a chosen APDU, before the card acts on it or after
  * it acted and the reply was lost; every APDU after that throws until
@@ -336,6 +337,8 @@ export class FakeGpCard {
         return this.load(p1, p2);
       case 0xd8:
         return this.putKey(p1, p2, data);
+      case 0xf2:
+        return this.getStatus(p1, p2, data);
       default:
         return sw(0x6d00);
     }
@@ -357,6 +360,37 @@ export class FakeGpCard {
       return ok([0x00]);
     }
     return sw(0x6a88);
+  }
+
+  /**
+   * GET STATUS as gp --list sends it: P1 40 (applications) or 20 (load
+   * files), P2 02 (TLV), every entry (4F 00). One E3 per object: its AID, its
+   * life cycle, and for an instance its load file; 6A88 when there are none.
+   */
+  private getStatus(p1: number, p2: number, data: number[]): number[] {
+    if ((p1 !== 0x40 && p1 !== 0x20) || p2 !== 0x02 || h(data) !== '4F00') {
+      return sw(0x6a86);
+    }
+    const tlv = (tag: number[], value: number[]) => [
+      ...tag,
+      value.length,
+      ...value,
+    ];
+    const entry = (aid: string, pkg?: string) =>
+      tlv(
+        [0xe3],
+        [
+          ...tlv([0x4f], fromHex(aid)),
+          ...tlv([0x9f, 0x70], [pkg ? 0x07 : 0x01]),
+          ...(pkg ? tlv([0xc4], fromHex(pkg)) : []),
+          ...tlv([0xcc], fromHex(ISD)),
+        ],
+      );
+    const entries =
+      p1 === 0x40
+        ? [...this.instances.entries()].flatMap(([aid, i]) => entry(aid, i.pkg))
+        : [...this.packages].flatMap(aid => entry(aid));
+    return entries.length ? ok(entries) : sw(0x6a88);
   }
 
   private installForLoad(data: number[]): number[] {

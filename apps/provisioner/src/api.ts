@@ -3,8 +3,8 @@ import {decodeInvite} from './federation';
 import type {
   CardOps,
   ManagerKeysReply,
-  ResetCardRow,
   ResetCheck,
+  ResetCompletion,
   ResetRecorded,
 } from './ops';
 
@@ -23,7 +23,8 @@ import type {
  * is its key issuing, keyed by chip rather than by attempt (OPS-PLAN O5):
  * `POST /registry/manager-keys` answers a card's own card-manager key set, and
  * `GET /registry/cards/:id/reset-check` and `POST /registry/cards/:id/reset`
- * bracket a reset.
+ * bracket a reset (the second is its completion, once the card is proved
+ * factory).
  *
  * There is no local client. The sidecar that keyed and loaded cards over a
  * relay left the operator's loop: the phone keys the card in the install tap
@@ -48,7 +49,7 @@ export type ServiceOperation =
   | 'list-federations'
   | 'manager-keys'
   | 'reset-check'
-  | 'record-reset';
+  | 'complete-reset';
 
 export class ApiServiceError extends Error {
   constructor(
@@ -493,7 +494,6 @@ export class RegistryClient extends HttpTransport {
       pending_msat: count(json.pending_msat),
       open_charges: count(json.open_charges),
       open_loads: count(json.open_loads),
-      replaced_by: typeof json.replaced_by === 'string' ? json.replaced_by : null,
     };
     if (
       check.short_id !== shortId ||
@@ -516,38 +516,35 @@ export class RegistryClient extends HttpTransport {
   }
 
   /**
-   * POST /registry/cards/:id/reset — the new card's row; ops marks the old one
-   * reset and linked to it. Idempotent on the service, so a lost answer is
-   * re-posted with the same body.
+   * POST /registry/cards/:id/reset — the completion: the card is factory and
+   * blank, proved on the card. Ops marks the old row reset and releases the
+   * chip's escrowed keys. Idempotent on the service, so the outbox re-posts
+   * the same body after a lost answer.
    */
-  async recordReset(
+  async completeReset(
     token: string,
-    oldShortId: string,
-    card: ResetCardRow,
+    completion: ResetCompletion,
   ): Promise<ResetRecorded> {
     const json = await this.post(
-      `/registry/cards/${encodeURIComponent(oldShortId)}/reset`,
+      `/registry/cards/${encodeURIComponent(completion.short_id)}/reset`,
       {
         token,
         body: {
-          short_id: card.short_id,
-          installed_at: card.installed_at,
-          load_sha256: LOAD_FILE_SHA256,
-          pin_set: true,
-          // A reset card's PIN is generated and shown once, like a per-card batch's.
-          pin_policy: 'perCard',
-          notes_issued: 0,
-          slot_pubkeys: [...card.slot_pubkeys],
-          chip: card.chip,
+          short_id: completion.short_id,
+          chip: completion.chip,
+          gp_key_version: completion.gp_key_version,
+          manager_keys: completion.manager_keys,
+          package: completion.package,
+          verified_at: completion.verified_at,
         },
-        operation: 'record-reset',
+        operation: 'complete-reset',
       },
     );
     const stranded = json.stranded as {live_notes?: unknown; pending_notes?: unknown} | undefined;
     const n = (v: unknown) => (Number.isSafeInteger(v) ? (v as number) : 0);
     return {
-      old_short_id: oldShortId,
-      short_id: card.short_id,
+      short_id: completion.short_id,
+      released: json.released === true,
       stranded_notes: n(stranded?.live_notes) + n(stranded?.pending_notes),
     };
   }
@@ -712,8 +709,8 @@ export class RegistryStoreApi implements CardOps {
     return this.client.resetCheck(this.token(), shortId);
   }
 
-  recordReset(oldShortId: string, card: ResetCardRow): Promise<ResetRecorded> {
-    return this.client.recordReset(this.token(), oldShortId, card);
+  completeReset(completion: ResetCompletion): Promise<ResetRecorded> {
+    return this.client.completeReset(this.token(), completion);
   }
 
   /** Open the batch once; a card row cannot be posted before it. */

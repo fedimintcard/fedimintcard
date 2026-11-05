@@ -1,7 +1,7 @@
 /**
  * What ops answers for a card's lifecycle (OPS-PLAN O5), as types only: the
  * card-manager key set the install tap rotates a card to, and the reset
- * check and record. `api.ts` builds these from the registry's JSON and
+ * check and completion. `api.ts` builds these from the registry's JSON and
  * `store.tsx` passes them through, so neither the store nor the card modules
  * import the network module.
  */
@@ -32,22 +32,31 @@ export interface ResetCheck {
   readonly pending_msat: number;
   readonly open_charges: number;
   readonly open_loads: number;
-  readonly replaced_by: string | null;
 }
 
-/** The finished card a reset leaves, as the phone records it: public keys only. */
-export interface ResetCardRow {
+/**
+ * What a reset ends on, proved on the card in the reset tap: the Fedimint
+ * package absent and the card manager on the factory keys, by a full login
+ * under them. No keys, no PIN: this is the body ops records, and what the
+ * phone's outbox keeps until ops has it.
+ */
+export interface ResetCompletion {
+  /** The old card's short id. */
   readonly short_id: string;
-  readonly installed_at: number;
-  /** The eight x-only slot keys, hex, slot 0 first. */
-  readonly slot_pubkeys: readonly string[];
   readonly chip: string;
+  /** The key set version the factory login reported (01 on a J3R180). */
+  readonly gp_key_version: number;
+  readonly manager_keys: 'factory';
+  readonly package: 'absent';
+  /** When the tap proved it, epoch ms. */
+  readonly verified_at: number;
 }
 
-/** `POST /registry/cards/:id/reset`: the record, and anything ops still held under the old id. */
+/** `POST /registry/cards/:id/reset`: recorded, and anything ops still held under the old id. */
 export interface ResetRecorded {
-  readonly old_short_id: string;
   readonly short_id: string;
+  /** Whether this call released the chip's escrowed keys (false on a repeat). */
+  readonly released: boolean;
   /** Live and pending notes left under the old short id; zero after a clean reset. */
   readonly stranded_notes: number;
 }
@@ -56,5 +65,5 @@ export interface ResetRecorded {
 export interface CardOps {
   managerKeys(chip: string, shortId?: string): Promise<ManagerKeysReply>;
   resetCheck(shortId: string): Promise<ResetCheck>;
-  recordReset(oldShortId: string, card: ResetCardRow): Promise<ResetRecorded>;
+  completeReset(completion: ResetCompletion): Promise<ResetRecorded>;
 }

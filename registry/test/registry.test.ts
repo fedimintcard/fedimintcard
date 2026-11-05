@@ -1075,6 +1075,7 @@ describe('O5: per-card manager keys', () => {
     const armored = await (await env.BACKUPS!.get(key))!.text();
     expect(armored).not.toContain(keys.enc);
     const snap = await decrypt(armored, 'AGE-SECRET-KEY-1AHS3RTK9NEEFMWRWJY6RQDF9HZZ9RQTD3UW0CNCX8YHQFSLN08LSECDQ2E');
+    expect(snap.tables.card_resets).toEqual([]);
     expect(snap.tables.manager_keys).toEqual([
       expect.objectContaining({chip: CHIP, operator_id: 1, key_version: 1, enc: keys.enc, mac: keys.mac, dek: keys.dek}),
     ]);
@@ -1084,7 +1085,6 @@ describe('O5: per-card manager keys', () => {
 describe('O5: reset in the provisioner', () => {
   const CHIP = 'cplc-v1:4790d3213041093363205547';
   const OLD = '0a0b0c0d';
-  const NEW = '1f2e3d4c';
 
   async function provisioned(token: string, shortId = OLD) {
     const batchId = await newBatch(token);
@@ -1103,13 +1103,21 @@ describe('O5: reset in the provisioner', () => {
       open_charges: number;
       open_loads: number;
       chip: string | null;
-      replaced_by: string | null;
     };
   };
-  /** The finished new card's row, as the phone posts it after the reset tap. */
-  const newRow = (over: Partial<Record<string, unknown>> = {}) => {
-    const {batch_id: _batch, ...row} = card({short_id: NEW, pin_policy: 'perCard', chip: CHIP, installed_at: 1_770_000_000_000});
-    return {...row, ...over};
+  /** The completion the phone posts once the card is proved factory. */
+  const done = (over: Partial<Record<string, unknown>> = {}) => ({
+    short_id: OLD,
+    chip: CHIP,
+    gp_key_version: 1,
+    manager_keys: 'factory',
+    package: 'absent',
+    verified_at: 1_770_000_000_000,
+    ...over,
+  });
+  const other = async () => {
+    await hook('/test/operator', {name: 'other', password: 'another long password'});
+    return signIn('other', 'another long password');
   };
 
   it('an empty card may be reset; the check names its chip', async () => {
@@ -1149,65 +1157,119 @@ describe('O5: reset in the provisioner', () => {
   it('another operator’s card and an unknown card answer 404; a till cannot ask', async () => {
     const token = await signIn();
     await provisioned(token);
-    await hook('/test/operator', {name: 'other', password: 'another long password'});
-    const other = await signIn('other', 'another long password');
-    expect((await get(`/registry/cards/${OLD}/reset-check`, other)).status).toBe(404);
-    expect((await post(`/registry/cards/${OLD}/reset`, other, newRow())).status).toBe(404);
+    const them = await other();
+    expect((await get(`/registry/cards/${OLD}/reset-check`, them)).status).toBe(404);
+    expect((await post(`/registry/cards/${OLD}/reset`, them, done())).status).toBe(404);
     expect((await get('/registry/cards/99999999/reset-check', token)).status).toBe(404);
     expect((await get('/registry/cards/XYZ/reset-check', token)).status).toBe(400);
     const till = await newTill(token);
     expect((await get(`/registry/cards/${OLD}/reset-check`, till.token)).status).toBe(403);
   });
 
-  it('records the reset: the new row in the old card’s batch, the old one linked, the escrow moved', async () => {
+  it('completes the reset: the old row reset, the chip released, the proof stored; a repeat changes nothing', async () => {
     const token = await signIn();
     const batchId = await provisioned(token);
-    expect((await post('/registry/manager-keys', token, {chip: CHIP, short_id: OLD})).status).toBe(200);
-    const res = await post(`/registry/cards/${OLD}/reset`, token, newRow());
+    const keys = (await (await post('/registry/manager-keys', token, {chip: CHIP, short_id: OLD})).json()) as {enc: string};
+    // Before the reset the chip is this operator's: another gets 409.
+    const them = await other();
+    expect((await post('/registry/manager-keys', them, {chip: CHIP})).status).toBe(409);
+
+    const res = await post(`/registry/cards/${OLD}/reset`, token, done());
     expect(res.status).toBe(200);
-    const body = (await res.json()) as {old_short_id: string; card: {short_id: string; batch_id: number; chip: string}; stranded: {live_notes: number}};
-    expect(body.old_short_id).toBe(OLD);
-    expect(body.card).toEqual(expect.objectContaining({short_id: NEW, batch_id: batchId, chip: CHIP, reset_at: null}));
+    const body = (await res.json()) as {reset: Record<string, unknown>; stranded: {live_notes: number}; released: boolean};
+    expect(body.reset).toEqual(
+      expect.objectContaining({short_id: OLD, chip: CHIP, operator_id: 1, gp_key_version: 1, manager_keys: 'factory', package: 'absent', verified_at: 1_770_000_000_000}),
+    );
     expect(body.stranded.live_notes).toBe(0);
-    // Replaying the same answer is a replay; another new card for the same old one is a conflict.
-    const replay = await post(`/registry/cards/${OLD}/reset`, token, newRow());
+    expect(body.released).toBe(true);
+    await runInDurableObject(stub(), async (_i, state) => {
+      const sql = state.storage.sql;
+      expect(sql.exec('SELECT COUNT(*) AS n FROM manager_keys WHERE chip = ?', CHIP).one()).toEqual({n: 0});
+      expect(sql.exec('SELECT short_id, chip, operator_id, gp_key_version, manager_keys, package FROM card_resets').toArray()).toEqual([
+        {short_id: OLD, chip: CHIP, operator_id: 1, gp_key_version: 1, manager_keys: 'factory', package: 'absent'},
+      ]);
+      expect(sql.exec('SELECT COUNT(*) AS n FROM cards').one()).toEqual({n: 1});
+    });
+
+    // The repeat (an outbox retry) answers the stored record and changes nothing.
+    const replay = await post(`/registry/cards/${OLD}/reset`, token, done({verified_at: 1_770_000_000_500}));
     expect(replay.status).toBe(200);
-    expect(((await replay.json()) as {card: {short_id: string}}).card.short_id).toBe(NEW);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow({short_id: '2a2a2a2a', slot_pubkeys: slots('2a2a2a2a')}))).status).toBe(409);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow({installed_at: 1_770_000_000_001}))).status).toBe(409);
+    const again = (await replay.json()) as {reset: {verified_at: number; completed_at: number}; released: boolean};
+    expect(again.reset).toEqual(body.reset);
+    expect(again.released).toBe(false);
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done({chip: 'cplc-v1:' + '1'.repeat(24)}))).status).toBe(409);
 
     const old = await check(token);
-    expect(old).toEqual(expect.objectContaining({resettable: false, replaced_by: NEW}));
-    expect(old.reasons).toEqual([`already reset; the card is ${NEW} now`]);
-    expect(await check(token, NEW)).toEqual(expect.objectContaining({resettable: true, chip: CHIP}));
-    const listed = (await (await get(`/registry/cards?batch_id=${batchId}`, token)).json()) as {cards: {short_id: string; replaced_by: string | null}[]};
-    expect(listed.cards.map(c => [c.short_id, c.replaced_by])).toEqual([[OLD, NEW], [NEW, null]]);
+    expect(old).toEqual(expect.objectContaining({resettable: false}));
+    expect(old.reasons).toEqual(['already reset: the card is blank, on its factory keys']);
+    const listed = (await (await get(`/registry/cards?batch_id=${batchId}`, token)).json()) as {cards: {short_id: string; reset_at: number | null}[]};
+    expect(listed.cards.map(c => [c.short_id, c.reset_at !== null])).toEqual([[OLD, true]]);
+
+    // The chip is released: another operator now gets its keys (the same bytes) and owns it.
+    const theirs = (await (await post('/registry/manager-keys', them, {chip: CHIP})).json()) as {enc: string};
+    expect(theirs.enc).toBe(keys.enc);
+    expect((await post('/registry/manager-keys', token, {chip: CHIP})).status).toBe(409);
+    // A late repeat from the first phone still changes nothing: their escrow stays.
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done())).status).toBe(200);
     await runInDurableObject(stub(), async (_i, state) => {
-      expect(state.storage.sql.exec('SELECT short_id FROM manager_keys WHERE chip = ?', CHIP).one()).toEqual({short_id: NEW});
+      const owner = state.storage.sql.exec('SELECT operator_id FROM manager_keys WHERE chip = ?', CHIP).one() as {operator_id: number};
+      expect(owner.operator_id).not.toBe(1);
     });
   });
 
-  it('refuses a new row that is not a finished card, keeps the old id, or names another chip', async () => {
+  it('refuses a completion that proves less than factory, or names another card or chip', async () => {
     const token = await signIn();
     await provisioned(token);
-    const {slot_pubkeys: _keys, ...noKeys} = newRow();
-    expect((await post(`/registry/cards/${OLD}/reset`, token, noKeys)).status).toBe(400);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow({pin_set: false}))).status).toBe(400);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow({short_id: OLD, slot_pubkeys: slots(OLD)}))).status).toBe(400);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow({chip: 'cplc-v1:' + '1'.repeat(24)}))).status).toBe(409);
+    for (const bad of [
+      done({manager_keys: 'own'}),
+      done({package: 'present'}),
+      done({gp_key_version: 0}),
+      done({gp_key_version: 'x'}),
+      done({verified_at: undefined}),
+      done({chip: 'cplc-v1:XYZ'}),
+      done({short_id: '99999999'}),
+    ]) {
+      expect((await post(`/registry/cards/${OLD}/reset`, token, bad)).status).toBe(400);
+    }
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done({chip: 'cplc-v1:' + '1'.repeat(24)}))).status).toBe(409);
     expect((await check(token)).resettable).toBe(true);
+  });
+
+  it('only the owner completes: another operator’s chip escrow, or a chip that carries another card, is 409', async () => {
+    const token = await signIn();
+    // a card row from before O5 names no chip, and the chip's escrow is someone else's
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: OLD, batch_id: batchId}))).status).toBe(200);
+    const them = await other();
+    expect((await post('/registry/manager-keys', them, {chip: CHIP})).status).toBe(200);
+    const res = await post(`/registry/cards/${OLD}/reset`, token, done());
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('another operator');
+    expect((await check(token)).resettable).toBe(true);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM manager_keys').one()).toEqual({n: 1});
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM card_resets').one()).toEqual({n: 0});
+    });
+  });
+
+  it('a chip whose escrow points at another live card is not released by this one', async () => {
+    const token = await signIn();
+    await provisioned(token);
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: '5e5e5e5e', batch_id: batchId, chip: CHIP}))).status).toBe(200);
+    expect((await post('/registry/manager-keys', token, {chip: CHIP, short_id: '5e5e5e5e'})).status).toBe(200);
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done())).status).toBe(409);
   });
 
   it('after a reset the old short id takes no load and no charge (410); its state still reads', async () => {
     const token = await signIn();
     const till = await newTill(token);
     await provisioned(token);
-    expect((await post(`/registry/cards/${OLD}/reset`, token, newRow())).status).toBe(200);
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done())).status).toBe(200);
     expect((await get(`/cards/${OLD}/slots`, null)).status).toBe(410);
     expect((await post(`/cards/${OLD}/load`, null, {version: 0, txid: txid(31), notes: []})).status).toBe(410);
     expect((await post(`/cards/${OLD}/intent`, till.token, intent(0))).status).toBe(410);
     expect((await get(`/cards/${OLD}/state`, till.token)).status).toBe(200);
-    expect((await get(`/cards/${NEW}/slots`, null)).status).toBe(200);
   });
 });
 

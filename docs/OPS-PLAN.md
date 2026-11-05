@@ -221,15 +221,30 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   (another operator's or an unknown card is refused); refuse while ops shows a live or pending
   note, an open charge or an open load; the holder's PIN is required as consent, because ops cannot
   see a load made around it; a blocked PIN needs ops to show the card empty plus a second operator
-  confirmation. Then delete and reinstall with the card's own keys from ops, key it, set a new PIN,
-  and mark the old record reset and linked to the new short id. **Built 2026-11-04, not deployed,
-  silicon pending**: `apps/provisioner/src/reset.ts` and `screens/ResetScreen.tsx`, two taps (read
-  slot 0 and the PIN's state without spending a try; then slot 0 again, ops' check again,
-  `VERIFY_PIN`, CPLC, keys, journal, cardkit's sweep and install, rotation, new keys and PIN). The
-  journal (AsyncStorage `prov.reset.v1`, no PINs or keys) lets the next tap finish a reset broken
-  after DELETE. Ops: `GET /registry/cards/:id/reset-check`, `POST /registry/cards/:id/reset` (the
-  new row goes into the old card's batch; idempotent; answers anything stranded under the old id);
-  after a reset the old short id answers 410 to holder routes and till writes.
+  confirmation. Then take the card back to factory, as cashucard's owned-card reset does: delete
+  our package (only `F0464D43415244`, its applet and opener), PUT KEY the factory set back in place
+  at version 01 (what a factory J3R180 reports), and prove both with a full login under the factory
+  keys and a GET STATUS that lists none of ours. No reinstall, no new PIN, no new card row: the card
+  is blank, and goes through a new batch to be used again (the install tap gets the same per-card
+  keys back from ops). **Built 2026-11-04, not deployed, silicon pending**:
+  `apps/provisioner/src/reset.ts` and `screens/ResetScreen.tsx` over cardkit's `factoryReset`
+  (`tools/cardkit/gp/reset.ts`), two taps (read slot 0 and the PIN's state without spending a try;
+  then slot 0 again, ops' check again, `VERIFY_PIN`, CPLC, keys, one INITIALIZE UPDATE checked
+  against the card's own set and the factory set, GET STATUS, journal, DELETE, PUT KEY, the factory
+  login and GET STATUS). A tap lifted anywhere is finished by tapping again: the card's state is
+  read from that one INITIALIZE UPDATE and GET STATUS, never by an EXTERNAL AUTHENTICATE with keys
+  the card did not prove (own keys and ours present: carry on deleting; own keys and ours gone:
+  restore the keys; factory keys and ours gone: only the record is left; factory keys with ours
+  still there: stop). The journal (AsyncStorage `prov.reset.v2`, no PINs or keys) is written just
+  before the first DELETE or PUT KEY; the proved completion goes to an outbox
+  (`prov.reset.outbox.v1`) and is retried until ops has it, so ops being unreachable never holds the
+  operator up. Ops: `GET /registry/cards/:id/reset-check`; `POST /registry/cards/:id/reset` takes
+  the completion `{short_id, chip, gp_key_version, manager_keys: 'factory', package: 'absent',
+  verified_at}` from the card's owner only and, in one transaction, marks the old row reset, deletes
+  the chip's `manager_keys` escrow row (the chip is released: the next operator to ask owns it and
+  gets the same derived bytes) and stores a `card_resets` row (migration 7); a repeat answers the
+  stored record and changes nothing. After a reset the old short id answers 410 to holder routes and
+  till writes.
 - [ ] **One tap on iPhone.** Measure install + key rotation + GEN_KEY ×8 + PIN on Max against the
   ~60 s reader session; split into two taps only if it does not fit.
 - [ ] **Cards from before O2** (for example `15989f91`, no slot keys on record): mark them retired.
@@ -261,7 +276,8 @@ Done means every box is ticked and the acceptance run at the end passes on relea
 **Acceptance run (release builds, production)**
 - [ ] A blank card provisioned on Max with its own manager keys, loaded from a separate wallet,
   charged at the till with the PIN typed in the POS app, reset in the provisioner, provisioned again
-  on the Pixel, and `gpp --list` with factory keys refused on it throughout.
+  on the Pixel, and `gpp --list` with factory keys refused on it whenever it is provisioned (and
+  answering, with nothing of ours listed, between the reset and the new install).
 
 ### O3 design (2026-11-04)
 

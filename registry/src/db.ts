@@ -170,6 +170,21 @@ export const MIGRATIONS: readonly string[] = [
   ALTER TABLE cards ADD COLUMN reset_at INTEGER;
   ALTER TABLE cards ADD COLUMN replaced_by TEXT;
   `,
+  // v7 (OPS-PLAN O5, reset to factory): a reset's completion, proved on the
+  // card (`reset.ts`). One row per old card. A reset no longer makes a new
+  // card row, so v6's `cards.replaced_by` is left unwritten.
+  `
+  CREATE TABLE card_resets (
+    short_id       TEXT    PRIMARY KEY,
+    chip           TEXT    NOT NULL,
+    operator_id    INTEGER NOT NULL,
+    gp_key_version INTEGER NOT NULL,
+    manager_keys   TEXT    NOT NULL CHECK (manager_keys = 'factory'),
+    package        TEXT    NOT NULL CHECK (package = 'absent'),
+    verified_at    INTEGER NOT NULL,
+    completed_at   INTEGER NOT NULL
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

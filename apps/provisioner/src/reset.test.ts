@@ -1,10 +1,12 @@
 import {FACTORY_KEYS, fromHex} from './cardkit';
-import type {ManagerKeysReply, ResetCheck} from './ops';
+import type {ManagerKeysReply, ResetCheck, ResetCompletion} from './ops';
 import {
+  flushOutbox,
   identifyCard,
   readJournal,
-  recordReset,
+  readOutbox,
   RESET_JOURNAL_KEY,
+  RESET_OUTBOX_KEY,
   resetTap,
   type JournalStorage,
   type ResetTapOptions,
@@ -20,10 +22,12 @@ import {
 
 /**
  * Reset a card (OPS-PLAN O5) against a card that keeps its keys, applets and
- * PIN across taps, and an ops that answers what the test says: refused with
- * value or an open charge, a wrong PIN, the blocked-PIN path, a reset broken
- * after DELETE and finished by the next tap, and the Cashu applet beside ours
- * never touched.
+ * PIN across taps, and an ops that answers what the test says: the card ends
+ * factory (our package gone, the factory keys back, proved by a factory
+ * login); refused with value or an open charge, a wrong PIN, the blocked-PIN
+ * path; a tap lifted at every APDU and finished by the next; never an
+ * EXTERNAL AUTHENTICATE with keys the card did not prove; the Cashu applet
+ * beside ours never touched; and ops unreachable after the card is done.
  */
 
 const OWN: ManagerKeysReply = {
@@ -39,9 +43,11 @@ const ownKeys = () => ({
   dek: fromHex(OWN.dek),
 });
 const HOLDER_PIN = '2468';
-const NEW_PIN = '813579';
 const DELETE = 0xe4;
 const VERIFY = 0x40;
+const PUT_KEY = 0xd8;
+const EXTERNAL_AUTH = 0x82;
+const PKG = 'F0464D43415244';
 
 function memoryJournal(): JournalStorage & {map: Map<string, string>} {
   const map = new Map<string, string>();
@@ -66,7 +72,6 @@ function check(shortId: string, over: Partial<ResetCheck> = {}): ResetCheck {
     pending_msat: 0,
     open_charges: 0,
     open_loads: 0,
-    replaced_by: null,
     ...over,
   };
 }
@@ -81,9 +86,9 @@ function setup(
   const ops = {
     resetCheck: jest.fn(async (id: string) => check(id, checked)),
     managerKeys: jest.fn(async (chip: string) => ({...OWN, chip})),
-    recordReset: jest.fn(async (old: string, row: {short_id: string}) => ({
-      old_short_id: old,
-      short_id: row.short_id,
+    completeReset: jest.fn(async (c: ResetCompletion) => ({
+      short_id: c.short_id,
+      released: true,
       stranded_notes: 0,
     })),
   };
@@ -93,7 +98,6 @@ function setup(
     expected: oldId,
     holderPin: HOLDER_PIN,
     blockedConfirmed: false,
-    newPin: NEW_PIN,
     ops,
     journal,
     random: n => Array.from({length: n}, (_, i) => (i * 29 + 3) & 0xff),
@@ -102,6 +106,27 @@ function setup(
   };
   return {oldId, journal, ops, options};
 }
+
+/** A finished card on its own manager keys, as the install tap leaves it, with a Cashu applet beside. */
+const ownCard = () =>
+  new FakeGpCard({keys: ownKeys()}).withCashu().withFinishedApplet(HOLDER_PIN);
+
+/** Factory and blank: the factory keys at version 01, nothing of ours on it, the Cashu applet where it was. */
+function expectFactory(card: FakeGpCard) {
+  expect(card.sameKeys(FACTORY_KEYS)).toBe(true);
+  expect(card.kvn).toBe(0x01);
+  expect(card.packages.has(PKG)).toBe(false);
+  expect([...card.instances.keys()].filter(a => a.startsWith(PKG))).toEqual([]);
+  expect(card.packages.has(CASHU_PACKAGE)).toBe(true);
+  expect(card.instances.has(CASHU_APPLET)).toBe(true);
+  expect(card.failedAuths).toBe(0);
+}
+
+const resume = (options: ResetTapOptions): ResetTapOptions => ({
+  ...options,
+  expected: null,
+  holderPin: null,
+});
 
 describe('identify', () => {
   it('reads the short id and the PIN’s state without spending a try', async () => {
@@ -124,21 +149,23 @@ describe('identify', () => {
 });
 
 describe('reset', () => {
-  it('resets a card: deleted, reinstalled, rotated, new keys and PIN; the Cashu applet untouched', async () => {
-    const card = new FakeGpCard().withCashu().withFinishedApplet(HOLDER_PIN);
+  it('takes the card to factory: ours deleted, factory keys back at 01, proved by a factory login; the Cashu applet untouched', async () => {
+    const card = ownCard();
     const {oldId, journal, ops, options} = setup(card);
     const r = await resetTap(card.transceive, options);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.card.short_id).not.toBe(oldId);
-    expect(r.card.short_id).toBe(shortIdOf(card.applet!.slots[0]!));
-    expect(r.card.chip).toBe(J3R180_CHIP);
-    expect(card.applet!.pin).toBe(NEW_PIN);
-    expect(card.sameKeys(ownKeys())).toBe(true);
-    expect(card.failedAuths).toBe(0);
-    // only this card's package and instances were deleted; the other applet is where it was
-    expect(card.packages.has(CASHU_PACKAGE)).toBe(true);
-    expect(card.instances.has(CASHU_APPLET)).toBe(true);
+    expect(r).toEqual({
+      ok: true,
+      completion: {
+        short_id: oldId,
+        chip: J3R180_CHIP,
+        gp_key_version: 1,
+        manager_keys: 'factory',
+        package: 'absent',
+        verified_at: expect.any(Number),
+      },
+    });
+    expectFactory(card);
+    // only this card's two instances and its package, instances first
     const deleted = card.log
       .filter(a => a[1] === DELETE)
       .map(a =>
@@ -152,28 +179,40 @@ describe('reset', () => {
       'f0464d434152444d',
       'f0464d43415244',
     ]);
+    // PUT KEY in place, P1 01, new version 01; then a factory login, after it, that the card accepted
+    const put = card.log.findIndex(a => a[1] === PUT_KEY);
+    expect(card.log[put].slice(0, 4)).toEqual([0x84, 0xd8, 0x01, 0x81]);
+    expect(card.log[put][5]).toBe(0x01);
+    const auths = card.log
+      .map((a, i) => [a[1], i] as const)
+      .filter(([ins]) => ins === EXTERNAL_AUTH);
+    expect(auths).toHaveLength(2);
+    expect(auths[1][1]).toBeGreaterThan(put);
+    // GET STATUS after the factory login: the proof that ours is absent
+    expect(card.log.slice(auths[1][1]).some(a => a[1] === 0xf2)).toBe(true);
+    // no new PIN, no keys made: nothing is installed
+    expect(card.ins()).not.toContain(0x10);
+    expect(card.ins()).not.toContain(0xe8);
     expect(ops.resetCheck).toHaveBeenCalledWith(oldId);
     expect(ops.managerKeys).toHaveBeenCalledWith(J3R180_CHIP, oldId);
 
-    // the journal names the finished card and holds no PIN and no manager key
-    const raw = journal.map.get(RESET_JOURNAL_KEY)!;
-    for (const secret of [HOLDER_PIN, NEW_PIN, OWN.enc, OWN.mac, OWN.dek]) {
+    // the journal is gone; the outbox holds the proof, and no PIN or key
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
+    const raw = journal.map.get(RESET_OUTBOX_KEY)!;
+    for (const secret of [HOLDER_PIN, OWN.enc, OWN.mac, OWN.dek]) {
       expect(raw).not.toContain(secret);
     }
-    expect(await readJournal(journal)).toEqual(
-      expect.objectContaining({
-        stage: 'recording',
-        old_short_id: oldId,
-        card: r.card,
-      }),
-    );
-    // ops records it, then the journal goes
-    expect(await recordReset(ops, journal, oldId, r.card)).toEqual({
-      old_short_id: oldId,
-      short_id: r.card.short_id,
-      stranded_notes: 0,
+    expect(await readOutbox(journal)).toEqual([
+      {...(r.ok ? r.completion : {}), operator_id: 1},
+    ]);
+    // ops gets it, then the outbox is empty
+    const flushed = await flushOutbox(ops, journal, 1);
+    expect(flushed).toEqual({
+      recorded: [{short_id: oldId, released: true, stranded_notes: 0}],
+      failed: null,
+      left: [],
     });
-    expect(ops.recordReset).toHaveBeenCalledWith(oldId, r.card);
+    expect(ops.completeReset).toHaveBeenCalledWith(r.ok && r.completion);
     expect(journal.map.size).toBe(0);
   });
 
@@ -182,7 +221,7 @@ describe('reset', () => {
       ['1 live note, 1024000 msat'],
       ['1 open charge at a till'],
     ]) {
-      const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+      const card = ownCard();
       const {journal, options} = setup(
         card,
         {},
@@ -201,7 +240,7 @@ describe('reset', () => {
   });
 
   it('a wrong PIN stops with the tries left, once, and touches nothing', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+    const card = ownCard();
     const {journal, options} = setup(card, {holderPin: '1111'});
     const r = await resetTap(card.transceive, options);
     expect(r).toEqual({
@@ -216,7 +255,7 @@ describe('reset', () => {
   });
 
   it('a different card than the one identified is refused before anything', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+    const card = ownCard();
     const {options, ops} = setup(card, {expected: 'deadbeef'});
     const r = await resetTap(card.transceive, options);
     expect(r).toEqual(
@@ -228,8 +267,8 @@ describe('reset', () => {
     expect(ops.resetCheck).not.toHaveBeenCalled();
   });
 
-  it('a blocked PIN: refused until the operator confirms, then reset when ops shows the card empty', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+  it('a blocked PIN: refused until the operator confirms, then reset to factory when ops shows the card empty', async () => {
+    const card = ownCard();
     card.applet!.blocked = true;
     const first = setup(card, {holderPin: null});
     expect(await resetTap(card.transceive, first.options)).toEqual({
@@ -263,12 +302,11 @@ describe('reset', () => {
     const confirmed = setup(card, {holderPin: null, blockedConfirmed: true});
     const r = await resetTap(card.transceive, confirmed.options);
     expect(r.ok).toBe(true);
-    expect(card.applet!.blocked).toBe(false);
-    expect(card.applet!.pin).toBe(NEW_PIN);
+    expectFactory(card);
   });
 
   it('the blocked path is not a way around a PIN that still works', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+    const card = ownCard();
     const {options} = setup(card, {holderPin: null, blockedConfirmed: true});
     expect(await resetTap(card.transceive, options)).toEqual({
       ok: false,
@@ -278,105 +316,133 @@ describe('reset', () => {
     expect(card.ins()).not.toContain(DELETE);
   });
 
-  it('a reset broken after DELETE is finished by the next tap: same chip, no PIN, rotated keys', async () => {
-    const card = new FakeGpCard().withCashu().withFinishedApplet(HOLDER_PIN);
+  it('own keys, ours still there (lifted at the first DELETE): the next tap carries on deleting, no PIN asked', async () => {
+    const card = ownCard();
     const {oldId, journal, options} = setup(card);
-    card.pull(a => a[1] === DELETE, 'after');
-    const r1 = await resetTap(card.transceive, options);
-    expect(r1).toEqual(
+    card.pull(a => a[1] === DELETE, 'before');
+    expect(await resetTap(card.transceive, options)).toEqual(
       expect.objectContaining({
         ok: false,
         resumable: true,
         stop: expect.objectContaining({kind: 'pulled'}),
       }),
     );
-    expect(card.instances.has('F0464D4341524401')).toBe(false);
+    expect(card.packages.has(PKG)).toBe(true);
     expect(await readJournal(journal)).toEqual(
       expect.objectContaining({
-        stage: 'erasing',
+        schema: 2,
         old_short_id: oldId,
         chip: J3R180_CHIP,
       }),
     );
+    // the journal holds no PIN and no key
+    const raw = journal.map.get(RESET_JOURNAL_KEY)!;
+    for (const secret of [HOLDER_PIN, OWN.enc, OWN.mac, OWN.dek]) {
+      expect(raw).not.toContain(secret);
+    }
 
-    // The next tap: the card has no applet now, so no PIN and no ops check; the journal says which chip.
+    // The applet's instance is still there here, with the old short id: the
+    // next tap would start over with consent. Lift it after the applet went.
+    card.reset();
+    card.pull(a => a[1] === DELETE && a[6] === 7, 'before'); // the package's DELETE
+    const second = await resetTap(card.transceive, options);
+    expect(second).toEqual(expect.objectContaining({ok: false}));
+    expect(card.instances.has('F0464D4341524401')).toBe(false);
+    expect(card.packages.has(PKG)).toBe(true);
+
     card.reset();
     const before = card.log.length;
-    const r2 = await resetTap(card.transceive, {
-      ...options,
-      expected: null,
-      holderPin: null,
-    });
-    expect(r2.ok).toBe(true);
-    // the only VERIFY_PIN is the new PIN's, the tap's last APDU: the holder was not asked again
-    const after = card.log.slice(before).map(a => a[1]);
-    expect(after.filter(i => i === VERIFY)).toHaveLength(1);
-    expect(after.at(-1)).toBe(VERIFY);
-    expect(options.ops.resetCheck).toHaveBeenCalledTimes(1);
-    expect(card.sameKeys(ownKeys())).toBe(true);
-    expect(card.applet!.pin).toBe(NEW_PIN);
-    expect(card.instances.has(CASHU_APPLET)).toBe(true);
-    expect(await readJournal(journal)).toEqual(
-      expect.objectContaining({stage: 'recording', old_short_id: oldId}),
-    );
-  });
-
-  it('a reset broken after the card took its own keys is finished on those keys, without a failed login', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
-    const {options} = setup(card);
-    card.pull(a => a[1] === 0xd8, 'after');
-    expect((await resetTap(card.transceive, options)).ok).toBe(false);
-    card.reset();
-    const r = await resetTap(card.transceive, {
-      ...options,
-      expected: null,
-      holderPin: null,
-    });
+    const r = await resetTap(card.transceive, resume(options));
     expect(r.ok).toBe(true);
-    expect(card.ins().filter(i => i === 0xd8)).toHaveLength(1);
-    expect(card.failedAuths).toBe(0);
+    const after = card.log.slice(before).map(a => a[1]);
+    expect(after).not.toContain(VERIFY);
+    expect(after.filter(i => i === DELETE).length).toBeGreaterThan(0);
+    expect(options.ops.resetCheck).toHaveBeenCalledTimes(2);
+    expectFactory(card);
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
   });
 
-  it('an unfinished reset is finished only on its own chip, and only by its operator', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
+  it('own keys, ours gone (lifted at PUT KEY): the next tap restores the factory keys without deleting', async () => {
+    const card = ownCard();
     const {journal, options} = setup(card);
-    card.pull(a => a[1] === DELETE, 'after');
-    await resetTap(card.transceive, options);
-    const otherCplc = [...J3R180_CPLC];
-    otherCplc[18] ^= 0x01; // another serial
-    const other = new FakeGpCard({cplc: otherCplc});
-    const r = await resetTap(other.transceive, {
-      ...options,
-      expected: null,
-      holderPin: null,
-    });
-    expect(r).toEqual(
-      expect.objectContaining({
-        ok: false,
-        stop: expect.objectContaining({kind: 'differentCard'}),
-      }),
-    );
-    expect(other.ins()).not.toContain(DELETE);
+    card.pull(a => a[1] === PUT_KEY, 'before');
+    expect((await resetTap(card.transceive, options)).ok).toBe(false);
+    expect(card.sameKeys(ownKeys())).toBe(true);
+    expect(card.packages.has(PKG)).toBe(false);
     card.reset();
-    expect(
-      await resetTap(card.transceive, {...options, operatorId: 2}),
-    ).toEqual({ok: false, stop: {kind: 'otherOperator'}, resumable: false});
-    expect(journal.map.size).toBe(1);
+    const before = card.log.length;
+    const r = await resetTap(card.transceive, resume(options));
+    expect(r.ok).toBe(true);
+    const after = card.log.slice(before).map(a => a[1]);
+    expect(after).not.toContain(DELETE);
+    expect(after.filter(i => i === PUT_KEY)).toHaveLength(1);
+    expectFactory(card);
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
   });
 
-  it('a finished card waiting on ops is never reported as a new reset', async () => {
-    const card = new FakeGpCard().withFinishedApplet(HOLDER_PIN);
-    const {options} = setup(card);
-    expect((await resetTap(card.transceive, options)).ok).toBe(true);
+  it('factory keys, ours gone (PUT KEY’s reply lost): the next tap writes nothing and only saves the completion', async () => {
+    const card = ownCard();
+    const {oldId, journal, options} = setup(card);
+    card.pull(a => a[1] === PUT_KEY, 'after');
+    expect((await resetTap(card.transceive, options)).ok).toBe(false);
+    expect(card.sameKeys(FACTORY_KEYS)).toBe(true);
+    expect(await readOutbox(journal)).toEqual([]);
     card.reset();
-    expect(await resetTap(card.transceive, options)).toEqual({
-      ok: false,
-      stop: {kind: 'recordPending'},
-      resumable: true,
-    });
+    const before = card.log.length;
+    const r = await resetTap(card.transceive, resume(options));
+    expect(r.ok).toBe(true);
+    const after = card.log.slice(before).map(a => a[1]);
+    expect(after).not.toContain(DELETE);
+    expect(after).not.toContain(PUT_KEY);
+    expect(after.filter(i => i === EXTERNAL_AUTH)).toHaveLength(1);
+    expectFactory(card);
+    expect((await readOutbox(journal)).map(p => p.short_id)).toEqual([oldId]);
   });
 
-  it('a card on keys ops does not hold is stopped without a failed login, the journal kept', async () => {
+  it('a tap lifted at any APDU, before or after the card acted, is finished by tapping again; never a failed login', async () => {
+    const full = ownCard();
+    await resetTap(full.transceive, setup(full).options);
+    const total = full.log.length;
+    for (let n = 0; n < total; n++) {
+      for (const when of ['before', 'after'] as const) {
+        const card = ownCard();
+        const original = shortIdOf(card.applet!.slots[0]!);
+        const {journal, ops, options} = setup(card);
+        card.pull((_a, i) => i === n, when);
+        const first = await resetTap(card.transceive, options).catch(
+          () => null,
+        );
+        expect(first?.ok ?? false).toBe(false);
+        card.reset();
+        // Anything written to the card is covered by the journal.
+        const touched =
+          !card.sameKeys(ownKeys()) ||
+          !card.packages.has(PKG) ||
+          !card.instances.has('F0464D4341524401');
+        if (touched) {
+          expect(await readJournal(journal)).not.toBeNull();
+        }
+        let r = await resetTap(
+          card.transceive,
+          (await readJournal(journal)) ? resume(options) : options,
+        );
+        if (!r.ok && r.stop.kind === 'pinRequired') {
+          // the journalled card still had its applet: the operator starts over with the PIN
+          card.reset();
+          await journal.removeItem(RESET_JOURNAL_KEY);
+          r = await resetTap(card.transceive, options);
+        }
+        expect({n, when, ok: r.ok}).toEqual({n, when, ok: true});
+        expectFactory(card);
+        expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
+        const outbox = await readOutbox(journal);
+        expect(outbox.map(p => p.short_id)).toEqual([original]);
+        expect((await flushOutbox(ops, journal, 1)).left).toEqual([]);
+      }
+    }
+  });
+
+  it('never sends EXTERNAL AUTHENTICATE for keys the card did not prove: a card on keys ops does not hold stops, untouched', async () => {
     const stranger = {
       enc: fromHex('77'.repeat(16)),
       mac: fromHex('77'.repeat(16)),
@@ -385,16 +451,96 @@ describe('reset', () => {
     const card = new FakeGpCard({keys: stranger}).withFinishedApplet(
       HOLDER_PIN,
     );
-    const {options} = setup(card);
+    const {journal, options} = setup(card);
     const r = await resetTap(card.transceive, options);
+    expect(r).toEqual({
+      ok: false,
+      stop: expect.objectContaining({kind: 'wrongKeys'}),
+      resumable: false,
+    });
+    expect(card.ins()).not.toContain(EXTERNAL_AUTH);
+    expect(card.failedAuths).toBe(0);
+    expect(card.ins()).not.toContain(DELETE);
+    expect(journal.map.size).toBe(0);
+  });
+
+  it('factory keys with our applet still on stops safely: nothing deleted, no journal', async () => {
+    const card = new FakeGpCard().withCashu().withFinishedApplet(HOLDER_PIN);
+    const {journal, options} = setup(card);
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual({
+      ok: false,
+      stop: expect.objectContaining({
+        kind: 'guarded',
+        reason: expect.stringMatching(
+          /factory keys and still has the Fedimint applet/,
+        ),
+      }),
+      resumable: false,
+    });
+    expect(card.ins()).not.toContain(DELETE);
+    expect(card.ins()).not.toContain(PUT_KEY);
+    expect(card.packages.has(PKG)).toBe(true);
+    expect(card.failedAuths).toBe(0);
+    expect(journal.map.size).toBe(0);
+  });
+
+  it('a journal that cannot be written stops before the first DELETE', async () => {
+    const card = ownCard();
+    const {journal, options} = setup(card);
+    journal.setItem = async () => {
+      throw new Error('disk full');
+    };
+    expect(await resetTap(card.transceive, options)).toEqual({
+      ok: false,
+      stop: {kind: 'journal', reason: 'disk full'},
+      resumable: false,
+    });
+    expect(card.ins()).not.toContain(DELETE);
+    expect(card.sameKeys(ownKeys())).toBe(true);
+  });
+
+  it('an unfinished reset is finished only on its own chip, and only by its operator', async () => {
+    const card = ownCard();
+    const {journal, options} = setup(card);
+    card.pull(a => a[1] === PUT_KEY, 'before');
+    await resetTap(card.transceive, options);
+    const otherCplc = [...J3R180_CPLC];
+    otherCplc[18] ^= 0x01; // another serial
+    const other = new FakeGpCard({cplc: otherCplc});
+    const r = await resetTap(other.transceive, resume(options));
     expect(r).toEqual(
       expect.objectContaining({
         ok: false,
-        stop: expect.objectContaining({kind: 'wrongKeys'}),
+        stop: expect.objectContaining({kind: 'differentCard'}),
       }),
     );
-    expect(card.failedAuths).toBe(0);
-    expect(card.ins()).not.toContain(DELETE);
-    expect(card.sameKeys(FACTORY_KEYS)).toBe(false);
+    expect(other.ins()).not.toContain(EXTERNAL_AUTH);
+    card.reset();
+    expect(
+      await resetTap(card.transceive, {...options, operatorId: 2}),
+    ).toEqual({ok: false, stop: {kind: 'otherOperator'}, resumable: false});
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(true);
+  });
+
+  it('ops unreachable after the card is factory: the card is done, the completion waits and is sent later', async () => {
+    const card = ownCard();
+    const {oldId, journal, ops, options} = setup(card);
+    expect((await resetTap(card.transceive, options)).ok).toBe(true);
+    ops.completeReset.mockRejectedValueOnce(new Error('network down'));
+    const failed = await flushOutbox(ops, journal, 1);
+    expect(failed.failed).toEqual({short_id: oldId, reason: 'network down'});
+    expect(failed.left.map(p => p.short_id)).toEqual([oldId]);
+    // the card needs nothing more: the next reset of another card is not blocked by this one
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
+    // another operator's waiting completion is not sent with this one's
+    const later = await flushOutbox(ops, journal, 2);
+    expect(later.recorded).toEqual([]);
+    const sent = await flushOutbox(ops, journal, 1);
+    expect(sent.recorded).toEqual([
+      {short_id: oldId, released: true, stranded_notes: 0},
+    ]);
+    expect(sent.left).toEqual([]);
+    expect(journal.map.size).toBe(0);
   });
 });

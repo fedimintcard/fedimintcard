@@ -1,9 +1,11 @@
 /**
  * Reset a card in the provisioner (OPS-PLAN O5): Settings → Reset a card.
- * The card's applet is deleted and installed again, the card manager is left
- * on (or moved to) the card's own keys, and the card gets new slot keys and a
- * new PIN, so it comes back as a new card with a new short id. Ops links the
- * old record to the new one.
+ * The card ends where it left the chip maker: the Fedimint package deleted
+ * (only ours: F0464D43415244, its applet and its opener), the card manager
+ * back on the factory keys at version 01, and both proved by a full login
+ * under those keys. Ops then marks the old record reset and releases the
+ * chip, so any operator can install it again in a new batch (the install tap
+ * gets the same per-card keys back from ops).
  *
  * Two taps. The first reads slot 0's key (the short id) and the PIN's state
  * without spending a try, and the phone asks ops whether the card may go: not
@@ -11,27 +13,36 @@
  * never another operator's card. The second, after the holder typed the PIN:
  *
  *   slot 0 again (the same card) → ops' check again → VERIFY_PIN in the same
- *   selection → CPLC → the card's keys from ops → journal → DELETE and
- *   reinstall (cardkit's sweep: this card's two instances and its package,
- *   nothing else) → rotate if still on factory keys → GEN_KEY ×8, SET_PIN,
- *   VERIFY_PIN → journal → ops records the reset
+ *   selection → CPLC → the card's keys from ops → cardkit's `factoryReset`:
+ *   one INITIALIZE UPDATE checked against the card's own set and the factory
+ *   set → login with the one it proved → GET STATUS → journal → DELETE ours
+ *   → PUT KEY back to the factory set → a fresh factory login and GET STATUS
+ *   (the proof) → the completion into the outbox → ops
  *
  * The holder's PIN is the consent: ops cannot see a load made around it. A
  * wrong PIN stops with the tries left and is never retried here. A blocked
  * card (or one whose PIN was never set) can be reset only when ops shows it
  * empty and the operator has confirmed a second warning.
  *
- * **The journal.** Written before the first DELETE, so a tap that breaks after
- * it can be finished: the card is then blank, or half installed, on its
- * factory keys or its own, and the next tap checks it is the same chip and
- * carries on without asking for the PIN again (the old PIN went with the
- * applet). It holds the operator, the old short id, the chip and, once the
- * card is finished, the new card's public keys. No PINs, no manager keys, no
- * notes: cashucard's rule for its reset journal.
+ * **Crash safety.** The journal is written just before the first DELETE or
+ * PUT KEY, so a tap lifted after it is finished by tapping the same card
+ * again: the next tap checks it is the same chip and lets `factoryReset` read
+ * where the card is (own keys with ours present: carry on deleting; own keys
+ * with ours gone: restore the keys; factory keys with ours gone: done, only
+ * the record is left; factory keys with ours present: stop). It never sends
+ * EXTERNAL AUTHENTICATE for a set the card did not prove. The holder is not
+ * asked again: the PIN went with the applet. The journal holds the operator,
+ * the old short id, the chip and when; no PINs, no keys.
+ *
+ * **The outbox.** Once the card is proved factory, its completion (the proof,
+ * no secrets) is saved before the journal goes, and posted to ops from
+ * there; a failed post is retried from the outbox, never from the card. The
+ * card is finished either way.
  */
 import {
   CardError,
   TransportError,
+  factoryReset,
   type Random,
   type RunEvent,
   type Transceiver,
@@ -47,13 +58,8 @@ import {
   SW_CONDITIONS,
   SW_OK,
 } from './cardSetup';
-import {
-  chipAndKeys,
-  forget,
-  installRotateFinish,
-  NEITHER_SET,
-} from './installTap';
-import type {CardOps, ResetCardRow, ResetCheck, ResetRecorded} from './ops';
+import {chipAndKeys, forget} from './installTap';
+import type {CardOps, ResetCheck, ResetCompletion, ResetRecorded} from './ops';
 import {shortIdOf} from './store';
 
 /** VERIFY_PIN: no PIN was ever set on this applet. */
@@ -74,15 +80,14 @@ export function pinStatusApdu(): number[] {
   return [0xb0, INS_VERIFY_PIN, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00];
 }
 
-const hex = (keys: readonly number[]) =>
-  keys.map(b => b.toString(16).padStart(2, '0')).join('');
-
 /* ------------------------------------------------------------------------- */
-/* The journal                                                               */
+/* The journal and the outbox                                                */
 /* ------------------------------------------------------------------------- */
 
-/** The one key. Bumping the suffix discards older shapes. */
-export const RESET_JOURNAL_KEY = 'prov.reset.v1';
+/** The one key. Bumping the suffix discards older shapes (v1 was the reinstalling reset's). */
+export const RESET_JOURNAL_KEY = 'prov.reset.v2';
+/** Completions ops has not acknowledged yet. */
+export const RESET_OUTBOX_KEY = 'prov.reset.outbox.v1';
 
 /** Where the journal lives: AsyncStorage on the phone, a map in the tests. */
 export interface JournalStorage {
@@ -91,34 +96,22 @@ export interface JournalStorage {
   removeItem(key: string): Promise<void>;
 }
 
+/** A reset that may have written to the card and is not yet proved factory. */
 export interface ResetJournal {
-  readonly schema: 1;
-  /** `erasing`: the card may have been wiped. `recording`: finished, ops not told yet. */
-  readonly stage: 'erasing' | 'recording';
+  readonly schema: 2;
   readonly operator_id: number;
   readonly old_short_id: string;
   readonly chip: string;
   readonly started_at: number;
-  /** The finished card, public keys only; set with `recording`. */
-  readonly card?: ResetCardRow;
+}
+
+/** A proved completion waiting for ops, and whose it is. */
+export interface PendingCompletion extends ResetCompletion {
+  readonly operator_id: number;
 }
 
 const SHORT_ID = /^[0-9a-f]{8}$/;
 const CHIP = /^cplc-v1:[0-9a-f]{24}$/;
-
-function isCardRow(v: unknown): v is ResetCardRow {
-  const r = v as ResetCardRow | undefined;
-  return (
-    typeof r === 'object' &&
-    r !== null &&
-    SHORT_ID.test(r.short_id) &&
-    Number.isSafeInteger(r.installed_at) &&
-    CHIP.test(r.chip) &&
-    Array.isArray(r.slot_pubkeys) &&
-    r.slot_pubkeys.length === 8 &&
-    r.slot_pubkeys.every(k => typeof k === 'string' && /^[0-9a-f]{64}$/.test(k))
-  );
-}
 
 /** The saved reset, or null for none (or one this build cannot read). */
 export async function readJournal(
@@ -131,13 +124,11 @@ export async function readJournal(
   try {
     const j = JSON.parse(raw) as ResetJournal;
     const ok =
-      j.schema === 1 &&
-      (j.stage === 'erasing' || j.stage === 'recording') &&
+      j.schema === 2 &&
       Number.isSafeInteger(j.operator_id) &&
       SHORT_ID.test(j.old_short_id) &&
       CHIP.test(j.chip) &&
-      Number.isSafeInteger(j.started_at) &&
-      (j.stage === 'erasing' || isCardRow(j.card));
+      Number.isSafeInteger(j.started_at);
     return ok ? j : null;
   } catch {
     return null;
@@ -150,28 +141,132 @@ async function writeJournal(
   j: ResetJournal,
 ): Promise<void> {
   const out: ResetJournal = {
-    schema: 1,
-    stage: j.stage,
+    schema: 2,
     operator_id: j.operator_id,
     old_short_id: j.old_short_id,
     chip: j.chip,
     started_at: j.started_at,
-    ...(j.card
-      ? {
-          card: {
-            short_id: j.card.short_id,
-            installed_at: j.card.installed_at,
-            slot_pubkeys: [...j.card.slot_pubkeys],
-            chip: j.card.chip,
-          },
-        }
-      : {}),
   };
   await storage.setItem(RESET_JOURNAL_KEY, JSON.stringify(out));
 }
 
 export function clearJournal(storage: JournalStorage): Promise<void> {
   return storage.removeItem(RESET_JOURNAL_KEY);
+}
+
+function isPending(v: unknown): v is PendingCompletion {
+  const p = v as PendingCompletion | undefined;
+  return (
+    typeof p === 'object' &&
+    p !== null &&
+    Number.isSafeInteger(p.operator_id) &&
+    SHORT_ID.test(p.short_id) &&
+    CHIP.test(p.chip) &&
+    Number.isInteger(p.gp_key_version) &&
+    p.manager_keys === 'factory' &&
+    p.package === 'absent' &&
+    Number.isSafeInteger(p.verified_at)
+  );
+}
+
+/** Every completion ops has not acknowledged, whoever's; entries this build cannot read are dropped. */
+export async function readOutbox(
+  storage: JournalStorage,
+): Promise<PendingCompletion[]> {
+  const raw = await storage.getItem(RESET_OUTBOX_KEY);
+  if (raw === null) {
+    return [];
+  }
+  try {
+    const list = JSON.parse(raw) as unknown;
+    return Array.isArray(list) ? list.filter(isPending) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeOutbox(
+  storage: JournalStorage,
+  list: readonly PendingCompletion[],
+): Promise<void> {
+  if (list.length === 0) {
+    await storage.removeItem(RESET_OUTBOX_KEY);
+    return;
+  }
+  const out = list.map(p => ({
+    operator_id: p.operator_id,
+    short_id: p.short_id,
+    chip: p.chip,
+    gp_key_version: p.gp_key_version,
+    manager_keys: p.manager_keys,
+    package: p.package,
+    verified_at: p.verified_at,
+  }));
+  await storage.setItem(RESET_OUTBOX_KEY, JSON.stringify(out));
+}
+
+/** Adds (or replaces, by old short id) a proved completion. */
+async function addToOutbox(
+  storage: JournalStorage,
+  p: PendingCompletion,
+): Promise<void> {
+  const list = (await readOutbox(storage)).filter(
+    q => q.short_id !== p.short_id,
+  );
+  await writeOutbox(storage, [...list, p]);
+}
+
+export interface Flushed {
+  readonly recorded: readonly ResetRecorded[];
+  /** Ops' refusal or the network's, for the first entry that failed; the rest wait. */
+  readonly failed: {readonly short_id: string; readonly reason: string} | null;
+  /** This operator's completions still waiting. */
+  readonly left: readonly PendingCompletion[];
+}
+
+/**
+ * Posts this operator's waiting completions to ops, oldest first, and drops
+ * each one ops acknowledges (the route is idempotent, so a repeat is safe).
+ * Stops at the first failure; another operator's entries are left alone.
+ */
+export async function flushOutbox(
+  ops: Pick<CardOps, 'completeReset'>,
+  storage: JournalStorage,
+  operatorId: number,
+): Promise<Flushed> {
+  const recorded: ResetRecorded[] = [];
+  let failed: Flushed['failed'] = null;
+  for (const p of await readOutbox(storage)) {
+    if (p.operator_id !== operatorId) {
+      continue;
+    }
+    try {
+      recorded.push(
+        await ops.completeReset({
+          short_id: p.short_id,
+          chip: p.chip,
+          gp_key_version: p.gp_key_version,
+          manager_keys: p.manager_keys,
+          package: p.package,
+          verified_at: p.verified_at,
+        }),
+      );
+    } catch (e) {
+      failed = {
+        short_id: p.short_id,
+        reason: e instanceof Error ? e.message : String(e),
+      };
+      break;
+    }
+    const rest = (await readOutbox(storage)).filter(
+      q => q.short_id !== p.short_id,
+    );
+    await writeOutbox(storage, rest);
+  }
+  const left = (await readOutbox(storage)).filter(
+    q => q.operator_id === operatorId,
+  );
+  return {recorded, failed, left};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -233,27 +328,25 @@ export type ResetStop =
   | {readonly kind: 'journal'; readonly reason: string}
   /** A reset another operator started on this phone is unfinished. */
   | {readonly kind: 'otherOperator'}
-  /** The card is finished and only ops' record is left: `recordReset`, no tap. */
-  | {readonly kind: 'recordPending'}
-  /** The card's own steps: cardkit's stops, ops' keys, or the keys and PIN. */
+  /** The card's own steps: cardkit's stops, or ops' keys. */
   | {
       readonly kind:
         | 'pulled'
         | 'refused'
         | 'wrongKeys'
         | 'guarded'
-        | 'noManagerKeys'
-        | 'notFinished';
+        | 'noManagerKeys';
       readonly reason?: string;
       readonly sw?: number | null;
     };
 
 export type ResetTapResult =
-  | {readonly ok: true; readonly card: ResetCardRow}
+  /** The card is proved factory; the completion is in the outbox for ops. */
+  | {readonly ok: true; readonly completion: ResetCompletion}
   | {
       readonly ok: false;
       readonly stop: ResetStop;
-      /** True once the journal was written: the card may be wiped, and the next tap finishes it. */
+      /** True once the journal was written: the card may be part way, and the next tap finishes it. */
       readonly resumable: boolean;
     };
 
@@ -261,10 +354,9 @@ export type ResetPhase =
   | 'check'
   | 'consent'
   | 'chip'
-  | 'install'
-  | 'rotate'
-  | 'keys'
-  | 'pin';
+  | 'erase'
+  | 'restore'
+  | 'prove';
 
 export interface ResetTapOptions {
   readonly operatorId: number;
@@ -274,8 +366,6 @@ export interface ResetTapOptions {
   readonly holderPin: string | null;
   /** The operator confirmed the second warning for a blocked (or unset) PIN. */
   readonly blockedConfirmed: boolean;
-  /** The new card's PIN; shown by the caller once the tap finishes. */
-  readonly newPin: string;
   readonly ops: Pick<CardOps, 'managerKeys' | 'resetCheck'>;
   readonly journal: JournalStorage;
   readonly random: Random;
@@ -289,6 +379,15 @@ const stop = (s: ResetStop, resumable = false): ResetTapResult => ({
   stop: s,
   resumable,
 });
+
+/** `beforeWrite` could not save the journal: nothing was written to the card. */
+class JournalFailed extends Error {}
+
+const CARD_PHASES: Record<string, ResetPhase> = {
+  erase: 'erase',
+  restore: 'restore',
+  prove: 'prove',
+};
 
 /** What the card holds now: a keyed applet with its short id, an unkeyed one, or none. */
 async function readCard(
@@ -352,7 +451,7 @@ async function consent(
 }
 
 /**
- * The reset tap. Throws only for a transport loss before the journal (the
+ * The reset tap. Throws only for a transport loss before cardkit's run (the
  * card is then untouched, and the caller says so) and for bugs; every other
  * outcome is a result.
  */
@@ -360,17 +459,9 @@ export async function resetTap(
   tx: Transceiver,
   options: ResetTapOptions,
 ): Promise<ResetTapResult> {
-  if (!/^[0-9]{4,8}$/.test(options.newPin)) {
-    throw new Error('resetTap: the new PIN must be 4 to 8 digits');
-  }
   const saved = await readJournal(options.journal);
   if (saved && saved.operator_id !== options.operatorId) {
     return stop({kind: 'otherOperator'});
-  }
-  if (saved?.stage === 'recording') {
-    // The card is finished; only ops is left, and that needs no card. Never
-    // an `ok`: the caller would show `newPin`, which this card does not have.
-    return stop({kind: 'recordPending'}, true);
   }
   const card = await readCard(tx);
   // A journalled reset whose card still answers with the old short id never
@@ -435,6 +526,7 @@ export async function resetTap(
       ? stop({kind: 'refused'}, resuming)
       : stop({kind: s.kind, reason: s.reason, sw: s.sw}, resuming);
   }
+  let journaled = saved !== null;
   try {
     if (saved && fetched.chip !== saved.chip) {
       return stop(
@@ -445,108 +537,74 @@ export async function resetTap(
         true,
       );
     }
-    if (!saved) {
-      try {
-        await writeJournal(options.journal, {
-          schema: 1,
-          stage: 'erasing',
-          operator_id: options.operatorId,
-          old_short_id: oldId,
-          chip: fetched.chip,
-          started_at: options.now(),
-        });
-      } catch (e) {
-        return stop({
-          kind: 'journal',
-          reason: e instanceof Error ? e.message : String(e),
-        });
-      }
-    }
-    options.onPhase?.('install');
-    // `none` always: the plan sweeps whatever of this card's applet is there
-    // (a keyed applet, a torn install, or nothing) and installs it fresh.
-    const done = await installRotateFinish(tx, 'none', fetched.keys, {
-      pin: options.newPin,
+    // The CPLC was matched in this tap: a factory card proved below is this chip.
+    const done = await factoryReset(tx, fetched.keys, {
       random: options.random,
       now: options.now,
-      onEvent: options.onEvent,
-      onPhase: () => options.onPhase?.('rotate'),
-      onSetupStep: step =>
-        options.onPhase?.(
-          step === 'setPin' || step === 'verifyPin' ? 'pin' : 'keys',
-        ),
+      onEvent: event => {
+        if (event.type === 'phase' && CARD_PHASES[event.phase]) {
+          options.onPhase?.(CARD_PHASES[event.phase]);
+        }
+        options.onEvent?.(event);
+      },
+      beforeWrite: async () => {
+        if (journaled) {
+          return;
+        }
+        try {
+          await writeJournal(options.journal, {
+            schema: 2,
+            operator_id: options.operatorId,
+            old_short_id: oldId,
+            chip: fetched.chip,
+            started_at: options.now(),
+          });
+        } catch (e) {
+          throw new JournalFailed(e instanceof Error ? e.message : String(e));
+        }
+        journaled = true;
+      },
     });
-    if (!done.installed.ok) {
-      const i = done.installed;
+    if (!done.ok) {
       return stop(
-        {
-          kind: i.kind,
-          sw: i.sw,
-          reason: i.kind === 'wrongKeys' ? NEITHER_SET : i.reason,
-        },
-        true,
+        {kind: done.kind ?? 'refused', reason: done.reason, sw: done.sw},
+        journaled,
       );
     }
-    const setup = done.setup;
-    if (!setup || !setup.ok) {
-      return stop(
-        {
-          kind: 'notFinished',
-          sw: setup?.sw ?? null,
-          reason: setup?.reason ?? 'key setup did not run',
-        },
-        true,
-      );
-    }
-    const row: ResetCardRow = {
-      short_id: shortIdOf(setup.keys[0]),
-      installed_at: options.now(),
-      slot_pubkeys: setup.keys.map(k => hex([...k])),
+    const completion: ResetCompletion = {
+      short_id: oldId,
       chip: fetched.chip,
+      gp_key_version: done.keyVersion!,
+      manager_keys: 'factory',
+      package: 'absent',
+      verified_at: options.now(),
     };
     try {
-      await writeJournal(options.journal, {
-        schema: 1,
-        stage: 'recording',
+      await addToOutbox(options.journal, {
+        ...completion,
         operator_id: options.operatorId,
-        old_short_id: oldId,
-        chip: fetched.chip,
-        started_at: saved?.started_at ?? options.now(),
-        card: row,
       });
+      await clearJournal(options.journal);
     } catch {
-      // The card is finished either way; the caller records it now, and a
-      // failed record is retried from the card's row it holds.
+      // The card is factory either way. A journal left behind is finished by
+      // the next tap, which proves the card factory again and saves this.
     }
-    return {ok: true, card: row};
+    return {ok: true, completion};
   } catch (e) {
+    if (e instanceof JournalFailed) {
+      return stop({kind: 'journal', reason: e.message});
+    }
     if (e instanceof TransportError || e instanceof CardError) {
       return stop(
         {
           kind: e instanceof TransportError ? 'pulled' : 'refused',
           reason: e.message,
         },
-        true,
+        journaled,
       );
     }
     throw e;
   } finally {
     forget(fetched.keys);
   }
-}
-
-/**
- * Tells ops, after the tap: the new row, and the old one marked reset. Clears
- * the journal once ops has it; a failure keeps it, and the same body is sent
- * again next time (the route is idempotent).
- */
-export async function recordReset(
-  ops: Pick<CardOps, 'recordReset'>,
-  journal: JournalStorage,
-  oldShortId: string,
-  card: ResetCardRow,
-): Promise<ResetRecorded> {
-  const recorded = await ops.recordReset(oldShortId, card);
-  await clearJournal(journal);
-  return recorded;
 }
