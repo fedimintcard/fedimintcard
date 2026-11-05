@@ -331,7 +331,7 @@ Goal: the whole demo runs on phones, cards and services nobody touches on stage.
    the pairing QR is shown (a StartOS action), the till's wallet in the package's volume and its
    backup, and the ops till token entered as a StartOS action (since replaced by a till claim the
    operator approves in the provisioner app, `docs/TILL-CLAIM.md`).
-3. **Top-up at the POS by Lightning**: a "Top up card" button: amount → the till makes a
+3. **Top-up at the POS by Lightning** — **done on silicon 2026-11-05**: a 98.304 sat top-up paid from a phone wallet and loaded at the zion till (`docs/TOPUP.md`). Was: a "Top up card" button: amount → the till makes a
    Lightning invoice through the federation's gateway → the holder pays it from any wallet on
    their phone → tap → the till loads the card from the eCash it received (the registry's
    till-funded load). A top-up from the till's own balance (cash at the counter) comes free with it.
