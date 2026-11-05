@@ -282,9 +282,12 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   masked, FLAG_SECURE) → card; the PIN lives in a wiped char array, dropped on cancel, error and
   `onStop`; `wrong_pin` returns to the pad with the same `client_ref`, `pin_blocked` back to the
   amount; every retry asks for the PIN again. JVM tests only; no real charge yet.
-- [ ] `duration_ms` is 0 in a charge reply.
-- [ ] The till runs as a service (launchd) that restarts itself, with its token from the file, not
-  a `nohup` line.
+- [x] `duration_ms` is 0 in a charge reply. **Fixed 2026-11-04 (`3031045`)**: the promote hook's mid-spend record no longer wins over the charge's timing.
+- [x] The till runs as a service (launchd) that restarts itself, with its token from the file, not
+  a `nohup` line. **Done 2026-11-04**: `host/scripts/till-service.sh install|restart|stop|status`;
+  LaunchAgent `org.fedimintcard.till`, KeepAlive, settings in `~/.config/fedimintcard/till.env`,
+  token read from `till-token` at each start, binary copied to `~/.local/libexec/fedimintcard`, log
+  `~/Library/Logs/fedimintcard/till.log`, no `CARD_PIN`. Restart after a kill checked on the Mac.
 - [ ] Operator setup without `adb` tunnels where possible; drop `android-relay` from the operator
   path once the POS needs nothing from it (O5 row).
 - [ ] **PIN encrypted to the card** (before merchants run tills you don't control): today the
