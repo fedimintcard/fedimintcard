@@ -194,6 +194,58 @@ O1 stands alone and removes the laptop from provisioning. O2 and O3 move the til
 works; then a plan for flash-mobile as the holder's wallet. flash-mobile has NFC and Cashu but no
 Fedimint client, so that plan starts with a Fedimint client inside a React Native app.
 
+### O5: the finishing checklist (owner, 2026-11-04)
+
+Done means every box is ticked and the acceptance run at the end passes on release builds.
+
+**Card security and lifecycle**
+- [ ] **Per-card card-manager keys, as cashucard does (D29).** Cards today keep the chip maker's
+  default GlobalPlatform keys (`404142…4F`), so anyone with a reader can delete the applet. Ops
+  derives each card's ENC/MAC/DEK set with HKDF-SHA256 from a master held as a Worker secret, keyed
+  by the chip's identity (CPLC fabricator, IC type, serial: stable across resets), and escrows it in
+  the same transaction that issues it, so a lost answer re-issues the same bytes. The phone fetches
+  the set during the install tap and rotates the card's keys (PUT KEY) after installing, then
+  forgets it. The backup then carries the escrow, still age-encrypted. Threat model written down:
+  whoever holds the escrow can manage every card in it.
+- [ ] **Reset in the provisioner.** Settings → Reset a card: read slot 0, ask ops for the card
+  (another operator's or an unknown card is refused); refuse while ops shows a live or pending
+  note, an open charge or an open load; the holder's PIN is required as consent, because ops cannot
+  see a load made around it; a blocked PIN needs ops to show the card empty plus a second operator
+  confirmation. Then delete and reinstall with the card's own keys from ops, key it, set a new PIN,
+  and mark the old record reset and linked to the new short id.
+- [ ] **One tap on iPhone.** Measure install + key rotation + GEN_KEY ×8 + PIN on Max against the
+  ~60 s reader session; split into two taps only if it does not fit.
+- [ ] **Cards from before O2** (for example `15989f91`, no slot keys on record): mark them retired.
+
+**Till**
+- [ ] **PIN entry in the POS app** (`android-relay`, "Fedimint Card POS"): the holder types the
+  PIN on the till's screen and the app sends it in `/v1/charge`; wrong-PIN tries left and a blocked
+  card shown plainly. Today the PIN only reaches the till by hand.
+- [ ] `duration_ms` is 0 in a charge reply.
+- [ ] The till runs as a service (launchd) that restarts itself, with its token from the file, not
+  a `nohup` line.
+- [ ] Operator setup without `adb` tunnels where possible; drop `android-relay` from the operator
+  path once the POS needs nothing from it (O5 row).
+
+**Ops**
+- [ ] **Restore.** A tested way to load a snapshot into a fresh registry object, drilled on staging
+  from a real backup; operators recover with an `OPERATOR_SETUP` recover, tills get new tokens.
+- [ ] **Backup monitoring.** Something outside Cloudflare reads `/registry/backup-status` daily and
+  says so when it is 503.
+- [ ] **Holder-route exposure** decided: `/slots` tells anyone whether a short id exists.
+
+**Apps and release**
+- [ ] **Signed release builds.** Android needs the upload key on this Mac; iOS a Release build that
+  embeds its bundle (Max's Debug build needs Metro on the LAN).
+- [ ] **Store forms.** App Store privacy and Play data safety name the card state ops holds.
+- [ ] **Docs.** `PROVISIONER-PLAN.md` § 4 rewritten; `TILL-API.md` with the load routes; an operator
+  runbook: till tokens, backup key custody, restore, reset.
+
+**Acceptance run (release builds, production)**
+- [ ] A blank card provisioned on Max with its own manager keys, loaded from a separate wallet,
+  charged at the till with the PIN typed in the POS app, reset in the provisioner, provisioned again
+  on the Pixel, and `gpp --list` with factory keys refused on it throughout.
+
 ### O3 design (2026-11-04)
 
 - **The intent carries the unsigned transaction.** A fedimint txid hashes inputs, outputs and the
