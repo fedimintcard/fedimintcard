@@ -193,10 +193,13 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     private fun onKey(k: Int?) {
-        if (flow.state != PosState.Entering) return
-        when (k) { null -> flow.pad.backspace(); -1 -> flow.pad.clear(); else -> flow.pad.press(k) }
-        ui.setPad(flow.pad)
+        val pad = when (flow.state) { PosState.Entering -> flow.pad; PosState.TopUpEntering -> flow.topUpPad; else -> return }
+        when (k) { null -> pad.backspace(); -1 -> pad.clear(); else -> pad.press(k) }
+        ui.setPad(pad)
     }
+
+    /** The keypad shows the top-up amount while one is typed or its invoice is made. */
+    private fun padFor(s: PosState) = if (s is PosState.TopUpEntering || s is PosState.TopUpCreating) flow.topUpPad else flow.pad
 
     /** PIN digits go to the pad only while the PIN screen shows; nothing about them is logged. */
     private fun onPinKey(k: Int?) {
@@ -216,10 +219,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         val refBefore = flow.unresolvedRef
         val effects = flow.dispatch(e)
         val now = flow.state
-        ui.setPad(flow.pad)
         ui.setPinPad(flow.pinPad)
         secureFor(now)
         ui.render(now)
+        ui.setPad(padFor(now)) // after render: the keypad's buttons depend on the state
         if (now is PosState.Signing && before !is PosState.Signing) {
             elapsed = 0; ui.resetElapsed()
             handler.removeCallbacks(tick); handler.postDelayed(tick, 1000)
@@ -228,8 +231,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         val refNow = flow.unresolvedRef
         if (refNow == null) salesGen.cancel()
         else if (refNow != refBefore) scheduleSalesPoll()
-        if (now is PosState.Receipt) pollNow()
+        if (now is PosState.Receipt || now is PosState.TopUpLoaded) pollNow()
         if (now is PosState.BalanceShown && before != now) startBalanceCountdown(now.readId)
+        if (now is PosState.TopUpInvoice && (before !is PosState.TopUpInvoice || before.topUp.topupId != now.topUp.topupId)) watchInvoice(now.topUp)
         for (fx in effects) when (fx) {
             is PosEffect.StartCharge -> Thread {
                 val r = withCard(
@@ -239,6 +243,14 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                 runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
             }.start()
             is PosEffect.StartBalanceRead -> readCardBalance(fx.readId)
+            is PosEffect.CreateTopUp -> Thread {
+                val r = client.createTopUp(fx.amountMsat, fx.clientRef)
+                runOnUiThread { dispatch(PosEvent.TopUpCreated(fx.createId, r)) }
+            }.start()
+            is PosEffect.LoadTopUp -> Thread {
+                val r = withCard({ link -> client.loadTopUp(fx.topupId, link) }, { TopUpReply.Failed(TillError.Unreachable) })
+                runOnUiThread { dispatch(PosEvent.TopUpLoadDone(fx.loadId, r)) }
+            }.start()
         }
     }
 
@@ -255,6 +267,37 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             }
         }
         handler.postDelayed(step, 1000)
+    }
+
+    /**
+     * While [t]'s invoice is on screen: the time left every second, and the till asked every
+     * 1.5 s whether it is paid. Both stop when another screen (or another invoice) takes over.
+     */
+    private fun watchInvoice(t: TopUp) {
+        val onScreen = { (flow.state as? PosState.TopUpInvoice)?.topUp?.topupId == t.topupId }
+        ui.setTimeLeft(timeLeft(t.expiresAtMs, System.currentTimeMillis()))
+        val clock = object : Runnable {
+            override fun run() {
+                if (!onScreen()) return
+                ui.setTimeLeft(timeLeft(t.expiresAtMs, System.currentTimeMillis()))
+                handler.postDelayed(this, 1000)
+            }
+        }
+        handler.postDelayed(clock, 1000)
+        val ask = object : Runnable {
+            override fun run() {
+                if (!onScreen()) return
+                Thread {
+                    val r = client.topUpStatus(t.topupId)
+                    runOnUiThread {
+                        if (!onScreen()) return@runOnUiThread
+                        dispatch(PosEvent.TopUpPolled(t.topupId, r))
+                        if (onScreen()) handler.postDelayed(this, INVOICE_POLL_MS)
+                    }
+                }.start()
+            }
+        }
+        handler.postDelayed(ask, INVOICE_POLL_MS)
     }
 
     private val tick = object : Runnable {
@@ -308,7 +351,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     private fun pollNow() {
-        if (flow.state is PosState.Signing || pollInFlight) return
+        if (flow.state is PosState.Signing || flow.state is PosState.TopUpLoading || pollInFlight) return
         pollInFlight = true
         Thread {
             val r = client.status()
@@ -354,5 +397,6 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         const val PORT = 9876
         const val SCAN_REQUEST = 7
         const val TAG = "Pos"
+        const val INVOICE_POLL_MS = 1_500L
     }
 }

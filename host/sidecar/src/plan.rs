@@ -374,6 +374,47 @@ impl Plan {
     }
 }
 
+/// The card amount nearest `msat` (docs/TOPUP.md): at most `max_notes` notes, each a power of two
+/// at least `min_denom` for which `is_denom` holds. The two candidates are the largest such value
+/// at or below `msat` and the smallest at or above it; the nearer wins, a tie goes to the lower.
+/// `None` when neither exists (e.g. `msat` below the smallest note).
+pub fn nearest_card_amount(msat: u64, max_notes: u32, min_denom: u64, is_denom: impl Fn(u64) -> bool) -> Option<u64> {
+    if msat == 0 || max_notes == 0 {
+        return None;
+    }
+    // Work in units of the smallest note (a power of two), so no candidate has a note below it.
+    let shift = min_denom.max(1).next_power_of_two().trailing_zeros();
+    let valid = |units: u64| {
+        let v = units.checked_shl(shift).filter(|v| v >> shift == units)?;
+        (units > 0 && units.count_ones() <= max_notes && binary(v).into_iter().all(&is_denom)).then_some(v)
+    };
+    // Largest value at or below: the top `max_notes` set bits.
+    let floor = msat >> shift;
+    let mut down = 0u64;
+    for b in (0..64).rev() {
+        if down.count_ones() == max_notes {
+            break;
+        }
+        if floor >> b & 1 == 1 {
+            down |= 1 << b;
+        }
+    }
+    // Smallest value at or above: add the lowest set bit until few enough remain.
+    let mut up = Some(floor + u64::from(floor << shift != msat));
+    while let Some(v) = up {
+        if v.count_ones() <= max_notes {
+            break;
+        }
+        up = v.checked_add(v & v.wrapping_neg());
+    }
+    let down = valid(down);
+    let up = up.and_then(valid);
+    match (down, up) {
+        (Some(d), Some(u)) => Some(if msat - d <= u - msat { d } else { u }),
+        (d, u) => d.or(u),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +607,48 @@ mod tests {
     fn too_many_notes_is_an_error_not_a_panic() {
         let notes = vec![1024u64; 21];
         assert!(matches!(solve(&notes, 1000, 4, &zero, 1), Err(PlanError::TooManyNotes(21))));
+    }
+
+    // ---- nearest_card_amount (docs/TOPUP.md)
+
+    fn any(_: u64) -> bool {
+        true
+    }
+
+    #[test]
+    fn nearest_card_amount_matches_the_doc() {
+        assert_eq!(nearest_card_amount(100_000, 3, 1, any), Some(100_352));
+        assert_eq!(nearest_card_amount(1_000_000, 3, 1, any), Some(1_048_576));
+        assert_eq!(nearest_card_amount(21_000, 3, 1, any), Some(20_992));
+        assert_eq!(nearest_card_amount(10_000_000, 3, 1, any), Some(9_961_472));
+    }
+
+    #[test]
+    fn nearest_card_amount_edges() {
+        // Already a card amount: unchanged.
+        assert_eq!(nearest_card_amount(1 << 16, 3, 1, any), Some(1 << 16));
+        assert_eq!(nearest_card_amount((1 << 16) + (1 << 10) + 1, 3, 1, any), Some((1 << 16) + (1 << 10) + 1));
+        // A tie goes to the lower: 6 msat in one note is 4 or 8.
+        assert_eq!(nearest_card_amount(6, 1, 1, any), Some(4));
+        // Nothing to round.
+        assert_eq!(nearest_card_amount(0, 3, 1, any), None);
+        assert_eq!(nearest_card_amount(5, 0, 1, any), None);
+        // Below the smallest note: only the upward candidate is valid.
+        assert_eq!(nearest_card_amount(700, 3, 1024, any), Some(1024));
+        // A candidate with a note below the smallest note is not a card amount.
+        assert_eq!(nearest_card_amount(1024 + 3, 3, 1024, any), Some(1024));
+        assert_eq!(nearest_card_amount(3 * 1024 - 1, 3, 1024, any), Some(3 * 1024));
+        // Notes the federation does not issue: only notes up to 2^20 here.
+        let small = |n: u64| n <= 1 << 20;
+        assert_eq!(nearest_card_amount((1 << 21) + 5, 3, 1, small), None);
+        assert_eq!(nearest_card_amount((1 << 20) + (1 << 19) + (1 << 18) + (1 << 17), 3, 1, small), Some((1 << 20) + (1 << 19) + (1 << 18)));
+        // Never more than max_notes notes, never far off.
+        for msat in [1_234_567u64, 999_999, 50_000, 5_000_000, 77_777_777] {
+            let v = nearest_card_amount(msat, 3, 1, any).unwrap();
+            assert!(v.count_ones() <= 3, "{msat} -> {v}");
+            assert!((v as f64 - msat as f64).abs() / (msat as f64) < 0.15, "{msat} -> {v}");
+        }
+        // Overflow at the top is not a candidate.
+        assert_eq!(nearest_card_amount(u64::MAX, 3, 1, any), Some(u64::MAX - (u64::MAX >> 3)));
     }
 }

@@ -150,6 +150,31 @@ Empty body. Reconciles the card's notes with the federation (shares the busy fla
 `200 {"ok":true,"live_msat":N,"notes":[{"slot":0,"msat":N,"status":"live"}],"free_slots":[...]}`
 Same error table as `/v1/charge` where applicable.
 
+## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load
+
+Top-up by Lightning (`docs/TOPUP.md`): the till makes an invoice through the federation's gateway
+(its `ln` module) and loads what it received onto the card as a holder load, recorded in ops.
+On ops only (`503 ops_not_connected` otherwise); `503 lightning_unavailable` when the federation's
+`ln` module is not usable.
+
+`POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>"}` rounds `N` to the
+nearest card amount (at most 3 notes) and answers the top-up:
+
+`200 {"ok":true,"topup_id":"<16 hex>","amount_msat":N,"invoice":"lnbc…","expires_at_ms":T,"state":"waiting"}`
+
+The invoice is for exactly `amount_msat` and expires in 10 minutes. The same `client_ref` answers
+the same top-up (no second invoice); with another amount it is `409 client_ref_conflict`.
+`400 bad_amount` for a missing, zero or too large (over 100,000 sats) amount; `502 invoice_failed`
+when no gateway made an invoice.
+
+`GET /v1/topup/{topup_id}` answers the same body with the current `state`: `waiting`, `paid`,
+`loaded` (with `load_txid`), `expired`, or `failed` (with `detail`). `404 unknown_topup`.
+
+`POST /v1/topup/{topup_id}/load` with `X-Card-Link` loads a `paid` top-up onto the card and
+answers it with `"state":"loaded"` and `"load_txid"`. A `loaded` top-up answers again without a
+card. `409 not_paid`, `410 expired`, `409 topup_failed`, `409 card_full` (too few free slots; the
+top-up stays `paid`), and the card errors of `/v1/charge`. Shares the job slot with charges.
+
 ## POST /v1/cards/precheck
 Empty body (or `{"batch_id":"<string>"}`, ignored). **Read-only**: nothing is written to
 `card_state.json`, so the app may call it on every tap. Answers what is on the card, in the order

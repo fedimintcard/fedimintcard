@@ -30,9 +30,12 @@ fedimint-client = { workspace = true }
 fedimint-connectors = { workspace = true }
 fedimint-core = { workspace = true }
 fedimint-mint-client = { workspace = true }
+fedimint-ln-client = { workspace = true }
+fedimint-ln-common = { workspace = true }
 fedimint-mint-common = { workspace = true }
 fedimint-rocksdb = { workspace = true }
 futures = "0.3"
+lightning-invoice = "0.33.2"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"

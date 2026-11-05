@@ -50,6 +50,8 @@ struct RootView: View {
         case .signing(let price, _, _, _): return ("\(formatSats(price)) sats", "Paying… keep the card on the phone", false, true)
         case .balanceWaiting: return ("Card balance", "Hold the card to the top of the phone", true, false)
         case .balanceReading: return ("Card balance", "Reading… keep the card on the phone", true, true)
+        case .topUpWaitingForCard(let t): return ("\(formatSats(t.amountMsat)) sats", "Hold the card to load \(formatSats(t.amountMsat)) sats", true, false)
+        case .topUpLoading(_, let t): return ("\(formatSats(t.amountMsat)) sats", "Loading… keep the card on the phone", false, true)
         default: return nil
         }
     }
@@ -66,7 +68,12 @@ struct RootView: View {
         switch pos.state {
         case .entering: AmountScreen(openSettings: { showSettings = true })
         case .enteringPin(let price, _, let wrong, let left, _): PinScreen(priceMsat: price, wrongPin: wrong, triesLeft: left)
-        case .waitingForCard, .signing, .balanceWaiting, .balanceReading: EmptyView()
+        case .waitingForCard, .signing, .balanceWaiting, .balanceReading, .topUpWaitingForCard, .topUpLoading: EmptyView()
+        case .topUpEntering: TopUpScreen(creating: false)
+        case .topUpCreating: TopUpScreen(creating: true)
+        case .topUpInvoice(let t, _): InvoiceScreen(topUp: t)
+        case .topUpLoaded(let msat, let txid): ReceiptScreen(headline: "Loaded \(formatSats(msat)) sats", txid: txid)
+        case .topUpFailed(let f): TopUpErrorScreen(failure: f)
         case .receipt(let r): ReceiptScreen(receipt: r)
         case .error(let e): ErrorScreen(info: e)
         case .sales: SalesScreen()

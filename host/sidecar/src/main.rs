@@ -37,6 +37,18 @@ enum Cmd {
     /// The point-of-sale HTTP service (see docs/TILL-API.md).
     #[command(subcommand)]
     Till(TillCmd),
+    /// Lightning through the federation's gateways.
+    #[command(subcommand)]
+    Ln(LnCmd),
+}
+
+#[derive(Subcommand)]
+enum LnCmd {
+    /// The gateways registered with the federation, with their fees.
+    Gateways,
+    /// Make an invoice for `amount_msat`, print it, and wait (up to 10 minutes) until it is paid
+    /// and the eCash is in the wallet.
+    Receive { amount_msat: u64 },
 }
 
 #[derive(Subcommand)]
@@ -203,6 +215,41 @@ async fn main() -> Result<()> {
             println!("joined federation {}", w.federation_id());
             println!("data dir: {}", cli.data_dir.display());
             println!("back up {}/mnemonic: it is the wallet's root secret", cli.data_dir.display());
+        }
+        Cmd::Ln(LnCmd::Gateways) => {
+            let w = Wallet::open(&cli.data_dir).await?;
+            let ln = w.lightning()?;
+            ln.update_gateway_cache().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let gws = ln.list_gateways().await;
+            println!("{} gateway(s)", gws.len());
+            for g in gws {
+                println!(
+                    "{} vetted={} fees base {} msat + {} ppm  {}",
+                    g.info.gateway_id, g.vetted, g.info.fees.base_msat, g.info.fees.proportional_millionths, g.info.api
+                );
+            }
+        }
+        Cmd::Ln(LnCmd::Receive { amount_msat }) => {
+            use futures::StreamExt as _;
+            let w = Wallet::open(&cli.data_dir).await?;
+            let ln = w.lightning()?;
+            ln.update_gateway_cache().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let gw = ln.select_available_gateway(None, None).await.map_err(|e| anyhow::anyhow!("no gateway: {e:?}"))?;
+            eprintln!("gateway {} ({})", gw.gateway_id, gw.api);
+            let desc = lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
+            let (op, invoice, _) = ln
+                .create_bolt11_invoice(fedimint_core::Amount::from_msats(*amount_msat), desc, Some(600), (), Some(gw))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            println!("{invoice}");
+            let mut updates = ln.subscribe_ln_receive(op).await?.into_stream();
+            while let Some(st) = updates.next().await {
+                eprintln!("{st:?}");
+                if matches!(st, fedimint_ln_client::LnReceiveState::Claimed | fedimint_ln_client::LnReceiveState::Canceled { .. }) {
+                    break;
+                }
+            }
+            println!("wallet balance now {} msat", w.balance_msat().await?);
         }
         Cmd::Info => {
             let w = Wallet::open(&cli.data_dir).await?;

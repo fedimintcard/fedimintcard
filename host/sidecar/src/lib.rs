@@ -10,4 +10,5 @@ pub mod sales;
 pub mod shares;
 pub mod state;
 pub mod till;
+pub mod topup;
 pub mod wallet;

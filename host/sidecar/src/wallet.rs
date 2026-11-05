@@ -40,6 +40,9 @@ pub fn sales_path(data_dir: &Path) -> PathBuf {
 }
 
 /// A joined federation client plus what the card glue needs from the mint module.
+/// Written once the API versions were refetched with the ln module registered (`Wallet::open`).
+const LN_VERSIONS_MARKER: &str = "api-versions-ln";
+
 #[derive(Clone)]
 pub struct Wallet {
     pub client: ClientHandleArc,
@@ -95,12 +98,25 @@ impl Wallet {
         let mnemonic = read_mnemonic(data_dir)
             .with_context(|| format!("no wallet in {}: run `join <invite>` first", data_dir.display()))?;
         let db = open_db(data_dir).await?;
+        // A wallet that joined before the ln module was registered has a cached API version set
+        // without it, and the client skips any module missing from that set. Drop the cache once
+        // (marker file) so the client fetches the versions afresh, ln included, as it does at join.
+        let marker = data_dir.join(LN_VERSIONS_MARKER);
+        if !marker.exists() {
+            use fedimint_core::db::IDatabaseTransactionOpsCoreTyped as _;
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.remove_entry(&fedimint_client::db::CachedApiVersionSetKey).await;
+            dbtx.commit_tx_result().await.context("clearing the cached API versions")?;
+        }
         let client = Client::builder()
             .await
             .with_module_for_join()
             .open(connectors().await, db, root_secret(&mnemonic))
             .await
             .context("opening the client database")?;
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, b"ln module registered; API versions refetched once\n");
+        }
         let mut w = Self::from_client(Arc::new(client)).await?;
         w.invite = std::fs::read_to_string(data_dir.join(INVITE_FILE))
             .ok()
@@ -110,6 +126,11 @@ impl Wallet {
 
     pub fn federation_id(&self) -> FederationId {
         self.client.federation_id()
+    }
+
+    /// The federation's ln module: the till's top-up invoices (docs/TOPUP.md).
+    pub fn lightning(&self) -> Result<fedimint_client::module::ClientModuleInstance<'_, fedimint_ln_client::LightningClientModule>> {
+        Ok(self.client.get_first_module::<fedimint_ln_client::LightningClientModule>()?)
     }
 
     pub fn mint(&self) -> Result<fedimint_client::module::ClientModuleInstance<'_, MintClientModule>> {
@@ -224,6 +245,9 @@ trait BuilderExt {
 impl BuilderExt for fedimint_client::ClientBuilder {
     fn with_module_for_join(mut self) -> fedimint_client::ClientBuilder {
         self.with_module(MintClientInit);
+        // Lightning (the federation's ln module; its lnv2 is older than this client speaks): the
+        // till's top-up invoices (docs/TOPUP.md).
+        self.with_module(fedimint_ln_client::LightningClientInit::default());
         self
     }
 }

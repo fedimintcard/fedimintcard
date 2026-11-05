@@ -59,6 +59,34 @@ pub struct PendingLoad {
     /// The wallet client's operation, hex: present in its log exactly when the build committed.
     pub operation_id: String,
     pub notes: Vec<LoadNote>,
+    /// Who asked for the load, if anyone did: a till's top-up id (docs/TOPUP.md), so the till
+    /// can tell which top-up a load finished by a later run belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+}
+
+/// The card has fewer free slots than the load has notes. Nothing was built or sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardFull {
+    pub short_id: String,
+    pub free: usize,
+    pub needed: usize,
+}
+
+impl std::fmt::Display for CardFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "card {} has {} free slot(s) and this load needs {}", self.short_id, self.free, self.needed)
+    }
+}
+
+impl std::error::Error for CardFull {}
+
+/// A load an earlier run left, as [`Loader::resume_each`] finished it.
+#[derive(Debug, Clone)]
+pub struct Finished {
+    pub load: PendingLoad,
+    /// `(slot, msat)` now live on the card; `None`: the load never became money.
+    pub live: Option<Vec<(u8, u64)>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +119,7 @@ pub struct Loader<'w> {
     wallet: &'w Wallet,
     ops: OpsClient,
     journal: PathBuf,
+    tag: Option<String>,
     #[doc(hidden)]
     pub crash: Option<LoadCrash>,
 }
@@ -98,7 +127,13 @@ pub struct Loader<'w> {
 impl<'w> Loader<'w> {
     /// A loader paying from `wallet`, against the registry at `ops_url`, journalling in `data_dir`.
     pub fn new(wallet: &'w Wallet, ops_url: &str, data_dir: &Path) -> Result<Self> {
-        Ok(Self { wallet, ops: OpsClient::holder(ops_url)?, journal: data_dir.join(JOURNAL_FILE), crash: None })
+        Ok(Self { wallet, ops: OpsClient::holder(ops_url)?, journal: data_dir.join(JOURNAL_FILE), tag: None, crash: None })
+    }
+
+    /// Mark this loader's loads with `tag` in the journal ([`PendingLoad::tag`]).
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
     }
 
     fn read_journal(&self) -> Result<Journal> {
@@ -145,12 +180,9 @@ impl<'w> Loader<'w> {
             "card {short_id} belongs to federation {}, and this wallet is in {ours}",
             free.federation_id
         );
-        ensure!(
-            free.free.len() >= notes.len(),
-            "card {short_id} has {} free slot(s) and this load needs {}",
-            free.free.len(),
-            notes.len()
-        );
+        if free.free.len() < notes.len() {
+            return Err(anyhow!(CardFull { short_id, free: free.free.len(), needed: notes.len() }));
+        }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
         let bal = self.wallet.balance_msat().await?;
         ensure!(bal >= need, "wallet holds {bal} msat but the load needs about {need} msat including fees");
@@ -205,6 +237,7 @@ impl<'w> Loader<'w> {
                     out_idx: i as u64,
                 })
                 .collect(),
+            tag: self.tag.clone(),
         };
 
         // 3. Journal, then ops; a refusal drops the build and nothing has left the wallet.
@@ -237,10 +270,16 @@ impl<'w> Loader<'w> {
     /// Finish every load an earlier run left, accepted or not. Returns how many were finished; one
     /// that cannot be finished yet stays in the journal and is an error.
     pub async fn resume(&self) -> Result<usize> {
-        let mut done = 0;
+        Ok(self.resume_each().await?.len())
+    }
+
+    /// [`Self::resume`], saying what became of each load.
+    pub async fn resume_each(&self) -> Result<Vec<Finished>> {
+        let mut done = vec![];
         for p in self.pending()? {
-            self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
-            done += 1;
+            let live =
+                self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
+            done.push(Finished { load: p, live });
         }
         Ok(done)
     }

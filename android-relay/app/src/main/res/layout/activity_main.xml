@@ -41,6 +41,10 @@
             android:layout_height="wrap_content" android:layout_marginTop="10dp" android:minHeight="32dp"
             android:gravity="center_vertical" android:textColor="@color/bad" android:background="@drawable/bg_chip_bad"
             android:clickable="true" android:focusable="true" android:visibility="gone" />
+        <!-- shown only on the top-up keypad -->
+        <TextView android:id="@+id/topup_title" style="@style/Heading" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="@string/top_up"
+            android:textColor="@color/gold_hi" android:visibility="gone" />
         <TextView android:id="@+id/amount_text" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" android:gravity="center" />
         <GridLayout android:id="@+id/keypad" android:layout_width="match_parent" android:layout_height="0dp"
@@ -194,8 +198,41 @@
         <TextView android:id="@+id/card_balance_countdown" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:textColor="@color/dim"
             android:textSize="14sp" />
-        <Button android:id="@+id/btn_card_balance_done" style="@style/PrimaryButton" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:text="@string/done" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <Button android:id="@+id/btn_charge_card" style="@style/OutlineButton" android:layout_width="0dp"
+                android:layout_weight="1" android:layout_height="wrap_content" android:layout_marginEnd="6dp"
+                android:text="@string/charge_card" />
+            <Button android:id="@+id/btn_top_up_card" style="@style/PrimaryButton" android:layout_width="0dp"
+                android:layout_weight="1" android:layout_height="wrap_content" android:layout_marginStart="6dp"
+                android:text="@string/top_up_card" />
+        </LinearLayout>
+        <Button android:id="@+id/btn_card_balance_done" style="@style/GhostButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="4dp" android:text="@string/done" />
+    </LinearLayout>
+
+    <!-- top-up invoice: the holder scans it with their own wallet -->
+    <LinearLayout android:id="@+id/screen_invoice" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">
+        <TextView android:id="@+id/invoice_amount" style="@style/Heading" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="24dp" android:maxLines="1"
+            android:autoSizeTextType="uniform" android:autoSizeMinTextSize="24sp" android:autoSizeMaxTextSize="40sp"
+            android:autoSizeStepGranularity="2sp" />
+        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+        <FrameLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:background="@drawable/bg_qr" android:padding="18dp">
+            <ImageView android:id="@+id/invoice_qr" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:adjustViewBounds="true" android:scaleType="fitCenter"
+                android:contentDescription="@string/invoice_qr_description" />
+        </FrameLayout>
+        <TextView style="@style/Body" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="20dp" android:text="@string/scan_with_wallet" android:textSize="20sp" />
+        <TextView android:id="@+id/invoice_time_left" style="@style/Body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="6dp" android:textColor="@color/dim"
+            android:textSize="15sp" android:accessibilityLiveRegion="none" />
+        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+        <Button android:id="@+id/btn_invoice_cancel" style="@style/OutlineButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="@string/cancel" />
     </LinearLayout>
 
     <!-- relay (old status screen) -->

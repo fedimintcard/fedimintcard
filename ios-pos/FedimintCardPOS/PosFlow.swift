@@ -101,7 +101,7 @@ func balanceProblem(_ r: BalanceResult) -> BalanceProblem {
     }
 }
 
-enum CardPurpose: Equatable { case charge, balance }
+enum CardPurpose: Equatable { case charge, balance, topUp }
 
 enum PosState: Equatable {
     case entering
@@ -119,6 +119,18 @@ enum PosState: Equatable {
     case balanceShown(readId: Int, liveMsat: Int64)
     /// `detail` is the till's own words, kept for diagnosis and never shown.
     case balanceFailed(BalanceProblem, detail: String)
+
+    // Top-up by Lightning (docs/TOPUP.md). The amount is typed on `PosFlow.topUpPad`.
+    case topUpEntering
+    /// Asking the till for the invoice; `clientRef` makes a repeat answer the same top-up.
+    case topUpCreating(createId: Int, requestedMsat: Int64, clientRef: String)
+    /// The invoice is on screen and the till is polled until it is paid.
+    case topUpInvoice(TopUp, clientRef: String)
+    /// Paid: the NFC sheet is up, waiting for the card.
+    case topUpWaitingForCard(TopUp)
+    case topUpLoading(loadId: Int, TopUp)
+    case topUpLoaded(amountMsat: Int64, loadTxid: String)
+    case topUpFailed(TopUpFailure)
 
     var isBalance: Bool {
         switch self {
@@ -151,6 +163,27 @@ enum PosEvent: Equatable {
     case balanceExpired(readId: Int)
     case donePressed
     case saleFound(Sale)
+    /// On the balance screen: charge this card (the amount keypad, then the charge).
+    case chargeCardPressed
+    /// On the balance screen: top up this card.
+    case topUpPressed
+    /// On the top-up keypad.
+    case createInvoicePressed
+    case topUpCreated(createId: Int, result: TopUpReply<TopUp>)
+    /// A poll of the invoice on screen.
+    case topUpPolled(topupId: String, result: TopUpReply<TopUpStatus>)
+    case topUpLoadDone(loadId: Int, result: TopUpReply<TopUpStatus>)
+}
+
+/// A failed top-up step. `topUp` is nil when the invoice was never made (Try again asks for it
+/// again with `clientRef`); `paid` when the holder has paid and the card still waits.
+struct TopUpFailure: Equatable {
+    let problem: TopUpProblem
+    let detail: String
+    let requestedMsat: Int64
+    let clientRef: String
+    var topUp: TopUp? = nil
+    var paid: Bool = false
 }
 
 enum PosEffect {
@@ -159,6 +192,10 @@ enum PosEffect {
     /// `pin` is handed over to the request, which wipes it once the body is built.
     case startCharge(chargeId: Int, priceMsat: Int64, clientRef: String, pin: Pin?)
     case startBalanceRead(readId: Int)
+    /// `POST /v1/topup`.
+    case createTopUp(createId: Int, amountMsat: Int64, clientRef: String)
+    /// `POST /v1/topup/{id}/load` over the card now linked.
+    case loadTopUp(loadId: Int, topupId: String)
 }
 
 /// Pure state machine for one till session. Call from the main thread.
@@ -167,6 +204,8 @@ final class PosFlow {
     static let balanceShownSeconds = 15
 
     let pad = AmountPad()
+    /// The top-up amount: separate from `pad`, which keeps the sale being typed.
+    let topUpPad = AmountPad()
     let pinPad = PinPad()
     private var heldPin: Pin?
     private(set) var state: PosState = .entering
@@ -211,6 +250,80 @@ final class PosFlow {
         return .error(PosErrorInfo(priceMsat: price, kind: kind, detail: detail, clientRef: ref, unresolvedRef: unresolved))
     }
 
+    private func createTopUp(_ msat: Int64, _ ref: String) -> [PosEffect] {
+        let cid = id()
+        state = .topUpCreating(createId: cid, requestedMsat: msat, clientRef: ref)
+        return [.createTopUp(createId: cid, amountMsat: msat, clientRef: ref)]
+    }
+
+    /// Paid: the NFC sheet asks for the card.
+    private func waitForCard(_ t: TopUp) -> [PosEffect] {
+        state = .topUpWaitingForCard(t)
+        return [.startCardSession(.topUp)]
+    }
+
+    private func paidFailure(_ p: TopUpProblem, _ detail: String, _ t: TopUp) -> PosState {
+        .topUpFailed(TopUpFailure(problem: p, detail: detail, requestedMsat: t.amountMsat, clientRef: "", topUp: t, paid: p != .expired))
+    }
+
+    /// The top-up transitions; nil when `e` is not one of them in `s`.
+    private func topUp(_ e: PosEvent, _ s: PosState) -> [PosEffect]? {
+        switch (e, s) {
+        case (.topUpPressed, .balanceShown):
+            topUpPad.clear(); state = .topUpEntering
+        case (.chargeCardPressed, .balanceShown):
+            state = .entering
+        case (.createInvoicePressed, .topUpEntering):
+            return topUpPad.isChargeable ? createTopUp(topUpPad.msat, newRef()) : []
+        case (.cancelPressed, .topUpEntering), (.cancelPressed, .topUpInvoice):
+            state = .entering
+        case (.topUpCreated(let cid, let r), .topUpCreating(let cur, let msat, let ref)) where cid == cur:
+            if case .ok(let t) = r { state = .topUpInvoice(t, clientRef: ref) }
+            else { state = .topUpFailed(TopUpFailure(problem: topUpProblem(r), detail: r.refusedDetail, requestedMsat: msat, clientRef: ref)) }
+        case (.topUpPolled(let tid, let r), .topUpInvoice(let t0, let ref)) where tid == t0.topupId:
+            guard case .ok(let st) = r else { return [] } // a failed poll: poll again
+            let t = TopUp(topupId: t0.topupId, amountMsat: st.amountMsat, invoice: t0.invoice, expiresAtMs: t0.expiresAtMs, state: st.state)
+            switch st.state {
+            case "paid": return waitForCard(t)
+            case "loaded": state = .topUpLoaded(amountMsat: st.amountMsat, loadTxid: st.loadTxid ?? "")
+            case "expired": state = .topUpFailed(TopUpFailure(problem: .expired, detail: "", requestedMsat: t.amountMsat, clientRef: ref, topUp: t))
+            case "failed": state = .topUpFailed(TopUpFailure(problem: .failed, detail: st.detail ?? "", requestedMsat: t.amountMsat, clientRef: ref, topUp: t))
+            default: break
+            }
+        case (.cardPresent, .topUpWaitingForCard(let t)):
+            let lid = id()
+            state = .topUpLoading(loadId: lid, t)
+            return [.loadTopUp(loadId: lid, topupId: t.topupId)]
+        // Paid: cancelling the tap (here or on the NFC sheet) must not lose the top-up quietly.
+        case (.cancelPressed, .topUpWaitingForCard(let t)):
+            state = paidFailure(.notLoaded, "", t); return [.endCardSession]
+        case (.cardSessionEnded, .topUpWaitingForCard(let t)):
+            state = paidFailure(.notLoaded, "", t)
+        case (.linkFailed(let te), .topUpWaitingForCard(let t)):
+            state = paidFailure(topUpProblem(TopUpReply<TopUpStatus>.failed(te == .timeout ? .unreachable : te)), "", t)
+            return [.endCardSession]
+        case (.topUpLoadDone(let lid, let r), .topUpLoading(let cur, let t)) where lid == cur:
+            switch r {
+            case .ok(let st) where st.state == "loaded": state = .topUpLoaded(amountMsat: st.amountMsat, loadTxid: st.loadTxid ?? "")
+            case .ok(let st): state = paidFailure(st.state == "failed" ? .failed : .other, st.detail ?? "", t)
+            default: state = paidFailure(topUpProblem(r), r.refusedDetail, t)
+            }
+        case (.retryPressed, .topUpFailed(let f)):
+            if f.problem == .failed || f.problem == .notPaired { return [] }
+            // A new invoice: a new ref, so the till makes a new top-up for the same amount.
+            if f.problem == .expired { return createTopUp(f.requestedMsat, newRef()) }
+            guard let t = f.topUp else { return createTopUp(f.requestedMsat, f.clientRef) }
+            return waitForCard(t)
+        case (.donePressed, .topUpFailed), (.backPressed, .topUpFailed), (.donePressed, .topUpLoaded), (.newSalePressed, .topUpLoaded):
+            state = .entering
+        case (.backgrounded, .topUpWaitingForCard(let t)):
+            state = paidFailure(.notLoaded, "", t); return [.endCardSession]
+        default:
+            return nil
+        }
+        return []
+    }
+
     private func balance() -> [PosEffect] {
         state = .balanceWaiting
         return [.startCardSession(.balance)]
@@ -219,6 +332,7 @@ final class PosFlow {
     @discardableResult
     func dispatch(_ e: PosEvent) -> [PosEffect] {
         let s = state
+        if let fx = topUp(e, s) { return fx }
         switch (e, s) {
         case (.chargePressed, .entering):
             guard pad.isChargeable else { return [] }

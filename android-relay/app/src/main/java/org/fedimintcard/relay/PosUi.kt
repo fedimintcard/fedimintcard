@@ -27,7 +27,7 @@ class PosUi(
 ) {
     private fun <T : View> v(id: Int): T = act.findViewById(id)
 
-    private val screens = listOf(R.id.screen_amount, R.id.screen_pin, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay)
+    private val screens = listOf(R.id.screen_amount, R.id.screen_pin, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay, R.id.screen_invoice)
     private val statusAlert: TextView = v(R.id.status_alert)
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
@@ -36,6 +36,12 @@ class PosUi(
     private val cardBalanceCountdown: TextView = v(R.id.card_balance_countdown)
     private val amountText: TextView = v(R.id.amount_text)
     private val charge: Button = v(R.id.btn_charge)
+    private val checkBalance: Button = v(R.id.btn_check_balance)
+    private val topUpTitle: View = v(R.id.topup_title)
+    private val invoiceAmount: TextView = v(R.id.invoice_amount)
+    private val invoiceQr: android.widget.ImageView = v(R.id.invoice_qr)
+    private val invoiceTimeLeft: TextView = v(R.id.invoice_time_left)
+    private var qrFor: String? = null
     private val pinAmount: TextView = v(R.id.pin_amount)
     private val pinNotice: TextView = v(R.id.pin_notice)
     private val pinDots: TextView = v(R.id.pin_dots)
@@ -81,7 +87,7 @@ class PosUi(
         v<View>(R.id.pkey_back).setOnClickListener { onPinKey(null) }
         pinConfirm.setOnClickListener { onEvent(PosEvent.PinConfirmed) }
         v<View>(R.id.btn_pin_cancel).setOnClickListener { onEvent(PosEvent.CancelPressed) }
-        charge.setOnClickListener { onEvent(PosEvent.ChargePressed) }
+        charge.setOnClickListener { onEvent(if (topUpMode) PosEvent.CreateInvoicePressed else PosEvent.ChargePressed) }
         cancel.setOnClickListener { onEvent(PosEvent.CancelPressed) }
         retry.setOnClickListener { onEvent(PosEvent.RetryPressed) }
         v<View>(R.id.btn_error_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
@@ -97,7 +103,10 @@ class PosUi(
         v<View>(R.id.btn_sales_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
         v<View>(R.id.btn_new_sale).setOnClickListener { onEvent(PosEvent.NewSalePressed) }
         v<View>(R.id.btn_relay_back).setOnClickListener { relayOpen = false; show() }
-        v<View>(R.id.btn_check_balance).setOnClickListener { onEvent(PosEvent.CardBalanceOpened) }
+        checkBalance.setOnClickListener { onEvent(if (topUpMode) PosEvent.CancelPressed else PosEvent.CardBalanceOpened) }
+        v<View>(R.id.btn_charge_card).setOnClickListener { onEvent(PosEvent.ChargeCardPressed) }
+        v<View>(R.id.btn_top_up_card).setOnClickListener { onEvent(PosEvent.TopUpPressed) }
+        v<View>(R.id.btn_invoice_cancel).setOnClickListener { onEvent(PosEvent.CancelPressed) }
         v<View>(R.id.btn_card_balance_done).setOnClickListener { onEvent(PosEvent.DonePressed) }
         statusAlert.setOnClickListener { showRelay() }
     }
@@ -134,12 +143,36 @@ class PosUi(
         balance.text = if (s == null) "" else "Till balance: ${formatSats(s.walletBalanceMsat)} sats"
     }
 
+    /** The amount keypad types a sale, or a top-up on [PosState.TopUpEntering] and while its invoice is made. */
+    private val topUpMode: Boolean get() = last is PosState.TopUpEntering || last is PosState.TopUpCreating
+
     fun setPad(pad: AmountPad) {
         lastPad = pad.display
         amountText.text = "${pad.display} sats"
-        charge.isEnabled = pad.isChargeable
-        charge.alpha = if (pad.isChargeable) 1f else 0.4f
-        charge.text = if (pad.isChargeable) "Charge ${pad.display} sats" else act.getString(R.string.charge)
+        val creating = last is PosState.TopUpCreating
+        val ok = pad.isChargeable && !creating
+        charge.isEnabled = ok
+        charge.alpha = if (ok) 1f else 0.4f
+        charge.text = when {
+            creating -> "Creating invoice…"
+            topUpMode -> act.getString(R.string.create_invoice)
+            pad.isChargeable -> "Charge ${pad.display} sats"
+            else -> act.getString(R.string.charge)
+        }
+        topUpTitle.visibility = if (topUpMode) View.VISIBLE else View.GONE
+        checkBalance.text = act.getString(if (topUpMode) R.string.cancel else R.string.check_balance)
+        checkBalance.isEnabled = !creating
+    }
+
+    /** Time left on the invoice on screen. */
+    fun setTimeLeft(text: String) { invoiceTimeLeft.text = "Expires in $text" }
+
+    private fun renderInvoice(s: PosState.TopUpInvoice) {
+        invoiceAmount.text = "Top up ${formatSats(s.topUp.amountMsat)} sats"
+        if (qrFor != s.topUp.invoice) {
+            qrFor = s.topUp.invoice
+            invoiceQr.setImageBitmap(qrBitmap(invoiceQrText(s.topUp.invoice)))
+        }
     }
 
     /** Dots only: the digits never reach a view. */
@@ -153,7 +186,8 @@ class PosUi(
 
     fun render(state: PosState) {
         last = state
-        if (state is PosState.Receipt || state is PosState.Error || state is PosState.BalanceShown || state is PosState.BalanceFailed) relayOpen = false
+        if (state is PosState.Receipt || state is PosState.Error || state is PosState.BalanceShown || state is PosState.BalanceFailed ||
+            state is PosState.TopUpLoaded || state is PosState.TopUpFailed || state is PosState.TopUpInvoice) relayOpen = false
         when (state) {
             PosState.BalanceWaiting, is PosState.BalanceReading -> tapAmount.text = act.getString(R.string.card_balance_label)
             is PosState.BalanceShown -> {
@@ -171,6 +205,14 @@ class PosUi(
             is PosState.Signing -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
             is PosState.Receipt -> renderReceipt(state.receipt)
             is PosState.Error -> renderError(state)
+            is PosState.TopUpInvoice -> renderInvoice(state)
+            is PosState.TopUpWaitingForCard -> tapAmount.text = "${formatSats(state.topUp.amountMsat)} sats"
+            is PosState.TopUpLoading -> tapAmount.text = "${formatSats(state.topUp.amountMsat)} sats"
+            is PosState.TopUpLoaded -> {
+                v<TextView>(R.id.receipt_amount).text = "Loaded ${formatSats(state.amountMsat)} sats"
+                v<TextView>(R.id.receipt_txid).text = shortTxid(state.loadTxid)
+            }
+            is PosState.TopUpFailed -> renderTopUpError(state)
             else -> {}
         }
         renderTapStatus()
@@ -185,11 +227,13 @@ class PosUi(
             is PosState.Signing -> "Paying… keep the card on the phone"
             PosState.BalanceWaiting -> act.getString(R.string.hold_card)
             is PosState.BalanceReading -> act.getString(R.string.reading_card)
+            is PosState.TopUpWaitingForCard -> "Hold the card to load ${formatSats(s.topUp.amountMsat)} sats"
+            is PosState.TopUpLoading -> "Loading… keep the card on the phone"
             else -> ""
         }
-        settle(last is PosState.Signing || last is PosState.BalanceReading)
+        settle(last is PosState.Signing || last is PosState.BalanceReading || last is PosState.TopUpLoading)
         val l = last
-        cancel.visibility = if (l is PosState.WaitingForCard || l is PosState.BalanceWaiting || l is PosState.BalanceReading) View.VISIBLE else View.INVISIBLE
+        cancel.visibility = if (l is PosState.WaitingForCard || l is PosState.BalanceWaiting || l is PosState.BalanceReading || l is PosState.TopUpWaitingForCard) View.VISIBLE else View.INVISIBLE
     }
 
     /** Seconds left before the shown balance gives way to the amount. */
@@ -248,6 +292,25 @@ class PosUi(
         checkSales.visibility = if (unresolved) View.VISIBLE else View.GONE
     }
 
+    /** A failed top-up step borrows the error screen too. */
+    private fun renderTopUpError(e: PosState.TopUpFailed) {
+        val (title, detail) = topUpErrorCopy(e.problem, e.paid, e.detail)
+        errTitle.text = title
+        errDetail.text = detail
+        abandon.visibility = View.GONE
+        checkSales.visibility = View.GONE
+        retry.text = act.getString(
+            when {
+                e.problem == TopUpProblem.EXPIRED -> R.string.new_invoice
+                e.topUp != null -> R.string.tap_again
+                else -> R.string.try_again
+            }
+        )
+        retry.visibility = if (e.problem == TopUpProblem.FAILED) View.GONE else View.VISIBLE
+        errBack.visibility = View.VISIBLE
+        (errBack as TextView).text = act.getString(R.string.done)
+    }
+
     /** A failed balance read borrows the error screen: Try again and Done, nothing about sales. */
     private fun renderBalanceError(e: PosState.BalanceFailed) {
         val (title, detail) = balanceErrorCopy(e.problem)
@@ -281,7 +344,11 @@ class PosUi(
         val target = when {
             relayOpen -> R.id.screen_relay
             else -> when (last) {
-                PosState.Entering -> R.id.screen_amount
+                PosState.Entering, PosState.TopUpEntering, is PosState.TopUpCreating -> R.id.screen_amount
+                is PosState.TopUpInvoice -> R.id.screen_invoice
+                is PosState.TopUpWaitingForCard, is PosState.TopUpLoading -> R.id.screen_tap
+                is PosState.TopUpLoaded -> R.id.screen_receipt
+                is PosState.TopUpFailed -> R.id.screen_error
                 is PosState.EnteringPin -> R.id.screen_pin
                 is PosState.WaitingForCard, is PosState.Signing, PosState.BalanceWaiting, is PosState.BalanceReading -> R.id.screen_tap
                 is PosState.BalanceShown -> R.id.screen_card_balance
@@ -414,4 +481,17 @@ fun wrongPinCopy(triesLeft: Int?): String = when (triesLeft) {
     null -> "Wrong PIN"
     1 -> "Wrong PIN — 1 try left"
     else -> "Wrong PIN — $triesLeft tries left"
+}
+
+/** A crisp QR bitmap, one pixel per module scaled up by the view (filter off keeps edges hard). */
+fun qrBitmap(text: String): android.graphics.Bitmap {
+    val m = com.google.zxing.qrcode.QRCodeWriter().encode(
+        text, com.google.zxing.BarcodeFormat.QR_CODE, 0, 0,
+        mapOf(com.google.zxing.EncodeHintType.MARGIN to 0, com.google.zxing.EncodeHintType.ERROR_CORRECTION to com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.M),
+    )
+    val scale = 12
+    val w = m.width * scale
+    val px = IntArray(w * w)
+    for (y in 0 until w) for (x in 0 until w) px[y * w + x] = if (m.get(x / scale, y / scale)) 0xFF0A163C.toInt() else 0xFFFFFFFF.toInt()
+    return android.graphics.Bitmap.createBitmap(px, w, w, android.graphics.Bitmap.Config.ARGB_8888)
 }

@@ -19,6 +19,14 @@
     <string name="settings">Settings</string>
     <string name="hold_card">Hold the card to the phone</string>
     <string name="reading_card">Reading… keep the card on the phone</string>
+    <string name="charge_card">Charge card</string>
+    <string name="top_up_card">Top up card</string>
+    <string name="top_up">Top up</string>
+    <string name="create_invoice">Create invoice</string>
+    <string name="scan_with_wallet">Scan with a Lightning wallet</string>
+    <string name="invoice_qr_description">Lightning invoice QR code</string>
+    <string name="new_invoice">New invoice</string>
+    <string name="tap_again">Tap again</string>
     <plurals name="sales_count">
         <item quantity="one">%d sale</item>
         <item quantity="other">%d sales</item>

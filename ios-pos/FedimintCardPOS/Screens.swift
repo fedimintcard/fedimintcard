@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreImage.CIFilterBuiltins
 
 private func keyLabel(_ k: Int?) -> String {
     switch k { case nil: return "⌫"; case .some(-1): return "C"; case let d?: return String(d) }
@@ -234,7 +235,8 @@ struct TapMotion: View {
 
 struct ReceiptScreen: View {
     @EnvironmentObject var pos: PosController
-    let receipt: ChargeReceipt
+    let headline: String
+    let txid: String
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var landed = false
     @State private var risen = false
@@ -249,11 +251,10 @@ struct ReceiptScreen: View {
                 }
                 .frame(width: 104, height: 104)
                 .scaleEffect(landed ? 1 : 0.4).opacity(landed ? 1 : 0)
-                // The price only: change and sub-sat rounding stay in the till's sales record.
-                Text("Paid \(formatSats(receipt.priceMsat)) sats").font(Fig.extraBold(44)).kerning(-0.8)
+                Text(headline).font(Fig.extraBold(44)).kerning(-0.8)
                     .foregroundStyle(Palette.ink).lineLimit(1).minimumScaleFactor(0.5).padding(.top, 24)
                     .opacity(risen ? 1 : 0).offset(y: risen ? 0 : 12)
-                Text(shortTxid(receipt.txid)).font(.system(size: 13, design: .monospaced)).foregroundStyle(Palette.dim).padding(.top, 12)
+                Text(shortTxid(txid)).font(.system(size: 13, design: .monospaced)).foregroundStyle(Palette.dim).padding(.top, 12)
             }
             .padding(24)
             .frame(maxWidth: .infinity)
@@ -268,6 +269,123 @@ struct ReceiptScreen: View {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) { landed = true }
             withAnimation(.timingCurve(0.2, 0, 0, 1, duration: 0.32).delay(0.14)) { risen = true }
         }
+    }
+}
+
+extension ReceiptScreen {
+    /// A sale: the price only. Change and sub-sat rounding stay in the till's sales record.
+    init(receipt: ChargeReceipt) { self.init(headline: "Paid \(formatSats(receipt.priceMsat)) sats", txid: receipt.txid) }
+}
+
+/// The top-up amount: the amount keypad again, with "Create invoice".
+struct TopUpScreen: View {
+    @EnvironmentObject var pos: PosController
+    let creating: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Top up").font(Fig.extraBold(28)).kerning(-0.4).foregroundStyle(Palette.goldHi).padding(.top, 16)
+            Text("\(pos.topUpDisplay) sats")
+                .font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.ink)
+                .minimumScaleFactor(0.4).lineLimit(1)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+            Keypad { pos.key($0) }
+                .frame(maxHeight: 380)
+                .disabled(creating)
+            let ok = pos.topUpChargeable && !creating
+            Button(creating ? "Creating invoice…" : "Create invoice") { pos.send(.createInvoicePressed) }
+                .buttonStyle(GoldButtonStyle(enabled: ok))
+                .disabled(!ok)
+                .padding(.top, 8)
+            Button("Cancel") { pos.send(.cancelPressed) }
+                .buttonStyle(OutlineButtonStyle())
+                .disabled(creating)
+                .padding(.top, 10)
+        }
+    }
+}
+
+/// The invoice the holder pays from their own wallet.
+struct InvoiceScreen: View {
+    @EnvironmentObject var pos: PosController
+    let topUp: TopUp
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Top up \(formatSats(topUp.amountMsat)) sats").font(Fig.extraBold(40)).kerning(-0.8)
+                .foregroundStyle(Palette.ink).lineLimit(1).minimumScaleFactor(0.5).padding(.top, 24)
+            Spacer()
+            InvoiceQR(text: invoiceQrText(topUp.invoice))
+                .padding(18)
+                .background(RoundedRectangle(cornerRadius: 20).fill(Color.white))
+                .accessibilityLabel("Lightning invoice QR code")
+            Text("Scan with a Lightning wallet").font(Fig.regular(20)).foregroundStyle(Palette.mist).padding(.top, 20)
+            Text("Expires in \(timeLeft(expiresAtMs: topUp.expiresAtMs, nowMs: pos.nowMs))")
+                .font(Fig.regular(15)).foregroundStyle(Palette.dim).monospacedDigit().padding(.top, 6)
+            Spacer()
+            Button("Cancel") { pos.send(.cancelPressed) }.buttonStyle(OutlineButtonStyle())
+        }
+        .padding(8)
+    }
+}
+
+/// A crisp QR: CoreImage draws one pixel per module, scaled without smoothing.
+struct InvoiceQR: View {
+    let text: String
+
+    var body: some View {
+        if let img = Self.image(text) {
+            Image(uiImage: img).interpolation(.none).resizable().aspectRatio(1, contentMode: .fit)
+        } else {
+            Color.white.aspectRatio(1, contentMode: .fit)
+        }
+    }
+
+    static func image(_ text: String) -> UIImage? {
+        let f = CIFilter.qrCodeGenerator()
+        f.message = Data(text.utf8)
+        f.correctionLevel = "M"
+        guard let out = f.outputImage else { return nil }
+        // Navy on white, as the Android POS draws it.
+        let colored = out.applyingFilter("CIFalseColor", parameters: [
+            "inputColor0": CIColor(red: 0x0a / 255.0, green: 0x16 / 255.0, blue: 0x3c / 255.0),
+            "inputColor1": CIColor(red: 1, green: 1, blue: 1),
+        ])
+        let scaled = colored.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+        guard let cg = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+}
+
+/// A failed top-up step.
+struct TopUpErrorScreen: View {
+    @EnvironmentObject var pos: PosController
+    let failure: TopUpFailure
+
+    private var retryLabel: String? {
+        switch failure.problem {
+        case .failed, .notPaired: return nil
+        case .expired: return "New invoice"
+        default: return failure.topUp == nil ? "Try again" : "Tap again"
+        }
+    }
+
+    var body: some View {
+        let (title, detail) = topUpErrorCopy(failure.problem, paid: failure.paid, detail: failure.detail)
+        VStack(spacing: 10) {
+            Spacer()
+            Text(title).font(Fig.extraBold(28)).foregroundStyle(Palette.bad).multilineTextAlignment(.center)
+            if !detail.isEmpty {
+                Text(detail).font(Fig.regular(16)).foregroundStyle(Palette.mist).multilineTextAlignment(.center).padding(.top, 2)
+            }
+            Spacer()
+            if let retryLabel {
+                Button(retryLabel) { pos.send(.retryPressed) }.buttonStyle(GoldButtonStyle())
+            }
+            Button("Done") { pos.send(.donePressed) }.buttonStyle(OutlineButtonStyle())
+        }
+        .padding(8)
     }
 }
 
@@ -348,7 +466,11 @@ struct BalanceScreen: View {
             .accessibilityLabel("Card balance: \(formatSats(liveMsat)) sats on this card")
             Spacer()
             Text("Back to the amount in \(pos.balanceCountdown) s").font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.bottom, 12)
-            Button("Done") { pos.send(.donePressed) }.buttonStyle(GoldButtonStyle())
+            HStack(spacing: 12) {
+                Button("Charge card") { pos.send(.chargeCardPressed) }.buttonStyle(OutlineButtonStyle())
+                Button("Top up card") { pos.send(.topUpPressed) }.buttonStyle(GoldButtonStyle())
+            }
+            Button("Done") { pos.send(.donePressed) }.buttonStyle(GhostButtonStyle()).padding(.top, 4)
         }
         .padding(8)
     }

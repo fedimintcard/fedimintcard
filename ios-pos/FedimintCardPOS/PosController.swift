@@ -14,6 +14,10 @@ final class PosController: ObservableObject {
     @Published private(set) var state: PosState = .entering
     @Published private(set) var amountDisplay = "0"
     @Published private(set) var chargeable = false
+    @Published private(set) var topUpDisplay = "0"
+    @Published private(set) var topUpChargeable = false
+    /// The clock the invoice's time left is shown against; ticks while an invoice is on screen.
+    @Published private(set) var nowMs: Int64 = PosController.clockMs()
     @Published private(set) var pinLength = 0
     @Published private(set) var pinComplete = false
     @Published private(set) var status: TillStatus?
@@ -28,6 +32,10 @@ final class PosController: ObservableObject {
     private var salesPollTask: Task<Void, Never>?
     private var countdownTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    private var invoiceTask: Task<Void, Never>?
+
+    static func clockMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+    static let invoicePollNanos: UInt64 = 1_500_000_000
 
     // The card job in progress.
     private var sessionGen = 0
@@ -61,8 +69,13 @@ final class PosController: ObservableObject {
     // MARK: keys
 
     func key(_ k: Int?) {
-        guard state == .entering else { return }
-        switch k { case nil: flow.pad.backspace(); case .some(-1): flow.pad.clear(); case let d?: flow.pad.press(d) }
+        let pad: AmountPad
+        switch state {
+        case .entering: pad = flow.pad
+        case .topUpEntering: pad = flow.topUpPad
+        default: return
+        }
+        switch k { case nil: pad.backspace(); case .some(-1): pad.clear(); case let d?: pad.press(d) }
         syncPads()
     }
 
@@ -76,6 +89,8 @@ final class PosController: ObservableObject {
     private func syncPads() {
         amountDisplay = flow.pad.display
         chargeable = flow.pad.isChargeable
+        topUpDisplay = flow.topUpPad.display
+        topUpChargeable = flow.topUpPad.isChargeable
         pinLength = flow.pinPad.length
         pinComplete = flow.pinPad.isComplete
     }
@@ -113,6 +128,10 @@ final class PosController: ObservableObject {
         let refNow = flow.unresolvedRef
         if refNow == nil { salesPollTask?.cancel(); salesPollTask = nil } else if refNow != refBefore { scheduleSalesPoll() }
         if case .receipt = now { pollNow() }
+        if case .topUpLoaded = now { pollNow() }
+        if case .topUpInvoice(let t, _) = now {
+            if case .topUpInvoice(let b, _) = before, b.topupId == t.topupId {} else { watchInvoice(t) }
+        }
         if case .balanceShown(let rid, _) = now, before != now { startCountdown(rid) }
         for fx in effects { run(fx) }
     }
@@ -135,6 +154,21 @@ final class PosController: ObservableObject {
                 default: self.endCardJob(message: "Payment didn't go through", ok: false)
                 }
                 self.send(.chargeDone(chargeId: cid, result: r))
+            }
+        case .createTopUp(let cid, let msat, let ref):
+            Task { [weak self] in
+                guard let self else { return }
+                let r = await self.client.createTopUp(amountMsat: msat, clientRef: ref)
+                self.send(.topUpCreated(createId: cid, result: r))
+            }
+        case .loadTopUp(let lid, let tid):
+            let linkId = link?.id
+            Task { [weak self] in
+                guard let self else { return }
+                let r = await self.client.loadTopUp(tid, cardLink: linkId)
+                if case .ok(let st) = r, st.state == "loaded" { self.endCardJob(message: "Loaded \(formatSats(st.amountMsat)) sats", ok: true) }
+                else { self.endCardJob(message: "Not loaded", ok: false) }
+                self.send(.topUpLoadDone(loadId: lid, result: r))
             }
         case .startBalanceRead(let rid):
             let linkId = link?.id
@@ -162,17 +196,25 @@ final class PosController: ObservableObject {
         reader.onEnd = { [weak self] hadCard in
             Task { @MainActor in self?.sessionEnded(gen: gen, hadCard: hadCard) }
         }
-        reader.begin(alert: "Hold the card to the top of the phone")
+        if case .topUpWaitingForCard(let t) = flow.state {
+            reader.begin(alert: "Hold the card to the top of the phone to load \(formatSats(t.amountMsat)) sats")
+        } else {
+            reader.begin(alert: "Hold the card to the top of the phone")
+        }
     }
 
     private func waitingForCard() -> Bool {
-        switch flow.state { case .waitingForCard, .balanceWaiting: return true; default: return false }
+        switch flow.state { case .waitingForCard, .balanceWaiting, .topUpWaitingForCard: return true; default: return false }
     }
 
     private func cardConnected(_ channel: CardChannel, gen: Int, url: URL, token: String?, purpose: CardPurpose) async {
         guard gen == sessionGen else { return }
         // The system's NFC sheet covers the lower half of the screen, so it carries the status too.
-        reader.update(alert: purpose == .charge ? "Paying… keep the card on the phone" : "Reading… keep the card on the phone")
+        switch purpose {
+        case .charge: reader.update(alert: "Paying… keep the card on the phone")
+        case .balance: reader.update(alert: "Reading… keep the card on the phone")
+        case .topUp: reader.update(alert: "Loading… keep the card on the phone")
+        }
         let l: CardLink
         do {
             l = try await CardLink.open(URLSessionLinkSocket(url: url, token: token))
@@ -222,6 +264,28 @@ final class PosController: ObservableObject {
         }
     }
 
+    /// While `t`'s invoice is on screen: the clock every second for the time left, and the till
+    /// asked every 1.5 s whether it is paid. Stops when another screen (or invoice) takes over.
+    private func watchInvoice(_ t: TopUp) {
+        invoiceTask?.cancel()
+        nowMs = Self.clockMs()
+        invoiceTask = Task { [weak self] in
+            var sincePoll: UInt64 = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                sincePoll += 500_000_000
+                guard let self, case .topUpInvoice(let cur, _) = self.state, cur.topupId == t.topupId else { return }
+                self.nowMs = Self.clockMs()
+                if sincePoll >= Self.invoicePollNanos {
+                    sincePoll = 0
+                    let r = await self.client.topUpStatus(t.topupId)
+                    guard case .topUpInvoice(let still, _) = self.state, still.topupId == t.topupId else { return }
+                    self.send(.topUpPolled(topupId: t.topupId, result: r))
+                }
+            }
+        }
+    }
+
     private func startCountdown(_ rid: Int) {
         balanceCountdown = PosFlow.balanceShownSeconds
         countdownTask?.cancel()
@@ -240,6 +304,7 @@ final class PosController: ObservableObject {
     func pollNow() {
         guard pairing != nil else { health = .notPaired; return }
         if case .signing = state { return }
+        if case .topUpLoading = state { return }
         guard !pollInFlight else { return }
         pollInFlight = true
         Task { [weak self] in

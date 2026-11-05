@@ -27,9 +27,11 @@
 		7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36D409088E3F90B17B12B0C4 /* TillClientTests.swift */; };
 		8106F75673DF6A1F71FC8562 /* Figtree.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 47C525FEABE9888F266B10B0 /* Figtree.ttf */; };
 		98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 915B237265E96624811EB5C1 /* PadTests.swift */; };
+		A19D8686B3ABBF0A3734F4A5 /* TopUp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 668D284B6F2504B7F55524FF /* TopUp.swift */; };
 		BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = E518F954B819A02AAFC7253B /* NFCCardReader.swift */; };
 		CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9AEA85277653C319EC8C7B /* PairingTests.swift */; };
 		EB7CB78117403AF777118344 /* PosController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86FE0870914BD0003EB671B /* PosController.swift */; };
+		ECC448B79524C5673C9452B0 /* TopUpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E62BA1ACE633798338DC8889 /* TopUpTests.swift */; };
 		F07D7EFDA9A00794775899A1 /* ErrorCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DDFC94C92C8812DAA33D897 /* ErrorCopy.swift */; };
 /* End PBXBuildFile section */
 
@@ -58,6 +60,7 @@
 		47C525FEABE9888F266B10B0 /* Figtree.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = Figtree.ttf; sourceTree = "<group>"; };
 		4EA9FEF5A783DC5F277E8949 /* card_front.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = card_front.png; sourceTree = "<group>"; };
 		566A92ECDEB2DA9A031B11DA /* CardLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardLink.swift; sourceTree = "<group>"; };
+		668D284B6F2504B7F55524FF /* TopUp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopUp.swift; sourceTree = "<group>"; };
 		6A07CEEB0E77F39004689A63 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardLinkTests.swift; sourceTree = "<group>"; };
 		80FF8DF36EA74756852185D9 /* Money.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Money.swift; sourceTree = "<group>"; };
@@ -69,6 +72,7 @@
 		D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OFL-Figtree.txt"; sourceTree = "<group>"; };
 		DD8734CE2845FF73DCFA1BCA /* TillClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillClient.swift; sourceTree = "<group>"; };
 		E518F954B819A02AAFC7253B /* NFCCardReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NFCCardReader.swift; sourceTree = "<group>"; };
+		E62BA1ACE633798338DC8889 /* TopUpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopUpTests.swift; sourceTree = "<group>"; };
 		E86FE0870914BD0003EB671B /* PosController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosController.swift; sourceTree = "<group>"; };
 		F7986F3432B14FF95BDD32A8 /* Pads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pads.swift; sourceTree = "<group>"; };
 		FC24BE04CC31D28A08266DDC /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -95,6 +99,7 @@
 				C39AEE1B854A9883FB8CC268 /* Theme.swift */,
 				DD8734CE2845FF73DCFA1BCA /* TillClient.swift */,
 				3456E4AEA9C75E40A4730629 /* TillModels.swift */,
+				668D284B6F2504B7F55524FF /* TopUp.swift */,
 				EF66FF253891CF83F657707D /* Resources */,
 			);
 			path = FedimintCardPOS;
@@ -118,6 +123,7 @@
 				BB9AEA85277653C319EC8C7B /* PairingTests.swift */,
 				0E997C08978966870EBE4456 /* PosFlowTests.swift */,
 				36D409088E3F90B17B12B0C4 /* TillClientTests.swift */,
+				E62BA1ACE633798338DC8889 /* TopUpTests.swift */,
 			);
 			path = FedimintCardPOSTests;
 			sourceTree = "<group>";
@@ -244,6 +250,7 @@
 				CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */,
 				5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */,
 				7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */,
+				ECC448B79524C5673C9452B0 /* TopUpTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -265,6 +272,7 @@
 				28DB1EAC30B41406FEBB03F3 /* Theme.swift in Sources */,
 				183A2BC4BCABE1E735E6FF0C /* TillClient.swift in Sources */,
 				2771CB3B1D818A94D0FEDD9E /* TillModels.swift in Sources */,
+				A19D8686B3ABBF0A3734F4A5 /* TopUp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

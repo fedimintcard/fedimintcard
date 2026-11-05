@@ -96,4 +96,68 @@ class TillClientTest {
         assertTrue(f.body!!.contains("\"price_msat\":7000")); assertTrue(f.body!!.contains("\"client_ref\":\"ref-1\""))
         assertTrue(f.readMs >= 120_000)
     }
+
+    // ---- top-up (docs/TOPUP.md) ----
+    private class HeaderFake(val resp: RawResponse) : Transport {
+        var method = ""; var url = ""; var body: String? = null; var headers: Map<String, String> = emptyMap()
+        override fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int): RawResponse = resp
+        override fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int, headers: Map<String, String>): RawResponse {
+            this.method = method; this.url = url; this.body = body; this.headers = headers
+            return resp
+        }
+    }
+
+    @Test fun createTopUpOk() {
+        val f = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":100352,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
+        val r = TillClient({ "http://h:1" }, f, { "tok" }).createTopUp(100_000, "r1") as TopUpReply.Ok
+        assertEquals(TopUp("t1", 100_352, "lnbc1", 99, "waiting"), r.value)
+        assertEquals("POST", f.method); assertEquals("http://h:1/v1/topup", f.url)
+        assertTrue(f.body!!.contains("\"amount_msat\":100000")); assertTrue(f.body!!.contains("\"client_ref\":\"r1\""))
+        assertEquals("Bearer tok", f.headers["Authorization"])
+    }
+
+    @Test fun createTopUpRefused() {
+        val r = client(Fake(raw(400, """{"ok":false,"error":"bad_amount","detail":"too much"}"""))).createTopUp(1, "r") as TopUpReply.Refused
+        assertEquals("bad_amount", r.error); assertEquals("too much", r.detail); assertEquals(400, r.httpStatus)
+        assertEquals(TopUpProblem.BAD_AMOUNT, topUpProblem(r))
+    }
+
+    @Test fun createTopUpMissingInvoiceIsBadResponse() {
+        val r = client(Fake(raw(200, """{"topup_id":"t1","amount_msat":1}"""))).createTopUp(1, "r")
+        assertTrue((r as TopUpReply.Failed).error is TillError.BadResponse)
+    }
+
+    @Test fun createTopUpUnreachable() {
+        val r = client(Fake(ex = IOException("x"))).createTopUp(1, "r") as TopUpReply.Failed
+        assertEquals(TillError.Unreachable, r.error)
+        assertEquals(TopUpProblem.TILL_UNREACHABLE, topUpProblem(r))
+    }
+
+    @Test fun topUpStatusOk() {
+        val f = Fake(raw(200, """{"topup_id":"t 1","amount_msat":5,"state":"paid","load_txid":null}"""))
+        val r = client(f).topUpStatus("t 1") as TopUpReply.Ok
+        assertEquals(TopUpStatus("t 1", 5, "paid", null, null), r.value)
+        assertEquals("GET", f.method); assertEquals("http://h:1/v1/topup/t+1", f.url)
+    }
+
+    @Test fun loadTopUpSendsTheLinkAndParsesLoaded() {
+        val f = HeaderFake(raw(200, """{"topup_id":"t1","amount_msat":5,"state":"loaded","load_txid":"abc"}"""))
+        val r = TillClient({ "http://h:1/" }, f).loadTopUp("t1", "L9") as TopUpReply.Ok
+        assertEquals("abc", r.value.loadTxid)
+        assertEquals("http://h:1/v1/topup/t1/load", f.url); assertEquals("POST", f.method)
+        assertEquals("L9", f.headers["X-Card-Link"])
+    }
+
+    @Test fun loadTopUpErrorsSort() {
+        fun p(code: String, s: Int = 409, d: String = "") = topUpProblem(client(Fake(raw(s, """{"ok":false,"error":"$code","detail":"$d"}"""))).loadTopUp("t1"))
+        assertEquals(TopUpProblem.CARD_FULL, p("card_full"))
+        assertEquals(TopUpProblem.EXPIRED, p("expired", 410))
+        assertEquals(TopUpProblem.CARD_MOVED, p("card_link_gone"))
+        assertEquals(TopUpProblem.CARD_MOVED, p("card_lost"))
+        assertEquals(TopUpProblem.NOT_OUR_CARD, p("card_error", 502, "a different card"))
+        assertEquals(TopUpProblem.CARD_SERVICE, p("ops_not_connected", 503))
+        assertEquals(TopUpProblem.OTHER, p("not_paid"))
+        val t = client(Fake(ex = SocketTimeoutException())).loadTopUp("t1") as TopUpReply.Failed
+        assertEquals(TopUpProblem.TIMEOUT, topUpProblem(t))
+    }
 }

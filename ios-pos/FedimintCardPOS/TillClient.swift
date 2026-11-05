@@ -64,7 +64,7 @@ final class TillClient {
         self.transport = transport
     }
 
-    private func request(_ method: String, _ path: String, body: Data?, timeout: TimeInterval, cardLink: String? = nil) -> HTTPRequest? {
+    fileprivate func request(_ method: String, _ path: String, body: Data?, timeout: TimeInterval, cardLink: String? = nil) -> HTTPRequest? {
         guard let p = pairing(), let url = URL(string: p.baseURL + path) else { return nil }
         var h = ["Accept": "application/json"]
         if let t = p.token { h["Authorization"] = "Bearer \(t)" }
@@ -73,7 +73,7 @@ final class TillClient {
         return HTTPRequest(method: method, url: url, headers: h, body: body, timeout: timeout)
     }
 
-    private func call(_ req: HTTPRequest?) async -> Result<RawResponse, TillError> {
+    fileprivate func call(_ req: HTTPRequest?) async -> Result<RawResponse, TillError> {
         guard let req else { return .failure(.notPaired) }
         do {
             return .success(try await transport.send(req))
@@ -142,6 +142,39 @@ final class TillClient {
         case .failure(let e): return .failed(e)
         case .success(let r): return TillParse.cardBalance(status: r.status, body: r.body)
         }
+    }
+}
+
+extension TillClient {
+    static let topUpCreateTimeout: TimeInterval = 30
+
+    /// Makes a top-up invoice (docs/TOPUP.md). The same `clientRef` answers the same top-up.
+    func createTopUp(amountMsat: Int64, clientRef: String) async -> TopUpReply<TopUp> {
+        let body = try? JSONSerialization.data(withJSONObject: ["amount_msat": amountMsat, "client_ref": clientRef])
+        switch await call(request("POST", "/v1/topup", body: body, timeout: Self.topUpCreateTimeout)) {
+        case .failure(let e): return .failed(e)
+        case .success(let r): return TillParse.topUp(status: r.status, body: r.body)
+        }
+    }
+
+    func topUpStatus(_ topupId: String) async -> TopUpReply<TopUpStatus> {
+        switch await call(request("GET", "/v1/topup/" + Self.pathSegment(topupId), body: nil, timeout: Self.quickTimeout)) {
+        case .failure(let e): return .failed(e)
+        case .success(let r): return TillParse.topUpStatus(status: r.status, body: r.body)
+        }
+    }
+
+    /// Loads a paid top-up onto the card on `cardLink`. Safe to repeat: a loaded top-up answers again.
+    func loadTopUp(_ topupId: String, cardLink: String?) async -> TopUpReply<TopUpStatus> {
+        let path = "/v1/topup/" + Self.pathSegment(topupId) + "/load"
+        switch await call(request("POST", path, body: Data("{}".utf8), timeout: Self.chargeTimeout, cardLink: cardLink)) {
+        case .failure(let e): return .failed(e)
+        case .success(let r): return TillParse.topUpStatus(status: r.status, body: r.body)
+        }
+    }
+
+    static func pathSegment(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
     }
 }
 
@@ -274,6 +307,44 @@ enum TillParse {
             return .read(CardBalance(liveMsat: optLong(o, "live_msat"), notes: rows, freeSlots: free))
         } catch {
             if status == 401 { return .refused(code: .unauthorized, detail: "unauthorized") }
+            return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))
+        }
+    }
+
+    private static func topUpRefused(_ status: Int, _ o: [String: Any]) -> Bool {
+        if let okv = o["ok"] as? NSNumber, !okv.boolValue { return true }
+        return status >= 400
+    }
+
+    /// `POST /v1/topup`: `{topup_id, amount_msat, invoice, expires_at_ms, state}`, or `{ok:false,…}`.
+    static func topUp(status: Int, body: Data) -> TopUpReply<TopUp> {
+        do {
+            let o = try obj(body)
+            if topUpRefused(status, o) {
+                return .refused(error: optStr(o, "error") ?? (status == 401 ? "unauthorized" : ""), detail: optStr(o, "detail") ?? "", httpStatus: status)
+            }
+            return .ok(TopUp(topupId: try reqStr(o, "topup_id"), amountMsat: try reqLong(o, "amount_msat"),
+                             invoice: try reqStr(o, "invoice"), expiresAtMs: try reqLong(o, "expires_at_ms"),
+                             state: optStr(o, "state") ?? "waiting"))
+        } catch {
+            if status == 401 { return .failed(.unauthorized) }
+            return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))
+        }
+    }
+
+    /// `GET /v1/topup/{id}` and `POST …/load`: `{topup_id, amount_msat, state, load_txid?, detail?}`.
+    static func topUpStatus(status: Int, body: Data) -> TopUpReply<TopUpStatus> {
+        do {
+            let o = try obj(body)
+            if topUpRefused(status, o) {
+                return .refused(error: optStr(o, "error") ?? (status == 401 ? "unauthorized" : ""), detail: optStr(o, "detail") ?? "", httpStatus: status)
+            }
+            let txid = optStr(o, "load_txid").flatMap { $0.isEmpty ? nil : $0 }
+            let detail = optStr(o, "detail").flatMap { $0.isEmpty ? nil : $0 }
+            return .ok(TopUpStatus(topupId: try reqStr(o, "topup_id"), amountMsat: try reqLong(o, "amount_msat"),
+                                   state: try reqStr(o, "state"), loadTxid: txid, detail: detail))
+        } catch {
+            if status == 401 { return .failed(.unauthorized) }
             return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))
         }
     }

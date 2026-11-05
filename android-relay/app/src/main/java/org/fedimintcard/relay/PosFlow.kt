@@ -57,6 +57,31 @@ sealed class PosState {
     data class BalanceShown(val readId: Int, val liveMsat: Long) : PosState()
     /** The read failed; [detail] is the till's own words, kept for diagnosis and never shown. */
     data class BalanceFailed(val problem: BalanceProblem, val detail: String = "") : PosState()
+
+    // Top-up by Lightning (docs/TOPUP.md). The amount is typed on [PosFlow.topUpPad].
+    /** Typing the top-up amount. */
+    object TopUpEntering : PosState()
+    /** Asking the till for the invoice; [clientRef] makes a repeat answer the same top-up. */
+    data class TopUpCreating(val createId: Int, val requestedMsat: Long, val clientRef: String) : PosState()
+    /** The invoice is on screen and the till is polled until it is paid. */
+    data class TopUpInvoice(val topUp: TopUp, val clientRef: String) : PosState()
+    /** Paid: waiting for the card. */
+    data class TopUpWaitingForCard(val topUp: TopUp) : PosState()
+    /** The till is loading the card; [loadId] matches the reply. */
+    data class TopUpLoading(val loadId: Int, val topUp: TopUp) : PosState()
+    data class TopUpLoaded(val amountMsat: Long, val loadTxid: String) : PosState()
+    /**
+     * A top-up step failed. [topUp] is null when the invoice was never made (Try again asks for
+     * it again with [clientRef]); [paid] when the holder has paid and the card still waits.
+     */
+    data class TopUpFailed(
+        val problem: TopUpProblem,
+        val detail: String,
+        val requestedMsat: Long,
+        val clientRef: String,
+        val topUp: TopUp? = null,
+        val paid: Boolean = false,
+    ) : PosState()
 }
 
 /** Why a balance read failed, in the terms the holder's screen needs. */
@@ -116,6 +141,16 @@ sealed class PosEvent {
     object DonePressed : PosEvent()
     /** The sales poll found a row carrying the unresolved sale's client_ref. */
     data class SaleFound(val sale: Sale) : PosEvent()
+    /** On the balance screen: charge this card (the amount keypad, then the charge). */
+    object ChargeCardPressed : PosEvent()
+    /** On the balance screen: top up this card. */
+    object TopUpPressed : PosEvent()
+    /** On the top-up keypad. */
+    object CreateInvoicePressed : PosEvent()
+    data class TopUpCreated(val createId: Int, val result: TopUpReply<TopUp>) : PosEvent()
+    /** A poll of the invoice on screen. */
+    data class TopUpPolled(val topupId: String, val result: TopUpReply<TopUpStatus>) : PosEvent()
+    data class TopUpLoadDone(val loadId: Int, val result: TopUpReply<TopUpStatus>) : PosEvent()
 }
 
 sealed class PosEffect {
@@ -123,6 +158,10 @@ sealed class PosEffect {
     data class StartCharge(val chargeId: Int, val priceMsat: Long, val clientRef: String, val pin: Pin? = null) : PosEffect()
     /** Ask the till to read the card now on the phone. */
     data class StartBalanceRead(val readId: Int) : PosEffect()
+    /** `POST /v1/topup`. */
+    data class CreateTopUp(val createId: Int, val amountMsat: Long, val clientRef: String) : PosEffect()
+    /** `POST /v1/topup/{id}/load` over the card now on the phone. */
+    data class LoadTopUp(val loadId: Int, val topupId: String) : PosEffect()
 }
 
 /** Pure state machine for one till session. Not thread-safe: call from the UI thread. */
@@ -132,6 +171,8 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         const val BALANCE_SHOWN_MS = 15_000L
     }
     val pad = AmountPad()
+    /** The top-up amount: separate from [pad], which keeps the sale being typed. */
+    val topUpPad = AmountPad()
     val pinPad = PinPad()
     /** The confirmed PIN between the pad and the charge request; handed to [PosEffect.StartCharge]. */
     private var heldPin: Pin? = null
@@ -176,7 +217,72 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         is PosState.Sales -> PosEvent.BackPressed
         PosState.BalanceWaiting, is PosState.BalanceReading -> PosEvent.CancelPressed
         is PosState.BalanceShown, is PosState.BalanceFailed -> PosEvent.DonePressed
+        PosState.TopUpEntering, is PosState.TopUpInvoice, is PosState.TopUpWaitingForCard -> PosEvent.CancelPressed
+        is PosState.TopUpFailed, is PosState.TopUpLoaded -> PosEvent.DonePressed
         else -> null
+    }
+
+    private fun createTopUp(msat: Long, ref: String): List<PosEffect> {
+        val id = ++nextId
+        state = PosState.TopUpCreating(id, msat, ref)
+        return listOf(PosEffect.CreateTopUp(id, msat, ref))
+    }
+
+    /** Paid: a card already on the phone is loaded at once (loading spends nothing from it). */
+    private fun loadWhenCard(t: TopUp): List<PosEffect> {
+        if (!cardPresent) { state = PosState.TopUpWaitingForCard(t); return emptyList() }
+        val id = ++nextId
+        state = PosState.TopUpLoading(id, t)
+        return listOf(PosEffect.LoadTopUp(id, t.topupId))
+    }
+
+    private fun topUp(e: PosEvent, s: PosState): List<PosEffect>? {
+        when {
+            e is PosEvent.TopUpPressed && s is PosState.BalanceShown -> { topUpPad.clear(); state = PosState.TopUpEntering }
+            e is PosEvent.ChargeCardPressed && s is PosState.BalanceShown -> state = PosState.Entering
+            e is PosEvent.CreateInvoicePressed && s is PosState.TopUpEntering ->
+                return if (topUpPad.isChargeable) createTopUp(topUpPad.msat, newRef()) else emptyList()
+            e is PosEvent.CancelPressed && (s is PosState.TopUpEntering || s is PosState.TopUpInvoice) -> state = PosState.Entering
+            // Paid: cancelling the tap must not lose the top-up quietly.
+            e is PosEvent.CancelPressed && s is PosState.TopUpWaitingForCard ->
+                state = PosState.TopUpFailed(TopUpProblem.NOT_LOADED, "", s.topUp.amountMsat, "", s.topUp, paid = true)
+            e is PosEvent.TopUpCreated && s is PosState.TopUpCreating && e.createId == s.createId -> state = when (val r = e.result) {
+                is TopUpReply.Ok -> PosState.TopUpInvoice(r.value, s.clientRef)
+                else -> PosState.TopUpFailed(topUpProblem(r), (r as? TopUpReply.Refused)?.detail ?: "", s.requestedMsat, s.clientRef)
+            }
+            e is PosEvent.TopUpPolled && s is PosState.TopUpInvoice && e.topupId == s.topUp.topupId -> {
+                val st = (e.result as? TopUpReply.Ok)?.value ?: return emptyList() // a failed poll: poll again
+                val t = s.topUp.copy(amountMsat = st.amountMsat, state = st.state)
+                when (st.state) {
+                    "paid" -> return loadWhenCard(t)
+                    "loaded" -> state = PosState.TopUpLoaded(st.amountMsat, st.loadTxid ?: "")
+                    "expired" -> state = PosState.TopUpFailed(TopUpProblem.EXPIRED, "", t.amountMsat, s.clientRef, t)
+                    "failed" -> state = PosState.TopUpFailed(TopUpProblem.FAILED, st.detail ?: "", t.amountMsat, s.clientRef, t)
+                }
+            }
+            e is PosEvent.TopUpLoadDone && s is PosState.TopUpLoading && e.loadId == s.loadId -> state = when (val r = e.result) {
+                is TopUpReply.Ok -> when (r.value.state) {
+                    "loaded" -> PosState.TopUpLoaded(r.value.amountMsat, r.value.loadTxid ?: "")
+                    "failed" -> PosState.TopUpFailed(TopUpProblem.FAILED, r.value.detail ?: "", s.topUp.amountMsat, "", s.topUp, paid = true)
+                    else -> PosState.TopUpFailed(TopUpProblem.OTHER, r.value.detail ?: "", s.topUp.amountMsat, "", s.topUp, paid = true)
+                }
+                else -> {
+                    val p = topUpProblem(r)
+                    PosState.TopUpFailed(p, (r as? TopUpReply.Refused)?.detail ?: "", s.topUp.amountMsat, "", s.topUp, paid = p != TopUpProblem.EXPIRED)
+                }
+            }
+            e is PosEvent.RetryPressed && s is PosState.TopUpFailed -> return when {
+                s.problem == TopUpProblem.FAILED -> emptyList()
+                // A new invoice: a new ref, so the till makes a new top-up for the same amount.
+                s.problem == TopUpProblem.EXPIRED -> createTopUp(s.requestedMsat, newRef())
+                s.topUp == null -> createTopUp(s.requestedMsat, s.clientRef)
+                else -> loadWhenCard(s.topUp)
+            }
+            (e is PosEvent.DonePressed || e is PosEvent.BackPressed) && s is PosState.TopUpFailed -> state = PosState.Entering
+            (e is PosEvent.DonePressed || e is PosEvent.NewSalePressed) && s is PosState.TopUpLoaded -> state = PosState.Entering
+            else -> return null
+        }
+        return emptyList()
     }
 
     /**
@@ -220,6 +326,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                 cardPresent = true
                 if (s is PosState.WaitingForCard && !s.mustRemoveFirst) return sign(s.priceMsat, pendingRef)
                 if (s is PosState.BalanceWaiting) return balance()
+                if (s is PosState.TopUpWaitingForCard) return loadWhenCard(s.topUp)
                 return emptyList()
             }
             PosEvent.CardLost -> {
@@ -230,6 +337,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             }
             else -> {}
         }
+        topUp(e, s)?.let { return it }
         when {
             e is PosEvent.ChargePressed && s is PosState.Entering -> {
                 if (!pad.isChargeable) return emptyList()

@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path as UrlPath, State};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -48,6 +48,7 @@ use crate::ops::{FederationReport, Ops, OpsConfig, OpsError};
 use crate::plan::PlanError;
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
+use crate::topup::{TopupRec, TopupState, Topups};
 use crate::wallet::{Wallet, sales_path};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9877";
@@ -408,6 +409,15 @@ enum Job {
     Precheck { reply: oneshot::Sender<Reply> },
     KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
     Issue { amounts: Vec<u64>, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
+    /// Load a paid top-up's eCash onto the card (docs/TOPUP.md).
+    TopupLoad {
+        topup_id: String,
+        amount_msat: u64,
+        ops_url: String,
+        link: Option<Link>,
+        topups: Arc<Topups>,
+        reply: oneshot::Sender<Reply>,
+    },
 }
 
 /// What handlers hold. Cheap to clone, `Send + Sync`.
@@ -431,6 +441,8 @@ pub struct TillHandle {
     links: Arc<Links>,
     /// The POS token: with one, `/v1/*` needs it as a bearer (from loopback too, if set so).
     pos_auth: crate::pos::PosAuth,
+    /// Top-ups by Lightning ([`Self::with_topups`]); without them the top-up routes answer 503.
+    topups: Option<Arc<Topups>>,
 }
 
 impl TillHandle {
@@ -444,6 +456,13 @@ impl TillHandle {
     /// (`till serve --require-pos-token`, for a till behind a proxy).
     pub fn with_pos_token_everywhere(mut self, token: String) -> Self {
         self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true };
+        self
+    }
+
+    /// Take top-ups by Lightning (docs/TOPUP.md), and watch the invoices still unpaid.
+    pub fn with_topups(mut self, topups: Arc<Topups>) -> Self {
+        topups.watch_waiting();
+        self.topups = Some(topups);
         self
     }
 
@@ -511,6 +530,7 @@ pub async fn new_with_conn(
         conn: conn.clone(),
         links: Arc::new(Links::default()),
         pos_auth: crate::pos::PosAuth::default(),
+        topups: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn))
 }
@@ -535,6 +555,8 @@ async fn actor(
     conn: SharedConn,
 ) {
     ensure_hook(&mut cw, &sales);
+    // The data directory: the holder loader journals top-up loads there.
+    let dir = cw.store.path().parent().map(Path::to_owned).unwrap_or_default();
     while let Some(job) = rx.recv().await {
         // Read per job: the claim poller may have put the till on ops since the last one.
         let ops = conn.lock().unwrap().ops.clone();
@@ -616,6 +638,10 @@ async fn actor(
                 };
                 (reply, r)
             }
+            Job::TopupLoad { topup_id, amount_msat, ops_url, link, topups, reply } => {
+                let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url).await;
+                (reply, r)
+            }
         };
         cw.card = Box::new(NoCard);
         // The holder's PIN lives for one job.
@@ -630,6 +656,92 @@ async fn actor(
             busy.store(false, Ordering::SeqCst);
         }
         let _ = reply_tx.send(reply);
+    }
+}
+
+/// Load top-up `id` onto the card. First finish any load an earlier run left (a top-up's own load
+/// cut short is among them, found by its tag), so a top-up is never loaded twice; then load.
+#[allow(clippy::too_many_arguments)]
+async fn topup_load_job(
+    wallet: &Wallet,
+    dir: &Path,
+    opener: &CardOpener,
+    link: Option<&Link>,
+    topups: &Topups,
+    id: &str,
+    amount_msat: u64,
+    ops_url: &str,
+) -> Reply {
+    let loader = match crate::holder::Loader::new(wallet, ops_url, dir) {
+        Ok(l) => l.with_tag(id),
+        Err(e) => return error_reply(&e),
+    };
+    match loader.resume_each().await {
+        Ok(done) => {
+            for f in done {
+                if let (Some(tag), Some(_)) = (&f.load.tag, &f.live) {
+                    mark_loaded(topups, tag, &f.load.txid, &f.load.short_id);
+                }
+            }
+        }
+        Err(e) => return error_reply(&e),
+    }
+    match topups.get(id) {
+        Some(t) if t.state == TopupState::Loaded => return Reply::ok(t.to_json()),
+        Some(t) if t.state == TopupState::Paid => {}
+        Some(t) => return topup_not_loadable(&t).unwrap_or_else(|| Reply::ok(t.to_json())),
+        None => return unknown_topup(),
+    }
+    let mut card = match on_card(|| open_for(opener, link)) {
+        Ok(c) => c,
+        Err(e) => return error_reply(&e),
+    };
+    match loader.load(card.as_mut(), &[amount_msat]).await {
+        Ok(r) => {
+            mark_loaded(topups, id, &r.txid, &r.short_id);
+            match topups.get(id) {
+                Some(t) => Reply::ok(t.to_json()),
+                None => unknown_topup(),
+            }
+        }
+        Err(e) => match e.downcast_ref::<crate::holder::CardFull>() {
+            Some(full) => Reply::fail(
+                409,
+                "card_full",
+                format!("{full}: spend on the card, then tap again; the top-up stays paid"),
+            ),
+            None => error_reply(&e),
+        },
+    }
+}
+
+fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
+    let r = topups.store.lock().unwrap().update(id, |t| {
+        t.state = TopupState::Loaded;
+        t.load_txid = Some(txid.to_owned());
+        t.short_id = Some(short_id.to_owned());
+        t.detail = None;
+    });
+    if let Err(e) = r {
+        eprintln!("top-up {id}: loaded in {txid} but could not record it: {e:#}");
+    }
+}
+
+fn unknown_topup() -> Reply {
+    Reply::fail(404, "unknown_topup", "no such top-up on this till")
+}
+
+/// Why a top-up in this state cannot be loaded; `None` for `paid` and `loaded`.
+fn topup_not_loadable(t: &TopupRec) -> Option<Reply> {
+    match t.state {
+        TopupState::Paid | TopupState::Loaded => None,
+        TopupState::Waiting => Some(Reply::fail(409, "not_paid", "the invoice is not paid yet")),
+        TopupState::Expired => Some(Reply::fail(410, "expired", "the invoice expired unpaid; make a new one")),
+        TopupState::Failed => Some(Reply::fail(
+            409,
+            "topup_failed",
+            t.detail.clone().unwrap_or_else(|| "the Lightning payment did not complete".into()),
+        )),
     }
 }
 
@@ -1097,6 +1209,9 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/cards/keySetup", post(cards_key_setup))
         .route("/v1/cards/issue", post(cards_issue))
         .route("/v1/card/link", get(card_link))
+        .route("/v1/topup", post(topup_create))
+        .route("/v1/topup/{topup_id}", get(topup_get))
+        .route("/v1/topup/{topup_id}/load", post(topup_load))
         .with_state(h)
         .layer(axum::middleware::from_fn_with_state(auth, crate::pos::auth))
 }
@@ -1325,6 +1440,140 @@ async fn cards_issue(State(h): State<TillHandle>, body: Bytes) -> Reply {
         .await
 }
 
+// ------------------------------------------------------------------ top-ups (docs/TOPUP.md)
+
+const TOPUP_MAX_CLIENT_REF: usize = 64;
+
+#[derive(Deserialize)]
+struct TopupReq {
+    amount_msat: Option<u64>,
+    client_ref: Option<String>,
+}
+
+fn topups_unavailable() -> Reply {
+    Reply::fail(503, "lightning_unavailable", "this till takes no Lightning top-ups (the federation's ln module is not available)")
+}
+
+/// The registry's URL, or the refusal: a top-up is a holder load, recorded in ops.
+fn topup_ops_url(h: &TillHandle) -> Result<String, Reply> {
+    let c = h.conn.lock().unwrap();
+    if let Some(r) = c.refusal() {
+        return Err(r);
+    }
+    match &c.ops {
+        Some(o) => Ok(o.client.url().to_owned()),
+        None => Err(Reply::fail(503, "ops_not_connected", "top-ups are recorded in the registry, and this till is not on one")),
+    }
+}
+
+async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    let Some(t) = h.topups.clone() else { return topups_unavailable() };
+    let req: TopupReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"amount_msat\":N,\"client_ref\":\"…\"}}: {e}")),
+    };
+    if req.client_ref.as_deref().is_some_and(|c| c.is_empty() || c.len() > TOPUP_MAX_CLIENT_REF) {
+        return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {TOPUP_MAX_CLIENT_REF} bytes"));
+    }
+    let Some(requested) = req.amount_msat.filter(|a| *a > 0) else {
+        return Reply::fail(400, "bad_amount", "amount_msat must be a positive number of msat");
+    };
+    if requested > crate::topup::MAX_TOPUP_MSAT {
+        return Reply::fail(400, "bad_amount", format!("a top-up is at most {} msat", crate::topup::MAX_TOPUP_MSAT));
+    }
+    if let Err(r) = topup_ops_url(&h) {
+        return r;
+    }
+    let _one = t.create.lock().await;
+    if let Some(cref) = req.client_ref.as_deref() {
+        if let Some(had) = t.store.lock().unwrap().by_ref(cref).cloned() {
+            if had.requested_msat != requested {
+                return Reply::fail(
+                    409,
+                    "client_ref_conflict",
+                    format!("client_ref {cref} was a top-up of {} msat, not {requested}", had.requested_msat),
+                );
+            }
+            return Reply::ok(had.to_json());
+        }
+    }
+    let cfg = &h.wallet.mint_cfg;
+    let amount = match crate::plan::nearest_card_amount(requested, crate::topup::MAX_TOPUP_NOTES, h.wallet.min_denom(), |n| {
+        cfg.tbs_pks.get(fedimint_core::Amount::from_msats(n)).is_some()
+    }) {
+        Some(a) if a <= crate::topup::MAX_TOPUP_MSAT => a,
+        _ => return Reply::fail(400, "bad_amount", format!("{requested} msat rounds to no amount a card can hold")),
+    };
+    let (operation_id, invoice) = match t.ln.invoice(amount, crate::topup::INVOICE_EXPIRY_SECS).await {
+        Ok(x) => x,
+        Err(e) => return Reply::fail(502, "invoice_failed", format!("{e:#}")),
+    };
+    let now = crate::topup::now_ms();
+    let rec = TopupRec {
+        topup_id: crate::topup::new_id(),
+        client_ref: req.client_ref,
+        requested_msat: requested,
+        amount_msat: amount,
+        invoice,
+        operation_id,
+        created_at_ms: now,
+        expires_at_ms: now + crate::topup::INVOICE_EXPIRY_SECS * 1000,
+        state: TopupState::Waiting,
+        load_txid: None,
+        short_id: None,
+        detail: None,
+    };
+    if let Err(e) = t.store.lock().unwrap().insert(rec.clone()) {
+        return error_reply(&e);
+    }
+    t.watch(&rec);
+    Reply::ok(rec.to_json())
+}
+
+async fn topup_get(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>) -> Reply {
+    let Some(t) = h.topups.clone() else { return topups_unavailable() };
+    match t.get(&id) {
+        Some(rec) => Reply::ok(rec.to_json()),
+        None => unknown_topup(),
+    }
+}
+
+async fn topup_load(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>, headers: HeaderMap) -> Reply {
+    let link = match link_of(&h, &headers) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let r = topup_load_on(&h, &id, link.clone()).await;
+    if let Some(l) = link {
+        l.close();
+    }
+    r
+}
+
+async fn topup_load_on(h: &TillHandle, id: &str, link: Option<Link>) -> Reply {
+    let Some(t) = h.topups.clone() else { return topups_unavailable() };
+    let Some(rec) = t.get(id) else { return unknown_topup() };
+    if rec.state == TopupState::Loaded {
+        return Reply::ok(rec.to_json());
+    }
+    if let Some(r) = topup_not_loadable(&rec) {
+        return r;
+    }
+    let ops_url = match topup_ops_url(h) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    run_job(h, None, |reply| Job::TopupLoad {
+        topup_id: rec.topup_id.clone(),
+        amount_msat: rec.amount_msat,
+        ops_url,
+        link,
+        topups: t.clone(),
+        reply,
+    })
+    .await
+}
+
 async fn sales_list(State(h): State<TillHandle>) -> Reply {
     let s = h.sales.lock().unwrap();
     let list: Vec<Value> = s
@@ -1448,7 +1697,19 @@ pub async fn serve_with(
     let opener: CardOpener = Box::new(move || open_relay_card(&relay_for_jobs));
     let mut cw = cw;
     cw.card = Box::new(NoCard);
+    let wallet = cw.wallet.clone();
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn).await;
+    // Top-ups by Lightning, when the federation's ln module is there (docs/TOPUP.md).
+    let handle = match wallet.lightning() {
+        Ok(_) => {
+            let store = crate::topup::TopupStore::open(crate::topup::TopupStore::path_in(&dir))?;
+            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet })))
+        }
+        Err(e) => {
+            eprintln!("no Lightning top-ups: {e:#}");
+            handle
+        }
+    };
     let (auth, handle) = match pos_token {
         Some(t) if require_pos_token => ("POS token required on every request", handle.with_pos_token_everywhere(t)),
         Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),

@@ -102,6 +102,30 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
             is TillResult.Ok -> parseCardBalance(r.value.status, r.value.body)
         }
 
+    /** Makes a top-up invoice (docs/TOPUP.md). The same [clientRef] answers the same top-up. */
+    fun createTopUp(amountMsat: Long, clientRef: String): TopUpReply<TopUp> {
+        val body = JSONObject().put("amount_msat", amountMsat).put("client_ref", clientRef).toString()
+        return when (val r = call("POST", "/v1/topup", body, QUICK_READ_MS + 20_000)) {
+            is TillResult.Err -> TopUpReply.Failed(r.error)
+            is TillResult.Ok -> parseTopUp(r.value.status, r.value.body)
+        }
+    }
+
+    fun topUpStatus(topupId: String): TopUpReply<TopUpStatus> =
+        when (val r = call("GET", "/v1/topup/" + encode(topupId), null, QUICK_READ_MS)) {
+            is TillResult.Err -> TopUpReply.Failed(r.error)
+            is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body)
+        }
+
+    /** Loads a paid top-up onto the card on [link]. Safe to repeat: a loaded top-up answers again. */
+    fun loadTopUp(topupId: String, link: String? = null): TopUpReply<TopUpStatus> =
+        when (val r = call("POST", "/v1/topup/" + encode(topupId) + "/load", "{}", CHARGE_READ_MS, link)) {
+            is TillResult.Err -> TopUpReply.Failed(r.error)
+            is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body)
+        }
+
+    private fun encode(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
+
     companion object {
         const val CONNECT_MS = 3_000
         const val QUICK_READ_MS = 10_000
@@ -255,4 +279,33 @@ internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = tr
     }
 } catch (e: JSONException) {
     BalanceResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
+}
+
+private fun refused(httpStatus: Int, o: JSONObject): TopUpReply.Refused {
+    val code = if (o.isNull("error")) "" else o.optString("error", "")
+    return TopUpReply.Refused(code, if (o.isNull("detail")) "" else o.optString("detail", ""), httpStatus)
+}
+
+/** `POST /v1/topup`: `{topup_id, amount_msat, invoice, expires_at_ms, state}`, or `{ok:false,…}`. */
+internal fun parseTopUp(httpStatus: Int, body: String): TopUpReply<TopUp> = try {
+    val o = JSONObject(body)
+    if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o)
+    else TopUpReply.Ok(TopUp(o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("invoice"), o.reqLong("expires_at_ms"), o.optString("state", "waiting")))
+} catch (e: JSONException) {
+    TopUpReply.Failed(TillError.BadResponse(e.message ?: "bad json"))
+}
+
+/** `GET /v1/topup/{id}` and `POST …/load`: `{topup_id, amount_msat, state, load_txid?, detail?}`. */
+internal fun parseTopUpStatus(httpStatus: Int, body: String): TopUpReply<TopUpStatus> = try {
+    val o = JSONObject(body)
+    if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o)
+    else TopUpReply.Ok(
+        TopUpStatus(
+            o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("state"),
+            if (o.isNull("load_txid")) null else o.optString("load_txid").ifEmpty { null },
+            if (o.isNull("detail")) null else o.optString("detail").ifEmpty { null },
+        )
+    )
+} catch (e: JSONException) {
+    TopUpReply.Failed(TillError.BadResponse(e.message ?: "bad json"))
 }
