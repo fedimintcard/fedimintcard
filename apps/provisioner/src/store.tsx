@@ -36,7 +36,7 @@ import React, {
 import {AppState} from 'react-native';
 
 import type {StopKind} from './cardkit';
-import type {CardOps} from './ops';
+import type {CardOps, TillOps} from './ops';
 import {
   useOptionalBatchPin,
   usePinReveal,
@@ -384,7 +384,7 @@ export interface Session {
  * tests need. `App.tsx` passes the real client in, and api.ts owns the
  * session's storage; nothing here is persisted.
  */
-export interface StoreApi extends Partial<CardOps> {
+export interface StoreApi extends Partial<CardOps>, Partial<TillOps> {
   readonly serviceUrl: string;
   /**
    * Resolves with the operator's session. Rejects with whatever api.ts throws:
@@ -430,6 +430,8 @@ export interface StoreShape {
    * tap reports as a stop rather than going on without the answer.
    */
   readonly ops: CardOps;
+  /** Settings → Tills: the operator's tills and the claims tills make. */
+  readonly tills: TillOps;
   /**
    * Start a batch. Exposed on the store as well as on `batch.actions` because
    * `batch` is null until a batch starts: BatchSetup has to call this before
@@ -786,6 +788,18 @@ export function StoreProvider({
     };
   }, []);
 
+  const tills = useMemo<TillOps>(() => {
+    const missing = (call: string) =>
+      Promise.reject(new Error(`${call} needs the registry, and this build has none`));
+    return {
+      listTills: () => apiRef.current?.listTills?.() ?? missing('the till list'),
+      revokeTill: id => apiRef.current?.revokeTill?.(id) ?? missing('revoking a till'),
+      claimInfo: code => apiRef.current?.claimInfo?.(code) ?? missing('a till claim'),
+      approveClaim: code =>
+        apiRef.current?.approveClaim?.(code) ?? missing('approving a till'),
+    };
+  }, []);
+
   const value = useMemo<StoreShape>(
     () => ({
       signedIn: session !== null,
@@ -795,6 +809,7 @@ export function StoreProvider({
       signOut,
       federationNames,
       ops,
+      tills,
       startBatch: actions.start,
       batch: view,
       loop: batch && batch.phase === 'running' ? batch.loop : null,
@@ -806,6 +821,7 @@ export function StoreProvider({
       signOut,
       federationNames,
       ops,
+      tills,
       actions,
       view,
       batch,

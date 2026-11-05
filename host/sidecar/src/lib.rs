@@ -1,4 +1,5 @@
 pub mod cards;
+pub mod claim;
 pub mod glue;
 pub mod holder;
 pub mod link;

@@ -15,6 +15,10 @@
  *
  *   anyone     GET  /health
  *              POST /auth/operator/session       {name, password} -> {operator_id, token}
+ *              POST /till-claims                 {name} -> {claim_id, code, poll_secret, expires_at}
+ *                                                (docs/TILL-CLAIM.md; per-IP and global limits, 429)
+ *   the till   POST /till-claims/:claim_id/poll  {poll_secret} -> {status: pending} or, once,
+ *   that asked                                    {status: approved, till_id, token} (claims.ts)
  *   a holder   GET  /cards/:short_id/slots       free slot keys and version, nothing else
  *   (no token) POST /cards/:short_id/load        notes from the holder's wallet, before it submits
  *              POST /cards/:short_id/load/outcome  their signatures, each verified (loads.ts)
@@ -27,6 +31,8 @@
  *              POST /registry/resume-check       {chip, short_id}: may a lifted install be finished (resume.ts);
  *                                                the finished row then names `supersedes`, closing the old one
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
+ *              GET  /till-claims/:code           a till's claim: name, status (pending, approved)
+ *              POST /till-claims/:code/approve   ties it to this operator; its till is made at the poll
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
  *   operator   GET  /cards/:short_id/state
@@ -73,6 +79,7 @@ import {
   renewSlot,
 } from './cards';
 import {backupStatus, nextBackupAt, runBackup} from './backup';
+import {approveClaim, pollClaim, readClaim, startClaim} from './claims';
 import {migrate} from './db';
 import {
   bearer,
@@ -208,6 +215,18 @@ export class Registry {
         : fail(401, 'the operator name or password is not correct');
     }
 
+    // A till asking for its token has nothing yet: these answer without one (claims.ts).
+    if (path === '/till-claims') {
+      if (method !== 'POST') return fail(405, 'use POST');
+      const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+      return json(200, {ok: true, ...(await startClaim(storage, ip, await objectBody(request), now))});
+    }
+    const poll = /^\/till-claims\/([^/]+)\/poll$/.exec(path);
+    if (poll) {
+      if (method !== 'POST') return fail(405, 'use POST');
+      return json(200, {ok: true, ...(await pollClaim(storage, poll[1]!, await objectBody(request), now))});
+    }
+
     // A holder has the card and nothing else: these answer without a token.
     const holder = /^\/cards\/([^/]+)\/(slots|load|load\/outcome)$/.exec(path);
     if (holder) {
@@ -319,6 +338,16 @@ export class Registry {
       }
       // The token is shown once, here; only its hash is kept.
       return json(200, {ok: true, ...(await createTill(storage, op, name.trim(), now))});
+    }
+    const claim = /^\/till-claims\/([^/]+)(\/approve)?$/.exec(path);
+    if (claim) {
+      if (claim[2]) {
+        if (method !== 'POST') return fail(405, 'use POST');
+        approveClaim(storage, op, claim[1]!, now);
+        return json(200, {ok: true});
+      }
+      if (method !== 'GET') return fail(405, 'use GET');
+      return json(200, {ok: true, ...readClaim(sql, op, claim[1]!, now)});
     }
     const till = /^\/tills\/(\d+)$/.exec(path);
     if (till && method === 'DELETE') {
@@ -435,6 +464,7 @@ export class Registry {
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
         'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys', 'card_resets',
+        'till_claims', 'till_claim_budget',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }

@@ -3,6 +3,9 @@ import {decodeInvite} from './federation';
 import type {
   CardOps,
   ManagerKeysReply,
+  TillClaimInfo,
+  TillOps,
+  TillRow,
   ResetCheck,
   ResetCompletion,
   ResetRecorded,
@@ -51,7 +54,11 @@ export type ServiceOperation =
   | 'manager-keys'
   | 'resume-check'
   | 'reset-check'
-  | 'complete-reset';
+  | 'complete-reset'
+  | 'list-tills'
+  | 'revoke-till'
+  | 'claim-info'
+  | 'approve-claim';
 
 export class ApiServiceError extends Error {
   constructor(
@@ -218,6 +225,10 @@ abstract class HttpTransport {
 
   protected post(path: string, call: CallOptions) {
     return this.call('POST', path, call);
+  }
+
+  protected delete(path: string, call: CallOptions) {
+    return this.call('DELETE', path, call);
   }
 }
 
@@ -607,6 +618,98 @@ export class RegistryClient extends HttpTransport {
     }
     return cards as StoredCard[];
   }
+
+  /** GET /tills — the operator's tills, revoked ones included. */
+  async listTills(token: string): Promise<TillRow[]> {
+    const json = await this.get('/tills', {token, operation: 'list-tills'});
+    if (!Array.isArray(json.tills)) {
+      throw new ApiServiceError('the till list is malformed', 200, undefined, 'list-tills');
+    }
+    const tills: TillRow[] = [];
+    for (const t of json.tills as unknown[]) {
+      const r = t as Partial<Record<keyof TillRow, unknown>> | null;
+      if (
+        r &&
+        Number.isSafeInteger(r.till_id) &&
+        typeof r.name === 'string' &&
+        typeof r.created_at === 'number'
+      ) {
+        tills.push({
+          till_id: r.till_id as number,
+          name: r.name,
+          created_at: r.created_at,
+          revoked_at: typeof r.revoked_at === 'number' ? r.revoked_at : null,
+        });
+      }
+    }
+    return tills;
+  }
+
+  /** DELETE /tills/:id — that till's token stops working at once. */
+  async revokeTill(token: string, tillId: number): Promise<void> {
+    if (!Number.isSafeInteger(tillId) || tillId <= 0) {
+      throw new Error('a till id is a positive integer');
+    }
+    await this.delete(`/tills/${tillId}`, {token, operation: 'revoke-till'});
+  }
+
+  /** GET /till-claims/:code — the claim a till started (docs/TILL-CLAIM.md). */
+  async claimInfo(token: string, code: string): Promise<TillClaimInfo> {
+    const json = await this.get(`/till-claims/${encodeURIComponent(claimPath(code))}`, {
+      token,
+      operation: 'claim-info',
+    });
+    if (
+      typeof json.name !== 'string' ||
+      typeof json.created_at !== 'number' ||
+      typeof json.expires_at !== 'number' ||
+      (json.status !== 'pending' && json.status !== 'approved')
+    ) {
+      throw new ApiServiceError('the till claim is malformed', 200, undefined, 'claim-info');
+    }
+    return {
+      name: json.name,
+      created_at: json.created_at,
+      expires_at: json.expires_at,
+      status: json.status,
+    };
+  }
+
+  /** POST /till-claims/:code/approve — ties the claim to this operator. */
+  async approveClaim(token: string, code: string): Promise<void> {
+    await this.post(`/till-claims/${encodeURIComponent(claimPath(code))}/approve`, {
+      token,
+      body: {},
+      operation: 'approve-claim',
+    });
+  }
+}
+
+/**
+ * A claim code as the registry is asked it: `XXXX-XXXX`, upper case, the form
+ * the till shows and its QR carries. Refuses anything else before it is sent.
+ */
+function claimPath(code: string): string {
+  const normal = normalizeClaimCode(code);
+  if (normal === null) {
+    throw new Error('not a till claim code');
+  }
+  return normal;
+}
+
+/**
+ * The code's alphabet (docs/TILL-CLAIM.md): no 0, O, 1, I or L, so what an
+ * operator reads off a till cannot be misread.
+ */
+const CLAIM_CODE = /^[A-HJKMNP-Z2-9]{8}$/;
+
+/**
+ * A typed or scanned claim code as `XXXX-XXXX`: upper case, with or without
+ * the dash and spaces. Null when it is not eight characters of the alphabet.
+ */
+export function normalizeClaimCode(input: string): string | null {
+  const bare = input.toUpperCase().replace(/[\s-]/g, '');
+  return CLAIM_CODE.test(bare) ? `${bare.slice(0, 4)}-${bare.slice(4)}` : null;
 }
 
 /**
@@ -699,7 +802,7 @@ type StoreSession = import('./store').Session;
  * The outbox holds the rows the registry could not take live, so a programmed
  * card's record survives a network that went away.
  */
-export class RegistryStoreApi implements CardOps {
+export class RegistryStoreApi implements CardOps, TillOps {
   private readonly outbox: RegistryOutbox;
   /** The batch id the registry answered; every card row names it. */
   private batchId: number | null = null;
@@ -756,6 +859,23 @@ export class RegistryStoreApi implements CardOps {
 
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {
     return this.client.completeReset(this.token(), completion);
+  }
+
+  /** Async, so a call before sign-in rejects rather than throws at the caller. */
+  async listTills(): Promise<TillRow[]> {
+    return this.client.listTills(this.token());
+  }
+
+  async revokeTill(tillId: number): Promise<void> {
+    return this.client.revokeTill(this.token(), tillId);
+  }
+
+  async claimInfo(code: string): Promise<TillClaimInfo> {
+    return this.client.claimInfo(this.token(), code);
+  }
+
+  async approveClaim(code: string): Promise<void> {
+    return this.client.approveClaim(this.token(), code);
   }
 
   /** Open the batch once; a card row cannot be posted before it. */

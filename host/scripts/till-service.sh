@@ -6,15 +6,19 @@
 #   till-service.sh stop       unload; start with `install` again
 #   till-service.sh status     launchd's view, /v1/status, the log's tail
 #   till-service.sh pair       make the POS token if needed and print the pairing QR (POS-LINK.md)
+#   till-service.sh claim NAME ask the registry for a till token; approve it in the provisioner app
 #   till-service.sh run        what launchd runs; not for a terminal
 #
 # Settings live in ~/.config/fedimintcard/till.env (written with defaults on first install):
 # OPS_URL, CARD_BACKEND, CARD_BRIDGE_URL, DATA_DIR, TILL_LISTEN. TILL_LISTEN defaults to
 # 127.0.0.1:9877 (USB phones through adb reverse); set it to 0.0.0.0:9877 to let paired POS phones
 # reach the till over the LAN. The till refuses a non-loopback address until `pair` has made the
-# POS token in DATA_DIR (docs/POS-LINK.md); off loopback every request must carry it. The till token is read from
-# ~/.config/fedimintcard/till-token at every start, so it is never in the plist or the env file;
-# make it with registry/scripts/new-till.sh. No CARD_PIN: on ops every charge carries the
+# POS token in DATA_DIR (docs/POS-LINK.md); off loopback every request must carry it. The till token is
+# ~/.config/fedimintcard/till-token if that file exists (made with registry/scripts/new-till.sh),
+# read at every start so it is never in the plist or the env file. Without it the till uses the
+# token a `claim` left in DATA_DIR/till-ops.json, or waits for one: `claim` shows a QR code an
+# operator approves in the provisioner app, and the running till picks the token up
+# (docs/TILL-CLAIM.md). No CARD_PIN: on ops every charge carries the
 # holder's PIN (`pin_required`), and the till never opens a card on its own.
 #
 # launchd restarts the till if it exits (KeepAlive, at most every 10 s). The binary is a copy in
@@ -83,9 +87,10 @@ case "${1:-}" in
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     set +a
-    [ -s "$TOKEN_FILE" ] || { echo "$(date -u +%FT%TZ) no till token at $TOKEN_FILE" >&2; sleep 60; exit 1; }
-    OPS_TILL_TOKEN=$(tr -d '\n' < "$TOKEN_FILE")
-    export OPS_TILL_TOKEN
+    if [ -s "$TOKEN_FILE" ]; then
+      OPS_TILL_TOKEN=$(tr -d '\n' < "$TOKEN_FILE")
+      export OPS_TILL_TOKEN
+    fi
     unset CARD_PIN
     echo "$(date -u +%FT%TZ) starting till on $OPS_URL"
     exec "$BIN" --data-dir "$DATA_DIR" till serve --listen "${TILL_LISTEN:-127.0.0.1:9877}"
@@ -96,6 +101,14 @@ case "${1:-}" in
     . "$ENV_FILE"
     [ -x "$BIN" ] || BIN=$BUILT
     exec "$BIN" --data-dir "$DATA_DIR" till pair "$@"
+    ;;
+  claim)
+    shift
+    [ -n "${1:-}" ] || { echo "usage: till-service.sh claim NAME" >&2; exit 2; }
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    [ -x "$BIN" ] || BIN=$BUILT
+    exec "$BIN" --data-dir "$DATA_DIR" till claim --ops-url "$OPS_URL" --name "$1"
     ;;
   install)
     copy_binary; write_env; write_plist
@@ -117,7 +130,7 @@ case "${1:-}" in
     echo; tail -n 5 "$LOG" 2>/dev/null || true
     ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

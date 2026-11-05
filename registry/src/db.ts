@@ -185,6 +185,25 @@ export const MIGRATIONS: readonly string[] = [
     completed_at   INTEGER NOT NULL
   );
   `,
+  // v8 (docs/TILL-CLAIM.md): till claims, which live 10 minutes, and the per-IP
+  // budget for starting them. Neither is in the backup.
+  `
+  CREATE TABLE till_claims (
+    claim_id         TEXT    PRIMARY KEY,
+    code             TEXT    NOT NULL UNIQUE,
+    name             TEXT    NOT NULL,
+    poll_secret_hash TEXT    NOT NULL,
+    created_at       INTEGER NOT NULL,
+    expires_at       INTEGER NOT NULL,
+    approved_by      INTEGER,
+    approved_at      INTEGER
+  );
+  CREATE TABLE till_claim_budget (
+    ip_hash       TEXT    PRIMARY KEY,
+    window_start  INTEGER NOT NULL,
+    claims        INTEGER NOT NULL
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

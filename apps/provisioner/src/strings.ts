@@ -203,6 +203,63 @@ export const SETTINGS = {
   resetBlocked: 'A batch is running. End it before resetting a card.',
   cardsHelp:
     'Reset a card that is empty: the Fedimint applet is deleted and the card goes back to the chip maker\'s keys, blank. Ops must show nothing on it, and the holder types their PIN to agree. To use it again, tap it in a new batch.',
+  tills: 'Tills',
+  tillsTitle: 'Tills',
+  tillsSub: 'Add a till, or stop one charging',
+  tillsBlocked: 'A batch is running. End it before changing tills.',
+  tillsHelp:
+    'A till charges cards for you. To add one, start Connect to registry on the till: it shows a QR code and a short code. Scan it or type the code here and approve. The till never sees your password, and only the till holds its key.',
+} as const;
+
+/** Settings → Tills (docs/TILL-CLAIM.md). */
+export const TILLS = {
+  title: 'Tills',
+  yours: 'Your tills',
+  none: 'No tills yet. Add one below.',
+  loading: 'Asking the registry…',
+  added: (when: string) => `Added ${when}`,
+  revoked: (when: string) => `Stopped ${when}`,
+  revoke: 'Stop',
+  revokeTitle: (name: string) => `Stop ${name}?`,
+  revokeBody: 'That till stops charging at once. To use it again, connect it again.',
+  revokeConfirm: 'Stop this till',
+  keep: 'Keep it',
+  revokedNote: (name: string) => `${name} has stopped. It can no longer charge cards.`,
+  add: 'Add a till',
+  addIntro:
+    'On the till, run Connect to registry. Scan the QR code it shows, or type the code under it.',
+  scan: 'Scan the till\'s QR code',
+  codeLabel: 'Code',
+  codePlaceholder: 'XXXX-XXXX',
+  check: 'Look up this code',
+  checking: 'Looking up the code…',
+  reviewTitle: 'Approve this till?',
+  name: 'Name',
+  asked: 'Asked',
+  reviewBody:
+    'Approve only a till you are standing at, with this name on its screen. It charges cards under your account until you stop it.',
+  approve: 'Approve',
+  approving: 'Approving…',
+  cancel: 'Cancel',
+  doneTitle: (name: string) => `${name} is connected`,
+  doneBody: 'The till picks up its key in a few seconds and can charge cards then.',
+  done: 'Done',
+  retry: 'Try again',
+  back: 'Back to tills',
+  problems: {
+    badCode: 'That is not a till code. A code is eight letters and digits, like K7QM-3XRP.',
+    otherRegistry: (asked: string, current: string) =>
+      `This till asked the ${asked}, and you are signed in to the ${current}. Switch the registry in Settings, or run Connect to registry on the till again with this one.`,
+    unknownCode:
+      'No till is waiting with that code. Codes last ten minutes: run Connect to registry on the till again for a new one.',
+    alreadyApproved: 'That till is already approved. It connects by itself in a few seconds.',
+    offline: 'The registry could not be reached. Check your connection and try again.',
+    signedOut: 'Your session has ended. Sign out and sign in again, then try again.',
+    noTill: 'That till is not one of yours, or is already gone.',
+    other: (detail?: string) =>
+      detail ? `The registry said: ${detail}` : 'That did not go through. Try again.',
+  },
+  listFailed: 'The tills could not be loaded.',
 } as const;
 
 /** Settings → Reset a card (OPS-PLAN O5). */
@@ -303,4 +360,9 @@ export const SCAN = {
   openSettings: 'Open Settings',
   noCamera: 'This phone has no camera the app can use. Paste the invite instead.',
   cancel: 'Cancel',
+  tillTitle: 'Scan the till\'s QR code',
+  tillHint: 'Point the camera at the QR code Connect to registry shows on the till.',
+  notTill: 'That QR code is not a till\'s.',
+  tillNoPermission: 'The camera is off for this app. Allow it, or type the code instead.',
+  tillNoCamera: 'This phone has no camera the app can use. Type the code instead.',
 };

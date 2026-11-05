@@ -92,3 +92,29 @@ export interface CardOps {
   resetCheck(shortId: string, chip?: string): Promise<ResetCheck>;
   completeReset(completion: ResetCompletion): Promise<ResetRecorded>;
 }
+
+/** `GET /tills`: one of the operator's tills. Epoch ms; `revoked_at` null while it may charge. */
+export interface TillRow {
+  readonly till_id: number;
+  readonly name: string;
+  readonly created_at: number;
+  readonly revoked_at: number | null;
+}
+
+/** `GET /till-claims/:code` (docs/TILL-CLAIM.md): what a till asked for, before approval. */
+export interface TillClaimInfo {
+  readonly name: string;
+  /** Epoch ms: when the till asked. */
+  readonly created_at: number;
+  readonly expires_at: number;
+  readonly status: 'pending' | 'approved';
+}
+
+/** The till calls Settings → Tills needs; each needs a signed-in operator. */
+export interface TillOps {
+  listTills(): Promise<TillRow[]>;
+  revokeTill(tillId: number): Promise<void>;
+  /** `code` as typed or scanned; normalised before it is sent. */
+  claimInfo(code: string): Promise<TillClaimInfo>;
+  approveClaim(code: string): Promise<void>;
+}

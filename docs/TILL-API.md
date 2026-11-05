@@ -26,6 +26,21 @@ till's own outputs, `sales.json` and `cashouts.log` stay local. Slot 0 is never 
 its key is the card's short id. At startup the till reports the federation's name to ops. The
 token is never logged.
 
+### Connecting by claim
+
+A till can ask for its own token instead (`docs/TILL-CLAIM.md`). `card-sidecar till claim
+--ops-url <registry> --name <name> [--text] [--replace]` starts a claim, prints the QR code the
+provisioner app scans (`fedimintcard-till-claim:<registry origin>?c=<code>`; with `--text`, that
+text and on a second line the code), writes the claim to `<data_dir>/till-claim.json` (0600) and
+exits. A till that already has a token is refused without `--replace` (its token works until the
+new claim is approved). `till serve` without `--ops-token` uses the token in
+`<data_dir>/till-ops.json` (0600, with the URL of the registry that issued it); with neither it is
+on ops but not connected whenever `--ops-url` is given or a claim file exists. It then polls the
+claim every 3 s, and on approval writes `till-ops.json`, deletes the claim file, reports the
+federation and is on ops at once, without a restart. Until then `/v1/status` says why, and
+`POST /v1/charge`, `/v1/card/balance` and `/v1/cards/issue` answer `ops_not_connected`. A till
+with no registry settings at all keeps its card state locally, as before ops.
+
 ### Auth and the card link (POS phones on the LAN)
 
 `card-sidecar till pair [--url URL]` (or `host/scripts/till-service.sh pair`) makes the POS token
@@ -55,7 +70,12 @@ relay (`CARD_BRIDGE_URL`) as before. Frames, timeouts and the pairing flow are i
 `200 {"ok":true}`
 
 ## GET /v1/status
-`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool}`
+`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null}`
+
+`ops_state` is `connected`, `waiting_for_approval` (a claim is live: `claim_code` and its expiry),
+`claim_expired`, `not_connected` (no token and no claim) or `local` (no registry configured).
+`connected` is true only for `connected`. A connected till with a newer claim waiting
+(`till claim --replace`) also shows that claim's code.
 
 `card_relay_ok` means the phone relay answered `/health`; it does not mean a card is present.
 
@@ -115,6 +135,7 @@ earlier attempt.
 | `unknown_card` | 404 | on ops: the registry has no such card for this till's operator | card not provisioned for this operator |
 | `ops_unreachable` | 502 | on ops: the registry could not be reached; nothing was sent | retry; check the network |
 | `ops_refused` | 502 | on ops: the registry refused the till (bad or revoked token) | check the till token |
+| `ops_not_connected` | 503 | the till belongs on ops but has no token yet (no claim, a claim waiting for approval, or an expired one); nothing ran | connect the till (Connect to registry), approve it in the provisioner app |
 | `internal` | 500 | anything else | show detail |
 
 ## GET /v1/sales

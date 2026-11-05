@@ -1,7 +1,7 @@
 /**
- * The six routes (docs/PROVISIONER-PLAN.md § 5, "Trimmed surface", and
+ * The seven routes (docs/PROVISIONER-PLAN.md § 5, "Trimmed surface", and
  * OPS-PLAN O5): SignIn, BatchSetup, the Loop, BatchSummary, Settings, and
- * Reset a card under Settings. There is no card browser and no load-test
+ * Reset a card and Tills under Settings. There is no card browser and no load-test
  * bench; those live in the laptop's `cardctl`.
  *
  * Which screen a batch shows is the batch's `phase`, not a route table: the
@@ -29,11 +29,12 @@ import {LoopScreen} from './src/screens/LoopScreen';
 import {ResetScreen} from './src/screens/ResetScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {SignInScreen} from './src/screens/SignInScreen';
+import {TillsScreen} from './src/screens/TillsScreen';
 import {SettingsProvider, useSettings} from './src/settings';
 import {StoreProvider, useStore} from './src/store';
 import type {StoreApi} from './src/store';
 
-type Route = 'home' | 'settings' | 'summary' | 'demo' | 'reset';
+type Route = 'home' | 'settings' | 'summary' | 'demo' | 'reset' | 'tills';
 
 function Navigator(): React.JSX.Element {
   const {batch, signedIn} = useStore();
@@ -72,12 +73,18 @@ function Navigator(): React.JSX.Element {
   if (route === 'reset' && phase !== 'running') {
     return <ResetScreen onBack={() => setRoute('settings')} />;
   }
+  // Settings → Tills needs the operator's session (the sign-in gate above) and,
+  // like Reset, is never over a running batch.
+  if (route === 'tills' && phase !== 'running') {
+    return <TillsScreen onBack={() => setRoute('settings')} />;
+  }
   if (route === 'settings') {
     return (
       <SettingsScreen
         onBack={() => setRoute('home')}
         onDemo={() => setRoute('demo')}
         onReset={() => setRoute('reset')}
+        onTills={() => setRoute('tills')}
       />
     );
   }

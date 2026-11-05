@@ -112,6 +112,8 @@ operator sign-in, one SQLite Durable Object and an idempotent `/registry/cards`.
 | `POST /cards/:short_id/intent` | till | records a charge before the card signs: tx hash, inputs, change outputs with blinding keys, `client_ref`; requires the `version` it read, else 409 |
 | `POST /cards/:short_id/outcome` | till | accepted or rejected, the change notes' signatures; marks inputs spent; bumps `version` |
 | `POST /tills`, `DELETE /tills/:id` | operator | issues and revokes a till token |
+| `POST /till-claims`, `POST /till-claims/:claim_id/poll` | none / the claim's poll secret | a till asks for its own token; the approved poll answers it once (`docs/TILL-CLAIM.md`) |
+| `GET /till-claims/:code`, `POST /till-claims/:code/approve` | operator | the provisioner app shows a till's claim and approves it |
 
 **Write order.** This is the sidecar's existing write-ahead order (`glue.rs`
 `sign_and_submit`), moved to ops. The intent is in ops before the card signs. Any till that
@@ -327,7 +329,8 @@ Goal: the whole demo runs on phones, cards and services nobody touches on stage.
    merchant installs a till on their own server. To settle: how phones reach it (StartOS LAN
    `https` with its root CA on each phone, a clearnet address, or Tor), `wss` for the link, where
    the pairing QR is shown (a StartOS action), the till's wallet in the package's volume and its
-   backup, and the ops till token entered as a StartOS action.
+   backup, and the ops till token entered as a StartOS action (since replaced by a till claim the
+   operator approves in the provisioner app, `docs/TILL-CLAIM.md`).
 3. **Top-up at the POS by Lightning**: a "Top up card" button: amount → the till makes a
    Lightning invoice through the federation's gateway → the holder pays it from any wallet on
    their phone → tap → the till loads the card from the eCash it received (the registry's

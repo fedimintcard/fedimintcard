@@ -1,9 +1,10 @@
 /**
- * The federation-invite scanner: a full-screen sheet with the back camera and
- * a QR code scanner. It hands back the first code that is a federation invite
- * (`normalizeInvite`) and closes; any other code shows one line and keeps
- * scanning. Camera permission is asked on open; a refusal shows the way to
- * Settings rather than a dead viewfinder.
+ * The QR scanner: a full-screen sheet with the back camera and a QR code
+ * scanner. `ScanSheet` hands back the first code its `read` accepts and
+ * closes; any other code shows one line and keeps scanning. Camera permission
+ * is asked on open; a refusal shows the way to Settings rather than a dead
+ * viewfinder. Two sheets use it: the federation invite (`ScanInviteSheet`,
+ * `normalizeInvite`) and a till's claim (Settings → Tills).
  */
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Linking, Modal, StyleSheet, Text, View} from 'react-native';
@@ -17,6 +18,15 @@ import {normalizeInvite} from './federation';
 import {SCAN} from './strings';
 import {FONT, PrimaryButton, SecondaryButton} from './ui';
 
+/** The words a sheet shows: its title, the hint, and the line for a code it does not take. */
+export interface ScanWords {
+  readonly title: string;
+  readonly hint: string;
+  readonly rejected: string;
+  readonly noPermission: string;
+  readonly noCamera: string;
+}
+
 export function ScanInviteSheet({
   visible,
   onClose,
@@ -26,6 +36,43 @@ export function ScanInviteSheet({
   onClose: () => void;
   /** Called once per opening, with the normalized invite. */
   onInvite: (invite: string) => void;
+}) {
+  return (
+    <ScanSheet
+      visible={visible}
+      onClose={onClose}
+      read={normalizeInvite}
+      onResult={onInvite}
+      words={INVITE_WORDS}
+      testID="scan-invite"
+    />
+  );
+}
+
+const INVITE_WORDS: ScanWords = {
+  title: SCAN.title,
+  hint: SCAN.hint,
+  rejected: SCAN.notInvite,
+  noPermission: SCAN.noPermission,
+  noCamera: SCAN.noCamera,
+};
+
+export function ScanSheet<T>({
+  visible,
+  onClose,
+  read,
+  onResult,
+  words,
+  testID,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  /** The code's text as a result, or null to keep scanning. */
+  read: (text: string) => T | null;
+  /** Called once per opening, with what `read` made of the code. */
+  onResult: (result: T) => void;
+  words: ScanWords;
+  testID?: string;
 }) {
   const {hasPermission, requestPermission} = useCameraPermission();
   const device = useCameraDevice('back');
@@ -54,15 +101,15 @@ export function ScanInviteSheet({
         return;
       }
       for (const code of codes) {
-        const invite = code.value ? normalizeInvite(code.value) : null;
-        if (invite) {
+        const result = code.value ? read(code.value) : null;
+        if (result !== null) {
           taken.current = true;
-          onInvite(invite);
+          onResult(result);
           return;
         }
       }
       if (codes.length > 0) {
-        setRejected(SCAN.notInvite);
+        setRejected(words.rejected);
       }
     },
   });
@@ -85,7 +132,7 @@ export function ScanInviteSheet({
       visible={visible}
       animationType="slide"
       onRequestClose={onClose}
-      testID="scan-invite">
+      testID={testID}>
       <View style={local.root}>
         {ready ? (
           <Camera
@@ -97,13 +144,13 @@ export function ScanInviteSheet({
         ) : null}
         <View style={local.overlay}>
           <View style={local.top}>
-            <Text style={local.title}>{SCAN.title}</Text>
+            <Text style={local.title}>{words.title}</Text>
             <Text style={local.hint}>
               {ready
-                ? rejected ?? SCAN.hint
+                ? rejected ?? words.hint
                 : hasPermission
-                  ? SCAN.noCamera
-                  : SCAN.noPermission}
+                  ? words.noCamera
+                  : words.noPermission}
             </Text>
           </View>
           {ready ? <View style={local.frame} /> : <View style={local.spacer} />}

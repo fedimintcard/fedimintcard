@@ -1,6 +1,6 @@
 /**
  * Settings: what the operator sets between batches. The federation (the same
- * picker as NEW BATCH), the registry endpoint, resetting a card, the demo,
+ * picker as NEW BATCH), the registry endpoint, resetting a card, the tills, the demo,
  * the session, and About. Reasons sit behind (i) on each header; choices save
  * as they are made, and a short line at the foot confirms each save.
  *
@@ -44,10 +44,12 @@ export function SettingsScreen({
   onBack,
   onDemo,
   onReset,
+  onTills,
 }: {
   onBack: () => void;
   onDemo: () => void;
   onReset: () => void;
+  onTills: () => void;
 }) {
   const settings = useSettings();
   const app = useStore();
@@ -122,6 +124,21 @@ export function SettingsScreen({
               onPress={onReset}
               disabled={running}
               testID="settings-reset-entry"
+            />
+          </Card>
+        </View>
+
+        <View style={local.section}>
+          <SectionHeader help={SETTINGS.tillsHelp} testID="settings-tills-help">
+            {SETTINGS.tills}
+          </SectionHeader>
+          <Card>
+            <EntryRow
+              title={SETTINGS.tillsTitle}
+              subtitle={running ? SETTINGS.tillsBlocked : SETTINGS.tillsSub}
+              onPress={onTills}
+              disabled={running}
+              testID="settings-tills-entry"
             />
           </Card>
         </View>

@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
-use fedimint_card_sidecar::ops::OpsConfig;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::{NoteStatus, StateStore};
 use fedimint_card_sidecar::wallet::{Wallet, sales_path, state_path};
@@ -52,10 +51,13 @@ enum TillCmd {
         #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
         relay: String,
         /// The ops registry (docs/OPS-PLAN.md § 6). With it, each card's state comes from ops,
-        /// keyed by the card's short id, instead of card_state.json. Needs --ops-token.
-        #[arg(long, env = "OPS_URL", requires = "ops_token")]
+        /// keyed by the card's short id, instead of card_state.json. The token is --ops-token, or
+        /// else the one an approved `till claim` left in <data_dir>/till-ops.json; with neither,
+        /// the till waits for a claim and refuses card jobs (docs/TILL-CLAIM.md).
+        #[arg(long, env = "OPS_URL")]
         ops_url: Option<String>,
-        /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url.
+        /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url. Takes precedence
+        /// over <data_dir>/till-ops.json.
         #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
         ops_token: Option<String>,
         /// Require the POS token on every request, loopback included, and make the token now if
@@ -63,6 +65,25 @@ enum TillCmd {
         /// arrive from a local address.
         #[arg(long, env = "TILL_REQUIRE_POS_TOKEN", value_parser = clap::builder::BoolishValueParser::new())]
         require_pos_token: bool,
+    },
+    /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
+    /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
+    /// <data_dir>/till-claim.json and exit. `till serve` polls it and goes on ops once approved.
+    Claim {
+        /// The registry, e.g. https://registry.fedimintcard.org.
+        #[arg(long, env = "OPS_URL")]
+        ops_url: String,
+        /// What the operator sees before approving, and what the registry lists: 1 to 64
+        /// characters.
+        #[arg(long)]
+        name: String,
+        /// Print only the QR text and, on a second line, the code: no QR code, no notes.
+        #[arg(long)]
+        text: bool,
+        /// Ask even though this till already has a token. The current token keeps working until
+        /// an operator approves the new claim.
+        #[arg(long)]
+        replace: bool,
     },
     /// Pair a POS phone: make the POS token if there is none, and print it as a QR code to scan
     /// in the POS app's settings (docs/POS-LINK.md).
@@ -248,11 +269,32 @@ async fn main() -> Result<()> {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
-            let ops = match (ops_url, ops_token) {
-                (Some(url), Some(token)) => Some(OpsConfig { url: url.clone(), token: token.clone() }),
-                _ => None,
-            };
-            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops, *require_pos_token).await?;
+            fedimint_card_sidecar::till::serve_with(
+                cw,
+                *listen,
+                relay.clone(),
+                ops_url.clone(),
+                ops_token.clone(),
+                *require_pos_token,
+            )
+            .await?;
+        }
+        Cmd::Till(TillCmd::Claim { ops_url, name, text: text_only, replace }) => {
+            use fedimint_card_sidecar::claim;
+            let c = claim::start(&cli.data_dir, ops_url, name, *replace).await?;
+            let text = c.qr_text()?;
+            if *text_only {
+                println!("{text}");
+                println!("{}", c.code);
+                return Ok(());
+            }
+            qr(&text)?;
+            println!("{text}");
+            println!("code: {}", c.code);
+            eprintln!(
+                "in the provisioner app open Settings, Tills, Add a till, and scan this or type the code. It expires in {} minutes; `till serve` picks up the token once it is approved.",
+                c.expires_at.saturating_sub(claim::now_ms()) / 60_000
+            );
         }
         Cmd::Till(TillCmd::Pair { url, text: text_only, new_token }) => {
             use fedimint_card_sidecar::pos;

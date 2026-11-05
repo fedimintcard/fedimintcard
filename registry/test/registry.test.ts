@@ -6,7 +6,7 @@ import {bls12_381} from '@noble/curves/bls12-381.js';
 import {applySetup, LOGIN_MAX_ATTEMPTS, parseSetup} from '../src/auth';
 import {decrypt, nextBackupAt} from '../src/backup';
 import {migrate, MIGRATIONS} from '../src/db';
-import {fromHex, toHex} from '../src/http';
+import {fromHex, sha256Hex, toHex} from '../src/http';
 import {deriveManagerKeys, issueManagerKeys, parseMaster} from '../src/managerKeys';
 import {messageOf} from '../src/tbs';
 
@@ -105,6 +105,9 @@ async function newTill(token: string, name = 'front desk'): Promise<{till_id: nu
   expect((await post('/federations', till.token, {federation_id: FED, tbs_pks: TBS_PKS})).status).toBe(200);
   return till;
 }
+
+/** The test-only identity for vitest.config.ts's BACKUP_RECIPIENT. */
+const BACKUP_IDENTITY = 'AGE-SECRET-KEY-1AHS3RTK9NEEFMWRWJY6RQDF9HZZ9RQTD3UW0CNCX8YHQFSLN08LSECDQ2E';
 
 const stub = () => env.REGISTRY.get(env.REGISTRY.idFromName('registry'));
 const hook = (path: string, body?: unknown) =>
@@ -392,6 +395,181 @@ describe('tills', () => {
     expect((await call('DELETE', `/tills/${mine.till_id}`, other)).status).toBe(404);
     const theirs = await newTill(other);
     expect((await get(`/cards/${shortId}/state`, theirs.token)).status).toBe(404);
+  });
+});
+
+describe('till claims (docs/TILL-CLAIM.md)', () => {
+  let ipSeq = 0;
+  /** Each test's claims come from its own address, so the per-IP budget is the rate-limit test's alone. */
+  const ip = () => `198.51.100.${(ipSeq += 1)}`;
+  function start(name: unknown = 'StartOS till', from = ip()) {
+    return SELF.fetch('https://r.test/till-claims', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'CF-Connecting-IP': from},
+      body: JSON.stringify({name}),
+    });
+  }
+  type Started = {claim_id: string; code: string; poll_secret: string; expires_at: number};
+  async function started(name = 'StartOS till'): Promise<Started> {
+    const res = await start(name);
+    expect(res.status).toBe(200);
+    return (await res.json()) as Started;
+  }
+  const pollOf = (c: Started, secret = c.poll_secret) => post(`/till-claims/${c.claim_id}/poll`, null, {poll_secret: secret});
+
+  it('runs the whole flow: start, read, approve, poll pending then the token once, and the claim is gone', async () => {
+    const c = await started('Front counter');
+    expect(c.claim_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(c.poll_secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(c.code).toMatch(/^[2-9A-HJKMNP-Z]{4}-[2-9A-HJKMNP-Z]{4}$/);
+    expect(c.expires_at - Date.now()).toBeGreaterThan(9 * 60 * 1000);
+
+    expect(await (await pollOf(c)).json()).toEqual({ok: true, status: 'pending'});
+    const token = await signIn();
+    const read = await get(`/till-claims/${c.code}`, token);
+    expect(read.status).toBe(200);
+    expect(await read.json()).toEqual({ok: true, name: 'Front counter', created_at: expect.any(Number), expires_at: c.expires_at, status: 'pending'});
+    expect((await post(`/till-claims/${c.code}/approve`, token, {})).status).toBe(200);
+    expect(((await (await get(`/till-claims/${c.code}`, token)).json()) as {status: string}).status).toBe('approved');
+
+    const res = await pollOf(c);
+    expect(res.status).toBe(200);
+    const done = (await res.json()) as {status: string; till_id: number; token: string};
+    expect(done).toEqual(expect.objectContaining({status: 'approved', till_id: expect.any(Number)}));
+    expect(done.token).toMatch(/^till_[0-9a-f]{64}$/);
+    // Once: the claim is gone for the till and for the operator.
+    expect((await pollOf(c)).status).toBe(404);
+    expect((await get(`/till-claims/${c.code}`, token)).status).toBe(404);
+
+    // The token is a till's like any other, listed under the approving operator.
+    const {tills} = (await (await get('/tills', token)).json()) as {tills: {till_id: number; name: string}[]};
+    expect(tills).toEqual([expect.objectContaining({till_id: done.till_id, name: 'Front counter'})]);
+    expect((await post('/federations', done.token, {federation_id: FED, tbs_pks: TBS_PKS})).status).toBe(200);
+    const {shortId} = await cardWithNote(token);
+    expect((await get(`/cards/${shortId}/state`, done.token)).status).toBe(200);
+  });
+
+  it('takes the code in any case, with or without the dash', async () => {
+    const token = await signIn();
+    const c = await started();
+    const bare = c.code.replace('-', '');
+    expect((await get(`/till-claims/${bare.toLowerCase()}`, token)).status).toBe(200);
+    expect((await get(`/till-claims/${c.code.toLowerCase()}`, token)).status).toBe(200);
+    expect((await post(`/till-claims/${bare}/approve`, token, {})).status).toBe(200);
+    expect(((await (await pollOf(c)).json()) as {status: string}).status).toBe('approved');
+  });
+
+  it('answers a wrong poll secret, an unknown claim and a malformed one 404, alike', async () => {
+    const c = await started();
+    for (const res of [
+      await pollOf(c, 'f'.repeat(64)),
+      await post(`/till-claims/${'0'.repeat(32)}/poll`, null, {poll_secret: c.poll_secret}),
+      await pollOf(c, 'nope'),
+    ]) {
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ok: false, reason: 'no claim'});
+    }
+    const token = await signIn();
+    expect((await get('/till-claims/AAAA-AAAA', token)).status).toBe(404);
+    expect((await get('/till-claims/0OIL-1234', token)).status).toBe(404);
+    expect((await post('/till-claims/AAAA-AAAA/approve', token, {})).status).toBe(404);
+    // The right secret still works after the wrong ones.
+    expect((await pollOf(c)).status).toBe(200);
+  });
+
+  it('answers an expired claim 404 everywhere, and sweeps it', async () => {
+    const token = await signIn();
+    const c = await started();
+    await runInDurableObject(stub(), async (_i, state) => {
+      state.storage.sql.exec('UPDATE till_claims SET expires_at = ? WHERE claim_id = ?', Date.now() - 1, c.claim_id);
+    });
+    expect((await get(`/till-claims/${c.code}`, token)).status).toBe(404);
+    expect((await post(`/till-claims/${c.code}/approve`, token, {})).status).toBe(404);
+    expect((await pollOf(c)).status).toBe(404);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM till_claims').one()).toEqual({n: 0});
+    });
+  });
+
+  it('answers a second approve 409; another operator neither sees nor approves an approved claim', async () => {
+    const token = await signIn();
+    const c = await started();
+    await hook('/test/operator', {name: 'second', password: 'another long password'});
+    const other = await signIn('second', 'another long password');
+    expect((await post(`/till-claims/${c.code}/approve`, token, {})).status).toBe(200);
+    const again = await post(`/till-claims/${c.code}/approve`, token, {});
+    expect(again.status).toBe(409);
+    expect((await get(`/till-claims/${c.code}`, other)).status).toBe(404);
+    expect((await post(`/till-claims/${c.code}/approve`, other, {})).status).toBe(404);
+    // The till lands under the operator who approved it.
+    const done = (await (await pollOf(c)).json()) as {till_id: number};
+    const theirs = (await (await get('/tills', other)).json()) as {tills: unknown[]};
+    expect(theirs.tills).toEqual([]);
+    const mine = (await (await get('/tills', token)).json()) as {tills: {till_id: number}[]};
+    expect(mine.tills.map(t => t.till_id)).toEqual([done.till_id]);
+  });
+
+  it('is for operators only: no token is 401, a till token is 403', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const c = await started();
+    expect((await get(`/till-claims/${c.code}`, null)).status).toBe(401);
+    expect((await post(`/till-claims/${c.code}/approve`, till.token, {})).status).toBe(403);
+    expect((await get(`/till-claims/${c.code}`, till.token)).status).toBe(403);
+  });
+
+  it('refuses a name that is empty, too long or carries control characters', async () => {
+    for (const name of ['', '   ', 'x'.repeat(65), 'bad\nname', 7, null]) {
+      expect((await start(name)).status).toBe(400);
+    }
+    expect((await start('Café till ☕')).status).toBe(200);
+  });
+
+  it('rate limits starts per IP (429) while another address still gets through', async () => {
+    const from = '203.0.113.9';
+    for (let i = 0; i < 10; i += 1) expect((await start('t', from)).status).toBe(200);
+    const res = await start('t', from);
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as {ok: boolean}).ok).toBe(false);
+    expect((await start('t', '203.0.113.10')).status).toBe(200);
+  });
+
+  it('caps live claims across the registry (429), and expired ones stop counting', async () => {
+    await runInDurableObject(stub(), async (_i, state) => {
+      const sql = state.storage.sql;
+      for (let i = 0; i < 200; i += 1) {
+        sql.exec(
+          `INSERT INTO till_claims (claim_id, code, name, poll_secret_hash, created_at, expires_at) VALUES (?, ?, 'x', ?, ?, ?)`,
+          i.toString(16).padStart(32, '0'), `T${i.toString().padStart(7, '0')}`, 'a'.repeat(64), Date.now(), Date.now() + 600_000,
+        );
+      }
+    });
+    expect((await start()).status).toBe(429);
+    await runInDurableObject(stub(), async (_i, state) => {
+      state.storage.sql.exec('UPDATE till_claims SET expires_at = ? WHERE claim_id < ?', Date.now() - 1, '0'.repeat(30) + '10');
+    });
+    expect((await start()).status).toBe(200);
+  });
+
+  it('keeps claims and their secrets out of the backup', async () => {
+    const token = await signIn();
+    const pending = await started('pending one');
+    const approved = await started('approved one');
+    expect((await post(`/till-claims/${approved.code}/approve`, token, {})).status).toBe(200);
+    const res = await stub().fetch('https://registry.internal/internal/backup', {method: 'POST'});
+    expect(res.status).toBe(200);
+    const {key} = (await res.json()) as {key: string};
+    const snap = await decrypt(await (await env.BACKUPS!.get(key))!.text(), BACKUP_IDENTITY);
+    expect(Object.keys(snap.tables)).not.toContain('till_claims');
+    expect(Object.keys(snap.tables)).not.toContain('till_claim_budget');
+    const text = JSON.stringify(snap);
+    for (const c of [pending, approved]) {
+      expect(text).not.toContain(c.claim_id);
+      expect(text).not.toContain(c.poll_secret);
+      expect(text).not.toContain(c.code);
+      expect(text).not.toContain(await sha256Hex(c.poll_secret));
+    }
+    expect(text).not.toContain('poll_secret_hash');
   });
 });
 
@@ -876,8 +1054,7 @@ describe('O4: holder loading', () => {
 });
 
 describe('backups', () => {
-  /** The test-only identity for vitest.config.ts's BACKUP_RECIPIENT. */
-  const IDENTITY = 'AGE-SECRET-KEY-1AHS3RTK9NEEFMWRWJY6RQDF9HZZ9RQTD3UW0CNCX8YHQFSLN08LSECDQ2E';
+  const IDENTITY = BACKUP_IDENTITY;
 
   it('status is 503 before the first backup', async () => {
     const token = await signIn();

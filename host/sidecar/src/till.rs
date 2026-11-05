@@ -10,11 +10,17 @@
 //! writes it owes the registry go out at the end of the job (`crate::ops`). The sales ledger and
 //! the till's own outputs stay local either way.
 //!
+//! A till may also be on ops without a token yet (`docs/TILL-CLAIM.md`): it then serves
+//! `/v1/status` saying so and refuses card jobs with `ops_not_connected`, while a claim poller
+//! waits for an operator's approval and puts the till on ops without a restart ([`Conn`]).
+//!
 //! At most one job (charge or card balance) runs at a time. The busy flag is set by the handler
 //! that admits the job and cleared by the actor when the job is finished, so a client that
 //! disconnects mid-charge cannot let a second charge start while the first is in flight.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,7 +43,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::link::{Link, Links};
 use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
-use crate::ops::{Ops, OpsConfig, OpsError};
+use crate::claim::{Claim, Poll};
+use crate::ops::{FederationReport, Ops, OpsConfig, OpsError};
 use crate::plan::PlanError;
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
@@ -146,6 +153,186 @@ fn error_reply(err: &anyhow::Error) -> Reply {
     Reply::fail(class.status, class.code, detail)
 }
 
+// ------------------------------------------------------------------ the till and the registry
+
+/// Where the till stands with the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpsState {
+    /// No registry configured: card state in `card_state.json`, as before ops.
+    Local,
+    /// On ops: card jobs load each card from the registry.
+    Connected { url: String },
+    /// No token yet; a claim is waiting for an operator's approval.
+    Waiting { url: String, code: String, expires_at_ms: u64 },
+    /// No token, and the claim expired (or the registry no longer knows it).
+    ClaimExpired { url: String, code: String },
+    /// No token and no claim.
+    NotConnected { url: Option<String> },
+}
+
+impl OpsState {
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpsState::Local => "local",
+            OpsState::Connected { .. } => "connected",
+            OpsState::Waiting { .. } => "waiting_for_approval",
+            OpsState::ClaimExpired { .. } => "claim_expired",
+            OpsState::NotConnected { .. } => "not_connected",
+        }
+    }
+
+    /// The state a claim file gives a till with no token.
+    pub fn of_claim(claim: Option<&Claim>, url: Option<String>, now_ms: u64) -> Self {
+        match claim {
+            None => OpsState::NotConnected { url },
+            Some(c) if c.expired(now_ms) => OpsState::ClaimExpired { url: c.ops_url.clone(), code: c.code.clone() },
+            Some(c) => OpsState::Waiting { url: c.ops_url.clone(), code: c.code.clone(), expires_at_ms: c.expires_at },
+        }
+    }
+
+    fn url(&self) -> Option<&str> {
+        match self {
+            OpsState::Local => None,
+            OpsState::Connected { url } | OpsState::Waiting { url, .. } | OpsState::ClaimExpired { url, .. } => Some(url),
+            OpsState::NotConnected { url } => url.as_deref(),
+        }
+    }
+}
+
+/// The till's registry connection, shared by the handlers, the actor and the claim poller.
+pub struct Conn {
+    pub state: OpsState,
+    /// Set exactly when `state` is `Connected`.
+    pub ops: Option<Ops>,
+    /// A newer claim waiting while the till is already connected (`till claim --replace`).
+    pub new_claim: Option<(String, u64)>,
+    /// `--ops-url`, for a till with neither token nor claim.
+    pub default_url: Option<String>,
+}
+
+pub type SharedConn = Arc<Mutex<Conn>>;
+
+impl Conn {
+    pub fn new(state: OpsState, ops: Option<Ops>) -> SharedConn {
+        let default_url = state.url().map(str::to_owned);
+        Arc::new(Mutex::new(Conn { state, ops, new_claim: None, default_url }))
+    }
+
+    /// The refusal for a card job while a till that belongs on ops has no token.
+    fn refusal(&self) -> Option<Reply> {
+        let detail = match &self.state {
+            OpsState::Local | OpsState::Connected { .. } => return None,
+            OpsState::Waiting { code, .. } => {
+                format!("this till is waiting for an operator to approve claim {code} in the provisioner app")
+            }
+            OpsState::ClaimExpired { code, .. } => format!(
+                "claim {code} expired before an operator approved it; start a new one (`till claim`, or Connect to registry on StartOS)"
+            ),
+            OpsState::NotConnected { .. } => {
+                "this till is not connected to a registry; connect it with `till claim` (Connect to registry on StartOS)".into()
+            }
+        };
+        Some(Reply::fail(503, "ops_not_connected", detail))
+    }
+
+    fn status_json(&self) -> Value {
+        let (code, expires) = match &self.state {
+            OpsState::Waiting { code, expires_at_ms, .. } => (Some(code.clone()), Some(*expires_at_ms)),
+            OpsState::ClaimExpired { code, .. } => (Some(code.clone()), None),
+            _ => match &self.new_claim {
+                Some((c, e)) => (Some(c.clone()), Some(*e)),
+                None => (None, None),
+            },
+        };
+        json!({
+            "connected": matches!(self.state, OpsState::Connected { .. }),
+            "ops_state": self.state.name(),
+            "ops_url": self.state.url(),
+            "claim_code": code,
+            "claim_expires_at_ms": expires,
+        })
+    }
+}
+
+/// One look at the claim file, and at the registry while the claim is live. On approval: keep the
+/// token (`till-ops.json`), report the federation, and put the till on ops. `dead` remembers
+/// claims the registry answered 404, so they are not asked about again.
+pub async fn claim_tick(conn: &SharedConn, dir: &Path, report: Option<&FederationReport>, dead: &mut HashSet<String>) {
+    let claim = match crate::claim::read_claim(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            return;
+        }
+    };
+    let now = crate::claim::now_ms();
+    let set = |state: OpsState, new_claim: Option<(String, u64)>| {
+        let mut g = conn.lock().unwrap();
+        if g.ops.is_some() {
+            g.new_claim = new_claim;
+        } else {
+            g.state = state;
+        }
+    };
+    let default_url = conn.lock().unwrap().default_url.clone();
+    let Some(c) = claim else {
+        set(OpsState::NotConnected { url: default_url }, None);
+        return;
+    };
+    let expired = OpsState::ClaimExpired { url: c.ops_url.clone(), code: c.code.clone() };
+    if c.expired(now) || dead.contains(&c.claim_id) {
+        set(expired, None);
+        return;
+    }
+    let waiting = OpsState::of_claim(Some(&c), None, now);
+    match crate::claim::poll(&c).await {
+        Ok(Poll::Pending) => set(waiting, Some((c.code.clone(), c.expires_at))),
+        Ok(Poll::Gone) => {
+            dead.insert(c.claim_id.clone());
+            set(expired, None);
+        }
+        Ok(Poll::Approved { till_id, token }) => {
+            // The registry answers the token once: if it cannot be saved, use it anyway.
+            let cfg = match crate::claim::adopt(dir, &c, token.clone()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("warning: could not save the till token ({e:#}); the till is on ops until it restarts");
+                    OpsConfig { url: c.ops_url.clone(), token }
+                }
+            };
+            let ops = match Ops::new(&cfg, dir) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("warning: {e:#}");
+                    return;
+                }
+            };
+            if let Some(r) = report {
+                crate::ops::report_federation(&ops.client, r).await;
+            }
+            let mut g = conn.lock().unwrap();
+            g.ops = Some(ops);
+            g.state = OpsState::Connected { url: cfg.url.clone() };
+            g.new_claim = None;
+            eprintln!("claim {} approved: on ops at {} as till {till_id}", c.code, cfg.url);
+        }
+        Err(e) => {
+            // Unreachable for now; the claim is still live.
+            eprintln!("warning: polling claim {}: {e:#}", c.code);
+            set(waiting, Some((c.code.clone(), c.expires_at)));
+        }
+    }
+}
+
+/// [`claim_tick`] every `every`, for as long as the till serves.
+pub async fn claim_poller(conn: SharedConn, dir: PathBuf, report: Option<FederationReport>, every: Duration) {
+    let mut dead = HashSet::new();
+    loop {
+        claim_tick(&conn, &dir, report.as_ref(), &mut dead).await;
+        tokio::time::sleep(every).await;
+    }
+}
+
 // ------------------------------------------------------------------ the card behind the relay
 
 /// Placeholder for the time before the first job: `serve` starts without a card present.
@@ -237,9 +424,9 @@ pub struct TillHandle {
     relay: String,
     sales: Arc<Mutex<SalesStore>>,
     federation_name: Option<String>,
-    /// Set on a till with ops: every card there has a holder PIN, so a charge without one would
+    /// The registry connection. On ops every card has a holder PIN, so a charge without one would
     /// verify `CARD_PIN` instead and spend one of the holder's tries.
-    pin_required: bool,
+    conn: SharedConn,
     /// Open card links from POS phones (`GET /v1/card/link`).
     links: Arc<Links>,
     /// The POS token: with one, `/v1/*` needs it as a bearer (from loopback too, if set so).
@@ -264,6 +451,11 @@ impl TillHandle {
     pub fn links(&self) -> Arc<Links> {
         self.links.clone()
     }
+
+    /// The registry connection.
+    pub fn conn(&self) -> SharedConn {
+        self.conn.clone()
+    }
 }
 
 /// Build the handle and the actor future. The caller must poll the future (it is not `Send`)
@@ -285,6 +477,22 @@ pub async fn new_with_ops(
     opener: CardOpener,
     ops: Option<Ops>,
 ) -> (TillHandle, impl std::future::Future<Output = ()>) {
+    let state = match &ops {
+        Some(o) => OpsState::Connected { url: o.client.url().to_owned() },
+        None => OpsState::Local,
+    };
+    new_with_conn(cw, relay, sales, opener, Conn::new(state, ops)).await
+}
+
+/// [`new`] with a registry connection that can change while the till runs ([`claim_poller`]).
+pub async fn new_with_conn(
+    cw: CardWallet,
+    relay: String,
+    sales: SalesStore,
+    opener: CardOpener,
+    conn: SharedConn,
+) -> (TillHandle, impl std::future::Future<Output = ()>) {
+    let ops = conn.lock().unwrap().ops.clone();
     let (tx, rx) = mpsc::channel(1);
     let busy = Arc::new(AtomicBool::new(false));
     let sales = Arc::new(Mutex::new(sales));
@@ -300,11 +508,11 @@ pub async fn new_with_ops(
         relay,
         sales: sales.clone(),
         federation_name,
-        pin_required: ops.is_some(),
+        conn: conn.clone(),
         links: Arc::new(Links::default()),
         pos_auth: crate::pos::PosAuth::default(),
     };
-    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, ops))
+    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn))
 }
 
 /// `client_ref`s of unresolved charges: in the wallet's file, or on ops in every card file.
@@ -324,10 +532,12 @@ async fn actor(
     pending_refs: Arc<Mutex<Vec<String>>>,
     sales: Arc<Mutex<SalesStore>>,
     opener: CardOpener,
-    ops: Option<Ops>,
+    conn: SharedConn,
 ) {
     ensure_hook(&mut cw, &sales);
     while let Some(job) = rx.recv().await {
+        // Read per job: the claim poller may have put the till on ops since the last one.
+        let ops = conn.lock().unwrap().ops.clone();
         let (reply_tx, reply) = match job {
             Job::Charge { price, client_ref, pin, link, reply } => {
                 let r = match on_card(|| open_for(&opener, link.as_ref())) {
@@ -922,13 +1132,17 @@ async fn status(State(h): State<TillHandle>) -> Reply {
     let relay = h.relay.clone();
     let probe = tokio::task::spawn_blocking(move || BridgeTransport::new(&relay).health());
     let relay_ok = matches!(tokio::time::timeout(RELAY_PROBE_TIMEOUT, probe).await, Ok(Ok(Ok(()))));
-    Reply::ok(json!({
+    let mut body = json!({
         "federation_id": h.wallet.federation_id().to_string(),
         "federation_name": h.federation_name,
         "wallet_balance_msat": balance,
         "card_relay_ok": relay_ok,
         "busy": h.busy.load(Ordering::SeqCst),
-    }))
+    });
+    if let (Some(b), Value::Object(c)) = (body.as_object_mut(), h.conn.lock().unwrap().status_json()) {
+        b.extend(c);
+    }
+    Reply::ok(body)
 }
 
 #[derive(Deserialize)]
@@ -1007,7 +1221,14 @@ async fn charge_on(h: &TillHandle, link: Option<Link>, body: Bytes) -> Reply {
     if let Some(r) = replay(&h.sales, req.client_ref.as_deref(), price) {
         return r;
     }
-    if h.pin_required && req.pin.is_none() {
+    let (refused, pin_required) = {
+        let c = h.conn.lock().unwrap();
+        (c.refusal(), c.ops.is_some())
+    };
+    if let Some(r) = refused {
+        return r;
+    }
+    if pin_required && req.pin.is_none() {
         return Reply::fail(400, "pin_required", "this till charges only with the holder's PIN");
     }
     let cref = req.client_ref.clone();
@@ -1021,6 +1242,12 @@ async fn card_balance(State(h): State<TillHandle>, headers: HeaderMap) -> Reply 
         Ok(l) => l,
         Err(r) => return r,
     };
+    if let Some(r) = h.conn.lock().unwrap().refusal() {
+        if let Some(l) = link {
+            l.close();
+        }
+        return r;
+    }
     let r = run_job(&h, None, |reply| Job::Balance { link: link.clone(), reply }).await;
     if let Some(l) = link {
         l.close();
@@ -1090,6 +1317,9 @@ async fn cards_issue(State(h): State<TillHandle>, body: Bytes) -> Reply {
     if req.client_ref.as_deref().is_some_and(|c| c.is_empty() || c.len() > MAX_CLIENT_REF) {
         return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {MAX_CLIENT_REF} bytes"));
     }
+    if let Some(r) = h.conn.lock().unwrap().refusal() {
+        return r;
+    }
     let cref = req.client_ref.clone();
     run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue { amounts: req.amounts_msat, client_ref: req.client_ref, reply })
         .await
@@ -1124,7 +1354,8 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 /// the state file). Starts without a card: each job opens the card behind `relay` afresh.
 ///
 /// With `ops`, each card job loads that card's state from the registry (see the module docs), and
-/// the federation's name and mint keys are reported to it once at startup.
+/// the federation's name and mint keys are reported to it once at startup. Without it, see
+/// [`serve_with`].
 ///
 /// With `require_pos_token`, every `/v1/*` request needs the POS token, loopback included, and
 /// the token is made now if there is none (`till pair` shows it). This is for a till behind a
@@ -1134,6 +1365,30 @@ pub async fn serve(
     listen: SocketAddr,
     relay: String,
     ops: Option<OpsConfig>,
+    require_pos_token: bool,
+) -> Result<()> {
+    let (url, token) = match ops {
+        Some(c) => (Some(c.url), Some(c.token)),
+        None => (None, None),
+    };
+    serve_with(cw, listen, relay, url, token, require_pos_token).await
+}
+
+/// [`serve`], with the registry settings as `till serve` takes them (docs/TILL-CLAIM.md):
+///
+/// - `ops_token` (with `ops_url`): on ops with that token.
+/// - else `<data_dir>/till-ops.json`, the token an approved claim left: on ops with it, at the
+///   URL it was issued by; a claim file next to it (`till claim --replace`) is polled too.
+/// - else, with `ops_url` or a claim file: on ops but not connected. `/v1/status` says so, card
+///   jobs answer `ops_not_connected`, and the claim is polled every few seconds; on approval the
+///   till goes on ops without a restart.
+/// - else local: card state in `card_state.json`, as before ops.
+pub async fn serve_with(
+    cw: CardWallet,
+    listen: SocketAddr,
+    relay: String,
+    ops_url: Option<String>,
+    ops_token: Option<String>,
     require_pos_token: bool,
 ) -> Result<()> {
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
@@ -1154,21 +1409,46 @@ pub async fn serve(
         );
     }
     let sales = SalesStore::open(sales_path(&dir))?;
-    let ops = match ops {
+    let claim = crate::claim::read_claim(&dir)?;
+    let (cfg, poll) = match (ops_url.clone(), ops_token) {
+        (Some(url), Some(token)) => (Some(OpsConfig { url, token }), false),
+        (None, Some(_)) => anyhow::bail!("--ops-token needs --ops-url"),
+        (_, None) => match crate::claim::read_ops(&dir)? {
+            Some(cfg) => {
+                if let Some(u) = ops_url.as_deref() {
+                    if crate::claim::origin(u).ok() != crate::claim::origin(&cfg.url).ok() {
+                        eprintln!("note: using {} from {}, the registry that issued this till's token, not {u}", cfg.url, crate::claim::OPS_FILE);
+                    }
+                }
+                (Some(cfg), true)
+            }
+            None => (None, ops_url.is_some() || claim.is_some()),
+        },
+    };
+    let report = if cfg.is_some() || poll { Some(crate::ops::FederationReport::of(&cw.wallet).await) } else { None };
+    let conn = match cfg {
         Some(cfg) => {
             let o = Ops::new(&cfg, &dir)?;
-            crate::ops::report_federation(&o.client, &crate::ops::FederationReport::of(&cw.wallet).await).await;
+            crate::ops::report_federation(&o.client, report.as_ref().expect("made above")).await;
             eprintln!("card state from ops at {}", cfg.url);
-            Some(o)
+            Conn::new(OpsState::Connected { url: cfg.url.clone() }, Some(o))
         }
-        None => None,
+        None if poll => {
+            let state = OpsState::of_claim(claim.as_ref(), ops_url.clone(), crate::claim::now_ms());
+            eprintln!("not connected to a registry yet ({}): card jobs are refused until a claim is approved", state.name());
+            let c = Conn::new(state, None);
+            c.lock().unwrap().default_url = ops_url.clone();
+            c
+        }
+        None => Conn::new(OpsState::Local, None),
     };
+    let poller = poll.then(|| tokio::spawn(claim_poller(conn.clone(), dir.clone(), report, crate::claim::POLL_EVERY)));
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     let relay_for_jobs = relay.clone();
     let opener: CardOpener = Box::new(move || open_relay_card(&relay_for_jobs));
     let mut cw = cw;
     cw.card = Box::new(NoCard);
-    let (handle, actor) = new_with_ops(cw, relay.clone(), sales, opener, ops).await;
+    let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn).await;
     let (auth, handle) = match pos_token {
         Some(t) if require_pos_token => ("POS token required on every request", handle.with_pos_token_everywhere(t)),
         Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),
@@ -1198,6 +1478,9 @@ pub async fn serve(
     ));
     // The actor ends once the server has dropped the router (and with it every handle).
     let (served, ()) = tokio::join!(server, actor);
+    if let Some(p) = poller {
+        p.abort();
+    }
     served.context("till server task")??;
     Ok(())
 }

@@ -12,8 +12,9 @@
  * Whoever holds a backup and its age identity can therefore delete and
  * reinstall the applet on every card in it (never spend from one).
  *
- * Left out: password and till-token hashes, sessions, the sign-in budget and
- * applied setup commands. After a restore, operators sign in again through an
+ * Left out: password and till-token hashes, sessions, the sign-in budget,
+ * applied setup commands, and till claims with their IP budget (`claims.ts`:
+ * ten-minute rows whose poll-secret hashes must not leave the object). After a restore, operators sign in again through an
  * OPERATOR_SETUP `recover` and tills are issued new tokens.
  */
 import * as age from 'age-encryption';
@@ -27,7 +28,7 @@ const TABLES = [
   'tills', 'federations', 'federation_keys', 'holder_loads', 'manager_keys', 'card_resets',
 ] as const;
 /** Columns that never leave the object. */
-const SECRET_COLUMNS = new Set(['password_hash', 'token_hash']);
+const SECRET_COLUMNS = new Set(['password_hash', 'token_hash', 'poll_secret_hash']);
 
 export interface Snapshot {
   readonly snapshot_version: number;

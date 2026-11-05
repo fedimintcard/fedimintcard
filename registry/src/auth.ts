@@ -13,7 +13,8 @@
  * - **Sign-in** is budgeted service-wide: 10 attempts a minute, reserved
  *   before the slow hash so concurrent attempts cannot all pass.
  * - **Till tokens** (`till_…`) are issued by an operator, stored hashed, never
- *   expire, and are revoked by the operator who issued them.
+ *   expire, and are revoked by the operator who issued them. A till can also ask
+ *   for one and have an operator approve it (`claims.ts`).
  */
 import {constantTimeEqual, fromHex, randomHex, sha256Hex, toHex} from './http';
 
@@ -306,23 +307,40 @@ export interface Till {
   readonly operator_id: number;
 }
 
+/** A new till token and its hash; the token is shown once and never stored. */
+export async function newTillToken(): Promise<{token: string; hash: string}> {
+  const token = `till_${randomHex(32)}`;
+  return {token, hash: await sha256Hex(token)};
+}
+
+/** The till row for a token from [`newTillToken`]. Synchronous, so it can join a transaction. */
+export function insertTill(
+  sql: SqlStorage,
+  operatorId: number,
+  name: string,
+  minted: {token: string; hash: string},
+  now: number,
+): {till_id: number; name: string; token: string} {
+  const row = sql
+    .exec(
+      'INSERT INTO tills (operator_id, name, token_hash, created_at, revoked_at) VALUES (?, ?, ?, ?, NULL) RETURNING till_id',
+      operatorId,
+      name,
+      minted.hash,
+      now,
+    )
+    .one() as {till_id: number};
+  return {till_id: Number(row.till_id), name, token: minted.token};
+}
+
+/** `POST /tills`; a till claim's approved poll makes its till the same way (`claims.ts`). */
 export async function createTill(
   storage: DurableObjectStorage,
   operatorId: number,
   name: string,
   now: number,
 ): Promise<{till_id: number; name: string; token: string}> {
-  const token = `till_${randomHex(32)}`;
-  const row = storage.sql
-    .exec(
-      'INSERT INTO tills (operator_id, name, token_hash, created_at, revoked_at) VALUES (?, ?, ?, ?, NULL) RETURNING till_id',
-      operatorId,
-      name,
-      await sha256Hex(token),
-      now,
-    )
-    .one() as {till_id: number};
-  return {till_id: Number(row.till_id), name, token};
+  return insertTill(storage.sql, operatorId, name, await newTillToken(), now);
 }
 
 export function listTills(storage: DurableObjectStorage, operatorId: number) {

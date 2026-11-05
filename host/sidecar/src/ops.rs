@@ -123,6 +123,11 @@ impl OpsClient {
         Ok(Self { http, url: cfg.url.trim_end_matches('/').to_owned(), token: cfg.token.clone() })
     }
 
+    /// The registry's URL, without a trailing slash.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     /// A client with no token, for the holder routes (`GET /cards/:id/slots`, `POST …/load`).
     pub fn holder(url: &str) -> Result<Self> {
         Self::new(&OpsConfig { url: url.to_owned(), token: String::new() })
@@ -258,6 +263,7 @@ pub fn short_id_of(slot0: &XOnlyPublicKey) -> String {
 }
 
 /// The till's side of ops: the client and where the per-card files live.
+#[derive(Clone)]
 pub struct Ops {
     pub client: OpsClient,
     cards_dir: PathBuf,
