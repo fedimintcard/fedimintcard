@@ -317,7 +317,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                 if (r is TillResult.Ok) {
                     failures = 0
                     ui.setStatus(r.value)
-                    ui.setHealth(tillOk = true, relayOk = r.value.cardRelayOk)
+                    // A paired phone brings its own card link on every job (withCard), so the
+                    // till's probe of a fixed relay says nothing about it: on a StartOS till there
+                    // is no such relay, and the probe always fails.
+                    ui.setHealth(tillOk = true, relayOk = settings.pairing != null || r.value.cardRelayOk)
                 } else if (++failures >= 2) ui.setHealth(tillOk = false, relayOk = false)
             }
         }.start()
