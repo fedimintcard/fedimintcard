@@ -288,7 +288,7 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   LaunchAgent `org.fedimintcard.till`, KeepAlive, settings in `~/.config/fedimintcard/till.env`,
   token read from `till-token` at each start, binary copied to `~/.local/libexec/fedimintcard`, log
   `~/Library/Logs/fedimintcard/till.log`, no `CARD_PIN`. Restart after a kill checked on the Mac.
-- [ ] Operator setup without `adb` tunnels where possible; drop `android-relay` from the operator
+- [x] Operator setup without `adb` tunnels where possible (done by the POS link, O6 step 1); drop `android-relay` from the operator
   path once the POS needs nothing from it (O5 row).
 - [ ] **PIN encrypted to the card** (before merchants run tills you don't control): today the
   PIN crosses POS → till → relay → NFC in a plain VERIFY, so a till, or anyone on that path, sees
@@ -320,7 +320,7 @@ Done means every box is ticked and the acceptance run at the end passes on relea
 
 Goal: the whole demo runs on phones, cards and services nobody touches on stage.
 
-1. **POS link** (`docs/POS-LINK.md`, built `edd83d0`, iOS app `43eb71d`): the phone connects to
+1. **POS link** — **done on silicon 2026-11-04**: Max (iOS POS) and the Pixel both paired by QR and each charged 5 sats over Wi-Fi with no `adb` tunnel. (`docs/POS-LINK.md`, built `edd83d0`, iOS app `43eb71d`, Pixel scanner on CameraX `73bd647`): the phone connects to
    the till with a paired token; the till sends the card's APDUs down a WebSocket. Removes the
    `adb` tunnels and lets an iPhone be a POS.
 2. **The till as a StartOS package**: `card-sidecar till serve` packaged for StartOS so a
