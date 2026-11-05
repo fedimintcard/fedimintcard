@@ -24,16 +24,18 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use fedimint_card_host_card::{
-    BridgeError, BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, SW_PIN_BLOCKED, StatusWord, status_word,
+    BridgeError, BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, SW_PIN_BLOCKED, StatusWord, Transport, status_word,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::link::{Link, Links};
 use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
 use crate::ops::{Ops, OpsConfig, OpsError};
 use crate::plan::PlanError;
@@ -176,13 +178,24 @@ impl Card for NoCard {
 /// phone died on its first `GET_PUB` while the same charge from a laptop worked, because the laptop
 /// path had selected the applet when it opened.
 pub fn open_relay_card(relay: &str) -> Result<Box<dyn Card>> {
-    let mut c = CardClient::new(BridgeTransport::new(relay));
+    open_card_over(BridgeTransport::new(relay), &format!("card relay at {relay}"))
+}
+
+/// The card behind a POS phone's link (`docs/POS-LINK.md`), opened as [`open_relay_card`] opens
+/// the relay's. Blocking.
+pub fn open_link_card(link: &Link) -> Result<Box<dyn Card>> {
+    open_card_over(link.transport(), &format!("card link {}", link.id))
+}
+
+/// [`open_relay_card`] over any transport: probe, then SELECT (a `6A82` is tolerated).
+pub fn open_card_over<T: Transport + 'static>(transport: T, what: &str) -> Result<Box<dyn Card>> {
+    let mut c = CardClient::new(transport);
     c.get_data_ff21()
         .or_else(|e| match status_word(&e) {
             Some(_) => Ok(vec![]),
             None => Err(e),
         })
-        .with_context(|| format!("card relay at {relay}"))?;
+        .with_context(|| what.to_owned())?;
     // A blank card, or one whose applet is absent, answers a status word; that is `precheck`'s
     // subject, not a reason to refuse to hand the card over.
     let _ = c.select();
@@ -196,8 +209,15 @@ pub type CardOpener = Box<dyn Fn() -> Result<Box<dyn Card>>>;
 
 enum Job {
     /// `pin` is the holder's, typed at the till. Never logged, stored or sent to ops.
-    Charge { price: u64, client_ref: Option<String>, pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
-    Balance { reply: oneshot::Sender<Reply> },
+    /// `link`: the POS phone's card link (`X-Card-Link`), used instead of the opener.
+    Charge {
+        price: u64,
+        client_ref: Option<String>,
+        pin: Option<Vec<u8>>,
+        link: Option<Link>,
+        reply: oneshot::Sender<Reply>,
+    },
+    Balance { link: Option<Link>, reply: oneshot::Sender<Reply> },
     Precheck { reply: oneshot::Sender<Reply> },
     KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
     Issue { amounts: Vec<u64>, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
@@ -220,6 +240,23 @@ pub struct TillHandle {
     /// Set on a till with ops: every card there has a holder PIN, so a charge without one would
     /// verify `CARD_PIN` instead and spend one of the holder's tries.
     pin_required: bool,
+    /// Open card links from POS phones (`GET /v1/card/link`).
+    links: Arc<Links>,
+    /// The POS token: with one, `/v1/*` from anywhere but loopback needs it as a bearer.
+    pos_token: Option<Arc<str>>,
+}
+
+impl TillHandle {
+    /// Require `token` as a bearer on every `/v1/*` request not from loopback.
+    pub fn with_pos_token(mut self, token: Option<String>) -> Self {
+        self.pos_token = token.map(Arc::from);
+        self
+    }
+
+    /// The open card links.
+    pub fn links(&self) -> Arc<Links> {
+        self.links.clone()
+    }
 }
 
 /// Build the handle and the actor future. The caller must poll the future (it is not `Send`)
@@ -257,6 +294,8 @@ pub async fn new_with_ops(
         sales: sales.clone(),
         federation_name,
         pin_required: ops.is_some(),
+        links: Arc::new(Links::default()),
+        pos_token: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, ops))
 }
@@ -283,8 +322,8 @@ async fn actor(
     ensure_hook(&mut cw, &sales);
     while let Some(job) = rx.recv().await {
         let (reply_tx, reply) = match job {
-            Job::Charge { price, client_ref, pin, reply } => {
-                let r = match on_card(|| opener()) {
+            Job::Charge { price, client_ref, pin, link, reply } => {
+                let r = match on_card(|| open_for(&opener, link.as_ref())) {
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
@@ -304,8 +343,8 @@ async fn actor(
                 };
                 (reply, r)
             }
-            Job::Balance { reply } => {
-                let r = match on_card(|| opener()) {
+            Job::Balance { link, reply } => {
+                let r = match on_card(|| open_for(&opener, link.as_ref())) {
                     Ok(card) => {
                         cw.card = card;
                         card_balance_job(&mut cw, ops.as_ref(), &sales).await
@@ -374,6 +413,14 @@ async fn actor(
             busy.store(false, Ordering::SeqCst);
         }
         let _ = reply_tx.send(reply);
+    }
+}
+
+/// A job's card: the POS phone's link when the job came with one, else the opener (the relay).
+fn open_for(opener: &CardOpener, link: Option<&Link>) -> Result<Box<dyn Card>> {
+    match link {
+        Some(l) => open_link_card(l),
+        None => opener(),
     }
 }
 
@@ -822,6 +869,7 @@ pub async fn charge_with(
 // ------------------------------------------------------------------ HTTP
 
 pub fn router(h: TillHandle) -> Router {
+    let token = h.pos_token.clone();
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
@@ -831,7 +879,28 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/cards/precheck", post(cards_precheck))
         .route("/v1/cards/keySetup", post(cards_key_setup))
         .route("/v1/cards/issue", post(cards_issue))
+        .route("/v1/card/link", get(card_link))
         .with_state(h)
+        .layer(axum::middleware::from_fn_with_state(token, crate::pos::auth))
+}
+
+/// `GET /v1/card/link`: a POS phone's card link (docs/POS-LINK.md).
+async fn card_link(State(h): State<TillHandle>, ws: WebSocketUpgrade) -> Response {
+    let links = h.links.clone();
+    ws.on_upgrade(move |socket| crate::link::run(socket, links))
+}
+
+const LINK_HEADER: &str = "x-card-link";
+
+/// The link a job names in `X-Card-Link`: `Ok(None)` without the header, `Err(409)` for an id
+/// that is unknown or closed.
+fn link_of(h: &TillHandle, headers: &HeaderMap) -> Result<Option<Link>, Reply> {
+    let Some(v) = headers.get(LINK_HEADER) else { return Ok(None) };
+    let id = v.to_str().unwrap_or_default().trim();
+    match h.links.get(id) {
+        Some(l) => Ok(Some(l)),
+        None => Err(Reply::fail(409, "card_link_gone", "the card link is closed or unknown; tap the card again")),
+    }
 }
 
 async fn health() -> Reply {
@@ -896,7 +965,20 @@ async fn run_job(
     rx.await.unwrap_or_else(|_| Reply::fail(500, "internal", "the till service stopped before answering"))
 }
 
-async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
+async fn charge(State(h): State<TillHandle>, headers: HeaderMap, body: Bytes) -> Reply {
+    let link = match link_of(&h, &headers) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let r = charge_on(&h, link.clone(), body).await;
+    // The link lives for one job: it ends once the job's reply exists.
+    if let Some(l) = link {
+        l.close();
+    }
+    r
+}
+
+async fn charge_on(h: &TillHandle, link: Option<Link>, body: Bytes) -> Reply {
     let req: ChargeReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"price_msat\":N}}: {e}")),
@@ -923,11 +1005,20 @@ async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
     }
     let cref = req.client_ref.clone();
     let pin = req.pin.map(String::into_bytes);
-    run_job(&h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, pin, reply }).await
+    run_job(h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, pin, link, reply })
+        .await
 }
 
-async fn card_balance(State(h): State<TillHandle>) -> Reply {
-    run_job(&h, None, |reply| Job::Balance { reply }).await
+async fn card_balance(State(h): State<TillHandle>, headers: HeaderMap) -> Reply {
+    let link = match link_of(&h, &headers) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let r = run_job(&h, None, |reply| Job::Balance { link: link.clone(), reply }).await;
+    if let Some(l) = link {
+        l.close();
+    }
+    r
 }
 
 #[derive(Deserialize)]
@@ -1028,10 +1119,15 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 /// With `ops`, each card job loads that card's state from the registry (see the module docs), and
 /// the federation's name and mint keys are reported to it once at startup.
 pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Option<OpsConfig>) -> Result<()> {
-    if !listen.ip().is_loopback() {
-        eprintln!("warning: {listen} is not a loopback address; the till API has no authentication");
-    }
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
+    // Off loopback the API needs the POS token (docs/POS-LINK.md); `till pair` makes it.
+    let pos_token = crate::pos::read_token(&dir)?;
+    if !listen.ip().is_loopback() && pos_token.is_none() {
+        anyhow::bail!(
+            "refusing to listen on {listen} without a POS token: run `card-sidecar till pair` first ({} is missing)",
+            crate::pos::token_path(&dir).display()
+        );
+    }
     let sales = SalesStore::open(sales_path(&dir))?;
     let ops = match ops {
         Some(cfg) => {
@@ -1048,12 +1144,15 @@ pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Optio
     let mut cw = cw;
     cw.card = Box::new(NoCard);
     let (handle, actor) = new_with_ops(cw, relay.clone(), sales, opener, ops).await;
-    eprintln!("till service listening on http://{} (card relay {relay})", listener.local_addr()?);
+    let auth = if pos_token.is_some() { "POS token required off loopback" } else { "no POS token: loopback only" };
+    let handle = handle.with_pos_token(pos_token);
+    eprintln!("till service listening on http://{} (card relay {relay}; {auth})", listener.local_addr()?);
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
     let server = tokio::spawn(std::future::IntoFuture::into_future(
-        axum::serve(listener, router(handle)).with_graceful_shutdown(shutdown),
+        axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(shutdown),
     ));
     // The actor ends once the server has dropped the router (and with it every handle).
     let (served, ()) = tokio::join!(server, actor);

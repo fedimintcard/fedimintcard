@@ -68,6 +68,13 @@ the header turns red after two failed status polls. The till URL defaults to
 `http://127.0.0.1:9877` and can be changed in settings. The app uses cleartext HTTP
 (`usesCleartextTraffic`); keep the till on loopback or an `adb` tunnel, there is no auth.
 
+Over the LAN instead (no tunnels, docs/POS-LINK.md): run `host/scripts/till-service.sh pair` on the
+laptop, then in the app's settings "Pair with till" and scan the QR code (or paste the
+`fedimintcard-till:` text). The URL and token are stored encrypted under a Keystore key. While
+paired, each charge and balance read opens a card link (WebSocket) to the till once the card is on
+the phone, answers the till's APDUs from it, and sends the job with `X-Card-Link`. "Unpair" goes
+back to the USB path above.
+
 To try the UI without the Rust service: `MOCK_SCENARIO=success python3 tools/mock_till.py`
 (also `change`, `undecided` which records the sale after 8 s, or any error code such as `insufficient`), then `adb reverse` as above.
 

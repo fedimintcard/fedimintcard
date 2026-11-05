@@ -44,8 +44,9 @@ enum Cmd {
 enum TillCmd {
     /// Serve the till API. Owns the data directory: do not run other commands meanwhile.
     Serve {
-        /// Address to listen on. Keep it on loopback: the API has no authentication.
-        #[arg(long, default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
+        /// Address to listen on. Anything but loopback needs the POS token (`till pair`), and
+        /// every request not from loopback must then carry it (docs/POS-LINK.md).
+        #[arg(long, env = "TILL_LISTEN", default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
         listen: std::net::SocketAddr,
         /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
         #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
@@ -57,6 +58,13 @@ enum TillCmd {
         /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url.
         #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
         ops_token: Option<String>,
+    },
+    /// Pair a POS phone: make the POS token if there is none, and print it as a QR code to scan
+    /// in the POS app's settings (docs/POS-LINK.md).
+    Pair {
+        /// The till's URL as the phone reaches it. Default: http://<first LAN IPv4>:9877.
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -231,6 +239,21 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops).await?;
+        }
+        Cmd::Till(TillCmd::Pair { url }) => {
+            use fedimint_card_sidecar::pos;
+            let (token, made) = pos::ensure_token(&cli.data_dir)?;
+            let url = match url {
+                Some(u) => u.clone(),
+                None => format!("http://{}:9877", pos::lan_ipv4()?),
+            };
+            let text = pos::pair_text(&url, &token);
+            if made {
+                eprintln!("made a POS token in {}", pos::token_path(&cli.data_dir).display());
+            }
+            qr(&text)?;
+            println!("{text}");
+            eprintln!("scan it in the POS app: Settings -> Pair with till. Restart the till to listen on the LAN.");
         }
         Cmd::Card(CardCmd::Load { amount_msat, ops_url }) => {
             // No `card_wallet`: a load never signs, so no PIN session is opened (a guessed PIN

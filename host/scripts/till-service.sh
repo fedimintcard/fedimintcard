@@ -5,10 +5,14 @@
 #   till-service.sh restart    copy the binary again (after a rebuild) and restart
 #   till-service.sh stop       unload; start with `install` again
 #   till-service.sh status     launchd's view, /v1/status, the log's tail
+#   till-service.sh pair       make the POS token if needed and print the pairing QR (POS-LINK.md)
 #   till-service.sh run        what launchd runs; not for a terminal
 #
 # Settings live in ~/.config/fedimintcard/till.env (written with defaults on first install):
-# OPS_URL, CARD_BACKEND, CARD_BRIDGE_URL, DATA_DIR. The till token is read from
+# OPS_URL, CARD_BACKEND, CARD_BRIDGE_URL, DATA_DIR, TILL_LISTEN. TILL_LISTEN defaults to
+# 127.0.0.1:9877 (USB phones through adb reverse); set it to 0.0.0.0:9877 to let paired POS phones
+# reach the till over the LAN. The till refuses a non-loopback address until `pair` has made the
+# POS token in DATA_DIR (docs/POS-LINK.md); off loopback every request must carry it. The till token is read from
 # ~/.config/fedimintcard/till-token at every start, so it is never in the plist or the env file;
 # make it with registry/scripts/new-till.sh. No CARD_PIN: on ops every charge carries the
 # holder's PIN (`pin_required`), and the till never opens a card on its own.
@@ -46,6 +50,8 @@ OPS_URL=https://registry.fedimintcard.org
 CARD_BACKEND=bridge
 CARD_BRIDGE_URL=http://127.0.0.1:9876
 DATA_DIR=$HOME/.local/share/fedimint-card-demo/wallet
+# 0.0.0.0:9877 for POS phones on the LAN (run \`till-service.sh pair\` first).
+TILL_LISTEN=127.0.0.1:9877
 CONF
   echo "wrote $ENV_FILE"
 }
@@ -82,7 +88,14 @@ case "${1:-}" in
     export OPS_TILL_TOKEN
     unset CARD_PIN
     echo "$(date -u +%FT%TZ) starting till on $OPS_URL"
-    exec "$BIN" --data-dir "$DATA_DIR" till serve
+    exec "$BIN" --data-dir "$DATA_DIR" till serve --listen "${TILL_LISTEN:-127.0.0.1:9877}"
+    ;;
+  pair)
+    shift
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    [ -x "$BIN" ] || BIN=$BUILT
+    exec "$BIN" --data-dir "$DATA_DIR" till pair "$@"
     ;;
   install)
     copy_binary; write_env; write_plist
@@ -104,7 +117,7 @@ case "${1:-}" in
     echo; tail -n 5 "$LOG" 2>/dev/null || true
     ;;
   *)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

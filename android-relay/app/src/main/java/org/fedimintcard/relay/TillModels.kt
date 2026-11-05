@@ -75,8 +75,9 @@ enum class ChargeErrorCode(val wire: String) {
     UNKNOWN("");
 
     companion object {
+        /** `card_link_gone` (the link closed before the job ran; nothing moved) reads as `no_card`. */
         fun fromWire(s: String?): ChargeErrorCode =
-            values().firstOrNull { it.wire.isNotEmpty() && it.wire == s } ?: UNKNOWN
+            if (s == "card_link_gone") NO_CARD else values().firstOrNull { it.wire.isNotEmpty() && it.wire == s } ?: UNKNOWN
     }
 }
 

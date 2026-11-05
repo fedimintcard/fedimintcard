@@ -7,7 +7,8 @@ and the card state, and drives the card through the phone's NFC relay (`POST /ap
 reaches the phone through `adb forward tcp:9876 tcp:9876`.
 
 All responses are JSON. Failures are `{"ok":false,"error":"<code>","detail":"<text>"}`.
-No auth: keep it on loopback. Responses never contain ecash strings or secrets.
+Responses never contain ecash strings or secrets. Auth and POS phones on the LAN: see below and
+`docs/POS-LINK.md`.
 While `serve` runs it owns the data directory; do not run other `card-sidecar` commands.
 
 ### On ops
@@ -24,6 +25,26 @@ card (or a repeat of the `client_ref`) posts them again and sends only once ops 
 till's own outputs, `sales.json` and `cashouts.log` stay local. Slot 0 is never re-keyed on ops:
 its key is the card's short id. At startup the till reports the federation's name to ops. The
 token is never logged.
+
+### Auth and the card link (POS phones on the LAN)
+
+`card-sidecar till pair [--url URL]` (or `host/scripts/till-service.sh pair`) makes the POS token
+in `<data_dir>/till-pos-token` (0600) if there is none and prints the pairing QR code and text,
+`fedimintcard-till:<url>?t=<token>`. `till serve --listen` (or `TILL_LISTEN`) on anything but
+loopback is refused until that file exists. With a token, every `/v1/*` request not from loopback
+needs `Authorization: Bearer <token>`; otherwise `401 {"ok":false,"error":"unauthorized"}`.
+Loopback stays open (the CLI, the tests, a USB phone through `adb reverse`).
+
+`GET /v1/card/link` upgrades to a WebSocket over which the till sends the card's APDUs to the
+phone holding it. A `POST /v1/charge` or `POST /v1/card/balance` with `X-Card-Link: <id>` uses
+only that link as its card and closes it after replying; without the header the till uses the
+relay (`CARD_BRIDGE_URL`) as before. Frames, timeouts and the pairing flow are in
+`docs/POS-LINK.md`. Errors specific to it:
+
+| code | HTTP | meaning | app action |
+|---|---|---|---|
+| `card_link_gone` | 409 | the `X-Card-Link` id is unknown or the link has closed; nothing ran | open a new link (tap again) |
+| `no_card` | 409 | the link closed, the phone sent `lost`, or an APDU went unanswered for 10 s mid-job | as for the relay: retry the same `client_ref` |
 
 ## GET /v1/health
 `200 {"ok":true}`

@@ -21,6 +21,8 @@ android {
 }
 
 dependencies {
+    // Pure-Java QR decoding for "Pair with till" (no Play Services on the test phones).
+    implementation("com.google.zxing:core:3.5.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

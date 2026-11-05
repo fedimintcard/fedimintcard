@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 fedimint-api-client = { workspace = true }
 fedimint-bip39 = { workspace = true }
@@ -35,6 +35,7 @@ fedimint-rocksdb = { workspace = true }
 futures = "0.3"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false }
+rand = "0.8"
 # The ops registry (docs/OPS-PLAN.md § 6). Same features fedimint already resolves, so no new crates.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -50,4 +51,5 @@ fedimint-dummy-server = { workspace = true }
 fedimint-mint-server = { workspace = true }
 fedimint-testing = { workspace = true }
 tempfile = "3"
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }

@@ -18,6 +18,11 @@ fun interface Transport {
     /** Throws SocketTimeoutException on read timeout; any other IOException means unreachable. */
     @Throws(IOException::class)
     fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int): RawResponse
+
+    /** [send] with extra request headers (the bearer, `X-Card-Link`). Fakes may ignore them. */
+    @Throws(IOException::class)
+    fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int, headers: Map<String, String>): RawResponse =
+        send(method, url, body, connectMs, readMs)
 }
 
 sealed class TillError {
@@ -39,12 +44,19 @@ sealed class ChargeResult {
     data class Failed(val error: TillError) : ChargeResult()
 }
 
-class TillClient(private val baseUrl: () -> String, private val transport: Transport) {
+/**
+ * [token]: the POS token of the paired till, sent as a bearer (docs/POS-LINK.md); null when
+ * unpaired. A job given a `link` id names the card link that holds its card (`X-Card-Link`).
+ */
+class TillClient(private val baseUrl: () -> String, private val transport: Transport, private val token: () -> String? = { null }) {
     private fun url(path: String) = baseUrl().trimEnd('/') + path
 
-    private fun call(method: String, path: String, body: String?, readMs: Int): TillResult<RawResponse> =
+    private fun call(method: String, path: String, body: String?, readMs: Int, link: String? = null): TillResult<RawResponse> =
         try {
-            TillResult.Ok(transport.send(method, url(path), body, CONNECT_MS, readMs))
+            val headers = HashMap<String, String>()
+            token()?.let { headers["Authorization"] = "Bearer $it" }
+            link?.let { headers["X-Card-Link"] = it }
+            TillResult.Ok(transport.send(method, url(path), body, CONNECT_MS, readMs, headers))
         } catch (e: SocketTimeoutException) {
             TillResult.Err(TillError.Timeout)
         } catch (e: PostConnectException) {
@@ -63,11 +75,11 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
      * failed), whatever the outcome, so the caller must not reuse it. The request body is the one
      * place the digits become a String, which the platform's HTTP stack needs.
      */
-    fun charge(priceMsat: Long, clientRef: String, pin: Pin? = null): ChargeResult = try {
+    fun charge(priceMsat: Long, clientRef: String, pin: Pin? = null, link: String? = null): ChargeResult = try {
         val o = JSONObject().put("price_msat", priceMsat).put("client_ref", clientRef)
         pin?.withChars { o.put("pin", String(it)) }
         val body = o.toString()
-        when (val r = call("POST", "/v1/charge", body, CHARGE_READ_MS)) {
+        when (val r = call("POST", "/v1/charge", body, CHARGE_READ_MS, link)) {
             is TillResult.Err -> ChargeResult.Failed(r.error)
             is TillResult.Ok -> parseCharge(r.value.status, r.value.body)
         }
@@ -84,8 +96,8 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
      * Reads the card. Long timeout on purpose: the till must reach the card over the relay and
      * reconcile every note against the federation before it can answer.
      */
-    fun cardBalance(): BalanceResult =
-        when (val r = call("POST", "/v1/card/balance", "", CARD_BALANCE_READ_MS)) {
+    fun cardBalance(link: String? = null): BalanceResult =
+        when (val r = call("POST", "/v1/card/balance", "", CARD_BALANCE_READ_MS, link)) {
             is TillResult.Err -> BalanceResult.Failed(r.error)
             is TillResult.Ok -> parseCardBalance(r.value.status, r.value.body)
         }
@@ -99,9 +111,13 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
 }
 
 class UrlConnectionTransport : Transport {
-    override fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int): RawResponse {
+    override fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int): RawResponse =
+        send(method, url, body, connectMs, readMs, emptyMap())
+
+    override fun send(method: String, url: String, body: String?, connectMs: Int, readMs: Int, headers: Map<String, String>): RawResponse {
         val c = URL(url).openConnection() as HttpURLConnection
         try {
+            for ((k, v) in headers) c.setRequestProperty(k, v)
             c.requestMethod = method
             c.connectTimeout = connectMs
             c.readTimeout = readMs

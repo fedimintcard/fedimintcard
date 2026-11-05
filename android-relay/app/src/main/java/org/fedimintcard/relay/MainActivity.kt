@@ -2,6 +2,8 @@ package org.fedimintcard.relay
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.util.Log
 import android.net.wifi.WifiManager
 import android.nfc.NfcAdapter
 import android.nfc.Tag
@@ -40,11 +42,11 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
         settings = Settings(this)
-        client = TillClient({ settings.baseUrl }, UrlConnectionTransport())
+        client = TillClient({ settings.baseUrl }, UrlConnectionTransport(), { settings.pairing?.token })
         flow = PosFlow()
         ui = PosUi(this, ::dispatch, ::onKey, ::onPinKey)
         status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
-        ui.onSettings { ui.settingsDialog(settings.baseUrl, { settings.baseUrl = it; failures = 0; pollNow() }, { ui.showRelay() }) }
+        ui.onSettings { openSettings() }
         cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
         ui.setPad(flow.pad)
         ui.render(flow.state)
@@ -52,7 +54,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (nfc == null) status.text = "no NFC"
         else if (nfc?.isEnabled == false) last.text = "NFC is switched off"
         try {
-            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> CardLink { a -> try { d.transceive(a) } catch (e: TagLostException) { val lost = isoDep.compareAndSet(d, null); runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }; throw e } } } }) { ev ->
+            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> cardOf(d) } }) { ev ->
                 runOnUiThread { last.text = ev }
             }.also { it.start() }
         } catch (e: Exception) {
@@ -109,17 +111,85 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                         if (!d.isConnected) throw TagLostException()
                         Thread.sleep(300)
                     } catch (e: Exception) {
-                        val lost = isoDep.compareAndSet(d, null)
-                        runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
+                        tagGone(d)
                     }
                 }
             }.start()
         } catch (e: TagLostException) {
-            val lost = isoDep.compareAndSet(d, null)
-            runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
+            tagGone(d)
         } catch (e: Exception) {
             runOnUiThread { last.text = "connect failed: ${e.message}" }
         }
+    }
+
+    /** The held card, answering APDUs; a lost tag is reported once and rethrown. */
+    private fun cardOf(d: IsoDep) = CardLink { a ->
+        try { d.transceive(a) } catch (e: TagLostException) { tagGone(d); throw e }
+    }
+
+    private fun tagGone(d: IsoDep) {
+        val lost = isoDep.compareAndSet(d, null)
+        if (lost) activeLink?.cardLost()
+        runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
+    }
+
+    /** The link of the job in flight, if it runs over one. */
+    @Volatile private var activeLink: TillLink? = null
+
+    /**
+     * Runs a card job. Paired: opens a card link answered from the card on the phone now, runs
+     * [job] with its id (the till uses only that link as the card), and closes it. Unpaired: runs
+     * [job] with null, and the till reaches the card through the USB relay as before. A link that
+     * cannot be opened is [unreachable] (nothing was sent).
+     */
+    private fun <T> withCard(job: (String?) -> T, unreachable: () -> T): T {
+        val p = settings.pairing ?: return job(null)
+        val d = isoDep.get()
+        val card = if (d != null) cardOf(d) else CardLink { throw TagLostException() }
+        val link = try {
+            TillLink.open(settings.baseUrl, p.token, card)
+        } catch (e: Exception) {
+            Log.w(TAG, "card link failed: ${e.javaClass.simpleName}")
+            return unreachable()
+        }
+        activeLink = link
+        if (isoDep.get() !== d || d == null) link.cardLost()
+        try {
+            return job(link.id)
+        } finally {
+            activeLink = null
+            link.close()
+        }
+    }
+
+    private fun openSettings() {
+        ui.settingsDialog(
+            settings.baseUrl,
+            settings.pairing?.url,
+            { settings.baseUrl = it; failures = 0; pollNow() },
+            { ui.showRelay() },
+            { startActivityForResult(Intent(this, ScanActivity::class.java), SCAN_REQUEST) },
+            { text -> pairWith(text) },
+            { settings.pairing = null; failures = 0; pollNow(); Toast.makeText(this, "Unpaired: using USB", Toast.LENGTH_SHORT).show() },
+        )
+    }
+
+    /** Stores a pairing code (scanned or pasted). False if [text] is not one. */
+    private fun pairWith(text: String): Boolean {
+        val p = parsePairing(text) ?: return false
+        settings.pairing = p
+        failures = 0
+        pollNow()
+        Toast.makeText(this, "Paired with ${p.url}", Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != SCAN_REQUEST || resultCode != RESULT_OK) return
+        val text = data?.getStringExtra(ScanActivity.EXTRA_TEXT) ?: return
+        if (!pairWith(text)) Toast.makeText(this, "Not a till pairing code", Toast.LENGTH_SHORT).show()
     }
 
     private fun onKey(k: Int?) {
@@ -162,7 +232,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (now is PosState.BalanceShown && before != now) startBalanceCountdown(now.readId)
         for (fx in effects) when (fx) {
             is PosEffect.StartCharge -> Thread {
-                val r = client.charge(fx.priceMsat, fx.clientRef, fx.pin) // wipes fx.pin
+                val r = withCard(
+                    { link -> client.charge(fx.priceMsat, fx.clientRef, fx.pin, link) }, // wipes fx.pin
+                    { fx.pin?.wipe(); ChargeResult.Failed(TillError.Unreachable) },
+                )
                 runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
             }.start()
             is PosEffect.StartBalanceRead -> readCardBalance(fx.readId)
@@ -229,7 +302,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
      */
     private fun readCardBalance(readId: Int) {
         Thread {
-            val r = client.cardBalance()
+            val r = withCard({ link -> client.cardBalance(link) }, { BalanceResult.Failed(TillError.Unreachable) })
             runOnUiThread { dispatch(PosEvent.BalanceDone(readId, r)) }
         }.start()
     }
@@ -274,5 +347,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         return "${ip and 0xFF}.${ip shr 8 and 0xFF}.${ip shr 16 and 0xFF}.${ip shr 24 and 0xFF}"
     }
 
-    companion object { const val PORT = 9876 }
+    companion object {
+        const val PORT = 9876
+        const val SCAN_REQUEST = 7
+        const val TAG = "Pos"
+    }
 }

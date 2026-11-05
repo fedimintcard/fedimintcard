@@ -263,15 +263,53 @@ class PosUi(
         if (target == R.id.screen_tap) { if (!pulser.isStarted) pulser.start() } else pulser.cancel()
     }
 
-    fun settingsDialog(current: String, onSave: (String) -> Unit, onRelay: () -> Unit) {
+    /**
+     * Settings: the till URL, pairing (scan the till's QR code, or paste its text), and the relay.
+     * [paired] is the paired till's URL, or null. [onPairText] returns false for text that is not
+     * a pairing code.
+     */
+    fun settingsDialog(
+        current: String,
+        paired: String?,
+        onSave: (String) -> Unit,
+        onRelay: () -> Unit,
+        onScan: () -> Unit,
+        onPairText: (String) -> Boolean,
+        onUnpair: () -> Unit,
+    ) {
+        val pad = (16 * act.resources.displayMetrics.density).toInt()
         val input = EditText(act).apply { setText(current); inputType = InputType.TYPE_TEXT_VARIATION_URI; setSingleLine() }
+        val state = TextView(act).apply {
+            text = if (paired != null) "Paired with $paired: the card goes to the till over the network." else "Not paired: the till reaches the card over USB (adb)."
+            setPadding(0, pad / 2, 0, pad / 2)
+        }
+        val pasted = EditText(act).apply { hint = "or paste fedimintcard-till:…"; setSingleLine(); inputType = InputType.TYPE_TEXT_VARIATION_URI }
+        var dialog: AlertDialog? = null
+        val scan = Button(act).apply { text = "Pair with till (scan QR)"; setOnClickListener { dialog?.dismiss(); onScan() } }
+        val usePasted = Button(act).apply {
+            text = "Pair with pasted text"
+            setOnClickListener {
+                if (onPairText(pasted.text.toString())) dialog?.dismiss() else pasted.error = "Not a till pairing code"
+            }
+        }
+        val unpair = Button(act).apply {
+            text = "Unpair (use USB)"
+            visibility = if (paired != null) View.VISIBLE else View.GONE
+            setOnClickListener { onUnpair(); dialog?.dismiss() }
+        }
+        val body = android.widget.LinearLayout(act).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+            addView(input); addView(state); addView(scan); addView(pasted); addView(usePasted); addView(unpair)
+        }
         AlertDialog.Builder(act)
-            .setTitle("Till service URL")
-            .setView(input)
+            .setTitle("Till")
+            .setView(android.widget.ScrollView(act).apply { addView(body) })
             .setPositiveButton("Save", null)
             .setNeutralButton("Card relay", { _, _ -> onRelay() })
             .setNegativeButton("Cancel", null)
             .create().also { d ->
+                dialog = d
                 d.setOnShowListener {
                     d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                         val n = normalizeBaseUrl(input.text.toString())
