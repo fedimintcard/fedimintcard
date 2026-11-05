@@ -278,7 +278,7 @@ Done means every box is ticked and the acceptance run at the end passes on relea
 **Till**
 - [x] **PIN entry in the POS app** (`android-relay`, "Fedimint Card POS"): the holder types the
   PIN on the till's screen and the app sends it in `/v1/charge`; wrong-PIN tries left and a blocked
-  card shown plainly. **Built, not on silicon (2026-11-04):** amount → holder PIN pad (4–8 digits,
+  card shown plainly. **Done on silicon, production, 2026-11-04** (`4ec1e93`, receipt `04a87a8`): card `6f94b19b` loaded 65,536 msat, charged 32 sats on the Pixel with the holder's PIN after one wrong PIN showed "2 tries left". Built as: amount → holder PIN pad (4–8 digits,
   masked, FLAG_SECURE) → card; the PIN lives in a wiped char array, dropped on cancel, error and
   `onStop`; `wrong_pin` returns to the pad with the same `client_ref`, `pin_blocked` back to the
   amount; every retry asks for the PIN again. JVM tests only; no real charge yet.
