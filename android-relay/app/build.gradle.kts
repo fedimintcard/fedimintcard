@@ -5,13 +5,32 @@ plugins {
 
 android {
     namespace = "org.fedimintcard.relay"
-    compileSdk = 35
+    compileSdk = 36
     defaultConfig {
-        applicationId = "org.fedimintcard.relay"
+        // The store id matches iOS (org.fedimintcard.pos); the Kotlin namespace keeps the old
+        // relay name so no source moves.
+        applicationId = "org.fedimintcard.pos"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
-        versionName = "0.2"
+        versionName = "0.3.0"
+    }
+    signingConfigs {
+        create("release") {
+            // The Fedimint Card upload key, shared with the provisioner (apps/provisioner): the
+            // path and alias from the environment, the passwords too (read from the macOS Keychain
+            // by scripts/release-android.sh). Never a committed keystore.
+            System.getenv("FEDIMINTCARD_ANDROID_UPLOAD_KEYSTORE")?.let { storeFile = file(it) }
+            storePassword = System.getenv("FEDIMINTCARD_ANDROID_UPLOAD_STORE_PASSWORD")
+            keyAlias = System.getenv("FEDIMINTCARD_ANDROID_UPLOAD_KEY_ALIAS")
+            keyPassword = System.getenv("FEDIMINTCARD_ANDROID_UPLOAD_KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -20,7 +20,28 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NFCReaderUsageDescription</key>
+	<string>Reads the customer's Fedimint card to take a payment or show its balance.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Scans the till's pairing QR code.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connects to the till on your local network to take payments.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Figtree.ttf</string>
+	</array>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchScreen</key>
 	<dict>
@@ -31,31 +52,12 @@
 	<array>
 		<string>arm64</string>
 	</array>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
-	<key>UIStatusBarStyle</key>
-	<string>UIStatusBarStyleLightContent</string>
-	<key>UIApplicationSupportsIndirectInputEvents</key>
-	<true/>
-	<key>UIAppFonts</key>
-	<array>
-		<string>Figtree.ttf</string>
-	</array>
-	<key>NFCReaderUsageDescription</key>
-	<string>Reads the customer's Fedimint card to take a payment or show its balance.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Scans the till's pairing QR code.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Connects to the till on your local network to take payments.</string>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<false/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
-	</dict>
 	<key>com.apple.developer.nfc.readersession.iso7816.select-identifiers</key>
 	<array>
 		<string>A000000151000000</string>

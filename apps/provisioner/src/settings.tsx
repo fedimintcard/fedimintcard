@@ -46,7 +46,7 @@ export const APP_IDENTITY = Object.freeze({
   androidNamespace: 'org.fedimintcard.provisioner',
   iosBundleIdentifier: 'org.fedimintcard.provisioner',
   reactNativeName: 'FedimintProvisioner',
-  displayName: 'FedimintProvisioner',
+  displayName: 'Fedimint Card Setup',
 } as const);
 
 /**
