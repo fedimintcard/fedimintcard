@@ -34,9 +34,7 @@ class ScanActivity : Activity(), SurfaceHolder.Callback, Camera.PreviewCallback 
     private var camera: Camera? = null
     private lateinit var surface: SurfaceView
     private lateinit var hint: TextView
-    private val reader = MultiFormatReader().apply {
-        setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE), DecodeHintType.TRY_HARDER to true))
-    }
+    private val reader = pairingReader()
     @Volatile private var decoding = false
     @Volatile private var done = false
     private var hasSurface = false
@@ -158,5 +156,22 @@ class ScanActivity : Activity(), SurfaceHolder.Callback, Camera.PreviewCallback 
         }.start()
     }
 
-    companion object { const val EXTRA_TEXT = "pairing" }
+    companion object {
+        const val EXTRA_TEXT = "pairing"
+
+        /**
+         * `till pair` prints its QR in a terminal, which is usually dark: light modules on black,
+         * the inverse of a printed code. zxing reads that only with ALSO_INVERTED (11/4: the
+         * iPhone scanned it, the Pixel never did).
+         */
+        fun pairingReader() = MultiFormatReader().apply {
+            setHints(
+                mapOf(
+                    DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+                    DecodeHintType.TRY_HARDER to true,
+                    DecodeHintType.ALSO_INVERTED to true,
+                )
+            )
+        }
+    }
 }
