@@ -1,0 +1,514 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		07160A79DE00CBB7EFCAF2D6 /* PosFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E65F454CD8BDECE17CF870C /* PosFlow.swift */; };
+		11A47F08ED7249D20FFDD0A1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6A07CEEB0E77F39004689A63 /* Assets.xcassets */; };
+		1724E279E92611527D686EE6 /* CardLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */; };
+		183A2BC4BCABE1E735E6FF0C /* TillClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD8734CE2845FF73DCFA1BCA /* TillClient.swift */; };
+		1D5EB784F49CA51113A217E3 /* OFL-Figtree.txt in Resources */ = {isa = PBXBuildFile; fileRef = D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */; };
+		2771CB3B1D818A94D0FEDD9E /* TillModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3456E4AEA9C75E40A4730629 /* TillModels.swift */; };
+		28DB1EAC30B41406FEBB03F3 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = C39AEE1B854A9883FB8CC268 /* Theme.swift */; };
+		2D04077260B95DEE89B22082 /* card_front.png in Resources */ = {isa = PBXBuildFile; fileRef = 4EA9FEF5A783DC5F277E8949 /* card_front.png */; };
+		39C37991176CDEAC01CDCD83 /* CardLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 566A92ECDEB2DA9A031B11DA /* CardLink.swift */; };
+		46BC3D29355500B390D8A336 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3685B2D3A58DEDD98FC5D81E /* Pairing.swift */; };
+		47FC7AFD6B1E63F51EC4636A /* Money.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80FF8DF36EA74756852185D9 /* Money.swift */; };
+		4A93A410EE7A943F1F8FD176 /* Screens.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32DF1049376C2E8D8027537 /* Screens.swift */; };
+		5223EC8F0E6EE1A74380EABA /* LinkSocketIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */; };
+		5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E997C08978966870EBE4456 /* PosFlowTests.swift */; };
+		64474BF43AFE8B19B3711F9C /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB46E83F11E1306121B63D09 /* App.swift */; };
+		75C43F6D387CAA02844DDF5D /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC24BE04CC31D28A08266DDC /* SettingsView.swift */; };
+		75DC8B98C973917D81C49DE9 /* Pads.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7986F3432B14FF95BDD32A8 /* Pads.swift */; };
+		7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36D409088E3F90B17B12B0C4 /* TillClientTests.swift */; };
+		8106F75673DF6A1F71FC8562 /* Figtree.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 47C525FEABE9888F266B10B0 /* Figtree.ttf */; };
+		98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 915B237265E96624811EB5C1 /* PadTests.swift */; };
+		BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = E518F954B819A02AAFC7253B /* NFCCardReader.swift */; };
+		CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9AEA85277653C319EC8C7B /* PairingTests.swift */; };
+		EB7CB78117403AF777118344 /* PosController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86FE0870914BD0003EB671B /* PosController.swift */; };
+		F07D7EFDA9A00794775899A1 /* ErrorCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DDFC94C92C8812DAA33D897 /* ErrorCopy.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B506379CC31E7E9092681F2D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = C978A80AABC67111141095C9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9FE8B564AEC85BD247944F43;
+			remoteInfo = FedimintCardPOS;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		00A355F8AAFD6787CE5DE124 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		06114E2CE518EF1CE10315EF /* FedimintCardPOSTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = FedimintCardPOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0E65F454CD8BDECE17CF870C /* PosFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosFlow.swift; sourceTree = "<group>"; };
+		0E997C08978966870EBE4456 /* PosFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosFlowTests.swift; sourceTree = "<group>"; };
+		109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkSocketIntegrationTests.swift; sourceTree = "<group>"; };
+		1DDFC94C92C8812DAA33D897 /* ErrorCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErrorCopy.swift; sourceTree = "<group>"; };
+		30EC643D30FC5863225DE43A /* FedimintCardPOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = FedimintCardPOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3456E4AEA9C75E40A4730629 /* TillModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillModels.swift; sourceTree = "<group>"; };
+		3685B2D3A58DEDD98FC5D81E /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		36D409088E3F90B17B12B0C4 /* TillClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillClientTests.swift; sourceTree = "<group>"; };
+		39002417E0A678C9CEC72D28 /* FedimintCardPOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FedimintCardPOS.entitlements; sourceTree = "<group>"; };
+		47C525FEABE9888F266B10B0 /* Figtree.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = Figtree.ttf; sourceTree = "<group>"; };
+		4EA9FEF5A783DC5F277E8949 /* card_front.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = card_front.png; sourceTree = "<group>"; };
+		566A92ECDEB2DA9A031B11DA /* CardLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardLink.swift; sourceTree = "<group>"; };
+		6A07CEEB0E77F39004689A63 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardLinkTests.swift; sourceTree = "<group>"; };
+		80FF8DF36EA74756852185D9 /* Money.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Money.swift; sourceTree = "<group>"; };
+		915B237265E96624811EB5C1 /* PadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PadTests.swift; sourceTree = "<group>"; };
+		B32DF1049376C2E8D8027537 /* Screens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Screens.swift; sourceTree = "<group>"; };
+		BB9AEA85277653C319EC8C7B /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
+		C39AEE1B854A9883FB8CC268 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		CB46E83F11E1306121B63D09 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OFL-Figtree.txt"; sourceTree = "<group>"; };
+		DD8734CE2845FF73DCFA1BCA /* TillClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillClient.swift; sourceTree = "<group>"; };
+		E518F954B819A02AAFC7253B /* NFCCardReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NFCCardReader.swift; sourceTree = "<group>"; };
+		E86FE0870914BD0003EB671B /* PosController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosController.swift; sourceTree = "<group>"; };
+		F7986F3432B14FF95BDD32A8 /* Pads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pads.swift; sourceTree = "<group>"; };
+		FC24BE04CC31D28A08266DDC /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0314F140A7FD1A196D2882E0 /* FedimintCardPOS */ = {
+			isa = PBXGroup;
+			children = (
+				CB46E83F11E1306121B63D09 /* App.swift */,
+				6A07CEEB0E77F39004689A63 /* Assets.xcassets */,
+				566A92ECDEB2DA9A031B11DA /* CardLink.swift */,
+				1DDFC94C92C8812DAA33D897 /* ErrorCopy.swift */,
+				39002417E0A678C9CEC72D28 /* FedimintCardPOS.entitlements */,
+				00A355F8AAFD6787CE5DE124 /* Info.plist */,
+				80FF8DF36EA74756852185D9 /* Money.swift */,
+				E518F954B819A02AAFC7253B /* NFCCardReader.swift */,
+				F7986F3432B14FF95BDD32A8 /* Pads.swift */,
+				3685B2D3A58DEDD98FC5D81E /* Pairing.swift */,
+				E86FE0870914BD0003EB671B /* PosController.swift */,
+				0E65F454CD8BDECE17CF870C /* PosFlow.swift */,
+				B32DF1049376C2E8D8027537 /* Screens.swift */,
+				FC24BE04CC31D28A08266DDC /* SettingsView.swift */,
+				C39AEE1B854A9883FB8CC268 /* Theme.swift */,
+				DD8734CE2845FF73DCFA1BCA /* TillClient.swift */,
+				3456E4AEA9C75E40A4730629 /* TillModels.swift */,
+				EF66FF253891CF83F657707D /* Resources */,
+			);
+			path = FedimintCardPOS;
+			sourceTree = "<group>";
+		};
+		1D7FE172E4E597CCFE27772D = {
+			isa = PBXGroup;
+			children = (
+				0314F140A7FD1A196D2882E0 /* FedimintCardPOS */,
+				30243F8E6AA66A7B7E45363B /* FedimintCardPOSTests */,
+				9965F64903959D7D4625C42A /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		30243F8E6AA66A7B7E45363B /* FedimintCardPOSTests */ = {
+			isa = PBXGroup;
+			children = (
+				7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */,
+				109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */,
+				915B237265E96624811EB5C1 /* PadTests.swift */,
+				BB9AEA85277653C319EC8C7B /* PairingTests.swift */,
+				0E997C08978966870EBE4456 /* PosFlowTests.swift */,
+				36D409088E3F90B17B12B0C4 /* TillClientTests.swift */,
+			);
+			path = FedimintCardPOSTests;
+			sourceTree = "<group>";
+		};
+		9965F64903959D7D4625C42A /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				30EC643D30FC5863225DE43A /* FedimintCardPOS.app */,
+				06114E2CE518EF1CE10315EF /* FedimintCardPOSTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		EF66FF253891CF83F657707D /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				4EA9FEF5A783DC5F277E8949 /* card_front.png */,
+				47C525FEABE9888F266B10B0 /* Figtree.ttf */,
+				D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		9FE8B564AEC85BD247944F43 /* FedimintCardPOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0BCA5E812BF4340DC74C46BB /* Build configuration list for PBXNativeTarget "FedimintCardPOS" */;
+			buildPhases = (
+				E5499C1D19530B9D314B5569 /* Sources */,
+				EDACD320E030C7CA7304CCA4 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FedimintCardPOS;
+			packageProductDependencies = (
+			);
+			productName = FedimintCardPOS;
+			productReference = 30EC643D30FC5863225DE43A /* FedimintCardPOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AAAFE3BAD3501A8927E2DCE6 /* FedimintCardPOSTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6853553BC97949C661857B02 /* Build configuration list for PBXNativeTarget "FedimintCardPOSTests" */;
+			buildPhases = (
+				E119E17D0686E104A8409E60 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				72AF8E0FACB370B161FA015F /* PBXTargetDependency */,
+			);
+			name = FedimintCardPOSTests;
+			packageProductDependencies = (
+			);
+			productName = FedimintCardPOSTests;
+			productReference = 06114E2CE518EF1CE10315EF /* FedimintCardPOSTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		C978A80AABC67111141095C9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					9FE8B564AEC85BD247944F43 = {
+						DevelopmentTeam = H7UAM79QQP;
+						ProvisioningStyle = Automatic;
+					};
+					AAAFE3BAD3501A8927E2DCE6 = {
+						DevelopmentTeam = H7UAM79QQP;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 97880A6171A17F9F83EF249E /* Build configuration list for PBXProject "FedimintCardPOS" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 1D7FE172E4E597CCFE27772D;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 9965F64903959D7D4625C42A /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9FE8B564AEC85BD247944F43 /* FedimintCardPOS */,
+				AAAFE3BAD3501A8927E2DCE6 /* FedimintCardPOSTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		EDACD320E030C7CA7304CCA4 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				11A47F08ED7249D20FFDD0A1 /* Assets.xcassets in Resources */,
+				8106F75673DF6A1F71FC8562 /* Figtree.ttf in Resources */,
+				1D5EB784F49CA51113A217E3 /* OFL-Figtree.txt in Resources */,
+				2D04077260B95DEE89B22082 /* card_front.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E119E17D0686E104A8409E60 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1724E279E92611527D686EE6 /* CardLinkTests.swift in Sources */,
+				5223EC8F0E6EE1A74380EABA /* LinkSocketIntegrationTests.swift in Sources */,
+				98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */,
+				CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */,
+				5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */,
+				7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E5499C1D19530B9D314B5569 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				64474BF43AFE8B19B3711F9C /* App.swift in Sources */,
+				39C37991176CDEAC01CDCD83 /* CardLink.swift in Sources */,
+				F07D7EFDA9A00794775899A1 /* ErrorCopy.swift in Sources */,
+				47FC7AFD6B1E63F51EC4636A /* Money.swift in Sources */,
+				BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */,
+				75DC8B98C973917D81C49DE9 /* Pads.swift in Sources */,
+				46BC3D29355500B390D8A336 /* Pairing.swift in Sources */,
+				EB7CB78117403AF777118344 /* PosController.swift in Sources */,
+				07160A79DE00CBB7EFCAF2D6 /* PosFlow.swift in Sources */,
+				4A93A410EE7A943F1F8FD176 /* Screens.swift in Sources */,
+				75C43F6D387CAA02844DDF5D /* SettingsView.swift in Sources */,
+				28DB1EAC30B41406FEBB03F3 /* Theme.swift in Sources */,
+				183A2BC4BCABE1E735E6FF0C /* TillClient.swift in Sources */,
+				2771CB3B1D818A94D0FEDD9E /* TillModels.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		72AF8E0FACB370B161FA015F /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9FE8B564AEC85BD247944F43 /* FedimintCardPOS */;
+			targetProxy = B506379CC31E7E9092681F2D /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		450DE3B7EC93F76919D30C87 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = FedimintCardPOS/FedimintCardPOS.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FedimintCardPOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = org.fedimintcard.pos;
+				PRODUCT_NAME = FedimintCardPOS;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		79C78F150FA38B6C26A25CC0 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = H7UAM79QQP;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		9F9B084C04D44F0D8F507059 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = H7UAM79QQP;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A5E0BCD11CA7B56EA97EA806 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.fedimintcard.pos.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/FedimintCardPOS.app/FedimintCardPOS";
+			};
+			name = Debug;
+		};
+		C773AE85F7DBF3DB9EE9CA79 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = FedimintCardPOS/FedimintCardPOS.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FedimintCardPOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = org.fedimintcard.pos;
+				PRODUCT_NAME = FedimintCardPOS;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		DC4015043448D6F6D47C20F1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.fedimintcard.pos.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/FedimintCardPOS.app/FedimintCardPOS";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0BCA5E812BF4340DC74C46BB /* Build configuration list for PBXNativeTarget "FedimintCardPOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C773AE85F7DBF3DB9EE9CA79 /* Debug */,
+				450DE3B7EC93F76919D30C87 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		6853553BC97949C661857B02 /* Build configuration list for PBXNativeTarget "FedimintCardPOSTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A5E0BCD11CA7B56EA97EA806 /* Debug */,
+				DC4015043448D6F6D47C20F1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		97880A6171A17F9F83EF249E /* Build configuration list for PBXProject "FedimintCardPOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9F9B084C04D44F0D8F507059 /* Debug */,
+				79C78F150FA38B6C26A25CC0 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = C978A80AABC67111141095C9 /* Project object */;
+}
