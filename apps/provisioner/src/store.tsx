@@ -516,6 +516,21 @@ export function StoreProvider({
     setSession(null);
   }, [pinSlot, batchPin]);
 
+  // A new client means another registry (Settings → Registry): the session
+  // was issued by the old one and the new client holds no token, so every
+  // call would be refused on the phone. Sign out rather than look signed in.
+  const firstApi = useRef(api);
+  useEffect(() => {
+    if (api === firstApi.current) {
+      return;
+    }
+    firstApi.current = api;
+    pinSlot.wipe();
+    batchPin?.wipe();
+    setBatch(null);
+    setSession(null);
+  }, [api, pinSlot, batchPin]);
+
   // Names come from the registry, once per session; a failure leaves the short
   // id on screen, which is what the operator saw before any till reported one.
   const signedIn = session !== null;

@@ -96,6 +96,15 @@ function foldedPhase(phase: string): CardPhase {
   }
 }
 
+/**
+ * The calm line, plus ops' own words when ops refused: its reasons are
+ * service strings, never a key, and without them the stop cannot be told
+ * from a dead connection.
+ */
+function stopWhat(stop: CardStop, reason: string | undefined): string {
+  return stop === 'noManagerKeys' && reason ? `${CALM[stop]} Ops said: ${reason}` : CALM[stop];
+}
+
 export function LoopScreen({
   armFirst = false,
   onArmed,
@@ -459,7 +468,7 @@ export function LoopScreen({
           <StopPanel
             title={LOOP.cardStopped}
             name={STOP_NAMES[stopShown]}
-            what={CALM[stopShown]}
+            what={stopWhat(stopShown, records[records.length - 1]?.reason)}
             now={STATE[stopShown]}
             testID="loop-stop"
           />
