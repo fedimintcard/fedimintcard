@@ -128,43 +128,116 @@ struct TapScreen: View {
     let title: String
     let status: String
     let cancellable: Bool
-    @State private var pulse = false
+    /// The card is on the phone and the till is working with it (signing, reading).
+    var working: Bool = false
 
+    // Everything sits in the top half: in every tap state the system's NFC sheet covers the
+    // lower half, and it brings its own Cancel and tap picture, so neither is drawn here.
     var body: some View {
-        VStack(spacing: 0) {
-            Text(title).font(Fig.extraBold(44)).kerning(-0.8).foregroundStyle(Palette.ink)
-                .lineLimit(1).minimumScaleFactor(0.5).padding(.top, 32)
-            Image(uiImage: UIImage(named: "card_front") ?? UIImage())
-                .resizable().aspectRatio(contentMode: .fit)
-                .frame(width: 280)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.line, lineWidth: 1))
-                .rotationEffect(.degrees(-6))
-                .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
-                .padding(.top, 28)
-                .accessibilityHidden(true)
-            ZStack {
-                Circle().fill(Color(hex: 0xd2bb6a, alpha: 0x22 / 255.0))
-                    .overlay(Circle().stroke(Palette.gold, lineWidth: 4))
-                    .frame(width: 160, height: 160)
-                    .scaleEffect(pulse ? 1.1 : 0.7)
-                    .opacity(pulse ? 0.35 : 1)
-                    .animation(.linear(duration: 0.9).repeatForever(autoreverses: true), value: pulse)
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                Text(title).font(Fig.extraBold(44)).kerning(-0.8).foregroundStyle(Palette.ink)
+                    .lineLimit(1).minimumScaleFactor(0.5).padding(.top, 24)
+                TapMotion(working: working)
+                    .frame(width: 200, height: 200)
+                    .padding(.top, 8)
+                    .accessibilityHidden(true)
+                Text(status).font(Fig.extraBold(22)).foregroundStyle(Palette.ink).multilineTextAlignment(.center)
+                    .contentTransition(.opacity)
+                    .animation(.easeOut(duration: 0.2), value: status)
+                    .padding(.top, 4)
+                    .accessibilityAddTraits(.updatesFrequently)
             }
-            .frame(maxHeight: .infinity)
-            Text(status).font(Fig.extraBold(24)).foregroundStyle(Palette.ink).multilineTextAlignment(.center)
-            Button("Cancel") { pos.send(.cancelPressed) }
-                .buttonStyle(GhostButtonStyle()).padding(.top, 16)
-                .opacity(cancellable ? 1 : 0).disabled(!cancellable)
+            .frame(width: geo.size.width, height: geo.size.height * 0.5, alignment: .top)
         }
         .padding(.horizontal, 8)
-        .onAppear { pulse = true }
+    }
+}
+
+/// The tap screen's motion, the same drawing as Android's TapMotionView. Waiting: contactless
+/// rings leave the centre one after another (2.4 s a ring). Working: the rings gather into a ring
+/// and a gold arc runs round it, its length breathing, so a 4 to 6 second signature reads as
+/// steady progress. The switch morphs over 0.42 s. With Reduce Motion, each mode is one still frame.
+struct TapMotion: View {
+    let working: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var start = Date()
+    @State private var changedAt = Date.distantPast
+    @State private var from: Double = 0
+
+    var body: some View {
+        TimelineView(.animation(paused: reduceMotion)) { tl in
+            Canvas { ctx, size in draw(&ctx, size, tl.date) }
+        }
+        .onChange(of: working) { _, now in
+            from = blend(at: Date(), target: now ? 0 : 1)
+            changedAt = Date()
+        }
+    }
+
+    /// 0 = waiting, 1 = working, eased (standard decelerate) from where the last switch left it.
+    private func blend(at now: Date, target: Double? = nil) -> Double {
+        let to = target ?? (working ? 1 : 0)
+        if reduceMotion { return to }
+        let p = min(1, max(0, now.timeIntervalSince(changedAt) / 0.42))
+        let e = UnitCurve.bezier(startControlPoint: UnitPoint(x: 0.2, y: 0), endControlPoint: UnitPoint(x: 0, y: 1)).value(at: p)
+        return from + (to - from) * e
+    }
+
+    private func draw(_ ctx: inout GraphicsContext, _ size: CGSize, _ now: Date) {
+        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+        let r = min(size.width, size.height) * 0.36
+        let still = reduceMotion
+        let ms = still ? 0 : now.timeIntervalSince(start) * 1000
+        let b = blend(at: now)
+        let waiting = 1 - b, working = b
+
+        func circle(_ radius: Double) -> Path {
+            Path(ellipseIn: CGRect(x: c.x - radius, y: c.y - radius, width: radius * 2, height: radius * 2))
+        }
+
+        if waiting > 0.01 {
+            let period = 2400.0
+            for i in 0..<3 {
+                let p = still ? 0.35 + Double(i) * 0.2 : (ms + Double(i) * period / 3).truncatingRemainder(dividingBy: period) / period
+                let eased = 1 - pow(1 - p, 3)
+                ctx.stroke(circle(r * (0.30 + 0.70 * eased)),
+                           with: .color(Palette.goldHi.opacity(0.6 * pow(1 - p, 1.6) * waiting)), lineWidth: 2)
+            }
+            let breath = still ? 0 : sin(2 * .pi * ms / 2400)
+            ctx.fill(circle(7 + 1.5 * breath), with: .color(Palette.gold.opacity(waiting)))
+        }
+
+        if working > 0.01 {
+            let ringR = r * (0.55 + 0.30 * working)
+            let glow = still ? 1 : 0.85 + 0.15 * sin(2 * .pi * ms / 1600)
+            ctx.fill(circle(ringR), with: .radialGradient(
+                Gradient(colors: [Palette.gold.opacity(70 / 255 * working * glow), Palette.gold.opacity(0)]),
+                center: c, startRadius: 0, endRadius: ringR))
+            ctx.stroke(circle(ringR), with: .color(Palette.ink.opacity(0.14 * working)), lineWidth: 3)
+
+            // The head turns once every 1.2 s; the arc's length breathes between 40° and 150°.
+            let head = still ? 300 : ms.truncatingRemainder(dividingBy: 1200) / 1200 * 360
+            let sweep = still ? 120 : 95 + 55 * sin(2 * .pi * ms / 1800)
+            let startDeg = head - sweep - 90
+            var arc = Path()
+            arc.addArc(center: c, radius: ringR, startAngle: .degrees(startDeg), endAngle: .degrees(startDeg + sweep), clockwise: false)
+            ctx.stroke(arc, with: .conicGradient(
+                Gradient(stops: [.init(color: Palette.goldHi.opacity(0), location: 0),
+                                 .init(color: Palette.goldHi.opacity(working), location: sweep / 360),
+                                 .init(color: Palette.goldHi.opacity(0), location: min(1, sweep / 360 + 0.001))]),
+                center: c, angle: .degrees(startDeg)),
+                style: StrokeStyle(lineWidth: 4, lineCap: .round))
+        }
     }
 }
 
 struct ReceiptScreen: View {
     @EnvironmentObject var pos: PosController
     let receipt: ChargeReceipt
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var landed = false
+    @State private var risen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -175,9 +248,11 @@ struct ReceiptScreen: View {
                     Text("✓").font(.system(size: 64)).foregroundStyle(Palette.ok)
                 }
                 .frame(width: 104, height: 104)
+                .scaleEffect(landed ? 1 : 0.4).opacity(landed ? 1 : 0)
                 // The price only: change and sub-sat rounding stay in the till's sales record.
                 Text("Paid \(formatSats(receipt.priceMsat)) sats").font(Fig.extraBold(44)).kerning(-0.8)
                     .foregroundStyle(Palette.ink).lineLimit(1).minimumScaleFactor(0.5).padding(.top, 24)
+                    .opacity(risen ? 1 : 0).offset(y: risen ? 0 : 12)
                 Text(shortTxid(receipt.txid)).font(.system(size: 13, design: .monospaced)).foregroundStyle(Palette.dim).padding(.top, 12)
             }
             .padding(24)
@@ -187,6 +262,12 @@ struct ReceiptScreen: View {
             Button("New sale") { pos.send(.newSalePressed) }.buttonStyle(GoldButtonStyle())
         }
         .padding(8)
+        // The tick lands with a small overshoot, then the amount rises in under it.
+        .onAppear {
+            if reduceMotion { landed = true; risen = true; return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) { landed = true }
+            withAnimation(.timingCurve(0.2, 0, 0, 1, duration: 0.32).delay(0.14)) { risen = true }
+        }
     }
 }
 

@@ -42,15 +42,31 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) { SettingsView().environmentObject(pos) }
     }
 
+    /// The four tap states share one TapScreen, so waiting to working is one view changing (the
+    /// motion morphs, the card settles) rather than one screen replacing another.
+    private var tap: (title: String, status: String, cancellable: Bool, working: Bool)? {
+        switch pos.state {
+        case .waitingForCard(let price, _, _): return ("\(formatSats(price)) sats", "Hold the card to the top of the phone", true, false)
+        case .signing(let price, _, _, _): return ("\(formatSats(price)) sats", "Paying… keep the card on the phone", false, true)
+        case .balanceWaiting: return ("Card balance", "Hold the card to the top of the phone", true, false)
+        case .balanceReading: return ("Card balance", "Reading… keep the card on the phone", true, true)
+        default: return nil
+        }
+    }
+
     @ViewBuilder private var screen: some View {
+        if let t = tap {
+            TapScreen(title: t.title, status: t.status, cancellable: t.cancellable, working: t.working)
+        } else {
+            other
+        }
+    }
+
+    @ViewBuilder private var other: some View {
         switch pos.state {
         case .entering: AmountScreen(openSettings: { showSettings = true })
         case .enteringPin(let price, _, let wrong, let left, _): PinScreen(priceMsat: price, wrongPin: wrong, triesLeft: left)
-        case .waitingForCard(let price, _, _): TapScreen(title: "\(formatSats(price)) sats", status: "Hold the card to the top of the phone", cancellable: true)
-        case .signing(let price, _, _, _):
-            TapScreen(title: "\(formatSats(price)) sats", status: pos.elapsed == 0 ? "Card present" : "Signing… \(pos.elapsed)s", cancellable: false)
-        case .balanceWaiting: TapScreen(title: "Card balance", status: "Hold the card to the phone", cancellable: true)
-        case .balanceReading: TapScreen(title: "Card balance", status: "Reading card…", cancellable: true)
+        case .waitingForCard, .signing, .balanceWaiting, .balanceReading: EmptyView()
         case .receipt(let r): ReceiptScreen(receipt: r)
         case .error(let e): ErrorScreen(info: e)
         case .sales: SalesScreen()

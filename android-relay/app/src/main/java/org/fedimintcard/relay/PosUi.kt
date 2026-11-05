@@ -1,6 +1,5 @@
 package org.fedimintcard.relay
 
-import android.animation.ObjectAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.drawable.GradientDrawable
@@ -8,8 +7,8 @@ import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.LinearInterpolator
-import android.animation.PropertyValuesHolder
+import android.view.animation.OvershootInterpolator
+import android.view.animation.PathInterpolator
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -44,7 +43,10 @@ class PosUi(
     private val tapAmount: TextView = v(R.id.tap_amount)
     private val tapStatus: TextView = v(R.id.tap_status)
     private val cancel: Button = v(R.id.btn_cancel)
-    private val pulse: View = v(R.id.pulse)
+    private val motion: TapMotionView = v(R.id.tap_motion)
+    private val tapCard: View = v(R.id.tap_card)
+    private val receiptCheck: View = v(R.id.receipt_check)
+    private val receiptAmount: View = v(R.id.receipt_amount)
     private val errTitle: TextView = v(R.id.error_title)
     private val errDetail: TextView = v(R.id.error_detail)
     private val retry: Button = v(R.id.btn_retry)
@@ -64,10 +66,8 @@ class PosUi(
     private var last: PosState = PosState.Entering
     private var lastPad = ""
     private var elapsedS = 0
-    private val pulser = ObjectAnimator.ofPropertyValuesHolder(
-        pulse, PropertyValuesHolder.ofFloat("scaleX", 0.7f, 1.1f), PropertyValuesHolder.ofFloat("scaleY", 0.7f, 1.1f),
-        PropertyValuesHolder.ofFloat("alpha", 1f, 0.35f),
-    ).apply { duration = 900; repeatCount = ObjectAnimator.INFINITE; repeatMode = ObjectAnimator.REVERSE; interpolator = LinearInterpolator() }
+    private var shownTarget = 0
+    private val decelerate = PathInterpolator(0.2f, 0f, 0f, 1f)
 
     init {
         salesList.adapter = salesAdapter
@@ -182,11 +182,12 @@ class PosUi(
     private fun renderTapStatus() {
         tapStatus.text = when (val s = last) {
             is PosState.WaitingForCard -> if (s.mustRemoveFirst) "Remove the card, then hold it again" else "Hold card to phone"
-            is PosState.Signing -> if (elapsedS == 0) "Card present" else "Signing… ${elapsedS}s"
+            is PosState.Signing -> "Paying… keep the card on the phone"
             PosState.BalanceWaiting -> act.getString(R.string.hold_card)
             is PosState.BalanceReading -> act.getString(R.string.reading_card)
             else -> ""
         }
+        settle(last is PosState.Signing || last is PosState.BalanceReading)
         val l = last
         cancel.visibility = if (l is PosState.WaitingForCard || l is PosState.BalanceWaiting || l is PosState.BalanceReading) View.VISIBLE else View.INVISIBLE
     }
@@ -194,6 +195,37 @@ class PosUi(
     /** Seconds left before the shown balance gives way to the amount. */
     fun setBalanceCountdown(seconds: Int) {
         cardBalanceCountdown.text = "Back to the amount in $seconds s"
+    }
+
+    private var working = false
+
+    /**
+     * The card on the phone: the drawing turns from rings to a running arc, and the card picture
+     * straightens and lifts a little, as if it had landed. Back to waiting, it tilts again.
+     */
+    private fun settle(on: Boolean) {
+        if (on == working) return
+        working = on
+        motion.setMode(if (on) TapMotionView.Mode.Working else TapMotionView.Mode.Waiting)
+        tapCard.animate().cancel()
+        tapCard.animate()
+            .rotation(if (on) 0f else -6f)
+            .scaleX(if (on) 1.04f else 1f).scaleY(if (on) 1.04f else 1f)
+            .translationY(if (on) -6f * act.resources.displayMetrics.density else 0f)
+            .setDuration(if (on) 380 else 300).setInterpolator(decelerate).start()
+    }
+
+    /** The receipt's tick lands with a small overshoot, then the amount rises in under it. */
+    private fun celebrate() {
+        val d = act.resources.displayMetrics.density
+        receiptCheck.apply {
+            animate().cancel(); scaleX = 0.4f; scaleY = 0.4f; alpha = 0f
+            animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(460).setInterpolator(OvershootInterpolator(1.8f)).start()
+        }
+        receiptAmount.apply {
+            animate().cancel(); alpha = 0f; translationY = 12 * d
+            animate().alpha(1f).translationY(0f).setStartDelay(140).setDuration(320).setInterpolator(decelerate).start()
+        }
     }
 
     private fun renderReceipt(r: ChargeReceipt) {
@@ -241,7 +273,7 @@ class PosUi(
     }
 
     fun closeRelay(): Boolean { if (!relayOpen) return false; relayOpen = false; show(); return true }
-    fun destroy() { pulser.cancel() }
+    fun destroy() { motion.stop() }
 
     fun showRelay() { relayOpen = true; show() }
 
@@ -260,7 +292,9 @@ class PosUi(
             }
         }
         screens.forEach { v<View>(it).visibility = if (it == target) View.VISIBLE else View.GONE }
-        if (target == R.id.screen_tap) { if (!pulser.isStarted) pulser.start() } else pulser.cancel()
+        if (target == R.id.screen_tap) motion.start() else motion.stop()
+        if (target == R.id.screen_receipt && shownTarget != R.id.screen_receipt) celebrate()
+        shownTarget = target
     }
 
     /**

@@ -108,11 +108,11 @@
             android:contentDescription="@null" android:rotation="-6" android:elevation="12dp"
             android:background="@drawable/bg_card" android:clipToOutline="true" />
         <FrameLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1">
-            <View android:id="@+id/pulse" android:layout_width="160dp" android:layout_height="160dp"
-                android:layout_gravity="center" android:background="@drawable/bg_pulse" />
+            <org.fedimintcard.relay.TapMotionView android:id="@+id/tap_motion" android:layout_width="220dp"
+                android:layout_height="220dp" android:layout_gravity="center" android:importantForAccessibility="no" />
         </FrameLayout>
         <TextView android:id="@+id/tap_status" style="@style/Heading" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:textSize="24sp" />
+            android:layout_height="wrap_content" android:textSize="24sp" android:accessibilityLiveRegion="polite" />
         <Button android:id="@+id/btn_cancel" style="@style/GhostButton" android:layout_width="wrap_content"
             android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="@string/cancel" />
     </LinearLayout>

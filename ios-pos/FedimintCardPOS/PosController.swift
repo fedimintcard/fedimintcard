@@ -157,7 +157,7 @@ final class PosController: ObservableObject {
         sessionGen += 1
         let gen = sessionGen
         reader.onCard = { [weak self] channel in
-            Task { @MainActor in await self?.cardConnected(channel, gen: gen, url: url, token: p.token) }
+            Task { @MainActor in await self?.cardConnected(channel, gen: gen, url: url, token: p.token, purpose: purpose) }
         }
         reader.onEnd = { [weak self] hadCard in
             Task { @MainActor in self?.sessionEnded(gen: gen, hadCard: hadCard) }
@@ -169,9 +169,10 @@ final class PosController: ObservableObject {
         switch flow.state { case .waitingForCard, .balanceWaiting: return true; default: return false }
     }
 
-    private func cardConnected(_ channel: CardChannel, gen: Int, url: URL, token: String?) async {
+    private func cardConnected(_ channel: CardChannel, gen: Int, url: URL, token: String?, purpose: CardPurpose) async {
         guard gen == sessionGen else { return }
-        reader.update(alert: "Keep holding the card…")
+        // The system's NFC sheet covers the lower half of the screen, so it carries the status too.
+        reader.update(alert: purpose == .charge ? "Paying… keep the card on the phone" : "Reading… keep the card on the phone")
         let l: CardLink
         do {
             l = try await CardLink.open(URLSessionLinkSocket(url: url, token: token))
