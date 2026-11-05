@@ -7,13 +7,18 @@
  * chip, so any operator can install it again in a new batch (the install tap
  * gets the same per-card keys back from ops).
  *
- * Two taps. The first reads slot 0's key (the short id) and the PIN's state
- * without spending a try, and the phone asks ops whether the card may go: not
- * while ops shows a live or pending note, an open charge or an open load, and
- * never another operator's card. The second, after the holder typed the PIN:
+ * Two taps. The first reads slot 0's key (the short id), the PIN's state
+ * without spending a try, and the chip's CPLC id, and the phone asks ops
+ * whether the card may go, naming both: not while ops shows a live or pending
+ * note, an open charge or an open load, and never another operator's card.
+ * The chip is always sent, not only when the short id is unknown: it costs
+ * no extra round trip, and it is what tells ops a card that never reached a
+ * holder (below) from one that did, even when ops has a stopped row under
+ * the short id. The second, after the holder typed the PIN:
  *
  *   slot 0 again (the same card) → ops' check again → VERIFY_PIN in the same
- *   selection → CPLC → the card's keys from ops → cardkit's `factoryReset`:
+ *   selection → CPLC (the chip the first tap read) → the card's keys from
+ *   ops → cardkit's `factoryReset`:
  *   one INITIALIZE UPDATE checked against the card's own set and the factory
  *   set → login with the one it proved → GET STATUS → journal → DELETE ours
  *   → PUT KEY back to the factory set → a fresh factory login and GET STATUS
@@ -23,6 +28,16 @@
  * wrong PIN stops with the tries left and is never retried here. A blocked
  * card (or one whose PIN was never set) can be reset only when ops shows it
  * empty and the operator has confirmed a second warning.
+ *
+ * **No holder, no PIN.** An install that stopped after SET_PIN, with the
+ * phone no longer holding the PIN it sent (`needsReset`), leaves a card with
+ * a PIN nobody knows, under a short id ops may not have. Ops finds it by its
+ * chip and answers `needs_holder_pin: false` only when the chip's escrow is
+ * this operator's, no open row on the chip is a finished card, and ops holds
+ * nothing on any of them: the card never reached a holder, so there is no
+ * consent to ask for. The tap then skips VERIFY_PIN and the PIN's state
+ * altogether; DELETE and PUT KEY need the card manager's keys, not the
+ * applet's PIN.
  *
  * **Crash safety.** The journal is written just before the first DELETE or
  * PUT KEY, so a tap lifted after it is finished by tapping the same card
@@ -46,6 +61,7 @@ import {
   type Random,
   type RunEvent,
   type Transceiver,
+  readChipIdentity,
 } from './cardkit';
 import {
   exchange,
@@ -96,6 +112,8 @@ export interface ResetJournal {
   readonly old_short_id: string;
   readonly chip: string;
   readonly started_at: number;
+  /** Ops has a row under the old short id; absent (older journals) reads true. */
+  readonly known?: boolean;
 }
 
 /** A proved completion waiting for ops, and whose it is. */
@@ -121,7 +139,8 @@ export async function readJournal(
       Number.isSafeInteger(j.operator_id) &&
       SHORT_ID.test(j.old_short_id) &&
       CHIP.test(j.chip) &&
-      Number.isSafeInteger(j.started_at);
+      Number.isSafeInteger(j.started_at) &&
+      (j.known === undefined || typeof j.known === 'boolean');
     return ok ? j : null;
   } catch {
     return null;
@@ -139,6 +158,7 @@ async function writeJournal(
     old_short_id: j.old_short_id,
     chip: j.chip,
     started_at: j.started_at,
+    known: j.known !== false,
   };
   await storage.setItem(RESET_JOURNAL_KEY, JSON.stringify(out));
 }
@@ -267,7 +287,13 @@ export async function flushOutbox(
 /* ------------------------------------------------------------------------- */
 
 export type Identified =
-  | {readonly ok: true; readonly shortId: string; readonly pin: PinStatus}
+  | {
+      readonly ok: true;
+      readonly shortId: string;
+      readonly pin: PinStatus;
+      /** The chip's CPLC id, which ops finds a card by when it has no row for the short id. */
+      readonly chip: string;
+    }
   | {
       readonly ok: false;
       /** `noApplet`: blank or wiped. `unkeyed`: installed, never keyed. */
@@ -275,7 +301,10 @@ export type Identified =
       readonly sw?: number | null;
     };
 
-/** Slot 0's key and the PIN's state. Writes nothing and spends no PIN try. */
+/**
+ * Slot 0's key, the PIN's state, then the chip's CPLC id (which selects the
+ * card manager, so it comes last). Writes nothing and spends no PIN try.
+ */
 export async function identifyCard(tx: Transceiver): Promise<Identified> {
   const selected = await exchange(tx, selectApdu());
   if (selected.sw !== SW_OK) {
@@ -300,7 +329,16 @@ export async function identifyCard(tx: Transceiver): Promise<Identified> {
   if (pin === null) {
     return {ok: false, why: 'refused', sw: status.sw};
   }
-  return {ok: true, shortId: shortIdOf(slot0.body), pin};
+  let chip: string;
+  try {
+    chip = (await readChipIdentity(tx)).id;
+  } catch (e) {
+    if (e instanceof CardError) {
+      return {ok: false, why: 'refused', sw: e.sw};
+    }
+    throw e;
+  }
+  return {ok: true, shortId: shortIdOf(slot0.body), pin, chip};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -355,6 +393,12 @@ export interface ResetTapOptions {
   readonly operatorId: number;
   /** The short id the first tap read; null when finishing a journalled reset. */
   readonly expected: string | null;
+  /**
+   * The chip the first tap read, sent with ops' check and matched against
+   * the CPLC before anything is written; null or absent when finishing a
+   * journalled reset (the journal names the chip) or from an older caller.
+   */
+  readonly expectedChip?: string | null;
   /** The holder's PIN, typed for this tap only; null on the blocked path. */
   readonly holderPin: string | null;
   /** The operator confirmed the second warning for a blocked (or unset) PIN. */
@@ -466,6 +510,9 @@ export async function resetTap(
   if (oldId === null) {
     throw new Error('resetTap: no card to reset was read');
   }
+  const expectedChip = saved ? saved.chip : options.expectedChip ?? null;
+  /** Whether ops has a row under the old id: only then is it named with the keys. */
+  let known = saved?.known !== false;
 
   if (!resuming) {
     if (card.kind !== 'keyed') {
@@ -486,7 +533,10 @@ export async function resetTap(
     options.onPhase?.('check');
     let check: ResetCheck;
     try {
-      check = await options.ops.resetCheck(oldId);
+      check =
+        expectedChip === null
+          ? await options.ops.resetCheck(oldId)
+          : await options.ops.resetCheck(oldId, expectedChip);
     } catch (e) {
       return stop({
         kind: 'notResettable',
@@ -501,19 +551,46 @@ export async function resetTap(
           : ['ops will not reset this card'],
       });
     }
-    options.onPhase?.('consent');
-    // The applet is still selected from `readCard`: the PIN is proved for the card just read.
-    const refused = await consent(tx, options);
-    if (refused) {
-      return stop(refused);
+    known = check.known;
+    // A card that never reached a holder has no PIN to consent with (ops
+    // says so only for the chip this tap must then prove, below).
+    if (check.needs_holder_pin || expectedChip === null) {
+      options.onPhase?.('consent');
+      // The applet is still selected from `readCard`: the PIN is proved for the card just read.
+      const refused = await consent(tx, options);
+      if (refused) {
+        return stop(refused);
+      }
     }
   }
 
   options.onPhase?.('chip');
-  const fetched = await chipAndKeys(tx, chip =>
-    options.ops.managerKeys(chip, oldId),
-  );
+  // Ops links the chip to a short id only when it has the card's row.
+  const fetched = await chipAndKeys(tx, async chip => {
+    if (expectedChip !== null && chip !== expectedChip) {
+      throw new Error('this is not the chip the card was read on');
+    }
+    return known
+      ? options.ops.managerKeys(chip, oldId)
+      : options.ops.managerKeys(chip);
+  });
   if (!fetched.ok) {
+    if (
+      expectedChip !== null &&
+      fetched.chip !== undefined &&
+      fetched.chip !== expectedChip
+    ) {
+      // Refused before ops was asked for anything.
+      return stop(
+        {
+          kind: 'differentCard',
+          reason: saved
+            ? 'this is not the chip the unfinished reset was on'
+            : 'this is not the chip the card was read on',
+        },
+        saved !== null,
+      );
+    }
     const s = fetched.stop;
     return s.ok
       ? stop({kind: 'refused'}, resuming)
@@ -551,6 +628,7 @@ export async function resetTap(
             old_short_id: oldId,
             chip: fetched.chip,
             started_at: options.now(),
+            known,
           });
         } catch (e) {
           throw new JournalFailed(e instanceof Error ? e.message : String(e));

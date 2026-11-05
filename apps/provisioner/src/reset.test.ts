@@ -63,6 +63,8 @@ function check(shortId: string, over: Partial<ResetCheck> = {}): ResetCheck {
   return {
     short_id: shortId,
     chip: J3R180_CHIP,
+    known: true,
+    needs_holder_pin: true,
     empty: true,
     resettable: true,
     reasons: [],
@@ -136,6 +138,7 @@ describe('identify', () => {
       ok: true,
       shortId: shortIdOf(card.applet!.slots[0]!),
       pin: 'set',
+      chip: J3R180_CHIP,
     });
     expect(card.applet!.tries).toBe(3);
     card.applet!.blocked = true;
@@ -542,5 +545,96 @@ describe('reset', () => {
     ]);
     expect(sent.left).toEqual([]);
     expect(journal.map.size).toBe(0);
+  });
+});
+
+describe('a card that never reached a holder (needsReset): ops finds it by its chip', () => {
+  /** The install's stop: our applet, keyed, a PIN set that nobody holds, on its own keys. */
+  const unfinished = () =>
+    new FakeGpCard({keys: ownKeys()}).withCashu().withFinishedApplet('9753');
+  const pinFree = {known: false, needs_holder_pin: false};
+
+  it('resets to factory without asking for a PIN; ops is asked by chip and keys are asked without the unknown short id', async () => {
+    const card = unfinished();
+    const {oldId, journal, ops, options} = setup(
+      card,
+      {holderPin: null, expectedChip: J3R180_CHIP},
+      pinFree,
+    );
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual(
+      expect.objectContaining({
+        ok: true,
+        completion: expect.objectContaining({short_id: oldId, chip: J3R180_CHIP}),
+      }),
+    );
+    expectFactory(card);
+    expect(card.ins()).not.toContain(VERIFY);
+    expect(card.applet).toBeFalsy();
+    expect(ops.resetCheck).toHaveBeenCalledWith(oldId, J3R180_CHIP);
+    expect(ops.managerKeys).toHaveBeenCalledWith(J3R180_CHIP);
+    expect(await readOutbox(journal)).toEqual([
+      expect.objectContaining({short_id: oldId, chip: J3R180_CHIP, operator_id: 1}),
+    ]);
+  });
+
+  it('a card on another chip than the one read is refused before ops is asked for keys', async () => {
+    const card = unfinished();
+    const {ops, journal, options} = setup(
+      card,
+      {holderPin: null, expectedChip: 'cplc-v1:' + '1'.repeat(24)},
+      pinFree,
+    );
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual(
+      expect.objectContaining({
+        ok: false,
+        resumable: false,
+        stop: expect.objectContaining({kind: 'differentCard'}),
+      }),
+    );
+    expect(ops.managerKeys).not.toHaveBeenCalled();
+    expect(card.packages.has(PKG)).toBe(true);
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
+  });
+
+  it('when ops still wants the holder’s PIN, the chip changes nothing: no PIN, no reset', async () => {
+    const card = unfinished();
+    const {ops, options} = setup(card, {
+      holderPin: null,
+      expectedChip: J3R180_CHIP,
+    });
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual(
+      expect.objectContaining({ok: false, stop: {kind: 'pinRequired'}}),
+    );
+    expect(ops.managerKeys).not.toHaveBeenCalled();
+    expect(card.packages.has(PKG)).toBe(true);
+  });
+
+  it('lifted mid-reset: the journal remembers ops has no row, and the next tap finishes it the same way', async () => {
+    const card = unfinished();
+    const {oldId, journal, ops, options} = setup(
+      card,
+      {holderPin: null, expectedChip: J3R180_CHIP},
+      pinFree,
+    );
+    card.pull(a => a[1] === DELETE && a[6] === 7, 'before'); // the package's DELETE
+    expect(await resetTap(card.transceive, options)).toEqual(
+      expect.objectContaining({ok: false, resumable: true}),
+    );
+    expect(await readJournal(journal)).toEqual(
+      expect.objectContaining({old_short_id: oldId, chip: J3R180_CHIP, known: false}),
+    );
+    card.reset();
+    const r = await resetTap(card.transceive, resume(options));
+    expect(r.ok).toBe(true);
+    expectFactory(card);
+    expect(card.ins()).not.toContain(VERIFY);
+    expect(ops.managerKeys.mock.calls.every(c => c.length === 1)).toBe(true);
+    expect(journal.map.has(RESET_JOURNAL_KEY)).toBe(false);
+    expect(await readOutbox(journal)).toEqual([
+      expect.objectContaining({short_id: oldId, chip: J3R180_CHIP}),
+    ]);
   });
 });

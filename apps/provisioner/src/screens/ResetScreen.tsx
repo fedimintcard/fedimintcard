@@ -1,8 +1,11 @@
 /**
  * Settings → Reset a card (OPS-PLAN O5). Two taps: the first reads which card
- * it is and asks ops whether it may go; the second, once the holder has typed
- * their PIN (or the operator has confirmed the blocked-PIN warning), takes the
- * card back to factory: applet deleted, factory keys, both proved. The card
+ * it is (short id and chip) and asks ops whether it may go; the second, once
+ * the holder has typed their PIN (or the operator has confirmed the
+ * blocked-PIN warning), takes the card back to factory: applet deleted,
+ * factory keys, both proved. A card ops says never reached a holder (an
+ * install stopped after its PIN was set) needs neither: there is no holder
+ * PIN to ask for. The card
  * logic is `reset.ts`; this screen holds the holder's PIN for that one tap and
  * keeps nothing.
  *
@@ -51,7 +54,13 @@ const journal: JournalStorage = AsyncStorage;
 
 type Step =
   | {kind: 'start'}
-  | {kind: 'review'; shortId: string; pin: PinStatus; check: ResetCheck}
+  | {
+      kind: 'review';
+      shortId: string;
+      chip: string;
+      pin: PinStatus;
+      check: ResetCheck;
+    }
   | {kind: 'done'; oldId: string; recorded: boolean; stranded: number};
 
 /** One line for a stop, and whether the card may now be wiped. */
@@ -155,10 +164,16 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         setProblem(RESET.identify[id.why]);
         return;
       }
-      const check = await ops.resetCheck(id.shortId);
+      const check = await ops.resetCheck(id.shortId, id.chip);
       setBlockedConfirmed(false);
       holderPin.clear();
-      setStep({kind: 'review', shortId: id.shortId, pin: id.pin, check});
+      setStep({
+        kind: 'review',
+        shortId: id.shortId,
+        chip: id.chip,
+        pin: id.pin,
+        check,
+      });
     } catch (e) {
       // api.ts's refusal, told apart by name: this screen imports no network module.
       const status = (e as {status?: unknown} | null)?.status;
@@ -197,8 +212,13 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         resetTap(tx, {
           operatorId,
           expected,
+          expectedChip:
+            expected !== null && step.kind === 'review' ? step.chip : null,
           holderPin:
-            expected !== null && step.kind === 'review' && step.pin === 'set'
+            expected !== null &&
+            step.kind === 'review' &&
+            step.check.needs_holder_pin &&
+            step.pin === 'set'
               ? holderPin.value
               : null,
           blockedConfirmed,
@@ -247,7 +267,8 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
   const canReset =
     review !== null &&
     review.check.resettable &&
-    (review.pin === 'set' ? holderPin.valid : blockedConfirmed);
+    (!review.check.needs_holder_pin ||
+      (review.pin === 'set' ? holderPin.valid : blockedConfirmed));
 
   return (
     <Screen
@@ -379,6 +400,20 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
                 ))}
                 <Text style={[local.body, {color: t.dim}]}>
                   {RESET.refusedBody}
+                </Text>
+              </View>
+            ) : !review.check.needs_holder_pin ? (
+              <View
+                style={[
+                  local.panel,
+                  {backgroundColor: t.card, borderColor: t.accent},
+                ]}
+                testID="reset-no-pin">
+                <Text style={[local.eyebrow, {color: t.accent}]}>
+                  {RESET.noHolderPinTitle}
+                </Text>
+                <Text style={[local.body, {color: t.ink}]}>
+                  {RESET.noHolderPinBody}
                 </Text>
               </View>
             ) : review.pin === 'set' ? (

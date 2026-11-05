@@ -1273,6 +1273,129 @@ describe('O5: reset in the provisioner', () => {
   });
 });
 
+describe('O5: reset by chip, a card that never reached a holder', () => {
+  const CHIP = 'cplc-v1:4790d3213041093363205547';
+  const OLD = '0a0b0c0d';
+  const NEW = '1e1f2021';
+  const other = async () => {
+    await hook('/test/operator', {name: 'other', password: 'another long password'});
+    return signIn('other', 'another long password');
+  };
+  type Check = {known: boolean; needs_holder_pin: boolean; resettable: boolean; reasons: string[]; chip: string | null; live_notes: number};
+  const check = async (token: string, shortId = NEW, chip: string | null = CHIP) => {
+    const res = await get(`/registry/cards/${shortId}/reset-check${chip === null ? '' : `?chip=${chip}`}`, token);
+    return {status: res.status, body: res.status === 200 ? ((await res.json()) as Check) : null};
+  };
+  const done = (over: Partial<Record<string, unknown>> = {}) => ({
+    short_id: NEW,
+    chip: CHIP,
+    gp_key_version: 1,
+    manager_keys: 'factory',
+    package: 'absent',
+    verified_at: 1_770_000_000_000,
+    ...over,
+  });
+  /** The stopped install's row: the card posted with its PIN not set. */
+  async function stoppedRow(token: string, shortId = OLD) {
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId, chip: CHIP, pin_set: false}))).status).toBe(200);
+  }
+  const escrow = async (token: string) => expect((await post('/registry/manager-keys', token, {chip: CHIP})).status).toBe(200);
+
+  it('needsReset: PIN set, short id unknown to ops, chip escrowed by the caller, nothing held: reset by chip without the PIN', async () => {
+    const token = await signIn();
+    await stoppedRow(token); // linked to the chip by the post
+    await escrow(token);
+    const c = await check(token);
+    expect(c.status).toBe(200);
+    expect(c.body).toEqual(
+      expect.objectContaining({known: false, needs_holder_pin: false, resettable: true, reasons: [], chip: CHIP, live_notes: 0}),
+    );
+    // Without the chip the short id is unknown, as before.
+    expect((await check(token, NEW, null)).status).toBe(404);
+
+    const res = await post(`/registry/cards/${NEW}/reset`, token, done());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {reset: Record<string, unknown>; released: boolean};
+    expect(body.reset).toEqual(expect.objectContaining({short_id: NEW, chip: CHIP, operator_id: 1}));
+    expect(body.released).toBe(true);
+    await runInDurableObject(stub(), async (_i, state) => {
+      const sql = state.storage.sql;
+      expect(sql.exec('SELECT COUNT(*) AS n FROM manager_keys').one()).toEqual({n: 0});
+      expect(sql.exec('SELECT short_id, chip FROM card_resets').toArray()).toEqual([{short_id: NEW, chip: CHIP}]);
+      // The stopped row on the chip is closed too; no row is made for the unknown id.
+      expect((sql.exec('SELECT reset_at FROM cards WHERE short_id = ?', OLD).one() as {reset_at: unknown}).reset_at).not.toBeNull();
+      expect(sql.exec('SELECT COUNT(*) AS n FROM cards').one()).toEqual({n: 1});
+    });
+    expect((await get(`/cards/${OLD}/slots`, null)).status).toBe(410);
+
+    // Idempotent: the repeat answers the stored record and releases nothing.
+    const replay = await post(`/registry/cards/${NEW}/reset`, token, done({verified_at: 1_770_000_000_900}));
+    expect(replay.status).toBe(200);
+    const again = (await replay.json()) as {reset: Record<string, unknown>; released: boolean};
+    expect(again.reset).toEqual(body.reset);
+    expect(again.released).toBe(false);
+    // The chip is anyone's again; a late repeat leaves the new owner's escrow alone.
+    const them = await other();
+    await escrow(them);
+    expect((await post(`/registry/cards/${NEW}/reset`, token, done())).status).toBe(200);
+    expect((await post(`/registry/cards/${NEW}/reset`, them, done())).status).toBe(404);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(state.storage.sql.exec('SELECT operator_id FROM manager_keys WHERE chip = ?', CHIP).one()).not.toEqual({operator_id: 1});
+    });
+  });
+
+  it('a stopped row the card still answers, or no row at all, needs no PIN either', async () => {
+    const token = await signIn();
+    await escrow(token);
+    expect((await check(token)).body).toEqual(expect.objectContaining({known: false, needs_holder_pin: false, resettable: true}));
+    await stoppedRow(token);
+    expect((await check(token, OLD)).body).toEqual(expect.objectContaining({known: true, needs_holder_pin: false, resettable: true}));
+    expect((await post(`/registry/cards/${OLD}/reset`, token, done({short_id: OLD}))).status).toBe(200);
+  });
+
+  it('another operator’s chip answers as if unknown', async () => {
+    const token = await signIn();
+    const them = await other();
+    await stoppedRow(them);
+    await escrow(them);
+    expect((await check(token)).status).toBe(404);
+    expect((await check(token, OLD)).status).toBe(404);
+    expect((await post(`/registry/cards/${NEW}/reset`, token, done())).status).toBe(404);
+    // A chip nobody escrowed is unknown too.
+    expect((await check(token, NEW, 'cplc-v1:' + '1'.repeat(24))).status).toBe(404);
+    expect((await get(`/registry/cards/${NEW}/reset-check?chip=nope`, token)).status).toBe(400);
+    await runInDurableObject(stub(), async (_i, state) => {
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM manager_keys').one()).toEqual({n: 1});
+      expect(state.storage.sql.exec('SELECT COUNT(*) AS n FROM card_resets').one()).toEqual({n: 0});
+    });
+  });
+
+  it('a chip with a finished open card still needs the holder’s PIN, and is not closed by another id', async () => {
+    const token = await signIn();
+    const batchId = await newBatch(token);
+    expect((await post('/registry/cards', token, card({short_id: OLD, batch_id: batchId, chip: CHIP}))).status).toBe(200);
+    await escrow(token);
+    expect((await check(token, OLD)).body).toEqual(expect.objectContaining({known: true, needs_holder_pin: true, resettable: true}));
+    const stray = await check(token);
+    expect(stray.body).toEqual(expect.objectContaining({known: false, needs_holder_pin: true, resettable: false}));
+    expect(stray.body!.reasons).toEqual([`ops records card ${OLD} on this chip`]);
+    expect((await post(`/registry/cards/${NEW}/reset`, token, done())).status).toBe(409);
+    expect((await check(token, OLD)).body!.resettable).toBe(true);
+  });
+
+  it('a chip with value on an open row is refused', async () => {
+    const token = await signIn();
+    await stoppedRow(token);
+    await escrow(token);
+    await hook('/test/note', {short_id: OLD, nonce: nonce(7), slot: 0, amount_msat: 2_000, signature: 'c'.repeat(96)});
+    const c = await check(token);
+    expect(c.body).toEqual(expect.objectContaining({needs_holder_pin: true, resettable: false, live_notes: 1}));
+    expect(c.body!.reasons).toEqual([`card ${OLD}: 1 live note, 2000 msat`]);
+    expect((await check(token, OLD)).body).toEqual(expect.objectContaining({needs_holder_pin: true, resettable: false}));
+  });
+});
+
 describe('O5: finishing a card lifted after its rotation', () => {
   const CHIP = 'cplc-v1:4790d3213041093363205547';
   const OLD = '0a0b0c0d';

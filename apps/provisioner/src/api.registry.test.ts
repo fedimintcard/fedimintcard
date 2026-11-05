@@ -112,6 +112,10 @@ test('O5: manager keys are checked before they reach a card; a reset completion 
       return post({ok: true, short_id: '0a0b0c0d', chip, empty: false, resettable: false, reasons: ['1 live note, 1000 msat'],
         live_notes: 1, live_msat: 1000, pending_notes: 0, pending_msat: 0, open_charges: 0, open_loads: 0});
     }
+    if (path === `/registry/cards/1e1f2021/reset-check?chip=${encodeURIComponent(chip)}`) {
+      return post({ok: true, short_id: '1e1f2021', chip, known: false, needs_holder_pin: false, empty: true, resettable: true, reasons: [],
+        live_notes: 0, live_msat: 0, pending_notes: 0, pending_msat: 0, open_charges: 0, open_loads: 0});
+    }
     if (path === '/registry/cards/0a0b0c0d/reset') return post({ok: true, released: true, stranded: {live_notes: 1, pending_notes: 0}});
     if (path === '/registry/batches') return post({batch: {batch_id: 9}});
     if (path === '/registry/cards') return post({stored: {}});
@@ -128,6 +132,12 @@ test('O5: manager keys are checked before they reach a card; a reset completion 
 
   const check = await api.resetCheck('0a0b0c0d');
   expect(check).toEqual(expect.objectContaining({resettable: false, live_notes: 1, reasons: ['1 live note, 1000 msat']}));
+  // A reply without the field (an older registry) never skips the holder's PIN.
+  expect(check).toEqual(expect.objectContaining({known: true, needs_holder_pin: true}));
+  // By chip: a card ops has no row for, which never reached a holder.
+  expect(await api.resetCheck('1e1f2021', chip)).toEqual(
+    expect.objectContaining({known: false, needs_holder_pin: false, resettable: true, chip}),
+  );
 
   const completion = {short_id: '0a0b0c0d', chip, gp_key_version: 1, manager_keys: 'factory', package: 'absent', verified_at: 5} as const;
   const recorded = await api.completeReset(completion);

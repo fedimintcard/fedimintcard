@@ -144,7 +144,7 @@ export const STATE = {
   differentCard: 'Set this card aside; it was not issued to.',
   pinNotSet: 'Do not hand this card out. Settings → Reset a card takes it back to blank; then install it again.',
   noManagerKeys: 'The card is unchanged. Check the connection, or whose card it is, and tap it again.',
-  needsReset: 'Do not hand this card out. Settings → Reset a card takes it back to blank; then install it again.',
+  needsReset: 'Do not hand this card out. Settings → Reset a card takes it back to blank, and asks for no PIN: this card was never finished. Then install it again.',
   outboxPending: 'The card work is done; only the registry row waits.',
 } as const;
 
@@ -231,6 +231,9 @@ export const RESET = {
     'The holder cannot agree with their PIN. Ops shows the card empty, but a load made around ops would be lost with the card\'s keys. Reset only if you are sure the card holds nothing.',
   blockedConfirm: 'I am sure: reset without the PIN',
   blockedConfirmed: 'Confirmed. Hold the card to the phone to reset it.',
+  noHolderPinTitle: 'No PIN needed',
+  noHolderPinBody:
+    'This card was never finished, so it has no holder PIN to ask for. Ops shows nothing on it and its chip is yours. Hold the card to the phone to reset it.',
   reset: 'Reset this card',
   resetting: 'Keep the card still…',
   stop: 'Stop',

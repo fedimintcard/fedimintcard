@@ -505,16 +505,24 @@ export class RegistryClient extends HttpTransport {
     };
   }
 
-  /** GET /registry/cards/:id/reset-check — what ops holds for the card. */
-  async resetCheck(token: string, shortId: string): Promise<ResetCheck> {
+  /**
+   * GET /registry/cards/:id/reset-check?chip= — what ops holds for the card.
+   * The chip lets ops find a card it knows only by its chip (a `needsReset`
+   * install), and say whether the holder's PIN is needed at all.
+   */
+  async resetCheck(token: string, shortId: string, chip?: string): Promise<ResetCheck> {
+    const query = chip === undefined ? '' : `?chip=${encodeURIComponent(chip)}`;
     const json = await this.get(
-      `/registry/cards/${encodeURIComponent(shortId)}/reset-check`,
+      `/registry/cards/${encodeURIComponent(shortId)}/reset-check${query}`,
       {token, operation: 'reset-check'},
     );
     const count = (v: unknown) => (Number.isSafeInteger(v) ? (v as number) : NaN);
     const check: ResetCheck = {
       short_id: String(json.short_id),
       chip: typeof json.chip === 'string' ? json.chip : null,
+      known: json.known !== false,
+      // Only an explicit false skips the PIN: an older registry's reply asks for it.
+      needs_holder_pin: json.needs_holder_pin !== false,
       empty: json.empty === true,
       resettable: json.resettable === true,
       reasons: Array.isArray(json.reasons)
@@ -529,6 +537,7 @@ export class RegistryClient extends HttpTransport {
     };
     if (
       check.short_id !== shortId ||
+      (chip !== undefined && !check.needs_holder_pin && check.chip !== chip) ||
       [
         check.live_notes,
         check.pending_notes,
@@ -737,8 +746,8 @@ export class RegistryStoreApi implements CardOps {
     return this.client.managerKeys(this.token(), chip, shortId);
   }
 
-  resetCheck(shortId: string): Promise<ResetCheck> {
-    return this.client.resetCheck(this.token(), shortId);
+  resetCheck(shortId: string, chip?: string): Promise<ResetCheck> {
+    return this.client.resetCheck(this.token(), shortId, chip);
   }
 
   resumeCheck(chip: string, shortId: string): Promise<ResumeCheck> {

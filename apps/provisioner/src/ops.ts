@@ -18,10 +18,18 @@ export interface ManagerKeysReply {
   readonly dek: string;
 }
 
-/** `GET /registry/cards/:id/reset-check`: what ops holds for a card, and whether it may be reset. */
+/** `GET /registry/cards/:id/reset-check?chip=`: what ops holds for a card, and whether it may be reset. */
 export interface ResetCheck {
   readonly short_id: string;
   readonly chip: string | null;
+  /** Ops has a row under this short id (false for a card it knows only by its chip). */
+  readonly known: boolean;
+  /**
+   * The holder's PIN (or the blocked-PIN warning) is the consent. False only
+   * for a card that never reached a holder: never finished, the chip's
+   * escrow this operator's, nothing held. A reply without it reads true.
+   */
+  readonly needs_holder_pin: boolean;
   readonly empty: boolean;
   readonly resettable: boolean;
   /** Why not, in ops' words, one line each. */
@@ -80,6 +88,7 @@ export interface ResumeCheck {
 export interface CardOps {
   managerKeys(chip: string, shortId?: string): Promise<ManagerKeysReply>;
   resumeCheck(chip: string, shortId: string): Promise<ResumeCheck>;
-  resetCheck(shortId: string): Promise<ResetCheck>;
+  /** `chip`, the CPLC id the tap read, lets ops find a card it has no row for. */
+  resetCheck(shortId: string, chip?: string): Promise<ResetCheck>;
   completeReset(completion: ResetCompletion): Promise<ResetRecorded>;
 }

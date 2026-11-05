@@ -51,7 +51,8 @@
  *   reads the eight keys back: no key is generated, the short id is the one
  *   the card answers. Without that PIN, or if the card refuses it, the tap
  *   stops `needsReset` (no try spent without it, one at most with it): the
- *   card goes through Settings → Reset a card.
+ *   card goes through Settings → Reset a card, which asks no PIN for a card
+ *   that never reached a holder (ops finds it by its chip, `reset.ts`).
  *
  * A blocked PIN, a card whose answers this build does not know, and every
  * card ops shows anything for are never written to (`guarded`).

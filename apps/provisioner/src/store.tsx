@@ -779,8 +779,8 @@ export function StoreProvider({
         apiRef.current?.managerKeys?.(chip, shortId) ?? missing('the card-manager keys'),
       resumeCheck: (chip, shortId) =>
         apiRef.current?.resumeCheck?.(chip, shortId) ?? missing('the resume check'),
-      resetCheck: shortId =>
-        apiRef.current?.resetCheck?.(shortId) ?? missing('the reset check'),
+      resetCheck: (shortId, chip) =>
+        apiRef.current?.resetCheck?.(shortId, chip) ?? missing('the reset check'),
       completeReset: completion =>
         apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };

@@ -2,8 +2,21 @@
  * Resetting a card in the provisioner (OPS-PLAN O5): the operator's two calls
  * around the tap that takes the card back to its factory state.
  *
- *   GET  /registry/cards/:short_id/reset-check  what ops holds for the card, and whether it may go
+ *   GET  /registry/cards/:short_id/reset-check?chip=  what ops holds for the card, and whether it may go
  *   POST /registry/cards/:short_id/reset        the completion: the card is factory, proved
+ *
+ * **By chip.** The phone sends the chip's CPLC id with the short id it read
+ * (`?chip=` on the check; the completion always named it). A card whose
+ * install stopped after the PIN was set, with the phone no longer holding
+ * that PIN (`needsReset`), answers a short id ops may have no row for, or
+ * only a stopped one (PIN not set). Such a card is found by its chip: it is
+ * this operator's when the chip's `manager_keys` escrow is, and another
+ * operator's chip answers 404 as an unknown short id does. It may be reset
+ * **without the holder's PIN** (`needs_holder_pin: false`) only when all of:
+ * the escrow is the caller's; no open row on the chip (nor the short id's
+ * own) is a finished card with its PIN set; and ops holds nothing for any
+ * open row on the chip. That card never reached a holder, so nobody has a
+ * PIN to consent with. Every other card keeps the rules below.
  *
  * The check refuses while ops shows value or work in flight on the card: a
  * live or pending note, an open charge, an open holder load. Deleting the
@@ -18,7 +31,9 @@
  * manager_keys: 'factory', package: 'absent', verified_at}`. One transaction:
  *
  * - the old row's `reset_at` (its short id answers 410 to holder routes and
- *   till writes after, `index.ts`);
+ *   till writes after, `index.ts`), and the same for every other open row of
+ *   this operator's on the chip whose PIN was never set (a stopped install);
+ *   ops may have no row for the old short id at all;
  * - the chip's escrow row in `manager_keys` is **deleted**: the card carries
  *   the factory keys now, so no card holds these bytes and there is nothing
  *   left to escrow. Whoever installs the chip next (any operator) asks
@@ -37,7 +52,7 @@
  * completion answers the stored one and changes nothing, so an outbox retry
  * can never release an escrow the chip took since (a new install).
  */
-import {storedCard} from './cards';
+import {cardOwner, storedCard} from './cards';
 import {BadRequest, Conflict, isPositiveInt, NotFound} from './http';
 import {isChip} from './managerKeys';
 
@@ -54,8 +69,15 @@ export interface CardHoldings {
 
 export interface ResetCheck extends CardHoldings {
   readonly short_id: string;
-  /** The chip ops recorded for the card; null for a card from before O5. */
+  /** The chip the phone read, else the one ops recorded; null for a card from before O5. */
   readonly chip: string | null;
+  /** Ops has a row under this short id. */
+  readonly known: boolean;
+  /**
+   * The holder's PIN (or the blocked-PIN path) is the consent. False only for
+   * a card that never reached a holder: see "By chip" above.
+   */
+  readonly needs_holder_pin: boolean;
   /** Nothing ops can see on the card: no note live or pending, nothing open. */
   readonly empty: boolean;
   /** Empty, and not already reset. */
@@ -89,30 +111,122 @@ export function holdings(sql: Sql, shortId: string): CardHoldings {
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** The check, for a card the caller has already found to be this operator's. */
-export function resetCheck(sql: Sql, shortId: string): ResetCheck {
+interface ChipRow {
+  readonly short_id: string;
+  readonly pin_set: boolean;
+  readonly operator_id: number | null;
+}
+
+/** The open rows (neither reset nor replaced) ops records on a chip, other than `shortId`. */
+function openOnChip(sql: Sql, chip: string, shortId: string): ChipRow[] {
+  return sql
+    .exec(
+      `SELECT c.short_id, c.pin_set, b.operator_id FROM cards c LEFT JOIN batches b ON b.batch_id = c.batch_id
+       WHERE c.chip = ? AND c.short_id != ? AND c.reset_at IS NULL AND c.replaced_by IS NULL`,
+      chip,
+      shortId,
+    )
+    .toArray()
+    .map(r => ({
+      short_id: String(r.short_id),
+      pin_set: Number(r.pin_set) === 1,
+      operator_id: r.operator_id === null ? null : Number(r.operator_id),
+    }));
+}
+
+/** The operator whose escrow the chip is under, or null. */
+export function escrowOwner(sql: Sql, chip: string): number | null {
+  const row = sql.exec('SELECT operator_id FROM manager_keys WHERE chip = ?', chip).toArray()[0];
+  return row ? Number(row.operator_id) : null;
+}
+
+/** The operator who completed a reset of this short id, or null. */
+export function resetBy(sql: Sql, shortId: string): number | null {
+  const row = sql.exec('SELECT operator_id FROM card_resets WHERE short_id = ?', shortId).toArray()[0];
+  return row ? Number(row.operator_id) : null;
+}
+
+/**
+ * Who a reset route answers for: the short id's owner when ops has its row,
+ * else whoever completed its reset (a repeat), else the chip's escrow owner.
+ */
+export function resetOwner(sql: Sql, shortId: string, chip: string | null): number | null {
+  const owner = cardOwner(sql, shortId) ?? resetBy(sql, shortId);
+  if (owner !== null) {
+    return owner;
+  }
+  return chip === null ? null : escrowOwner(sql, chip);
+}
+
+function sumHoldings(all: readonly CardHoldings[]): CardHoldings {
+  return all.reduce<CardHoldings>(
+    (a, h) => ({
+      live_notes: a.live_notes + h.live_notes,
+      live_msat: a.live_msat + h.live_msat,
+      pending_notes: a.pending_notes + h.pending_notes,
+      pending_msat: a.pending_msat + h.pending_msat,
+      open_charges: a.open_charges + h.open_charges,
+      open_loads: a.open_loads + h.open_loads,
+    }),
+    {live_notes: 0, live_msat: 0, pending_notes: 0, pending_msat: 0, open_charges: 0, open_loads: 0},
+  );
+}
+
+/**
+ * The check, for a card the caller has already found to be this operator's
+ * (`resetOwner`). `chip` is the one the phone read, or null from a phone
+ * that sent none: then only the short id's row is looked at, as before.
+ */
+export function resetCheck(sql: Sql, operatorId: number, shortId: string, chip: string | null = null): ResetCheck {
   const card = storedCard(sql, shortId);
-  if (!card) {
+  if (!card && chip === null) {
     throw new NotFound(`no card ${shortId}`);
   }
-  const held = holdings(sql, shortId);
+  const own = holdings(sql, shortId);
   const reasons: string[] = [];
-  if (card.reset_at !== null) {
+  if (card && card.reset_at !== null) {
     reasons.push('already reset: the card is blank, on its factory keys');
   }
-  if (card.replaced_by !== null) {
+  if (card && card.replaced_by !== null) {
     reasons.push(`closed: the card was finished as ${card.replaced_by}; reset that id instead`);
   }
-  reasons.push(...holdingReasons(held));
+  if (chip !== null && card && card.chip !== null && card.chip !== chip) {
+    reasons.push(`ops recorded card ${shortId} on another chip`);
+  }
+  reasons.push(...holdingReasons(own));
+  let held = own;
+  let pinFree = false;
+  if (chip !== null) {
+    const others = chip === card?.chip || !card || card.chip === null ? openOnChip(sql, chip, shortId) : [];
+    for (const row of others) {
+      if (row.pin_set) {
+        // Ops thinks the chip carries this finished card: resetting would close it.
+        reasons.push(`ops records card ${row.short_id} on this chip`);
+      }
+      const theirs = holdings(sql, row.short_id);
+      reasons.push(...holdingReasons(theirs).map(r => `card ${row.short_id}: ${r}`));
+      held = sumHoldings([held, theirs]);
+    }
+    pinFree =
+      escrowOwner(sql, chip) === operatorId &&
+      (card === null || (card.chip === chip && !card.pin_set)) &&
+      reasons.length === 0 &&
+      isEmpty(held);
+    if (!card && !pinFree && reasons.length === 0) {
+      reasons.push(`ops has no record of card ${shortId}, so it has no holder PIN to check`);
+    }
+  }
   const empty = isEmpty(held);
   return {
     short_id: shortId,
-    chip: card.chip,
+    chip: chip ?? card?.chip ?? null,
+    known: card !== null,
+    needs_holder_pin: !pinFree,
     ...held,
     empty,
-    resettable: empty && card.reset_at === null && card.replaced_by === null,
+    resettable: empty && reasons.length === 0,
     reasons,
-    reset_at: card.reset_at,
+    reset_at: card?.reset_at ?? null,
   };
 }
 
@@ -218,10 +332,7 @@ export function completeReset(
   const done = parseCompletion(shortId, r);
   return storage.transactionSync(() => {
     const old = storedCard(sql, shortId);
-    if (!old) {
-      throw new NotFound(`no card ${shortId}`);
-    }
-    if (old.chip !== null && old.chip !== done.chip) {
+    if (old && old.chip !== null && old.chip !== done.chip) {
       throw new Conflict(`card ${shortId} was installed on another chip`);
     }
     const before = storedCompletion(sql, shortId);
@@ -234,18 +345,33 @@ export function completeReset(
     const escrow = sql
       .exec('SELECT operator_id, short_id FROM manager_keys WHERE chip = ?', done.chip)
       .toArray()[0] as {operator_id: number; short_id: string | null} | undefined;
+    if (!old && (!escrow || Number(escrow.operator_id) !== operatorId)) {
+      // Known by its chip only, and the chip is not this operator's (any more).
+      throw new NotFound(`no card ${shortId}`);
+    }
+    // Every other open row on the chip: a finished one means the chip carries
+    // that card now; this operator's stopped ones (PIN never set) close here.
+    const others = openOnChip(sql, done.chip, shortId);
+    const finished = others.find(row => row.pin_set);
+    if (finished) {
+      throw new Conflict(`this chip carries card ${finished.short_id} now, not ${shortId}`);
+    }
+    const closing = others.filter(row => row.operator_id === operatorId).map(row => row.short_id);
     if (escrow) {
       if (Number(escrow.operator_id) !== operatorId) {
         throw new Conflict('this chip’s manager keys belong to another operator');
       }
       const linked = escrow.short_id === null ? null : String(escrow.short_id);
-      if (linked !== null && linked !== shortId && !wasReset(sql, linked)) {
+      if (linked !== null && linked !== shortId && !wasReset(sql, linked) && !closing.includes(linked)) {
         throw new Conflict(`this chip carries card ${linked} now, not ${shortId}`);
       }
       sql.exec('DELETE FROM manager_keys WHERE chip = ?', done.chip);
     }
-    if (old.reset_at === null) {
+    if (old && old.reset_at === null) {
       sql.exec('UPDATE cards SET reset_at = ? WHERE short_id = ?', now, shortId);
+    }
+    for (const id of closing) {
+      sql.exec('UPDATE cards SET reset_at = ? WHERE short_id = ? AND reset_at IS NULL', now, id);
     }
     const record: ResetCompletion = {
       short_id: shortId,
@@ -268,6 +394,7 @@ export function completeReset(
       done.verified_at,
       now,
     );
-    return {reset: record, stranded: holdings(sql, shortId), released: escrow !== undefined};
+    const stranded = sumHoldings([shortId, ...closing].map(id => holdings(sql, id)));
+    return {reset: record, stranded, released: escrow !== undefined};
   });
 }

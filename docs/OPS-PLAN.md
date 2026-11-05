@@ -228,7 +228,8 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   same transaction, refusing if it holds value, has its PIN set or is another operator's or chip's,
   and the old id answers 410 like a reset id. A PIN that was set but whose answer was lost is
   verified once with the PIN the phone still holds in memory for that chip, and the keys are kept;
-  without it the tap stops `needsReset` (no try spent) for Settings → Reset a card. Ops takes no
+  without it the tap stops `needsReset` (no try spent) for Settings → Reset a card, which then
+  needs no PIN (below). Ops takes no
   load or till charge for a row whose PIN is not set (409).
 - [ ] **Reset in the provisioner.** Settings → Reset a card: read slot 0, ask ops for the card
   (another operator's or an unknown card is refused); refuse while ops shows a live or pending
@@ -257,7 +258,19 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   the chip's `manager_keys` escrow row (the chip is released: the next operator to ask owns it and
   gets the same derived bytes) and stores a `card_resets` row (migration 7); a repeat answers the
   stored record and changes nothing. After a reset the old short id answers 410 to holder routes and
-  till writes.
+  till writes. **By chip (2026-11-04, not deployed, silicon pending):** the first tap also reads the
+  chip's CPLC id and the check always sends it (`reset-check?chip=`), so ops can find a `needsReset`
+  card whose short id it has no row for (or only a stopped row): such a card is the caller's when the
+  chip's escrow is, and another operator's chip answers 404 like an unknown id. It resets **without
+  the holder's PIN** (`needs_holder_pin: false`; the app skips VERIFY_PIN and says the card was never
+  finished, so it has no holder PIN to ask for) only when the escrow is the caller's, no open row on
+  the chip is a finished card with its PIN set, and ops holds nothing on any open row on the chip.
+  Every other card keeps the PIN or blocked-PIN rules. The completion, by chip, also closes the
+  caller's other open stopped rows on the chip (410), refuses (409) while a finished card is open on
+  it, releases the escrow and stores `card_resets` under the short id the card answered; a repeat is
+  answered from that row. The second tap checks the CPLC against the first tap's before asking for
+  keys, names the short id to `manager-keys` only when ops has its row, and the journal keeps that
+  (`known`) for a lifted tap.
 - [ ] **One tap on iPhone.** Measure install + key rotation + GEN_KEY ×8 + PIN on Max against the
   ~60 s reader session; split into two taps only if it does not fit.
 - [ ] **Cards from before O2** (for example `15989f91`, no slot keys on record): mark them retired.

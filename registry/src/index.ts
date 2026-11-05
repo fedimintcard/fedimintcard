@@ -85,8 +85,8 @@ import {
   Unprocessable,
 } from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
-import {issueManagerKeys} from './managerKeys';
-import {completeReset, resetCheck} from './reset';
+import {isChip, issueManagerKeys} from './managerKeys';
+import {completeReset, resetCheck, resetOwner} from './reset';
 import {closedReason, closeSuperseded, parseSupersedes, pinIsSet, resumeCheck} from './resume';
 
 export interface Env {
@@ -284,17 +284,22 @@ export class Registry {
     if (reset) {
       const shortId = reset[1]!;
       if (!isShortId(shortId)) return fail(400, 'short_id must be 8 lower-case hex characters');
-      // Another operator's card answers as if it did not exist, as the card routes do.
-      if (cardOwner(sql, shortId) !== op) return fail(404, `no card ${shortId}`);
-      expireLoads(storage, shortId, now);
-      if (reset[2] === 'reset-check') {
-        if (method !== 'GET') return fail(405, 'use GET');
-        return json(200, {ok: true, ...resetCheck(sql, shortId)});
+      const checking = reset[2] === 'reset-check';
+      if (method !== (checking ? 'GET' : 'POST')) return fail(405, checking ? 'use GET' : 'use POST');
+      // The chip the phone read: on the check as ?chip=, in the completion's body.
+      const body = checking ? null : await objectBody(request);
+      if (!checking && !body) return fail(400, 'the completion must be an object');
+      const chip = checking ? url.searchParams.get('chip') : body!.chip;
+      if (checking && chip !== null && !isChip(chip)) {
+        return fail(400, 'chip must be the card’s CPLC id, cplc-v1: and 24 lower-case hex characters');
       }
-      if (method !== 'POST') return fail(405, 'use POST');
-      const body = await objectBody(request);
-      if (!body) return fail(400, 'the completion must be an object');
-      return json(200, {ok: true, ...completeReset(storage, op, shortId, body, now)});
+      // Another operator's card, or chip, answers as if it did not exist, as the card routes do.
+      if (resetOwner(sql, shortId, isChip(chip) ? chip : null) !== op) return fail(404, `no card ${shortId}`);
+      expireLoads(storage, shortId, now);
+      if (checking) {
+        return json(200, {ok: true, ...resetCheck(sql, op, shortId, isChip(chip) ? chip : null)});
+      }
+      return json(200, {ok: true, ...completeReset(storage, op, shortId, body!, now)});
     }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.
