@@ -74,6 +74,7 @@ starts a second spend while the first may still count:
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
 | `undecided` | 202 | submitted, not yet confirmed; nothing further to do now | show "pending", then poll /v1/sales |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
+| `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
 | `pin_blocked` | 423 | the card's PIN is blocked (`69 83`) | stop: the card cannot pay |
 | `card_changed` | 409 | on ops: the card's state changed under this till (another till, a stale version) | retry the tap |

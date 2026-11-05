@@ -217,6 +217,9 @@ pub struct TillHandle {
     relay: String,
     sales: Arc<Mutex<SalesStore>>,
     federation_name: Option<String>,
+    /// Set on a till with ops: every card there has a holder PIN, so a charge without one would
+    /// verify `CARD_PIN` instead and spend one of the holder's tries.
+    pin_required: bool,
 }
 
 /// Build the handle and the actor future. The caller must poll the future (it is not `Send`)
@@ -253,6 +256,7 @@ pub async fn new_with_ops(
         relay,
         sales: sales.clone(),
         federation_name,
+        pin_required: ops.is_some(),
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, ops))
 }
@@ -913,6 +917,9 @@ async fn charge(State(h): State<TillHandle>, body: Bytes) -> Reply {
     // A repeat of a finished sale needs neither the card nor the busy flag.
     if let Some(r) = replay(&h.sales, req.client_ref.as_deref(), price) {
         return r;
+    }
+    if h.pin_required && req.pin.is_none() {
+        return Reply::fail(400, "pin_required", "this till charges only with the holder's PIN");
     }
     let cref = req.client_ref.clone();
     let pin = req.pin.map(String::into_bytes);

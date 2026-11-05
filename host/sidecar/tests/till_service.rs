@@ -767,3 +767,33 @@ async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
     drop(app); // the actor ends only after the last handle is gone
     Ok(())
 }
+
+/// On ops every card has a holder PIN: a charge without one is refused before the card is
+/// touched, rather than verifying `CARD_PIN` and spending one of the holder's tries.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ops_till_refuses_a_charge_without_the_holders_pin() -> anyhow::Result<()> {
+    let f = fx(true, Amount::from_sats(10_000)).await?;
+    let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
+    // Never reached: the refusal comes before any card or ops call.
+    let ops = fedimint_card_sidecar::ops::Ops::new(
+        &fedimint_card_sidecar::ops::OpsConfig { url: closed_port_url(), token: "till_x".into() },
+        f._dir.path(),
+    )?;
+    let opened = Rc::new(std::cell::Cell::new(0u32));
+    let counter = opened.clone();
+    let (handle, _actor) = till::new_with_ops(
+        f.cw,
+        closed_port_url(),
+        sales,
+        Box::new(move || {
+            counter.set(counter.get() + 1);
+            Ok(Box::new(SoftCard::new()) as Box<dyn Card>)
+        }),
+        Some(ops),
+    )
+    .await;
+    let (status, body) = call(till::router(handle), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"np"}"#).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("pin_required")), "{body}");
+    assert_eq!(opened.get(), 0, "the card was never opened");
+    Ok(())
+}
