@@ -382,6 +382,31 @@ async fn a_full_card_keeps_the_top_up_paid_until_it_has_room() -> anyhow::Result
     Ok(())
 }
 
+/// A top-up for a named card is rounded to fit that card's free slots, and a card with none is
+/// refused before any invoice exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_for_a_card_fits_its_free_slots() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, registry) = (f.addr, f.registry.clone());
+    with_actor(actor, async move {
+        registry.free.store(2, Ordering::SeqCst);
+        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "0011aabb"}))).await;
+        assert_eq!(s, 200, "{v}");
+        let amount = v["amount_msat"].as_u64().unwrap();
+        assert!(amount.count_ones() <= 2, "{amount} needs more than 2 notes");
+        assert_eq!(amount, 98_304, "nearest 2-note amount to 100,000 msat");
+
+        registry.free.store(0, Ordering::SeqCst);
+        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "0011aabb"}))).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
+
+        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "nothex!!"}))).await;
+        assert_eq!((s, v["error"].as_str()), (400, Some("bad_request")), "{v}");
+    })
+    .await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_and_failed_top_ups_do_not_load() -> anyhow::Result<()> {
     let (f, actor) = start(Setup::OnOps).await?;

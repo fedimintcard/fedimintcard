@@ -27,6 +27,17 @@ pub const MAX_EXP: u32 = 50;
 pub const MAX_CASHOUT_NOTES: usize = 40;
 /// Work cap for the exhaustive search, in fee evaluations / DFS nodes.
 const BUDGET: u64 = 6_000_000;
+/// Free slots a charge tries to leave on the card: room for a top-up (`topup::MAX_TOPUP_NOTES`).
+/// When the cheapest plan would leave fewer, the planner spends more of the card's notes so the
+/// change comes back as fewer, larger notes. Costs a card signature (about a second) per extra
+/// input, and only when the card is nearly full.
+pub const ROOM_AFTER_CHARGE: usize = 3;
+
+/// How far a plan leaves the card short of [`ROOM_AFTER_CHARGE`] free slots, assuming the spent
+/// inputs' slots are renewed after the charge (`glue.rs` renews until a slot is free).
+fn room_short(free_slots: usize, inputs: usize, change: usize) -> usize {
+    ROOM_AFTER_CHARGE.saturating_sub((free_slots + inputs).saturating_sub(change))
+}
 
 /// Fee in msat for one input or output of the given amount.
 pub type FeeFn<'a> = &'a dyn Fn(u64) -> u64;
@@ -242,8 +253,9 @@ fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
 /// notes. Output notes are at least `min_denom` (the federation's smallest economical
 /// denomination) when an exact balance exists that way; since fees are not multiples of
 /// `min_denom` that is rare, and the planner then retries allowing any tier and sets `dust`.
-/// Objective, in order: fewest change notes, fewest inputs (each costs one card signature, about
-/// a second on silicon), smallest overpay.
+/// Objective, in order: leave [`ROOM_AFTER_CHARGE`] free slots if any plan can (else get as close
+/// as possible), fewest change notes, fewest inputs (each costs one card signature, about a second
+/// on silicon), smallest overpay.
 pub fn solve(
     notes: &[u64],
     price: u64,
@@ -263,7 +275,15 @@ pub fn solve(
         match solve_with(notes, price, free_slots, fee, floor) {
             Ok(mut p) => {
                 p.dust = floor < min_denom;
-                let key = |p: &Plan| (p.change.len(), p.till.len() + p.change.len(), p.inputs.len(), p.overpay);
+                let key = |p: &Plan| {
+                    (
+                        room_short(free_slots, p.inputs.len(), p.change.len()),
+                        p.change.len(),
+                        p.till.len() + p.change.len(),
+                        p.inputs.len(),
+                        p.overpay,
+                    )
+                };
                 if best.as_ref().is_none_or(|b| key(&p) < key(b)) {
                     best = Some(p);
                 }
@@ -310,7 +330,7 @@ fn solve_with(
 
     let flat = flat_fee(fee);
     let mut budget = BUDGET;
-    let mut best: Option<(usize, usize, u64, Vec<usize>)> = None; // (change notes, inputs, overpay, indices)
+    let mut best: Option<(usize, usize, usize, u64, Vec<usize>)> = None; // (room short, change notes, inputs, overpay, indices)
     // Every input size is searched, not just the sizes up to the first fitted one: a price the
     // small sizes cannot pay must still find its plan among the larger ones, and a sale refused
     // for lack of a plan is a customer turned away at the counter. `budget` bounds the work.
@@ -332,17 +352,22 @@ fn solve_with(
                         // slots than the card has cannot be signed at all. Among plans that fit,
                         // fewer change notes still wins, so once one exists only a strictly smaller
                         // one is worth finding — but the ceiling itself is always `free_slots`.
-                        let cap = best.as_ref().map_or(free_slots, |(cc, ..)| cc.saturating_sub(1));
+                        // While the best plan still leaves the card short of room, a plan with as
+                        // many change notes (or more) but more inputs can beat it, so no pruning.
+                        let cap = match &best {
+                            Some((0, cc, ..)) => cc.saturating_sub(1),
+                            _ => free_slots,
+                        };
 
                         budget = budget.saturating_sub(1 + if flat.is_some() { 0 } else { 64 });
                         let Some(change) = min_notes(r, cap, fee, min_denom) else { continue };
-                        let cand = (change.len(), size, *o);
+                        let cand = (room_short(free_slots, size, change.len()), change.len(), size, *o);
                         let better = match &best {
                             None => true,
-                            Some((cc, ni, ov, _)) => cand < (*cc, *ni, *ov),
+                            Some((rs, cc, ni, ov, _)) => cand < (*rs, *cc, *ni, *ov),
                         };
                         if better {
-                            best = Some((change.len(), size, *o, idx.clone()));
+                            best = Some((cand.0, change.len(), size, *o, idx.clone()));
                         }
                     }
                 }
@@ -354,7 +379,7 @@ fn solve_with(
         }
     }
 
-    let Some((_, _, overpay, idx)) = best else {
+    let Some((_, _, _, overpay, idx)) = best else {
         return Err(PlanError::NoExactPlan { price, free_slots });
     };
     let gross: u64 = idx.iter().map(|&i| notes[i]).sum();
@@ -444,6 +469,25 @@ mod tests {
         assert_eq!(p.till.iter().sum::<u64>(), price + p.overpay);
         assert!(p.till.iter().chain(&p.change).all(|a| a.is_power_of_two()));
         p
+    }
+
+    /// A card filled with change (5 notes, 2 free slots): the charge spends more notes so the
+    /// card keeps room for a 3-note top-up afterwards.
+    #[test]
+    fn nearly_full_card_is_tidied() {
+        let notes = [65_536, 32_768, 16_384, 8_192, 2_048];
+        let p = check(&notes, 5_000, 2, &zero);
+        let free_after = 2 + p.inputs.len() - p.change.len();
+        assert!(free_after >= ROOM_AFTER_CHARGE, "{p:?} leaves {free_after} free");
+        assert!(p.inputs.len() > 1);
+    }
+
+    /// With room to spare the planner keeps the fastest plan: one input.
+    #[test]
+    fn roomy_card_is_not_tidied() {
+        let notes = [65_536, 32_768, 16_384, 8_192, 2_048];
+        let p = check(&notes, 5_000, 6, &zero);
+        assert_eq!(p.inputs.len(), 1, "{p:?}");
     }
 
     #[test]

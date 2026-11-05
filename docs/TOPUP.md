@@ -28,11 +28,24 @@ economical note. Examples: 100 sats → 100.352 sats; 1,000 sats → 1,048.576 s
 need 4 notes); 21 sats → 20.992 sats. The invoice is for exactly that amount, so the holder pays exactly what lands on the card.
 The gateway's receive fee, if any, is the till's cost (zero on the gateways seen 2026-11-05).
 
+## Room on the card
+
+A top-up started from the balance screen names the card (`short_id`, from `/v1/card/balance`).
+The till asks the registry for that card's free slots and rounds to at most that many notes (still
+at most 3); a card with no free slot is refused with 409 `card_full` before any invoice exists, so
+nobody pays for a load that cannot land. (Without `short_id` the till assumes 3 and the load itself
+answers `card_full`, keeping the top-up `paid`.)
+
+Charges keep room too: when the cheapest charge plan would leave fewer than 3 free slots
+(`plan::ROOM_AFTER_CHARGE`), the planner spends more of the card's notes so the change comes back
+as fewer, larger notes. Each extra input is one more card signature (about a second), and only on
+a nearly full card.
+
 ## Till routes (POS token as for every `/v1` route)
 
 | Route | Body → reply |
 |---|---|
-| `POST /v1/topup` | `{amount_msat, client_ref?}` → the top-up |
+| `POST /v1/topup` | `{amount_msat, client_ref?, short_id?}` → the top-up |
 | `GET /v1/topup/{topup_id}` | → the top-up |
 | `POST /v1/topup/{topup_id}/load` | `{}` with `X-Card-Link` → the top-up, `state: "loaded"` |
 

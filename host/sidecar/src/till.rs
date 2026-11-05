@@ -900,7 +900,13 @@ pub async fn card_balance_job(cw: &mut CardWallet, ops: Option<&Ops>, sales: &Ar
         Ok(b) => b,
         Err(e) => return error_reply(&e),
     };
-    let r = balance_job(cw, sales).await;
+    let mut r = balance_job(cw, sales).await;
+    // The card's id lets a top-up started from this screen fit the card's free slots.
+    if let (Some(link), Some(body)) = (cw.ops.as_ref(), r.body.as_object_mut()) {
+        if r.status == 200 {
+            body.insert("short_id".into(), json!(link.short_id));
+        }
+    }
     Ops::finish(cw, base).await;
     r
 }
@@ -1448,6 +1454,9 @@ const TOPUP_MAX_CLIENT_REF: usize = 64;
 struct TopupReq {
     amount_msat: Option<u64>,
     client_ref: Option<String>,
+    /// The card the top-up is for (`short_id` from `/v1/card/balance`): the amount is then rounded
+    /// to fit that card's free slots, and a card with none is refused before any invoice exists.
+    short_id: Option<String>,
 }
 
 fn topups_unavailable() -> Reply {
@@ -1497,8 +1506,24 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
             return Reply::ok(had.to_json());
         }
     }
+    let mut max_notes = crate::topup::MAX_TOPUP_NOTES;
+    if let Some(id) = req.short_id.as_deref() {
+        if id.len() != 8 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Reply::fail(400, "bad_request", "short_id must be 8 hex characters");
+        }
+        let ops = h.conn.lock().unwrap().ops.clone();
+        let Some(ops) = ops else { return Reply::fail(503, "ops_not_connected", "this till is not connected to a registry") };
+        let free = match ops.client.free_slots(id).await {
+            Ok(f) => f.free.len() as u32,
+            Err(e) => return Reply::fail(503, "ops_unreachable", format!("the card's free slots: {e}")),
+        };
+        if free == 0 {
+            return Reply::fail(409, "card_full", "this card has no free slot: spend from it, then top up");
+        }
+        max_notes = max_notes.min(free);
+    }
     let cfg = &h.wallet.mint_cfg;
-    let amount = match crate::plan::nearest_card_amount(requested, crate::topup::MAX_TOPUP_NOTES, h.wallet.min_denom(), |n| {
+    let amount = match crate::plan::nearest_card_amount(requested, max_notes, h.wallet.min_denom(), |n| {
         cfg.tbs_pks.get(fedimint_core::Amount::from_msats(n)).is_some()
     }) {
         Some(a) if a <= crate::topup::MAX_TOPUP_MSAT => a,
