@@ -134,10 +134,6 @@
             android:textColor="@color/ok" android:textSize="64sp" />
         <TextView android:id="@+id/receipt_amount" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="24dp" android:textSize="44sp" />
-        <TextView android:id="@+id/receipt_change" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="12dp" />
-        <TextView android:id="@+id/receipt_overpaid" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="4dp" />
         <TextView android:id="@+id/receipt_txid" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="12dp" android:fontFamily="monospace"
             android:textColor="@color/dim" android:textSize="13sp" />

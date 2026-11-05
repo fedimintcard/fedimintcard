@@ -175,14 +175,9 @@ class PosUi(
     }
 
     private fun renderReceipt(r: ChargeReceipt) {
-        v<TextView>(R.id.receipt_amount).text = "${formatSats(r.priceMsat)} sats"
-        val change = v<TextView>(R.id.receipt_change)
-        val cm = r.change.sumOf { it.msat }
-        change.visibility = if (r.change.isEmpty()) View.GONE else View.VISIBLE
-        change.text = "Change returned to card: ${formatSats(cm)} sats across ${r.change.size} notes"
-        val over = v<TextView>(R.id.receipt_overpaid)
-        over.visibility = if (r.overpaidMsat == 0L) View.GONE else View.VISIBLE
-        over.text = "Overpaid: ${formatSats(r.overpaidMsat)} sats"
+        // The price only. Change and the sub-sat rounding the planner adds to save card slots
+        // (plan.rs) stay in the till's sales record; at the counter they read like an error.
+        v<TextView>(R.id.receipt_amount).text = "Paid ${formatSats(r.priceMsat)} sats"
         v<TextView>(R.id.receipt_txid).text = shortTxid(r.txid)
     }
 
