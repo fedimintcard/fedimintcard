@@ -689,6 +689,9 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     assert_eq!(b.1["error"], "busy");
     assert_eq!(bal.0, 409);
     assert_eq!(first.0, 200, "{:?}", first.1);
+    // With a client_ref the promote hook records the sale mid-spend; the reply must still carry
+    // the time the charge took (it was 0 until 11/4).
+    assert!(first.1["duration_ms"].as_u64().unwrap() > 0, "{:?}", first.1);
 
     // 7: /v1/status with a dead relay.
     assert_eq!(st.0, 200);

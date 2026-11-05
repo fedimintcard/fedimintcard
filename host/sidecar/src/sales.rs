@@ -109,16 +109,23 @@ impl SalesStore {
                 bail!("transaction {} is already recorded under another client_ref", rec.txid);
             }
             // Recorded while its notes were still being collected: bring the amounts up to date.
-            if r.collection_pending && !rec.collection_pending {
-                let (received, pending) = (rec.received_msat, rec.collection_pending);
+            let collected = r.collection_pending && !rec.collection_pending;
+            // Recorded by the promote hook mid-spend, before the charge knew how long it took.
+            let timed = r.duration_ms == 0 && rec.duration_ms > 0;
+            if collected || timed {
                 let r = self.file.sales.iter_mut().find(|s| s.txid == rec.txid).expect("just found");
-                let old = (r.received_msat, r.collection_pending);
-                r.received_msat = received;
-                r.collection_pending = pending;
+                let old = (r.received_msat, r.collection_pending, r.duration_ms);
+                if collected {
+                    r.received_msat = rec.received_msat;
+                    r.collection_pending = rec.collection_pending;
+                }
+                if timed {
+                    r.duration_ms = rec.duration_ms;
+                }
                 let updated = r.clone();
                 if let Err(e) = self.save() {
                     let r = self.file.sales.iter_mut().find(|s| s.txid == rec.txid).expect("just found");
-                    (r.received_msat, r.collection_pending) = old;
+                    (r.received_msat, r.collection_pending, r.duration_ms) = old;
                     return Err(e);
                 }
                 return Ok(updated);
