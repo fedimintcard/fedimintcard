@@ -350,6 +350,14 @@ export function signInReason(e: unknown): string {
     if (e.name === 'ApiUnreachableError') {
       return 'unreachable';
     }
+    // The registry words its refusals in prose; the status is what is stable.
+    const status = (e as {status?: unknown}).status;
+    if (e.name === 'ApiServiceError' && status === 401) {
+      return 'bad-credentials';
+    }
+    if (e.name === 'ApiServiceError' && status === 429) {
+      return 'login-rate-limited';
+    }
     return e.message;
   }
   return 'unknown';
