@@ -217,4 +217,73 @@ class TopUpFlowTest {
         assertEquals("0:00", timeLeft(1_000, 5_000))
         assertEquals("LIGHTNING:LNBC1X", invoiceQrText("lnbc1x"))
     }
+
+    // ---- waiting top-ups (docs/TOPUP.md § Waiting top-ups)
+
+    private val w1 = WaitingTopUp("w1", 100_352, null, 1)
+    private val w2 = WaitingTopUp("w2", 65_536, "6f94b19b", 2)
+
+    /** The balance read for card 6f94b19b, and the fetch it asked for. */
+    private fun shownAsking(lift: Boolean = true): Pair<PosFlow, PosEffect.FetchWaiting> {
+        val f = flow()
+        f.dispatch(PosEvent.CardPresent)
+        val fx = f.dispatch(PosEvent.CardBalanceOpened).single() as PosEffect.StartBalanceRead
+        val ask = f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(CardBalance(5_000, emptyList(), emptyList(), "6f94b19b")))).single() as PosEffect.FetchWaiting
+        if (lift) f.dispatch(PosEvent.CardLost)
+        return f to ask
+    }
+
+    @Test fun aBalanceReadAsksForWaitingTopUpsWithoutDelayingTheBalance() {
+        val (f, ask) = shownAsking()
+        assertEquals("6f94b19b", ask.shortId)
+        val s = f.state as PosState.BalanceShown
+        assertEquals(5_000L, s.liveMsat); assertNull(s.waiting)
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, listOf(w1, w2)))
+        assertEquals(w1, (f.state as PosState.BalanceShown).waiting) // the oldest
+    }
+
+    @Test fun aReadWithoutACardIdAsksForNothing() {
+        val f = flow()
+        f.dispatch(PosEvent.CardPresent)
+        val fx = f.dispatch(PosEvent.CardBalanceOpened).single() as PosEffect.StartBalanceRead
+        assertTrue(f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(CardBalance(5_000, emptyList(), emptyList(), null)))).isEmpty())
+    }
+
+    @Test fun noneOrAFailedFetchShowsNoButtonAndStaleRepliesAreIgnored() {
+        val (f, ask) = shownAsking()
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, null))
+        assertNull((f.state as PosState.BalanceShown).waiting)
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, emptyList()))
+        assertNull((f.state as PosState.BalanceShown).waiting)
+        f.dispatch(PosEvent.WaitingFetched(ask.readId + 99, listOf(w1)))
+        assertNull((f.state as PosState.BalanceShown).waiting)
+        f.dispatch(PosEvent.DonePressed)
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, listOf(w1))) // the balance screen is gone
+        assertEquals(PosState.Entering, f.state)
+        assertTrue(f.dispatch(PosEvent.LoadWaitingPressed).isEmpty())
+    }
+
+    @Test fun loadingAWaitingTopUpTakesThePaidPath() {
+        val (f, ask) = shownAsking()
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, listOf(w1)))
+        assertTrue(f.dispatch(PosEvent.LoadWaitingPressed).isEmpty())
+        val waiting = f.state as PosState.TopUpWaitingForCard
+        assertEquals("w1", waiting.topUp.topupId); assertEquals(100_352L, waiting.topUp.amountMsat)
+        val l = f.dispatch(PosEvent.CardPresent).single() as PosEffect.LoadTopUp
+        assertEquals("w1", l.topupId)
+        f.dispatch(PosEvent.TopUpLoadDone(l.loadId, TopUpReply.Ok(TopUpStatus("w1", 100_352, "loaded", "tx", null))))
+        assertEquals(PosState.TopUpLoaded(100_352, "tx"), f.state)
+    }
+
+    @Test fun aWaitingTopUpLoadsAtOnceWhileTheCardIsOnThePhone() {
+        val (f, ask) = shownAsking(lift = false)
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, listOf(w2)))
+        val l = f.dispatch(PosEvent.LoadWaitingPressed).single() as PosEffect.LoadTopUp
+        assertEquals("w2", l.topupId)
+        // A full card: the top-up stays paid and the tap can be tried again.
+        f.dispatch(PosEvent.TopUpLoadDone(l.loadId, TopUpReply.Refused("card_full", "", 409)))
+        val failed = f.state as PosState.TopUpFailed
+        assertEquals(TopUpProblem.CARD_FULL, failed.problem); assertTrue(failed.paid)
+        assertTrue(f.dispatch(PosEvent.RetryPressed).single() is PosEffect.LoadTopUp)
+    }
 }

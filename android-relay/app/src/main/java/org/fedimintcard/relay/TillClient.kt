@@ -123,6 +123,16 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
             is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body)
         }
 
+    /**
+     * The paid top-ups waiting for [shortId] (or for no card), oldest first. Null on any error or
+     * a till without the route: the screen then just shows no button.
+     */
+    fun waitingTopUps(shortId: String): List<WaitingTopUp>? =
+        when (val r = call("GET", "/v1/topups/waiting?short_id=" + encode(shortId), null, QUICK_READ_MS)) {
+            is TillResult.Err -> null
+            is TillResult.Ok -> parseWaitingTopUps(r.value.status, r.value.body)
+        }
+
     /** Loads a paid top-up onto the card on [link]. Safe to repeat: a loaded top-up answers again. */
     fun loadTopUp(topupId: String, link: String? = null): TopUpReply<TopUpStatus> =
         when (val r = call("POST", "/v1/topup/" + encode(topupId) + "/load", "{}", CHARGE_READ_MS, link)) {
@@ -300,6 +310,25 @@ internal fun parseTopUp(httpStatus: Int, body: String): TopUpReply<TopUp> = try 
     else TopUpReply.Ok(TopUp(o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("invoice"), o.reqLong("expires_at_ms"), o.optString("state", "waiting")))
 } catch (e: JSONException) {
     TopUpReply.Failed(TillError.BadResponse(e.message ?: "bad json"))
+}
+
+/** `GET /v1/topups/waiting`: `{ok:true, topups:[{topup_id, amount_msat, for_card, created_at_ms}]}`. */
+internal fun parseWaitingTopUps(httpStatus: Int, body: String): List<WaitingTopUp>? = try {
+    val o = JSONObject(body)
+    if (httpStatus >= 400 || !o.optBoolean("ok", true)) null
+    else {
+        val a = o.getJSONArray("topups")
+        (0 until a.length()).map { i ->
+            val t = a.getJSONObject(i)
+            WaitingTopUp(
+                t.reqStr("topup_id"), t.reqLong("amount_msat"),
+                if (t.isNull("for_card")) null else t.optString("for_card").ifEmpty { null },
+                t.optL("created_at_ms"),
+            )
+        }
+    }
+} catch (e: JSONException) {
+    null
 }
 
 /** `GET /v1/topup/{id}` and `POST …/load`: `{topup_id, amount_msat, state, load_txid?, detail?}`. */

@@ -9,6 +9,20 @@ data class TopUp(
     val state: String,
 )
 
+/**
+ * A paid top-up the till holds that is not on a card yet (`GET /v1/topups/waiting`, docs/TOPUP.md
+ * § Waiting top-ups): the card was lifted, the app closed, or the card was full.
+ */
+data class WaitingTopUp(
+    val topupId: String,
+    val amountMsat: Long,
+    val forCard: String?,
+    val createdAtMs: Long,
+) {
+    /** The top-up the load path takes: paid, no invoice to show. */
+    fun toTopUp() = TopUp(topupId, amountMsat, "", 0, "paid")
+}
+
 /** `GET /v1/topup/{id}` and the reply to `POST /v1/topup/{id}/load`. */
 data class TopUpStatus(
     val topupId: String,

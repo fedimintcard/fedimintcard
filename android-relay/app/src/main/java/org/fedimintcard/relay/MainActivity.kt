@@ -232,7 +232,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (refNow == null) salesGen.cancel()
         else if (refNow != refBefore) scheduleSalesPoll()
         if (now is PosState.Receipt || now is PosState.TopUpLoaded) pollNow()
-        if (now is PosState.BalanceShown && before != now) startBalanceCountdown(now.readId)
+        // The waiting top-up arriving changes the state, not the read: the countdown keeps going.
+        if (now is PosState.BalanceShown && (before !is PosState.BalanceShown || before.readId != now.readId)) startBalanceCountdown(now.readId)
         if (now is PosState.TopUpInvoice && (before !is PosState.TopUpInvoice || before.topUp.topupId != now.topUp.topupId)) watchInvoice(now.topUp)
         for (fx in effects) when (fx) {
             is PosEffect.StartCharge -> Thread {
@@ -246,6 +247,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             is PosEffect.CreateTopUp -> Thread {
                 val r = client.createTopUp(fx.amountMsat, fx.clientRef, fx.shortId)
                 runOnUiThread { dispatch(PosEvent.TopUpCreated(fx.createId, r)) }
+            }.start()
+            is PosEffect.FetchWaiting -> Thread {
+                val r = client.waitingTopUps(fx.shortId)
+                runOnUiThread { dispatch(PosEvent.WaitingFetched(fx.readId, r)) }
             }.start()
             is PosEffect.LoadTopUp -> Thread {
                 val r = withCard({ link -> client.loadTopUp(fx.topupId, link) }, { TopUpReply.Failed(TillError.Unreachable) })

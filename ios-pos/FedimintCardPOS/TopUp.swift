@@ -9,6 +9,18 @@ struct TopUp: Equatable {
     let state: String
 }
 
+/// A paid top-up the till holds that is not on a card yet (`GET /v1/topups/waiting`, docs/TOPUP.md
+/// § Waiting top-ups): the card was lifted, the app closed, or the card was full.
+struct WaitingTopUp: Equatable {
+    let topupId: String
+    let amountMsat: Int64
+    let forCard: String?
+    let createdAtMs: Int64
+
+    /// The top-up the load path takes: paid, no invoice to show.
+    var asTopUp: TopUp { TopUp(topupId: topupId, amountMsat: amountMsat, invoice: "", expiresAtMs: 0, state: "paid") }
+}
+
 /// `GET /v1/topup/{id}` and the reply to `POST /v1/topup/{id}/load`.
 struct TopUpStatus: Equatable {
     let topupId: String

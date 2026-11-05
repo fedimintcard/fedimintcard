@@ -168,6 +168,15 @@ extension TillClient {
         }
     }
 
+    /// The paid top-ups waiting for `shortId` (or for no card), oldest first. Nil on any error or a
+    /// till without the route: the screen then just shows no button.
+    func waitingTopUps(shortId: String) async -> [WaitingTopUp]? {
+        switch await call(request("GET", "/v1/topups/waiting?short_id=" + Self.pathSegment(shortId), body: nil, timeout: Self.quickTimeout)) {
+        case .failure: return nil
+        case .success(let r): return TillParse.waitingTopUps(status: r.status, body: r.body)
+        }
+    }
+
     /// Loads a paid top-up onto the card on `cardLink`. Safe to repeat: a loaded top-up answers again.
     func loadTopUp(_ topupId: String, cardLink: String?) async -> TopUpReply<TopUpStatus> {
         let path = "/v1/topup/" + Self.pathSegment(topupId) + "/load"
@@ -338,6 +347,19 @@ enum TillParse {
     }
 
     /// `GET /v1/topup/{id}` and `POST …/load`: `{topup_id, amount_msat, state, load_txid?, detail?}`.
+    /// `GET /v1/topups/waiting`: `{ok:true, topups:[{topup_id, amount_msat, for_card, created_at_ms}]}`.
+    static func waitingTopUps(status: Int, body: Data) -> [WaitingTopUp]? {
+        guard status < 400, let o = try? obj(body), (o["ok"] as? Bool) ?? true,
+              let a = o["topups"] as? [[String: Any]] else { return nil }
+        var out: [WaitingTopUp] = []
+        for t in a {
+            guard let id = try? reqStr(t, "topup_id"), let amount = try? reqLong(t, "amount_msat") else { return nil }
+            let card = optStr(t, "for_card").flatMap { $0.isEmpty ? nil : $0 }
+            out.append(WaitingTopUp(topupId: id, amountMsat: amount, forCard: card, createdAtMs: optLong(t, "created_at_ms")))
+        }
+        return out
+    }
+
     static func topUpStatus(status: Int, body: Data) -> TopUpReply<TopUpStatus> {
         do {
             let o = try obj(body)

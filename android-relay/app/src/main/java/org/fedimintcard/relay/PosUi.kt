@@ -32,6 +32,7 @@ class PosUi(
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
     private val cardBalanceAmount: TextView = v(R.id.card_balance_amount)
+    private val loadWaiting: Button = v(R.id.btn_load_waiting)
     private val cardBalancePanel: View = v(R.id.card_balance_panel)
     private val cardBalanceCountdown: TextView = v(R.id.card_balance_countdown)
     private val amountText: TextView = v(R.id.amount_text)
@@ -106,6 +107,7 @@ class PosUi(
         checkBalance.setOnClickListener { onEvent(if (topUpMode) PosEvent.CancelPressed else PosEvent.CardBalanceOpened) }
         v<View>(R.id.btn_charge_card).setOnClickListener { onEvent(PosEvent.ChargeCardPressed) }
         v<View>(R.id.btn_top_up_card).setOnClickListener { onEvent(PosEvent.TopUpPressed) }
+        loadWaiting.setOnClickListener { onEvent(PosEvent.LoadWaitingPressed) }
         v<View>(R.id.btn_invoice_cancel).setOnClickListener { onEvent(PosEvent.CancelPressed) }
         v<View>(R.id.btn_card_balance_done).setOnClickListener { onEvent(PosEvent.DonePressed) }
         statusAlert.setOnClickListener { showRelay() }
@@ -194,6 +196,17 @@ class PosUi(
                 val amount = "${formatSats(state.liveMsat)} sats"
                 cardBalanceAmount.text = amount
                 cardBalancePanel.contentDescription = "Card balance: $amount on this card"
+                val w = state.waiting
+                if (w == null) loadWaiting.visibility = View.GONE
+                else {
+                    loadWaiting.text = act.getString(R.string.load_waiting_top_up, formatSats(w.amountMsat))
+                    if (loadWaiting.visibility != View.VISIBLE) {
+                        // Arrives after the balance: fade it in rather than pop.
+                        loadWaiting.alpha = 0f
+                        loadWaiting.visibility = View.VISIBLE
+                        loadWaiting.animate().alpha(1f).setDuration(220).start()
+                    }
+                }
             }
             is PosState.BalanceFailed -> renderBalanceError(state)
             is PosState.EnteringPin -> {

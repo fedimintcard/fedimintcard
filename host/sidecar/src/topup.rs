@@ -75,6 +75,10 @@ pub struct TopupRec {
     pub short_id: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The card the top-up was made for (`short_id` in `POST /v1/topup`); `None` for one made
+    /// without it, which any card may take (docs/TOPUP.md § Waiting top-ups).
+    #[serde(default)]
+    pub for_card: Option<String>,
 }
 
 impl TopupRec {
@@ -130,6 +134,23 @@ impl TopupStore {
 
     pub fn by_ref(&self, client_ref: &str) -> Option<&TopupRec> {
         self.file.topups.iter().find(|t| t.client_ref.as_deref() == Some(client_ref))
+    }
+
+    /// The paid top-ups not yet loaded that `card` may take: made for it or for no card; every one
+    /// when `card` is `None`. Oldest first.
+    pub fn waiting_for(&self, card: Option<&str>) -> Vec<&TopupRec> {
+        let mut v: Vec<&TopupRec> = self
+            .file
+            .topups
+            .iter()
+            .filter(|t| t.state == TopupState::Paid)
+            .filter(|t| match (card, t.for_card.as_deref()) {
+                (None, _) | (_, None) => true,
+                (Some(c), Some(f)) => c.eq_ignore_ascii_case(f),
+            })
+            .collect();
+        v.sort_by_key(|t| t.created_at_ms);
+        v
     }
 
     pub fn all(&self) -> &[TopupRec] {

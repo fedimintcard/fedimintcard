@@ -407,6 +407,80 @@ async fn a_top_up_for_a_card_fits_its_free_slots() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Paid top-ups not yet on a card are listed for the card they were made for and for any card when
+/// made for none; another card's, and waiting, expired or loaded ones, are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_top_ups_are_offered_to_their_card() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, ln, topups, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.card.clone());
+    with_actor(actor, async move {
+        let mine = "0011aabb";
+        let create = |body: Value| async move {
+            let (s, v) = call(addr, "POST", "/v1/topup", None, Some(body)).await;
+            assert_eq!(s, 200, "{v}");
+            v["topup_id"].as_str().unwrap().to_owned()
+        };
+        let a = create(json!({"amount_msat": 100_000, "short_id": mine})).await;
+        let b = create(json!({"amount_msat": 50_000})).await;
+        let c = create(json!({"amount_msat": 20_000, "short_id": "FFFF0000"})).await;
+        let unpaid = create(json!({"amount_msat": 30_000, "short_id": mine})).await;
+        let expired = create(json!({"amount_msat": 40_000, "short_id": mine})).await;
+        for id in [&a, &b, &c] {
+            ln.settle(&op_of(&topups, id), LnOutcome::Paid);
+            until_state(addr, id, "paid").await;
+        }
+        ln.settle(&op_of(&topups, &expired), LnOutcome::Expired);
+        until_state(addr, &expired, "expired").await;
+
+        let ids = |v: &Value| v["topups"].as_array().unwrap().iter().map(|t| t["topup_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let (s, v) = call(addr, "GET", &format!("/v1/topups/waiting?short_id={mine}"), None, None).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(ids(&v), vec![a.clone(), b.clone()], "{v}");
+        let first = &v["topups"][0];
+        assert_eq!(first["amount_msat"].as_u64(), Some(100_352));
+        assert_eq!(first["for_card"].as_str(), Some(mine));
+        assert!(first["created_at_ms"].as_u64().is_some());
+        assert!(v["topups"][1]["for_card"].is_null());
+
+        let (_, v) = call(addr, "GET", "/v1/topups/waiting?short_id=ffff0000", None, None).await;
+        assert_eq!(ids(&v), vec![b.clone(), c.clone()], "{v}");
+        let (_, v) = call(addr, "GET", "/v1/topups/waiting", None, None).await;
+        assert_eq!(ids(&v), vec![a.clone(), b.clone(), c.clone()], "{v}");
+        assert!(!ids(&v).contains(&unpaid));
+
+        let (s, v) = call(addr, "GET", "/v1/topups/waiting?short_id=nothex!!", None, None).await;
+        assert_eq!((s, v["error"].as_str()), (400, Some("bad_request")), "{v}");
+
+        // Loaded: no longer offered.
+        let (link, _phone) = open_link(addr, card).await;
+        let (s, v) = call(addr, "POST", &format!("/v1/topup/{a}/load"), Some(&link), None).await;
+        assert_eq!((s, v["state"].as_str()), (200, Some("loaded")), "{v}");
+        let (_, v) = call(addr, "GET", &format!("/v1/topups/waiting?short_id={mine}"), None, None).await;
+        assert_eq!(ids(&v), vec![b.clone()], "{v}");
+    })
+    .await;
+    Ok(())
+}
+
+/// A topups.json written before `for_card` existed (the zion till has one) still loads; its
+/// top-ups belong to no card.
+#[test]
+fn old_records_without_for_card_load() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = TopupStore::path_in(dir.path());
+    std::fs::write(
+        &path,
+        r#"{"version":1,"topups":[{"topup_id":"bbbbbbbbbbbbbbbb","client_ref":null,"requested_msat":100000,
+        "amount_msat":100352,"invoice":"lnbc1","operation_id":"00","created_at_ms":5,"expires_at_ms":6,
+        "state":"paid","load_txid":null,"short_id":null,"detail":null}]}"#,
+    )?;
+    let store = TopupStore::open(&path)?;
+    let t = store.get("bbbbbbbbbbbbbbbb").expect("loaded");
+    assert_eq!(t.for_card, None);
+    assert_eq!(store.waiting_for(Some("0011aabb")).len(), 1);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_and_failed_top_ups_do_not_load() -> anyhow::Result<()> {
     let (f, actor) = start(Setup::OnOps).await?;
@@ -500,6 +574,7 @@ async fn a_restarted_till_watches_its_unpaid_invoices() -> anyhow::Result<()> {
             load_txid: None,
             short_id: None,
             detail: None,
+            for_card: None,
         })?;
     }
     let mode = std::fs::metadata(TopupStore::path_in(dir.path()))?;

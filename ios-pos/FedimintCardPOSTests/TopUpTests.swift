@@ -200,6 +200,75 @@ final class TopUpFlowTests: XCTestCase {
     }
 }
 
+/// Waiting top-ups (docs/TOPUP.md § Waiting top-ups).
+final class WaitingTopUpFlowTests: XCTestCase {
+    private let w1 = WaitingTopUp(topupId: "w1", amountMsat: 100_352, forCard: nil, createdAtMs: 1)
+    private let w2 = WaitingTopUp(topupId: "w2", amountMsat: 65_536, forCard: "6f94b19b", createdAtMs: 2)
+
+    /// The balance read for card 6f94b19b, and the read id its fetch carries.
+    private func shownAsking() -> (PosFlow, Int) {
+        let f = PosFlow { "ref" }
+        f.dispatch(.cardBalanceOpened)
+        guard case .startBalanceRead(let rid)? = f.dispatch(.cardPresent).first else { XCTFail("no read"); return (f, -1) }
+        let fx = f.dispatch(.balanceDone(readId: rid, result: .read(CardBalance(liveMsat: 5_000, notes: [], freeSlots: [], shortId: "6f94b19b"))))
+        guard case .fetchWaiting(let frid, let sid)? = fx.first else { XCTFail("no fetch"); return (f, -1) }
+        XCTAssertEqual(frid, rid); XCTAssertEqual(sid, "6f94b19b")
+        return (f, rid)
+    }
+
+    func testABalanceReadAsksWithoutDelayingTheBalance() {
+        let (f, rid) = shownAsking()
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000))
+        f.dispatch(.waitingFetched(readId: rid, topUps: [w1, w2]))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000, waiting: w1)) // the oldest
+    }
+
+    func testAReadWithoutACardIdAsksForNothing() {
+        let f = PosFlow { "ref" }
+        f.dispatch(.cardBalanceOpened)
+        guard case .startBalanceRead(let rid)? = f.dispatch(.cardPresent).first else { return XCTFail() }
+        let fx = f.dispatch(.balanceDone(readId: rid, result: .read(CardBalance(liveMsat: 5_000, notes: [], freeSlots: [], shortId: nil))))
+        XCTAssertTrue(fx.isEmpty)
+    }
+
+    func testNoneOrAFailedFetchShowsNoButtonAndStaleRepliesAreIgnored() {
+        let (f, rid) = shownAsking()
+        f.dispatch(.waitingFetched(readId: rid, topUps: nil))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000))
+        f.dispatch(.waitingFetched(readId: rid, topUps: []))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000))
+        f.dispatch(.waitingFetched(readId: rid + 99, topUps: [w1]))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000))
+        f.dispatch(.donePressed)
+        f.dispatch(.waitingFetched(readId: rid, topUps: [w1]))
+        XCTAssertEqual(f.state, .entering)
+        XCTAssertTrue(f.dispatch(.loadWaitingPressed).isEmpty)
+    }
+
+    func testLoadingAWaitingTopUpTakesThePaidPath() {
+        let (f, rid) = shownAsking()
+        f.dispatch(.waitingFetched(readId: rid, topUps: [w1]))
+        guard case .startCardSession(.topUp)? = f.dispatch(.loadWaitingPressed).first else { return XCTFail("no NFC") }
+        guard case .topUpWaitingForCard(let t) = f.state else { return XCTFail("\(f.state)") }
+        XCTAssertEqual(t.topupId, "w1"); XCTAssertEqual(t.amountMsat, 100_352)
+        guard case .loadTopUp(let lid, let tid)? = f.dispatch(.cardPresent).first else { return XCTFail("no load") }
+        XCTAssertEqual(tid, "w1")
+        f.dispatch(.topUpLoadDone(loadId: lid, result: .ok(TopUpStatus(topupId: "w1", amountMsat: 100_352, state: "loaded", loadTxid: "tx", detail: nil))))
+        XCTAssertEqual(f.state, .topUpLoaded(amountMsat: 100_352, loadTxid: "tx"))
+    }
+
+    func testAFullCardKeepsTheWaitingTopUpPaid() {
+        let (f, rid) = shownAsking()
+        f.dispatch(.waitingFetched(readId: rid, topUps: [w2]))
+        f.dispatch(.loadWaitingPressed)
+        guard case .loadTopUp(let lid, _)? = f.dispatch(.cardPresent).first else { return XCTFail() }
+        f.dispatch(.topUpLoadDone(loadId: lid, result: .refused(error: "card_full", detail: "", httpStatus: 409)))
+        guard case .topUpFailed(let fl) = f.state else { return XCTFail() }
+        XCTAssertEqual(fl.problem, .cardFull); XCTAssertTrue(fl.paid)
+        guard case .startCardSession(.topUp)? = f.dispatch(.retryPressed).first else { return XCTFail("no retry tap") }
+    }
+}
+
 final class TopUpClientTests: XCTestCase {
     let pairing = TillPairing(baseURL: "http://10.0.0.2:9877", token: "deadbeef")
     private func client(_ status: Int, _ body: String) -> (TillClient, MockTransport) {
@@ -283,5 +352,26 @@ final class TopUpClientTests: XCTestCase {
         let other = await p("card_error", 502, "a different card"); XCTAssertEqual(other, .notOurCard)
         let ops = await p("ops_not_connected", 503); XCTAssertEqual(ops, .cardService)
         let notPaid = await p("not_paid"); XCTAssertEqual(notPaid, .other)
+    }
+
+    func testWaitingTopUpsParsesAndAsksForTheCard() async throws {
+        let (c, t) = client(200, #"{"ok":true,"topups":[{"topup_id":"w1","amount_msat":100352,"for_card":null,"created_at_ms":7},{"topup_id":"w2","amount_msat":65536,"for_card":"6f94b19b","created_at_ms":9}]}"#)
+        let r = await c.waitingTopUps(shortId: "6f94b19b")
+        XCTAssertEqual(r, [WaitingTopUp(topupId: "w1", amountMsat: 100_352, forCard: nil, createdAtMs: 7),
+                           WaitingTopUp(topupId: "w2", amountMsat: 65_536, forCard: "6f94b19b", createdAtMs: 9)])
+        let req = try XCTUnwrap(t.requests.first)
+        XCTAssertEqual(req.method, "GET"); XCTAssertEqual(req.url.absoluteString, "http://10.0.0.2:9877/v1/topups/waiting?short_id=6f94b19b")
+    }
+
+    func testWaitingTopUpsIsNilOnAnyError() async {
+        let notFound = client(404, #"{"ok":false,"error":"not_found","detail":""}"#).0
+        let r404 = await notFound.waitingTopUps(shortId: "x")
+        XCTAssertNil(r404)
+        let rJunk = await client(200, "not json").0.waitingTopUps(shortId: "x")
+        XCTAssertNil(rJunk)
+        let rNoList = await client(200, #"{"ok":true}"#).0.waitingTopUps(shortId: "x")
+        XCTAssertNil(rNoList)
+        let rEmpty = await client(200, #"{"ok":true,"topups":[]}"#).0.waitingTopUps(shortId: "x")
+        XCTAssertEqual(rEmpty, [])
     }
 }

@@ -75,6 +75,20 @@ load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
 - Records live in `<data_dir>/topups.json`; after a restart the till goes on watching unpaid
   invoices and finishes interrupted loads.
 
+## Waiting top-ups
+
+A top-up can be paid and not loaded: the card was lifted, the app closed, Cancel after paying, or
+the card was full. The till keeps it `paid`, and the POS offers it again.
+
+- `POST /v1/topup` with `short_id` records that card as the top-up's card (`for_card`).
+- `GET /v1/topups/waiting?short_id=<id>` → `{ok:true, topups:[{topup_id, amount_msat, for_card,
+  created_at_ms}]}`: the `paid` top-ups whose `for_card` is that card or none, oldest first.
+  Without `short_id`, every `paid` top-up.
+- The POS asks after every balance read. With one or more, the balance screen shows **Load waiting
+  top-up · N sats** (the oldest; after it loads the next is offered on the next read). A top-up
+  made for another card is never offered. Tapping it goes straight to the tap screen and the
+  ordinary `POST /v1/topup/{id}/load`.
+
 ## POS
 
 - Balance screen: **Charge card** and **Top up card** side by side under the balance; either

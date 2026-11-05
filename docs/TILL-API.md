@@ -150,15 +150,18 @@ Empty body. Reconciles the card's notes with the federation (shares the busy fla
 `200 {"ok":true,"live_msat":N,"notes":[{"slot":0,"msat":N,"status":"live"}],"free_slots":[...]}`
 Same error table as `/v1/charge` where applicable.
 
-## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load
+## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load, GET /v1/topups/waiting
 
 Top-up by Lightning (`docs/TOPUP.md`): the till makes an invoice through the federation's gateway
 (its `ln` module) and loads what it received onto the card as a holder load, recorded in ops.
 On ops only (`503 ops_not_connected` otherwise); `503 lightning_unavailable` when the federation's
 `ln` module is not usable.
 
-`POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>"}` rounds `N` to the
-nearest card amount (at most 3 notes) and answers the top-up:
+`POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>","short_id":"<8 hex, optional>"}`
+rounds `N` to the nearest card amount (at most 3 notes) and answers the top-up. With `short_id`
+(from `/v1/card/balance`) the till reads that card's free slots from ops, rounds to fit them, and
+refuses a card with none (`409 card_full`) before any invoice exists; the card is recorded as the
+top-up's `for_card`.
 
 `200 {"ok":true,"topup_id":"<16 hex>","amount_msat":N,"invoice":"lnbc…","expires_at_ms":T,"state":"waiting"}`
 
@@ -174,6 +177,12 @@ when no gateway made an invoice.
 answers it with `"state":"loaded"` and `"load_txid"`. A `loaded` top-up answers again without a
 card. `409 not_paid`, `410 expired`, `409 topup_failed`, `409 card_full` (too few free slots; the
 top-up stays `paid`), and the card errors of `/v1/charge`. Shares the job slot with charges.
+
+`GET /v1/topups/waiting?short_id=<8 hex>` lists the `paid` top-ups not yet on a card that this card
+may take: made for it (`for_card`) or for no card, oldest first. Without `short_id`, every `paid`
+top-up. `400 bad_request` for a malformed `short_id`.
+
+`200 {"ok":true,"topups":[{"topup_id":"<16 hex>","amount_msat":N,"for_card":"<8 hex>"|null,"created_at_ms":T}]}`
 
 ## POST /v1/cards/precheck
 Empty body (or `{"batch_id":"<string>"}`, ignored). **Read-only**: nothing is written to

@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -1217,6 +1217,7 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/card/link", get(card_link))
         .route("/v1/topup", post(topup_create))
         .route("/v1/topup/{topup_id}", get(topup_get))
+        .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
         .with_state(h)
         .layer(axum::middleware::from_fn_with_state(auth, crate::pos::auth))
@@ -1475,6 +1476,29 @@ fn topup_ops_url(h: &TillHandle) -> Result<String, Reply> {
     }
 }
 
+#[derive(Deserialize)]
+struct WaitingQuery {
+    short_id: Option<String>,
+}
+
+/// `GET /v1/topups/waiting?short_id=<id>`: paid top-ups not yet on a card that this card may take
+/// (docs/TOPUP.md § Waiting top-ups), oldest first.
+async fn topups_waiting(State(h): State<TillHandle>, Query(q): Query<WaitingQuery>) -> Reply {
+    let Some(t) = h.topups.clone() else { return topups_unavailable() };
+    if let Some(id) = q.short_id.as_deref() {
+        if id.len() != 8 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Reply::fail(400, "bad_request", "short_id must be 8 hex characters");
+        }
+    }
+    let store = t.store.lock().unwrap();
+    let list: Vec<Value> = store
+        .waiting_for(q.short_id.as_deref())
+        .into_iter()
+        .map(|r| json!({"topup_id": r.topup_id, "amount_msat": r.amount_msat, "for_card": r.for_card, "created_at_ms": r.created_at_ms}))
+        .collect();
+    Reply::ok(json!({"ok": true, "topups": list}))
+}
+
 async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
     let Some(t) = h.topups.clone() else { return topups_unavailable() };
     let req: TopupReq = match serde_json::from_slice(&body) {
@@ -1547,6 +1571,7 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         load_txid: None,
         short_id: None,
         detail: None,
+        for_card: req.short_id.as_ref().map(|c| c.to_ascii_lowercase()),
     };
     if let Err(e) = t.store.lock().unwrap().insert(rec.clone()) {
         return error_reply(&e);

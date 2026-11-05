@@ -116,7 +116,8 @@ enum PosState: Equatable {
     case sales(returnTo: PosErrorInfo?)
     case balanceWaiting
     case balanceReading(readId: Int)
-    case balanceShown(readId: Int, liveMsat: Int64)
+    /// `waiting`: a paid top-up the till holds for this card, offered once the till answers.
+    case balanceShown(readId: Int, liveMsat: Int64, waiting: WaitingTopUp? = nil)
     /// `detail` is the till's own words, kept for diagnosis and never shown.
     case balanceFailed(BalanceProblem, detail: String)
 
@@ -173,6 +174,10 @@ enum PosEvent: Equatable {
     /// A poll of the invoice on screen.
     case topUpPolled(topupId: String, result: TopUpReply<TopUpStatus>)
     case topUpLoadDone(loadId: Int, result: TopUpReply<TopUpStatus>)
+    /// The till's paid top-ups for the card just read (nil: none, or the till could not say).
+    case waitingFetched(readId: Int, topUps: [WaitingTopUp]?)
+    /// "Load waiting top-up" on the balance screen.
+    case loadWaitingPressed
 }
 
 /// A failed top-up step. `topUp` is nil when the invoice was never made (Try again asks for it
@@ -196,6 +201,8 @@ enum PosEffect {
     case createTopUp(createId: Int, amountMsat: Int64, clientRef: String, shortId: String?)
     /// `POST /v1/topup/{id}/load` over the card now linked.
     case loadTopUp(loadId: Int, topupId: String)
+    /// `GET /v1/topups/waiting` for the card just read; answers `.waitingFetched`.
+    case fetchWaiting(readId: Int, shortId: String)
 }
 
 /// Pure state machine for one till session. Call from the main thread.
@@ -277,6 +284,13 @@ final class PosFlow {
             topUpPad.clear(); topUpCard = shownCard; state = .topUpEntering
         case (.chargeCardPressed, .balanceShown):
             state = .entering
+        case (.waitingFetched(let rid, let list), .balanceShown(let cur, let live, _)) where rid == cur:
+            state = .balanceShown(readId: cur, liveMsat: live, waiting: list?.first)
+        case (.waitingFetched, _):
+            return [] // a stale reply: the balance it belonged to is gone
+        case (.loadWaitingPressed, .balanceShown(_, _, let w?)):
+            topUpCard = shownCard
+            return waitForCard(w.asTopUp)
         case (.createInvoicePressed, .topUpEntering):
             return topUpPad.isChargeable ? createTopUp(topUpPad.msat, newRef()) : []
         case (.cancelPressed, .topUpEntering), (.cancelPressed, .topUpInvoice):
@@ -401,13 +415,17 @@ final class PosFlow {
             state = .entering
         case (.balanceDone(let rid, let r), .balanceReading(let cur)) where rid == cur:
             switch r {
-            case .read(let b): shownCard = b.shortId; state = .balanceShown(readId: cur, liveMsat: b.liveMsat)
+            case .read(let b):
+                shownCard = b.shortId; state = .balanceShown(readId: cur, liveMsat: b.liveMsat)
+                // The balance shows at once; a paid top-up waiting for this card is offered when
+                // the till answers.
+                if let sid = b.shortId { return [.fetchWaiting(readId: cur, shortId: sid)] }
             case .refused(_, let d): state = .balanceFailed(balanceProblem(r), detail: d)
             case .failed(let te):
                 if case .badResponse(let d) = te { state = .balanceFailed(balanceProblem(r), detail: d) }
                 else { state = .balanceFailed(balanceProblem(r), detail: "") }
             }
-        case (.balanceExpired(let rid), .balanceShown(let cur, _)) where rid == cur:
+        case (.balanceExpired(let rid), .balanceShown(let cur, _, _)) where rid == cur:
             state = .entering
         case (.donePressed, .balanceShown), (.donePressed, .balanceFailed), (.backPressed, .balanceFailed):
             state = .entering

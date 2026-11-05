@@ -21,6 +21,7 @@
     <string name="reading_card">Reading… keep the card on the phone</string>
     <string name="charge_card">Charge card</string>
     <string name="top_up_card">Top up card</string>
+    <string name="load_waiting_top_up">Load waiting top-up · %1$s sats</string>
     <string name="top_up">Top up</string>
     <string name="create_invoice">Create invoice</string>
     <string name="scan_with_wallet">Scan with a Lightning wallet</string>

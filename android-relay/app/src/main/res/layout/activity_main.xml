@@ -198,6 +198,9 @@
         <TextView android:id="@+id/card_balance_countdown" style="@style/Body" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:textColor="@color/dim"
             android:textSize="14sp" />
+        <!-- a paid top-up the till holds for this card: shown once the till answers -->
+        <Button android:id="@+id/btn_load_waiting" style="@style/PrimaryButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:visibility="gone" />
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal">
             <Button android:id="@+id/btn_charge_card" style="@style/OutlineButton" android:layout_width="0dp"

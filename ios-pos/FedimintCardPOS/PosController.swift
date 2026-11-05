@@ -132,7 +132,10 @@ final class PosController: ObservableObject {
         if case .topUpInvoice(let t, _) = now {
             if case .topUpInvoice(let b, _) = before, b.topupId == t.topupId {} else { watchInvoice(t) }
         }
-        if case .balanceShown(let rid, _) = now, before != now { startCountdown(rid) }
+        // The waiting top-up arriving changes the state, not the read: the countdown keeps going.
+        if case .balanceShown(let rid, _, _) = now {
+            if case .balanceShown(let was, _, _) = before, was == rid {} else { startCountdown(rid) }
+        }
         for fx in effects { run(fx) }
     }
 
@@ -160,6 +163,12 @@ final class PosController: ObservableObject {
                 guard let self else { return }
                 let r = await self.client.createTopUp(amountMsat: msat, clientRef: ref, shortId: card)
                 self.send(.topUpCreated(createId: cid, result: r))
+            }
+        case .fetchWaiting(let rid, let sid):
+            Task { [weak self] in
+                guard let self else { return }
+                let r = await self.client.waitingTopUps(shortId: sid)
+                self.send(.waitingFetched(readId: rid, topUps: r))
             }
         case .loadTopUp(let lid, let tid):
             let linkId = link?.id
@@ -292,7 +301,7 @@ final class PosController: ObservableObject {
         countdownTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, case .balanceShown(let cur, _) = self.state, cur == rid else { return }
+                guard let self, case .balanceShown(let cur, _, _) = self.state, cur == rid else { return }
                 self.balanceCountdown -= 1
                 if self.balanceCountdown <= 0 { self.send(.balanceExpired(readId: rid)); return }
             }

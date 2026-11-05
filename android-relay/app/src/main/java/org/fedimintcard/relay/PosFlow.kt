@@ -54,7 +54,7 @@ sealed class PosState {
     /** A card is on the phone and the till is reading it; [readId] matches the reply. */
     data class BalanceReading(val readId: Int) : PosState()
     /** What the card holds, shown to the holder until Done or [PosFlow.BALANCE_SHOWN_MS] pass. */
-    data class BalanceShown(val readId: Int, val liveMsat: Long, val shortId: String? = null) : PosState()
+    data class BalanceShown(val readId: Int, val liveMsat: Long, val shortId: String? = null, val waiting: WaitingTopUp? = null) : PosState()
     /** The read failed; [detail] is the till's own words, kept for diagnosis and never shown. */
     data class BalanceFailed(val problem: BalanceProblem, val detail: String = "") : PosState()
 
@@ -151,6 +151,10 @@ sealed class PosEvent {
     /** A poll of the invoice on screen. */
     data class TopUpPolled(val topupId: String, val result: TopUpReply<TopUpStatus>) : PosEvent()
     data class TopUpLoadDone(val loadId: Int, val result: TopUpReply<TopUpStatus>) : PosEvent()
+    /** The till's paid top-ups for the card just read (null: none, or the till could not say). */
+    data class WaitingFetched(val readId: Int, val topUps: List<WaitingTopUp>?) : PosEvent()
+    /** "Load waiting top-up" on the balance screen. */
+    object LoadWaitingPressed : PosEvent()
 }
 
 sealed class PosEffect {
@@ -162,6 +166,8 @@ sealed class PosEffect {
     data class CreateTopUp(val createId: Int, val amountMsat: Long, val clientRef: String, val shortId: String? = null) : PosEffect()
     /** `POST /v1/topup/{id}/load` over the card now on the phone. */
     data class LoadTopUp(val loadId: Int, val topupId: String) : PosEffect()
+    /** Ask the till for paid top-ups waiting for the card just read; answers [PosEvent.WaitingFetched]. */
+    data class FetchWaiting(val readId: Int, val shortId: String) : PosEffect()
 }
 
 /** Pure state machine for one till session. Not thread-safe: call from the UI thread. */
@@ -243,6 +249,13 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         when {
             e is PosEvent.TopUpPressed && s is PosState.BalanceShown -> { topUpPad.clear(); topUpCard = s.shortId; state = PosState.TopUpEntering }
             e is PosEvent.ChargeCardPressed && s is PosState.BalanceShown -> state = PosState.Entering
+            e is PosEvent.WaitingFetched && s is PosState.BalanceShown && e.readId == s.readId ->
+                state = s.copy(waiting = e.topUps?.firstOrNull())
+            e is PosEvent.WaitingFetched -> {} // a stale reply: the balance it belonged to is gone
+            e is PosEvent.LoadWaitingPressed && s is PosState.BalanceShown && s.waiting != null -> {
+                topUpCard = s.shortId
+                return loadWhenCard(s.waiting.toTopUp())
+            }
             e is PosEvent.CreateInvoicePressed && s is PosState.TopUpEntering ->
                 return if (topUpPad.isChargeable) createTopUp(topUpPad.msat, newRef()) else emptyList()
             e is PosEvent.CancelPressed && (s is PosState.TopUpEntering || s is PosState.TopUpInvoice) -> state = PosState.Entering
@@ -373,10 +386,16 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             }
             e is PosEvent.CardBalanceOpened && s is PosState.Entering -> return balance()
             e is PosEvent.CancelPressed && (s is PosState.BalanceWaiting || s is PosState.BalanceReading) -> state = PosState.Entering
-            e is PosEvent.BalanceDone && s is PosState.BalanceReading && e.readId == s.readId -> state = when (val r = e.result) {
-                is BalanceResult.Read -> PosState.BalanceShown(s.readId, r.balance.liveMsat, r.balance.shortId)
-                is BalanceResult.Refused -> PosState.BalanceFailed(balanceProblem(r), r.detail)
-                is BalanceResult.Failed -> PosState.BalanceFailed(balanceProblem(r), (r.error as? TillError.BadResponse)?.detail ?: "")
+            e is PosEvent.BalanceDone && s is PosState.BalanceReading && e.readId == s.readId -> {
+                state = when (val r = e.result) {
+                    is BalanceResult.Read -> PosState.BalanceShown(s.readId, r.balance.liveMsat, r.balance.shortId)
+                    is BalanceResult.Refused -> PosState.BalanceFailed(balanceProblem(r), r.detail)
+                    is BalanceResult.Failed -> PosState.BalanceFailed(balanceProblem(r), (r.error as? TillError.BadResponse)?.detail ?: "")
+                }
+                // The balance shows at once; a paid top-up waiting for this card is offered when
+                // the till answers.
+                val id = (e.result as? BalanceResult.Read)?.balance?.shortId
+                if (id != null) return listOf(PosEffect.FetchWaiting(s.readId, id))
             }
             e is PosEvent.BalanceExpired && s is PosState.BalanceShown && e.readId == s.readId -> state = PosState.Entering
             e is PosEvent.DonePressed && (s is PosState.BalanceShown || s is PosState.BalanceFailed) -> state = PosState.Entering

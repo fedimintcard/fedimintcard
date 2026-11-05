@@ -447,6 +447,8 @@ struct BalanceErrorScreen: View {
 struct BalanceScreen: View {
     @EnvironmentObject var pos: PosController
     let liveMsat: Int64
+    /// A paid top-up the till holds for this card; arrives after the balance.
+    var waiting: WaitingTopUp? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -466,6 +468,12 @@ struct BalanceScreen: View {
             .accessibilityLabel("Card balance: \(formatSats(liveMsat)) sats on this card")
             Spacer()
             Text("Back to the amount in \(pos.balanceCountdown) s").font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.bottom, 12)
+            if let w = waiting {
+                Button("Load waiting top-up · \(formatSats(w.amountMsat)) sats") { pos.send(.loadWaitingPressed) }
+                    .buttonStyle(GoldButtonStyle())
+                    .padding(.bottom, 12)
+                    .transition(.opacity)
+            }
             HStack(spacing: 12) {
                 Button("Charge card") { pos.send(.chargeCardPressed) }.buttonStyle(OutlineButtonStyle())
                 Button("Top up card") { pos.send(.topUpPressed) }.buttonStyle(GoldButtonStyle())
@@ -473,6 +481,7 @@ struct BalanceScreen: View {
             Button("Done") { pos.send(.donePressed) }.buttonStyle(GhostButtonStyle()).padding(.top, 4)
         }
         .padding(8)
+        .animation(.easeOut(duration: 0.22), value: waiting)
     }
 }
 

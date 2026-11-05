@@ -176,4 +176,19 @@ class TillClientTest {
         val t = client(Fake(ex = SocketTimeoutException())).loadTopUp("t1") as TopUpReply.Failed
         assertEquals(TopUpProblem.TIMEOUT, topUpProblem(t))
     }
+
+    @Test fun waitingTopUpsParsesAndAsksForTheCard() {
+        val f = Fake(raw(200, """{"ok":true,"topups":[{"topup_id":"w1","amount_msat":100352,"for_card":null,"created_at_ms":7},{"topup_id":"w2","amount_msat":65536,"for_card":"6f94b19b","created_at_ms":9}]}"""))
+        val r = client(f).waitingTopUps("6f94b19b")!!
+        assertEquals(listOf(WaitingTopUp("w1", 100_352, null, 7), WaitingTopUp("w2", 65_536, "6f94b19b", 9)), r)
+        assertEquals("GET", f.method); assertEquals("http://h:1/v1/topups/waiting?short_id=6f94b19b", f.url)
+    }
+
+    @Test fun waitingTopUpsIsNullOnAnyError() {
+        assertNull(client(Fake(raw(404, """{"ok":false,"error":"not_found","detail":""}"""))).waitingTopUps("x"))
+        assertNull(client(Fake(raw(200, "not json"))).waitingTopUps("x"))
+        assertNull(client(Fake(raw(200, """{"ok":true}"""))).waitingTopUps("x"))
+        assertNull(client(Fake(ex = IOException("x"))).waitingTopUps("x"))
+        assertEquals(emptyList<WaitingTopUp>(), client(Fake(raw(200, """{"ok":true,"topups":[]}"""))).waitingTopUps("x"))
+    }
 }
