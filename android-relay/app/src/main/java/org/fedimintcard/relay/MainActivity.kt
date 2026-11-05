@@ -45,7 +45,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         ui = PosUi(this, ::dispatch, ::onKey, ::onPinKey)
         status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
         ui.onSettings { ui.settingsDialog(settings.baseUrl, { settings.baseUrl = it; failures = 0; pollNow() }, { ui.showRelay() }) }
-        cardListener = { present -> ui.setCard(present); dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
+        cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
         ui.setPad(flow.pad)
         ui.render(flow.state)
         nfc = NfcAdapter.getDefaultAdapter(this)
@@ -142,11 +142,6 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     private fun dispatch(e: PosEvent) {
-        if (e is PosEvent.CardBalanceOpened) {
-            ui.openCardBalance()
-            readCardBalance()
-            return
-        }
         val before = flow.state
         val refBefore = flow.unresolvedRef
         val effects = flow.dispatch(e)
@@ -164,12 +159,29 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (refNow == null) salesGen.cancel()
         else if (refNow != refBefore) scheduleSalesPoll()
         if (now is PosState.Receipt) pollNow()
-        for (fx in effects) if (fx is PosEffect.StartCharge) {
-            Thread {
+        if (now is PosState.BalanceShown && before != now) startBalanceCountdown(now.readId)
+        for (fx in effects) when (fx) {
+            is PosEffect.StartCharge -> Thread {
                 val r = client.charge(fx.priceMsat, fx.clientRef, fx.pin) // wipes fx.pin
                 runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
             }.start()
+            is PosEffect.StartBalanceRead -> readCardBalance(fx.readId)
         }
+    }
+
+    /** Counts the shown balance down, then hands the screen back to the amount. */
+    private fun startBalanceCountdown(readId: Int) {
+        var left = (PosFlow.BALANCE_SHOWN_MS / 1000).toInt()
+        ui.setBalanceCountdown(left)
+        val step = object : Runnable {
+            override fun run() {
+                val s = flow.state
+                if (s !is PosState.BalanceShown || s.readId != readId) return
+                if (--left <= 0) dispatch(PosEvent.BalanceExpired(readId))
+                else { ui.setBalanceCountdown(left); handler.postDelayed(this, 1000) }
+            }
+        }
+        handler.postDelayed(step, 1000)
     }
 
     private val tick = object : Runnable {
@@ -211,13 +223,14 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     /**
-     * Reads the card. The till serialises this against charges, so a read during a sale is refused
-     * with "busy" rather than interleaved — the reply lands on the same screen.
+     * Reads the card now on the phone. The flow only asks once a card is there, so the till's
+     * relay call finds it. The till serialises this against charges: a read during a sale is
+     * refused with "busy" rather than interleaved.
      */
-    private fun readCardBalance() {
+    private fun readCardBalance(readId: Int) {
         Thread {
             val r = client.cardBalance()
-            runOnUiThread { ui.showCardBalance(r) }
+            runOnUiThread { dispatch(PosEvent.BalanceDone(readId, r)) }
         }.start()
     }
 
@@ -231,8 +244,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                 if (r is TillResult.Ok) {
                     failures = 0
                     ui.setStatus(r.value)
-                    ui.setConnection(r.value.cardRelayOk)
-                } else if (++failures >= 2) ui.setConnection(false)
+                    ui.setHealth(tillOk = true, relayOk = r.value.cardRelayOk)
+                } else if (++failures >= 2) ui.setHealth(tillOk = false, relayOk = false)
             }
         }.start()
     }
@@ -247,7 +260,6 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (ui.closeCardBalance()) return
         if (ui.closeRelay()) return
         val ev = flow.systemBack()
         if (ev != null) dispatch(ev)

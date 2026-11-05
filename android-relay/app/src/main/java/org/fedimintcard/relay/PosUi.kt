@@ -29,15 +29,12 @@ class PosUi(
     private fun <T : View> v(id: Int): T = act.findViewById(id)
 
     private val screens = listOf(R.id.screen_amount, R.id.screen_pin, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay)
-    private val dot: View = v(R.id.dot)
-    private val cardChip: TextView = v(R.id.card_chip)
+    private val statusAlert: TextView = v(R.id.status_alert)
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
-    private val cardBalanceLine: TextView = v(R.id.card_balance_line)
-    private val cardBalanceTotal: TextView = v(R.id.card_balance_total)
-    private val cardBalanceSlots: TextView = v(R.id.card_balance_slots)
-    private val cardNotesList: ListView = v(R.id.card_notes_list)
-    private val cardNotesAdapter = CardNotesAdapter()
+    private val cardBalanceAmount: TextView = v(R.id.card_balance_amount)
+    private val cardBalancePanel: View = v(R.id.card_balance_panel)
+    private val cardBalanceCountdown: TextView = v(R.id.card_balance_countdown)
     private val amountText: TextView = v(R.id.amount_text)
     private val charge: Button = v(R.id.btn_charge)
     private val pinAmount: TextView = v(R.id.pin_amount)
@@ -61,9 +58,9 @@ class PosUi(
     val relayStatus: TextView = v(R.id.relay_status)
     val relayLast: TextView = v(R.id.relay_last)
     val relayInfo: TextView = v(R.id.relay_info)
+    private val relayTill: TextView = v(R.id.relay_till)
 
     private var relayOpen = false
-    private var cardBalanceOpen = false
     private var last: PosState = PosState.Entering
     private var lastPad = ""
     private var elapsedS = 0
@@ -74,7 +71,6 @@ class PosUi(
 
     init {
         salesList.adapter = salesAdapter
-        cardNotesList.adapter = cardNotesAdapter
         val digits = listOf(R.id.key_0, R.id.key_1, R.id.key_2, R.id.key_3, R.id.key_4, R.id.key_5, R.id.key_6, R.id.key_7, R.id.key_8, R.id.key_9)
         digits.forEachIndexed { d, id -> v<View>(id).setOnClickListener { onKey(d) } }
         v<View>(R.id.key_c).setOnClickListener { onKey(-1) }
@@ -101,8 +97,9 @@ class PosUi(
         v<View>(R.id.btn_sales_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
         v<View>(R.id.btn_new_sale).setOnClickListener { onEvent(PosEvent.NewSalePressed) }
         v<View>(R.id.btn_relay_back).setOnClickListener { relayOpen = false; show() }
-        v<View>(R.id.btn_card_balance).setOnClickListener { onEvent(PosEvent.CardBalanceOpened) }
-        v<View>(R.id.btn_card_balance_back).setOnClickListener { cardBalanceOpen = false; show() }
+        v<View>(R.id.btn_check_balance).setOnClickListener { onEvent(PosEvent.CardBalanceOpened) }
+        v<View>(R.id.btn_card_balance_done).setOnClickListener { onEvent(PosEvent.DonePressed) }
+        statusAlert.setOnClickListener { showRelay() }
     }
 
     fun onSettings(handler: () -> Unit) {
@@ -110,16 +107,26 @@ class PosUi(
         v<View>(R.id.federation_name).setOnLongClickListener { handler(); true }
     }
 
-    fun setConnection(ok: Boolean?) {
-        val c = when (ok) { true -> R.color.ok; false -> R.color.bad; null -> R.color.dim }
-        (dot.background.mutate() as GradientDrawable).setColor(act.getColor(c))
-    }
-
-    /** Card presence chip on the amount screen; independent of the till connectivity dot. */
-    fun setCard(present: Boolean) {
-        cardChip.text = if (present) "Card: present" else "Card: none"
-        cardChip.setTextColor(act.getColor(if (present) R.color.gold_hi else R.color.dim))
-        cardChip.setBackgroundResource(if (present) R.drawable.bg_chip_on else R.drawable.bg_chip)
+    /**
+     * The home screen says nothing about the till's link while it works; a merchant only needs to
+     * hear about it when it is broken. [tillOk] false: the till service did not answer; [relayOk]
+     * false: the till answered but cannot reach this phone's card relay. The pill opens the relay
+     * screen, which keeps the detail (relay state, last APDU, port, Wi-Fi IP, till line).
+     */
+    fun setHealth(tillOk: Boolean, relayOk: Boolean) {
+        val problem = when {
+            !tillOk -> "Till offline"
+            !relayOk -> "Card reader not linked"
+            else -> null
+        }
+        statusAlert.visibility = if (problem == null) View.GONE else View.VISIBLE
+        statusAlert.text = problem ?: ""
+        statusAlert.contentDescription = problem?.let { "$it. Open connection details" }
+        relayTill.text = when {
+            !tillOk -> "Till service: not answering"
+            !relayOk -> "Till service: up · card relay: not reachable from the till"
+            else -> "Till service: up · card relay: linked"
+        }
     }
 
     fun setStatus(s: TillStatus?) {
@@ -146,8 +153,15 @@ class PosUi(
 
     fun render(state: PosState) {
         last = state
-        if (state is PosState.Receipt || state is PosState.Error) relayOpen = false
+        if (state is PosState.Receipt || state is PosState.Error || state is PosState.BalanceShown || state is PosState.BalanceFailed) relayOpen = false
         when (state) {
+            PosState.BalanceWaiting, is PosState.BalanceReading -> tapAmount.text = act.getString(R.string.card_balance_label)
+            is PosState.BalanceShown -> {
+                val amount = "${formatSats(state.liveMsat)} sats"
+                cardBalanceAmount.text = amount
+                cardBalancePanel.contentDescription = "Card balance: $amount on this card"
+            }
+            is PosState.BalanceFailed -> renderBalanceError(state)
             is PosState.EnteringPin -> {
                 pinAmount.text = "Pay ${formatSats(state.priceMsat)} sats"
                 pinNotice.visibility = if (state.wrongPin) View.VISIBLE else View.GONE
@@ -169,9 +183,17 @@ class PosUi(
         tapStatus.text = when (val s = last) {
             is PosState.WaitingForCard -> if (s.mustRemoveFirst) "Remove the card, then hold it again" else "Hold card to phone"
             is PosState.Signing -> if (elapsedS == 0) "Card present" else "Signing… ${elapsedS}s"
+            PosState.BalanceWaiting -> act.getString(R.string.hold_card)
+            is PosState.BalanceReading -> act.getString(R.string.reading_card)
             else -> ""
         }
-        cancel.visibility = if (last is PosState.WaitingForCard) View.VISIBLE else View.INVISIBLE
+        val l = last
+        cancel.visibility = if (l is PosState.WaitingForCard || l is PosState.BalanceWaiting || l is PosState.BalanceReading) View.VISIBLE else View.INVISIBLE
+    }
+
+    /** Seconds left before the shown balance gives way to the amount. */
+    fun setBalanceCountdown(seconds: Int) {
+        cardBalanceCountdown.text = "Back to the amount in $seconds s"
     }
 
     private fun renderReceipt(r: ChargeReceipt) {
@@ -190,7 +212,21 @@ class PosUi(
         retry.text = act.getString(if (unresolved) R.string.try_again else R.string.retry)
         retry.visibility = if (e.kind.retryable) View.VISIBLE else View.GONE
         errBack.visibility = if (unresolved) View.GONE else View.VISIBLE
+        (errBack as TextView).text = act.getString(R.string.back)
         checkSales.visibility = if (unresolved) View.VISIBLE else View.GONE
+    }
+
+    /** A failed balance read borrows the error screen: Try again and Done, nothing about sales. */
+    private fun renderBalanceError(e: PosState.BalanceFailed) {
+        val (title, detail) = balanceErrorCopy(e.problem)
+        errTitle.text = title
+        errDetail.text = detail
+        abandon.visibility = View.GONE
+        checkSales.visibility = View.GONE
+        retry.text = act.getString(R.string.try_again)
+        retry.visibility = View.VISIBLE
+        errBack.visibility = View.VISIBLE
+        (errBack as TextView).text = act.getString(R.string.done)
     }
 
     fun showSales(r: TillResult<SalesList>?) {
@@ -204,35 +240,6 @@ class PosUi(
         }
     }
 
-    /** The card-balance screen is an overlay the back button closes before the state machine sees it. */
-    fun closeCardBalance(): Boolean { if (!cardBalanceOpen) return false; cardBalanceOpen = false; show(); return true }
-
-    fun openCardBalance() { cardBalanceOpen = true; cardBalanceTotal.text = "Reading card…"; cardBalanceSlots.text = ""; cardNotesAdapter.rows = emptyList(); show() }
-
-    /**
-     * Renders a card read. [r] is null while the read is in flight. A failed read keeps the last
-     * figure off screen rather than showing a stale one beside a fresh error.
-     */
-    fun showCardBalance(r: TillResult<CardBalance>?) {
-        when (r) {
-            null -> { cardBalanceTotal.text = "Reading card…"; cardBalanceSlots.text = ""; cardNotesAdapter.rows = emptyList() }
-            is TillResult.Ok -> {
-                val b = r.value
-                cardBalanceTotal.text = "${formatSats(b.liveMsat)} sats"
-                val live = b.notes.count { it.status == "live" }
-                cardBalanceSlots.text = "$live of ${b.notes.size + b.freeSlots.size} slots live · free slots: " +
-                    if (b.freeSlots.isEmpty()) "none" else b.freeSlots.joinToString(", ")
-                cardNotesAdapter.rows = b.notes
-                cardBalanceLine.text = "Card balance: ${formatSats(b.liveMsat)} sats"
-            }
-            is TillResult.Err -> {
-                cardBalanceTotal.text = "Card unreadable"
-                cardBalanceSlots.text = cardBalanceErrorCopy(r.error)
-                cardNotesAdapter.rows = emptyList()
-            }
-        }
-    }
-
     fun closeRelay(): Boolean { if (!relayOpen) return false; relayOpen = false; show(); return true }
     fun destroy() { pulser.cancel() }
 
@@ -240,12 +247,13 @@ class PosUi(
 
     private fun show() {
         val target = when {
-            cardBalanceOpen -> R.id.screen_card_balance
             relayOpen -> R.id.screen_relay
             else -> when (last) {
                 PosState.Entering -> R.id.screen_amount
                 is PosState.EnteringPin -> R.id.screen_pin
-                is PosState.WaitingForCard, is PosState.Signing -> R.id.screen_tap
+                is PosState.WaitingForCard, is PosState.Signing, PosState.BalanceWaiting, is PosState.BalanceReading -> R.id.screen_tap
+                is PosState.BalanceShown -> R.id.screen_card_balance
+                is PosState.BalanceFailed -> R.id.screen_error
                 is PosState.Receipt -> R.id.screen_receipt
                 is PosState.Error -> R.id.screen_error
                 is PosState.Sales -> R.id.screen_sales
@@ -274,22 +282,6 @@ class PosUi(
             }.show()
     }
 
-    private inner class CardNotesAdapter : BaseAdapter() {
-        var rows: List<CardNote> = emptyList()
-            set(x) { field = x; notifyDataSetChanged() }
-        override fun getCount() = rows.size
-        override fun getItem(i: Int) = rows[i]
-        override fun getItemId(i: Int) = rows[i].slot.toLong()
-        override fun getView(i: Int, convert: View?, parent: ViewGroup): View {
-            val row = convert ?: LayoutInflater.from(act).inflate(R.layout.row_card_note, parent, false)
-            val n = rows[i]
-            row.findViewById<TextView>(R.id.row_slot).text = "slot ${n.slot}"
-            row.findViewById<TextView>(R.id.row_note_amount).text = "${formatSats(n.msat)} sats"
-            row.findViewById<TextView>(R.id.row_note_status).text = n.status
-            return row
-        }
-    }
-
     private inner class SalesAdapter : BaseAdapter() {
         var rows: List<Sale> = emptyList()
             set(x) { field = x; notifyDataSetChanged() }
@@ -309,14 +301,16 @@ class PosUi(
     }
 }
 
-/** Why a card read failed, in words a cashier can act on. */
-fun cardBalanceErrorCopy(e: TillError): String = when (e) {
-    is TillError.Unreachable -> "Till service unreachable — check adb reverse tcp:9877 tcp:9877"
-    is TillError.Timeout -> "The till did not answer in time"
-    is TillError.Interrupted -> "The read was interrupted"
-    is TillError.BadResponse ->
-        if (e.detail.contains("no card", true) || e.detail.contains("card relay", true)) "No card on the phone — hold the card to it, then read again"
-        else e.detail
+/** Title and detail for a failed balance read, in words the card holder can act on. */
+fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
+    BalanceProblem.CARD_MOVED -> "The card moved away" to "Hold the card still against the back of the phone until the balance shows."
+    BalanceProblem.NOT_OUR_CARD -> "Not a card for this till" to "This card isn't set up here. Try another card."
+    BalanceProblem.TILL_UNREACHABLE -> "Can't reach the till" to "Check that the till is running, then try again."
+    BalanceProblem.RELAY_UNREACHABLE -> "The till can't reach this phone" to "Check the connection in Settings, then try again."
+    BalanceProblem.BUSY -> "The till is busy" to "Try again in a moment."
+    BalanceProblem.CARD_SERVICE -> "Card service unreachable" to "Check the network, then try again."
+    BalanceProblem.TIMEOUT -> "The till took too long" to "Hold the card to the phone and try again."
+    BalanceProblem.OTHER -> "Couldn't read the card" to "Hold the card to the phone and try again."
 }
 
 /** Title and detail copy for a charge error. */

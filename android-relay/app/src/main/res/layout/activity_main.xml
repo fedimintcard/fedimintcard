@@ -7,11 +7,12 @@
     <LinearLayout android:id="@+id/screen_amount" android:layout_width="match_parent" android:layout_height="match_parent"
         android:orientation="vertical" android:padding="16dp">
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="horizontal" android:gravity="top">
+            android:orientation="horizontal" android:gravity="center_vertical">
             <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
                 android:orientation="vertical">
                 <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:orientation="horizontal" android:gravity="center_vertical">
+                    android:orientation="horizontal" android:gravity="center_vertical"
+                    android:contentDescription="fedimint card" android:focusable="true">
                     <ImageView android:layout_width="34dp" android:layout_height="26dp"
                         android:src="@drawable/ic_mark" android:contentDescription="@null" />
                     <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
@@ -20,34 +21,26 @@
                     <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
                         android:layout_marginStart="4dp" android:text="card" android:textColor="@color/mist" android:textSize="20sp" />
                 </LinearLayout>
-                <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp" android:orientation="horizontal" android:gravity="center_vertical">
-                    <View android:id="@+id/dot" android:layout_width="12dp" android:layout_height="12dp"
-                        android:background="@drawable/bg_dot" />
-                    <TextView android:id="@+id/card_chip" style="@style/Pill" android:layout_width="wrap_content"
-                        android:layout_height="wrap_content" android:layout_marginStart="10dp" android:text="Card: none" />
-                </LinearLayout>
             </LinearLayout>
             <Button android:id="@+id/btn_sales" style="@style/HeaderButton" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="@string/sales" />
             <Button android:id="@+id/btn_gear" style="@style/HeaderButton" android:layout_width="wrap_content"
-                android:layout_height="wrap_content" android:text="⚙" android:minWidth="48dp" />
+                android:layout_height="wrap_content" android:text="⚙" android:minWidth="48dp"
+                android:contentDescription="@string/settings" />
         </LinearLayout>
+        <!-- the merchant's header: whose till, and what it holds. Quiet; the amount is the subject. -->
         <TextView android:id="@+id/federation_name" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="@string/app_name"
+            android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="@string/app_name"
             android:fontFamily="@font/figtree_extrabold" android:letterSpacing="-0.02" android:textColor="@color/ink"
             android:textSize="22sp" android:singleLine="true" android:ellipsize="end" />
         <TextView android:id="@+id/balance_line" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:gravity="start" android:textSize="14sp" />
-        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="horizontal" android:gravity="center_vertical">
-            <TextView android:id="@+id/card_balance_line" style="@style/Body" android:layout_width="0dp"
-                android:layout_weight="1" android:layout_height="wrap_content" android:gravity="start"
-                android:textSize="14sp" android:text="@string/card_balance_reading" />
-            <Button android:id="@+id/btn_card_balance" style="@style/GhostButton" android:layout_width="wrap_content"
-                android:layout_height="wrap_content" android:minWidth="0dp" android:paddingStart="8dp"
-                android:paddingEnd="8dp" android:text="@string/card_balance" />
-        </LinearLayout>
+            android:layout_height="wrap_content" android:layout_marginTop="2dp" android:gravity="start"
+            android:textColor="@color/dim" android:textSize="14sp" />
+        <!-- shown only when something is wrong; tapping it opens the relay diagnostics -->
+        <TextView android:id="@+id/status_alert" style="@style/Pill" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:layout_marginTop="10dp" android:minHeight="32dp"
+            android:gravity="center_vertical" android:textColor="@color/bad" android:background="@drawable/bg_chip_bad"
+            android:clickable="true" android:focusable="true" android:visibility="gone" />
         <TextView android:id="@+id/amount_text" style="@style/Heading" android:layout_width="match_parent"
             android:layout_height="0dp" android:layout_weight="1" android:textSize="64sp" android:text="0 sats" android:gravity="center" />
         <GridLayout android:id="@+id/keypad" android:layout_width="match_parent" android:layout_height="0dp"
@@ -67,6 +60,8 @@
         </GridLayout>
         <Button android:id="@+id/btn_charge" style="@style/PrimaryButton" android:layout_width="match_parent"
             android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="@string/charge" />
+        <Button android:id="@+id/btn_check_balance" style="@style/OutlineButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="10dp" android:text="@string/check_balance" />
     </LinearLayout>
 
     <!-- holder PIN: handed to the holder; the window is FLAG_SECURE while it shows -->
@@ -178,22 +173,29 @@
             android:clipToPadding="false" android:paddingTop="8dp" />
     </LinearLayout>
 
-    <!-- card balance: what the card itself holds, read off the card -->
+    <!-- card balance: shown to the holder, so money only, in plain words -->
     <LinearLayout android:id="@+id/screen_card_balance" android:layout_width="match_parent" android:layout_height="match_parent"
-        android:orientation="vertical" android:padding="16dp" android:visibility="gone">
-        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="horizontal" android:gravity="center_vertical">
-            <Button android:id="@+id/btn_card_balance_back" style="@style/GhostButton" android:layout_width="wrap_content"
-                android:layout_height="wrap_content" android:text="@string/back" />
-            <TextView android:id="@+id/card_balance_total" android:layout_width="0dp" android:layout_weight="1"
-                android:layout_height="wrap_content" android:gravity="end" android:fontFamily="@font/figtree_extrabold"
-                android:textColor="@color/gold_hi" android:textSize="16sp" />
+        android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">
+        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+        <LinearLayout android:id="@+id/card_balance_panel" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:gravity="center_horizontal" android:paddingTop="36dp"
+            android:paddingBottom="36dp" android:paddingStart="20dp" android:paddingEnd="20dp"
+            android:background="@drawable/bg_card" android:focusable="true" android:screenReaderFocusable="true">
+            <TextView style="@style/Pill" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/card_balance_label" android:textColor="@color/mist" />
+            <TextView android:id="@+id/card_balance_amount" style="@style/Heading" android:layout_width="match_parent"
+                android:layout_height="96dp" android:layout_marginTop="20dp" android:maxLines="1"
+                android:autoSizeTextType="uniform" android:autoSizeMinTextSize="28sp" android:autoSizeMaxTextSize="64sp"
+                android:autoSizeStepGranularity="2sp" android:textColor="@color/gold_hi" />
+            <TextView style="@style/Body" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="4dp" android:text="@string/on_this_card" android:textSize="20sp" />
         </LinearLayout>
-        <TextView android:id="@+id/card_balance_slots" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:textSize="14sp" />
-        <ListView android:id="@+id/card_notes_list" android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" android:divider="@null" android:dividerHeight="0dp"
-            android:clipToPadding="false" android:paddingTop="8dp" />
+        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+        <TextView android:id="@+id/card_balance_countdown" style="@style/Body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:textColor="@color/dim"
+            android:textSize="14sp" />
+        <Button android:id="@+id/btn_card_balance_done" style="@style/PrimaryButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="@string/done" />
     </LinearLayout>
 
     <!-- relay (old status screen) -->
@@ -205,6 +207,8 @@
             android:gravity="center" android:textSize="18sp" android:textColor="@color/ink" />
         <TextView android:id="@+id/relay_info" android:layout_width="wrap_content" android:layout_height="wrap_content"
             android:gravity="center" android:textSize="16sp" android:textColor="@color/ink" />
+        <TextView android:id="@+id/relay_till" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginTop="12dp" android:gravity="center" android:textSize="16sp" android:textColor="@color/mist" />
         <Button android:id="@+id/btn_relay_back" style="@style/GhostButton" android:layout_width="wrap_content"
             android:layout_height="wrap_content" android:layout_marginTop="24dp" android:text="@string/back" />
     </LinearLayout>

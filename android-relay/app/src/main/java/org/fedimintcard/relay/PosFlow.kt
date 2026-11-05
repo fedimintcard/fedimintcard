@@ -48,6 +48,48 @@ sealed class PosState {
     data class Error(val priceMsat: Long, val kind: ErrorKind, val detail: String, val clientRef: String, val unresolvedRef: String? = null) : PosState()
     /** [returnTo] is the unresolved Error to go back to, or null to go back to Entering. */
     data class Sales(val returnTo: Error? = null) : PosState()
+
+    /** Check card balance: waiting for the holder to hold a card to the phone. */
+    object BalanceWaiting : PosState()
+    /** A card is on the phone and the till is reading it; [readId] matches the reply. */
+    data class BalanceReading(val readId: Int) : PosState()
+    /** What the card holds, shown to the holder until Done or [PosFlow.BALANCE_SHOWN_MS] pass. */
+    data class BalanceShown(val readId: Int, val liveMsat: Long) : PosState()
+    /** The read failed; [detail] is the till's own words, kept for diagnosis and never shown. */
+    data class BalanceFailed(val problem: BalanceProblem, val detail: String = "") : PosState()
+}
+
+/** Why a balance read failed, in the terms the holder's screen needs. */
+enum class BalanceProblem { CARD_MOVED, NOT_OUR_CARD, TILL_UNREACHABLE, RELAY_UNREACHABLE, BUSY, CARD_SERVICE, TIMEOUT, OTHER }
+
+/** The till's reply to `POST /v1/card/balance`. */
+sealed class BalanceResult {
+    data class Read(val balance: CardBalance) : BalanceResult()
+    data class Refused(val code: ChargeErrorCode, val detail: String) : BalanceResult()
+    data class Failed(val error: TillError) : BalanceResult()
+}
+
+/** Sorts a failed read into what the holder can do about it. */
+fun balanceProblem(r: BalanceResult): BalanceProblem = when (r) {
+    is BalanceResult.Read -> BalanceProblem.OTHER
+    is BalanceResult.Failed -> when (r.error) {
+        TillError.Unreachable -> BalanceProblem.TILL_UNREACHABLE
+        TillError.Timeout, TillError.Interrupted -> BalanceProblem.TIMEOUT
+        is TillError.BadResponse -> BalanceProblem.OTHER
+    }
+    is BalanceResult.Refused -> when (r.code) {
+        ChargeErrorCode.NO_CARD, ChargeErrorCode.CARD_CHANGED -> BalanceProblem.CARD_MOVED
+        ChargeErrorCode.UNKNOWN_CARD -> BalanceProblem.NOT_OUR_CARD
+        // A key that does not match, or an applet that is not there, is a card this till does
+        // not know; anything else from the card mid-read is the card leaving the field.
+        ChargeErrorCode.CARD_ERROR ->
+            if (Regex("different card|6a82|6e00|6d00", RegexOption.IGNORE_CASE).containsMatchIn(r.detail)) BalanceProblem.NOT_OUR_CARD
+            else BalanceProblem.CARD_MOVED
+        ChargeErrorCode.RELAY_UNREACHABLE -> BalanceProblem.RELAY_UNREACHABLE
+        ChargeErrorCode.BUSY, ChargeErrorCode.RECOVERING -> BalanceProblem.BUSY
+        ChargeErrorCode.OPS_UNREACHABLE, ChargeErrorCode.OPS_REFUSED -> BalanceProblem.CARD_SERVICE
+        else -> BalanceProblem.OTHER
+    }
 }
 
 sealed class PosEvent {
@@ -65,8 +107,13 @@ sealed class PosEvent {
     object BackPressed : PosEvent()
     object AbandonPressed : PosEvent()
     object SalesOpened : PosEvent()
-    /** The card-balance screen was opened. It is an overlay: it does not change [PosFlow.state]. */
+    /** Check card balance, from the amount screen. The amount typed so far is kept. */
     object CardBalanceOpened : PosEvent()
+    data class BalanceDone(val readId: Int, val result: BalanceResult) : PosEvent()
+    /** The shown balance's time is up; ignored unless that same read is still on screen. */
+    data class BalanceExpired(val readId: Int) : PosEvent()
+    /** Done on the balance screens: back to the amount. */
+    object DonePressed : PosEvent()
     /** The sales poll found a row carrying the unresolved sale's client_ref. */
     data class SaleFound(val sale: Sale) : PosEvent()
 }
@@ -74,10 +121,16 @@ sealed class PosEvent {
 sealed class PosEffect {
     /** [pin] is handed over to the request, which wipes it once sent. */
     data class StartCharge(val chargeId: Int, val priceMsat: Long, val clientRef: String, val pin: Pin? = null) : PosEffect()
+    /** Ask the till to read the card now on the phone. */
+    data class StartBalanceRead(val readId: Int) : PosEffect()
 }
 
 /** Pure state machine for one till session. Not thread-safe: call from the UI thread. */
 class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() }) {
+    companion object {
+        /** How long the holder sees their balance before the amount comes back. */
+        const val BALANCE_SHOWN_MS = 15_000L
+    }
     val pad = AmountPad()
     val pinPad = PinPad()
     /** The confirmed PIN between the pad and the charge request; handed to [PosEffect.StartCharge]. */
@@ -121,7 +174,20 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         is PosState.Receipt -> PosEvent.NewSalePressed
         is PosState.Error -> if (s.unresolvedRef != null) null else PosEvent.BackPressed
         is PosState.Sales -> PosEvent.BackPressed
+        PosState.BalanceWaiting, is PosState.BalanceReading -> PosEvent.CancelPressed
+        is PosState.BalanceShown, is PosState.BalanceFailed -> PosEvent.DonePressed
         else -> null
+    }
+
+    /**
+     * The read waits for a card: one already on the phone is read at once (reading is harmless,
+     * and a holder who just paid may want the figure); otherwise the screen asks for it.
+     */
+    private fun balance(): List<PosEffect> {
+        if (!cardPresent) { state = PosState.BalanceWaiting; return emptyList() }
+        val id = ++nextId
+        state = PosState.BalanceReading(id)
+        return listOf(PosEffect.StartBalanceRead(id))
     }
 
     private fun sign(price: Long, ref: String, unresolved: String? = null): List<PosEffect> {
@@ -153,6 +219,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             PosEvent.CardPresent -> {
                 cardPresent = true
                 if (s is PosState.WaitingForCard && !s.mustRemoveFirst) return sign(s.priceMsat, pendingRef)
+                if (s is PosState.BalanceWaiting) return balance()
                 return emptyList()
             }
             PosEvent.CardLost -> {
@@ -187,7 +254,19 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                 // Without its PIN the sale cannot go on: put the amount back on screen.
                 if (s is PosState.EnteringPin) state = s.returnTo ?: PosState.Entering
                 if (s is PosState.WaitingForCard) state = PosState.Entering
+                if (s.isBalance) state = PosState.Entering
             }
+            e is PosEvent.CardBalanceOpened && s is PosState.Entering -> return balance()
+            e is PosEvent.CancelPressed && (s is PosState.BalanceWaiting || s is PosState.BalanceReading) -> state = PosState.Entering
+            e is PosEvent.BalanceDone && s is PosState.BalanceReading && e.readId == s.readId -> state = when (val r = e.result) {
+                is BalanceResult.Read -> PosState.BalanceShown(s.readId, r.balance.liveMsat)
+                is BalanceResult.Refused -> PosState.BalanceFailed(balanceProblem(r), r.detail)
+                is BalanceResult.Failed -> PosState.BalanceFailed(balanceProblem(r), (r.error as? TillError.BadResponse)?.detail ?: "")
+            }
+            e is PosEvent.BalanceExpired && s is PosState.BalanceShown && e.readId == s.readId -> state = PosState.Entering
+            e is PosEvent.DonePressed && (s is PosState.BalanceShown || s is PosState.BalanceFailed) -> state = PosState.Entering
+            e is PosEvent.BackPressed && s is PosState.BalanceFailed -> state = PosState.Entering
+            e is PosEvent.RetryPressed && s is PosState.BalanceFailed -> return balance()
             e is PosEvent.ChargeDone && s is PosState.Signing && e.chargeId == s.chargeId -> {
                 lingering = true // the card is still on the phone after any outcome
                 dropPin()
@@ -236,6 +315,9 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         return emptyList()
     }
 }
+
+private val PosState.isBalance: Boolean
+    get() = this is PosState.BalanceWaiting || this is PosState.BalanceReading || this is PosState.BalanceShown || this is PosState.BalanceFailed
 
 /** Generation counter so only the newest sales-poll loop keeps running. */
 class PollGeneration {

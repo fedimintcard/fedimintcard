@@ -84,9 +84,9 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
      * Reads the card. Long timeout on purpose: the till must reach the card over the relay and
      * reconcile every note against the federation before it can answer.
      */
-    fun cardBalance(): TillResult<CardBalance> =
+    fun cardBalance(): BalanceResult =
         when (val r = call("POST", "/v1/card/balance", "", CARD_BALANCE_READ_MS)) {
-            is TillResult.Err -> r
+            is TillResult.Err -> BalanceResult.Failed(r.error)
             is TillResult.Ok -> parseCardBalance(r.value.status, r.value.body)
         }
 
@@ -221,11 +221,12 @@ internal fun parseSales(body: String): TillResult<SalesList> = try {
 }
 
 /** `{"ok":true,"live_msat":N,"notes":[{"slot","msat","status"}],"free_slots":[..]}`. */
-internal fun parseCardBalance(httpStatus: Int, body: String): TillResult<CardBalance> = try {
+internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = try {
     val o = JSONObject(body)
     if (!o.optBoolean("ok", false)) {
         // A card error or a missing card is a normal answer from this route, not a parse failure.
-        TillResult.Err(TillError.BadResponse(if (o.isNull("detail")) o.optString("error", "card unreadable") else o.optString("detail")))
+        val code = if (o.isNull("error")) null else o.optString("error")
+        BalanceResult.Refused(ChargeErrorCode.fromWire(code), if (o.isNull("detail")) code ?: "card unreadable" else o.optString("detail"))
     } else {
         val a = o.optJSONArray("notes")
         val rows = if (a == null) emptyList() else (0 until a.length()).map {
@@ -234,8 +235,8 @@ internal fun parseCardBalance(httpStatus: Int, body: String): TillResult<CardBal
         }
         val f = o.optJSONArray("free_slots")
         val free = if (f == null) emptyList() else (0 until f.length()).map { f.getInt(it) }
-        TillResult.Ok(CardBalance(o.optL("live_msat"), rows, free))
+        BalanceResult.Read(CardBalance(o.optL("live_msat"), rows, free))
     }
 } catch (e: JSONException) {
-    TillResult.Err(TillError.BadResponse(e.message ?: "bad json"))
+    BalanceResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
 }
