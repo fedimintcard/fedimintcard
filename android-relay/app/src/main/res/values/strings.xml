@@ -4,6 +4,8 @@
     <string name="charge">Charge</string>
     <string name="sales">Sales</string>
     <string name="cancel">Cancel</string>
+    <string name="pin_title">Card holder: enter your PIN</string>
+    <string name="pin_confirm">Pay</string>
     <string name="retry">Retry</string>
     <string name="try_again">Try again</string>
     <string name="back">Back</string>

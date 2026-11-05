@@ -42,7 +42,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         settings = Settings(this)
         client = TillClient({ settings.baseUrl }, UrlConnectionTransport())
         flow = PosFlow()
-        ui = PosUi(this, ::dispatch, ::onKey)
+        ui = PosUi(this, ::dispatch, ::onKey, ::onPinKey)
         status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
         ui.onSettings { ui.settingsDialog(settings.baseUrl, { settings.baseUrl = it; failures = 0; pollNow() }, { ui.showRelay() }) }
         cardListener = { present -> ui.setCard(present); dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
@@ -78,6 +78,12 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         resumed = false; salesGen.cancel(); handler.removeCallbacks(poll)
         nfc?.disableReaderMode(this)
         super.onPause()
+    }
+
+    /** Leaving the app drops any PIN typed or waiting for the card. */
+    override fun onStop() {
+        dispatch(PosEvent.Backgrounded)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -122,6 +128,19 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         ui.setPad(flow.pad)
     }
 
+    /** PIN digits go to the pad only while the PIN screen shows; nothing about them is logged. */
+    private fun onPinKey(k: Int?) {
+        if (flow.state !is PosState.EnteringPin) return
+        when (k) { null -> flow.pinPad.backspace(); -1 -> flow.pinPad.clear(); else -> flow.pinPad.press(k) }
+        ui.setPinPad(flow.pinPad)
+    }
+
+    /** No screenshots, recents thumbnail or screen cast of the PIN screen. */
+    private fun secureFor(s: PosState) {
+        if (s is PosState.EnteringPin) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
     private fun dispatch(e: PosEvent) {
         if (e is PosEvent.CardBalanceOpened) {
             ui.openCardBalance()
@@ -133,6 +152,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         val effects = flow.dispatch(e)
         val now = flow.state
         ui.setPad(flow.pad)
+        ui.setPinPad(flow.pinPad)
+        secureFor(now)
         ui.render(now)
         if (now is PosState.Signing && before !is PosState.Signing) {
             elapsed = 0; ui.resetElapsed()
@@ -145,7 +166,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (now is PosState.Receipt) pollNow()
         for (fx in effects) if (fx is PosEffect.StartCharge) {
             Thread {
-                val r = client.charge(fx.priceMsat, fx.clientRef)
+                val r = client.charge(fx.priceMsat, fx.clientRef, fx.pin) // wipes fx.pin
                 runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
             }.start()
         }

@@ -276,9 +276,12 @@ Done means every box is ticked and the acceptance run at the end passes on relea
 - [ ] **Cards from before O2** (for example `15989f91`, no slot keys on record): mark them retired.
 
 **Till**
-- [ ] **PIN entry in the POS app** (`android-relay`, "Fedimint Card POS"): the holder types the
+- [x] **PIN entry in the POS app** (`android-relay`, "Fedimint Card POS"): the holder types the
   PIN on the till's screen and the app sends it in `/v1/charge`; wrong-PIN tries left and a blocked
-  card shown plainly. Today the PIN only reaches the till by hand.
+  card shown plainly. **Built, not on silicon (2026-11-04):** amount → holder PIN pad (4–8 digits,
+  masked, FLAG_SECURE) → card; the PIN lives in a wiped char array, dropped on cancel, error and
+  `onStop`; `wrong_pin` returns to the pad with the same `client_ref`, `pin_blocked` back to the
+  amount; every retry asks for the PIN again. JVM tests only; no real charge yet.
 - [ ] `duration_ms` is 0 in a charge reply.
 - [ ] The till runs as a service (launchd) that restarts itself, with its token from the file, not
   a `nohup` line.

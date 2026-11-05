@@ -63,6 +63,14 @@ enum class ChargeErrorCode(val wire: String) {
     DECLINED("declined"),
     UNDECIDED("undecided"),
     RECOVERING("recovering"),
+    CONFLICT("conflict"),
+    PIN_REQUIRED("pin_required"),
+    WRONG_PIN("wrong_pin"),
+    PIN_BLOCKED("pin_blocked"),
+    CARD_CHANGED("card_changed"),
+    UNKNOWN_CARD("unknown_card"),
+    OPS_UNREACHABLE("ops_unreachable"),
+    OPS_REFUSED("ops_refused"),
     INTERNAL("internal"),
     UNKNOWN("");
 
@@ -71,3 +79,7 @@ enum class ChargeErrorCode(val wire: String) {
             values().firstOrNull { it.wire.isNotEmpty() && it.wire == s } ?: UNKNOWN
     }
 }
+
+/** Tries left from a `wrong_pin` detail ("wrong PIN; 2 tries left before the card blocks"), or null. */
+fun parseTriesLeft(detail: String): Int? =
+    Regex("""(\d+)\s+tr(?:y|ies)\s+left""", RegexOption.IGNORE_CASE).find(detail)?.groupValues?.get(1)?.toIntOrNull()

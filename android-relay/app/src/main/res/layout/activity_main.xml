@@ -69,6 +69,40 @@
             android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="@string/charge" />
     </LinearLayout>
 
+    <!-- holder PIN: handed to the holder; the window is FLAG_SECURE while it shows -->
+    <LinearLayout android:id="@+id/screen_pin" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:orientation="vertical" android:padding="16dp" android:visibility="gone">
+        <TextView android:id="@+id/pin_amount" style="@style/Body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="16dp" android:textSize="20sp" />
+        <TextView style="@style/Heading" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" android:text="@string/pin_title" />
+        <TextView android:id="@+id/pin_notice" style="@style/Body" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="8dp" android:textColor="@color/bad"
+            android:visibility="gone" />
+        <TextView android:id="@+id/pin_dots" style="@style/Heading" android:layout_width="match_parent"
+            android:layout_height="0dp" android:layout_weight="1" android:textSize="48sp" android:letterSpacing="0.3"
+            android:gravity="center" android:importantForAccessibility="no" android:saveEnabled="false" />
+        <GridLayout android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="3" android:columnCount="3" android:rowCount="4">
+        <TextView android:id="@+id/pkey_1" style="@style/Key" android:text="1" />
+        <TextView android:id="@+id/pkey_2" style="@style/Key" android:text="2" />
+        <TextView android:id="@+id/pkey_3" style="@style/Key" android:text="3" />
+        <TextView android:id="@+id/pkey_4" style="@style/Key" android:text="4" />
+        <TextView android:id="@+id/pkey_5" style="@style/Key" android:text="5" />
+        <TextView android:id="@+id/pkey_6" style="@style/Key" android:text="6" />
+        <TextView android:id="@+id/pkey_7" style="@style/Key" android:text="7" />
+        <TextView android:id="@+id/pkey_8" style="@style/Key" android:text="8" />
+        <TextView android:id="@+id/pkey_9" style="@style/Key" android:text="9" />
+        <TextView android:id="@+id/pkey_c" style="@style/Key" android:text="C" />
+        <TextView android:id="@+id/pkey_0" style="@style/Key" android:text="0" />
+        <TextView android:id="@+id/pkey_back" style="@style/Key" android:text="⌫" />
+        </GridLayout>
+        <Button android:id="@+id/btn_pin_confirm" style="@style/PrimaryButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="@string/pin_confirm" />
+        <Button android:id="@+id/btn_pin_cancel" style="@style/GhostButton" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginTop="4dp" android:text="@string/cancel" />
+    </LinearLayout>
+
     <!-- tap -->
     <LinearLayout android:id="@+id/screen_tap" android:layout_width="match_parent" android:layout_height="match_parent"
         android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">

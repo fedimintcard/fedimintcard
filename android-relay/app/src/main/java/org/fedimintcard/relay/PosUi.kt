@@ -20,10 +20,15 @@ import java.util.Date
 import java.util.Locale
 
 /** Binds views, switches screens, renders [PosState]. All calls on the UI thread. */
-class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, private val onKey: (Int?) -> Unit) {
+class PosUi(
+    private val act: Activity,
+    private val onEvent: (PosEvent) -> Unit,
+    private val onKey: (Int?) -> Unit,
+    private val onPinKey: (Int?) -> Unit,
+) {
     private fun <T : View> v(id: Int): T = act.findViewById(id)
 
-    private val screens = listOf(R.id.screen_amount, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay)
+    private val screens = listOf(R.id.screen_amount, R.id.screen_pin, R.id.screen_tap, R.id.screen_receipt, R.id.screen_error, R.id.screen_sales, R.id.screen_card_balance, R.id.screen_relay)
     private val dot: View = v(R.id.dot)
     private val cardChip: TextView = v(R.id.card_chip)
     private val fedName: TextView = v(R.id.federation_name)
@@ -35,6 +40,10 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
     private val cardNotesAdapter = CardNotesAdapter()
     private val amountText: TextView = v(R.id.amount_text)
     private val charge: Button = v(R.id.btn_charge)
+    private val pinAmount: TextView = v(R.id.pin_amount)
+    private val pinNotice: TextView = v(R.id.pin_notice)
+    private val pinDots: TextView = v(R.id.pin_dots)
+    private val pinConfirm: Button = v(R.id.btn_pin_confirm)
     private val tapAmount: TextView = v(R.id.tap_amount)
     private val tapStatus: TextView = v(R.id.tap_status)
     private val cancel: Button = v(R.id.btn_cancel)
@@ -70,6 +79,12 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         digits.forEachIndexed { d, id -> v<View>(id).setOnClickListener { onKey(d) } }
         v<View>(R.id.key_c).setOnClickListener { onKey(-1) }
         v<View>(R.id.key_back).setOnClickListener { onKey(null) }
+        val pinDigits = listOf(R.id.pkey_0, R.id.pkey_1, R.id.pkey_2, R.id.pkey_3, R.id.pkey_4, R.id.pkey_5, R.id.pkey_6, R.id.pkey_7, R.id.pkey_8, R.id.pkey_9)
+        pinDigits.forEachIndexed { d, id -> v<View>(id).setOnClickListener { onPinKey(d) } }
+        v<View>(R.id.pkey_c).setOnClickListener { onPinKey(-1) }
+        v<View>(R.id.pkey_back).setOnClickListener { onPinKey(null) }
+        pinConfirm.setOnClickListener { onEvent(PosEvent.PinConfirmed) }
+        v<View>(R.id.btn_pin_cancel).setOnClickListener { onEvent(PosEvent.CancelPressed) }
         charge.setOnClickListener { onEvent(PosEvent.ChargePressed) }
         cancel.setOnClickListener { onEvent(PosEvent.CancelPressed) }
         retry.setOnClickListener { onEvent(PosEvent.RetryPressed) }
@@ -120,12 +135,24 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         charge.text = if (pad.isChargeable) "Charge ${pad.display} sats" else act.getString(R.string.charge)
     }
 
+    /** Dots only: the digits never reach a view. */
+    fun setPinPad(pad: PinPad) {
+        pinDots.text = if (pad.length == 0) "" else pad.masked
+        pinConfirm.isEnabled = pad.isComplete
+        pinConfirm.alpha = if (pad.isComplete) 1f else 0.4f
+    }
+
     fun setElapsed(seconds: Int) { elapsedS = seconds; if (last is PosState.Signing) renderTapStatus() }
 
     fun render(state: PosState) {
         last = state
         if (state is PosState.Receipt || state is PosState.Error) relayOpen = false
         when (state) {
+            is PosState.EnteringPin -> {
+                pinAmount.text = "Pay ${formatSats(state.priceMsat)} sats"
+                pinNotice.visibility = if (state.wrongPin) View.VISIBLE else View.GONE
+                pinNotice.text = if (state.wrongPin) wrongPinCopy(state.triesLeft) else ""
+            }
             is PosState.WaitingForCard -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
             is PosState.Signing -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
             is PosState.Receipt -> renderReceipt(state.receipt)
@@ -166,6 +193,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
         val unresolved = e.unresolvedRef != null
         abandon.visibility = if (unresolved) View.VISIBLE else View.GONE
         retry.text = act.getString(if (unresolved) R.string.try_again else R.string.retry)
+        retry.visibility = if (e.kind.retryable) View.VISIBLE else View.GONE
         errBack.visibility = if (unresolved) View.GONE else View.VISIBLE
         checkSales.visibility = if (unresolved) View.VISIBLE else View.GONE
     }
@@ -221,6 +249,7 @@ class PosUi(private val act: Activity, private val onEvent: (PosEvent) -> Unit, 
             relayOpen -> R.id.screen_relay
             else -> when (last) {
                 PosState.Entering -> R.id.screen_amount
+                is PosState.EnteringPin -> R.id.screen_pin
                 is PosState.WaitingForCard, is PosState.Signing -> R.id.screen_tap
                 is PosState.Receipt -> R.id.screen_receipt
                 is PosState.Error -> R.id.screen_error
@@ -308,5 +337,20 @@ fun errorCopy(kind: ErrorKind, detail: String): Pair<String, String> = when (kin
     ErrorKind.UNDECIDED -> "Payment pending" to "Waiting for the federation. This screen updates when the sale is recorded; Try again re-checks without charging twice."
     ErrorKind.TIMEOUT_UNKNOWN -> "Outcome unknown" to "The till did not answer. The card may have been charged. This screen updates when the sale is recorded; Try again re-checks without charging twice."
     ErrorKind.TILL_UNREACHABLE -> "Till service unreachable" to "Check adb reverse tcp:9877 tcp:9877"
+    ErrorKind.WRONG_PIN -> wrongPinCopy(parseTriesLeft(detail)) to "Ask the card holder to enter it again"
+    ErrorKind.PIN_BLOCKED -> "PIN blocked" to "This card's PIN is blocked. The card can't pay."
+    ErrorKind.PIN_REQUIRED -> "Something went wrong" to "The app sent the charge without the holder's PIN. This is an app bug; the card was not touched."
+    ErrorKind.CONFLICT -> "Something went wrong" to detail
+    ErrorKind.CARD_CHANGED -> "Card changed" to "The card was used elsewhere. Hold it to the phone and try again."
+    ErrorKind.UNKNOWN_CARD -> "Card not recognised" to "This card is not set up for this till"
+    ErrorKind.OPS_UNREACHABLE -> "Card service unreachable" to "Check the network, then try again"
+    ErrorKind.OPS_REFUSED -> "Card service refused the till" to "Check the till token"
     ErrorKind.BAD_REQUEST, ErrorKind.INTERNAL, ErrorKind.UNKNOWN -> "Something went wrong" to detail
+}
+
+/** The line over the PIN pad after a refused PIN. Never includes the PIN. */
+fun wrongPinCopy(triesLeft: Int?): String = when (triesLeft) {
+    null -> "Wrong PIN"
+    1 -> "Wrong PIN — 1 try left"
+    else -> "Wrong PIN — $triesLeft tries left"
 }

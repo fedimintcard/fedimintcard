@@ -61,6 +61,14 @@ starts a second spend while the first may still count:
   `declined`, a crash before submission, ...): the repeat is a fresh attempt with the same ref;
 * the same `client_ref` with a different `price_msat` is `conflict` 409.
 
+With `pin`: a finished sale replays without a PIN, but every other repeat on a till that requires
+one (unresolved, in flight, or a fresh attempt) needs `pin` again, since `pin_required` is
+answered before the till looks at the earlier attempt. A `wrong_pin` or `pin_blocked` comes from
+inside the spend, after any earlier attempt with that ref was settled, so it proves nothing moved:
+the POS asks the holder again and resends the **same** `client_ref` with the new PIN.
+`pin_required` and the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an
+earlier attempt.
+
 | error | HTTP | meaning | app action |
 |---|---|---|---|
 | `bad_request` | 400 | missing or zero price | fix input |

@@ -58,12 +58,21 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
         is TillResult.Ok -> parseStatus(r.value.body)
     }
 
-    fun charge(priceMsat: Long, clientRef: String): ChargeResult {
-        val body = JSONObject().put("price_msat", priceMsat).put("client_ref", clientRef).toString()
-        return when (val r = call("POST", "/v1/charge", body, CHARGE_READ_MS)) {
+    /**
+     * Posts a charge. [pin] is consumed: it is wiped once the request has been sent (or has
+     * failed), whatever the outcome, so the caller must not reuse it. The request body is the one
+     * place the digits become a String, which the platform's HTTP stack needs.
+     */
+    fun charge(priceMsat: Long, clientRef: String, pin: Pin? = null): ChargeResult = try {
+        val o = JSONObject().put("price_msat", priceMsat).put("client_ref", clientRef)
+        pin?.withChars { o.put("pin", String(it)) }
+        val body = o.toString()
+        when (val r = call("POST", "/v1/charge", body, CHARGE_READ_MS)) {
             is TillResult.Err -> ChargeResult.Failed(r.error)
             is TillResult.Ok -> parseCharge(r.value.status, r.value.body)
         }
+    } finally {
+        pin?.wipe()
     }
 
     fun sales(): TillResult<SalesList> = when (val r = call("GET", "/v1/sales", null, QUICK_READ_MS)) {

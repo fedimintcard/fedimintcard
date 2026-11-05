@@ -10,10 +10,15 @@ class PosFlowTest {
     private val ok = ChargeResult.Success(receipt)
     private fun declined(c: ChargeErrorCode) = ChargeResult.Declined(c, "d", 409)
     private fun PosFlow.signingId() = (state as PosState.Signing).chargeId
+    private fun PosFlow.typePin(p: String = "1234") = p.forEach { pinPad.press(it - '0') }
+    /** Amount screen's Charge, then the holder's PIN and Pay. */
+    private fun PosFlow.charge(): List<PosEffect> { dispatch(PosEvent.ChargePressed); typePin(); return dispatch(PosEvent.PinConfirmed) }
+    /** Error screen's Retry / Try again, then the holder's PIN and Pay. */
+    private fun PosFlow.retry(): List<PosEffect> { dispatch(PosEvent.RetryPressed); typePin(); return dispatch(PosEvent.PinConfirmed) }
 
     @Test fun happyPath() {
         val f = flow()
-        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty())
+        assertTrue(f.charge().isEmpty())
         assertEquals(PosState.WaitingForCard(5000, false), f.state)
         val fx = f.dispatch(PosEvent.CardPresent)
         assertEquals(1, fx.size)
@@ -26,21 +31,21 @@ class PosFlowTest {
     }
     @Test fun cardAlreadyPresentGoesStraightToSigning() {
         val f = flow(); f.dispatch(PosEvent.CardPresent)
-        assertTrue(f.dispatch(PosEvent.ChargePressed).single() is PosEffect.StartCharge)
+        assertTrue(f.charge().single() is PosEffect.StartCharge)
         assertTrue(f.state is PosState.Signing)
     }
     @Test fun noEffectUntilCardPresent() {
         val f = flow()
-        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty())
+        assertTrue(f.charge().isEmpty())
         assertTrue(f.dispatch(PosEvent.CardLost).isEmpty())
         assertTrue(f.state is PosState.WaitingForCard)
     }
     @Test fun zeroAmountNotChargeable() {
         val f = PosFlow { "r" }
-        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty()); assertEquals(PosState.Entering, f.state)
+        assertTrue(f.charge().isEmpty()); assertEquals(PosState.Entering, f.state)
     }
     @Test fun signingIgnoresCardEventsAndCancel() {
-        val f = flow(); f.dispatch(PosEvent.ChargePressed)
+        val f = flow(); f.charge()
         f.dispatch(PosEvent.CardPresent); val before = f.state
         assertTrue(f.dispatch(PosEvent.CardPresent).isEmpty())
         assertTrue(f.dispatch(PosEvent.CardLost).isEmpty())
@@ -48,15 +53,15 @@ class PosFlowTest {
         assertEquals(before, f.state)
     }
     @Test fun staleChargeDoneIgnored() {
-        val f = flow(); f.dispatch(PosEvent.ChargePressed); f.dispatch(PosEvent.CardPresent)
+        val f = flow(); f.charge(); f.dispatch(PosEvent.CardPresent)
         f.dispatch(PosEvent.ChargeDone(99, ok))
         assertTrue(f.state is PosState.Signing)
     }
     @Test fun lingeringCardNeedsCardLostFirst() {
-        val f = flow(); f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed)
+        val f = flow(); f.dispatch(PosEvent.CardPresent); f.charge()
         f.dispatch(PosEvent.ChargeDone(f.signingId(), ok)); f.dispatch(PosEvent.NewSalePressed)
         f.pad.press(3)
-        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty())
+        assertTrue(f.charge().isEmpty())
         assertEquals(PosState.WaitingForCard(3000, true), f.state)
         assertTrue(f.dispatch(PosEvent.CardPresent).isEmpty())
         assertTrue(f.state is PosState.WaitingForCard)
@@ -77,7 +82,7 @@ class PosFlowTest {
             ChargeResult.Failed(TillError.BadResponse("x")) to ErrorKind.INTERNAL,
         )
         for ((r, k) in cases) {
-            val f = flow(); f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed)
+            val f = flow(); f.dispatch(PosEvent.CardPresent); f.charge()
             f.dispatch(PosEvent.ChargeDone(f.signingId(), r))
             assertEquals(k, (f.state as PosState.Error).kind)
         }
@@ -85,24 +90,24 @@ class PosFlowTest {
     }
     @Test fun retryReusesClientRefAndGoesStraightToSigningWithCard() {
         val f = flow(); f.dispatch(PosEvent.CardPresent)
-        val first = f.dispatch(PosEvent.ChargePressed).single() as PosEffect.StartCharge
+        val first = f.charge().single() as PosEffect.StartCharge
         f.dispatch(PosEvent.ChargeDone(first.chargeId, declined(ChargeErrorCode.BUSY)))
-        val second = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.StartCharge
+        val second = f.retry().single() as PosEffect.StartCharge
         assertEquals(first.clientRef, second.clientRef); assertNotEquals(first.chargeId, second.chargeId)
     }
     @Test fun retryWithoutCardWaitsThenReusesRef() {
-        val f = flow(); f.dispatch(PosEvent.ChargePressed)
+        val f = flow(); f.charge()
         val first = f.dispatch(PosEvent.CardPresent).single() as PosEffect.StartCharge
         f.dispatch(PosEvent.CardLost)
         f.dispatch(PosEvent.ChargeDone(first.chargeId, declined(ChargeErrorCode.NO_CARD)))
-        assertTrue(f.dispatch(PosEvent.RetryPressed).isEmpty())
+        assertTrue(f.retry().isEmpty())
         assertTrue(f.state is PosState.WaitingForCard)
         val second = f.dispatch(PosEvent.CardPresent).single() as PosEffect.StartCharge
         assertEquals(first.clientRef, second.clientRef)
     }
     private fun unresolved(r: ChargeResult): Pair<PosFlow, PosEffect.StartCharge> {
         val f = flow(); f.dispatch(PosEvent.CardPresent)
-        val fx = f.dispatch(PosEvent.ChargePressed).single() as PosEffect.StartCharge
+        val fx = f.charge().single() as PosEffect.StartCharge
         f.dispatch(PosEvent.ChargeDone(fx.chargeId, r))
         return f to fx
     }
@@ -122,7 +127,7 @@ class PosFlowTest {
     }
     @Test fun tryAgainFromUndecidedReusesRef() {
         val (f, fx) = unresolved(declined(ChargeErrorCode.UNDECIDED))
-        val again = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.StartCharge
+        val again = f.retry().single() as PosEffect.StartCharge
         assertEquals(fx.clientRef, again.clientRef)
     }
     @Test fun salesPollResolvesToReceipt() {
@@ -142,26 +147,26 @@ class PosFlowTest {
     @Test fun lingeringAfterDeclinedBlocksImmediateResign() {
         val (f, _) = unresolved(declined(ChargeErrorCode.DECLINED))
         f.dispatch(PosEvent.BackPressed)
-        assertTrue(f.dispatch(PosEvent.ChargePressed).isEmpty())
+        assertTrue(f.charge().isEmpty())
         assertEquals(PosState.WaitingForCard(5000, true), f.state)
     }
     @Test fun systemBackMapping() {
         val f = flow()
         assertNull(f.systemBack())
-        f.dispatch(PosEvent.ChargePressed); assertEquals(PosEvent.CancelPressed, f.systemBack())
+        f.charge(); assertEquals(PosEvent.CancelPressed, f.systemBack())
         f.dispatch(PosEvent.CardPresent); assertTrue(f.state is PosState.Signing)
         assertNull(f.systemBack())
         f.dispatch(PosEvent.BackPressed); assertTrue(f.state is PosState.Signing)
         f.dispatch(PosEvent.ChargeDone(f.signingId(), ok)); assertEquals(PosEvent.NewSalePressed, f.systemBack())
     }
     @Test fun cancelWorksWhileWaitingNotSigning() {
-        val f = flow(); f.dispatch(PosEvent.ChargePressed); f.dispatch(PosEvent.CancelPressed)
+        val f = flow(); f.charge(); f.dispatch(PosEvent.CancelPressed)
         assertEquals(PosState.Entering, f.state)
-        f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed); f.dispatch(PosEvent.CancelPressed)
+        f.dispatch(PosEvent.CardPresent); f.charge(); f.dispatch(PosEvent.CancelPressed)
         assertTrue(f.state is PosState.Signing)
     }
     @Test fun errorBackAndSalesFromEntering() {
-        val f = flow(); f.dispatch(PosEvent.CardPresent); f.dispatch(PosEvent.ChargePressed)
+        val f = flow(); f.dispatch(PosEvent.CardPresent); f.charge()
         f.dispatch(PosEvent.ChargeDone(f.signingId(), declined(ChargeErrorCode.DECLINED)))
         f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
         f.dispatch(PosEvent.SalesOpened); assertEquals(PosState.Sales(null), f.state)
@@ -169,7 +174,7 @@ class PosFlowTest {
     @Test fun tryAgainFromUnresolvedSignsImmediatelyWithoutCard() {
         val (f, fx) = unresolved(ChargeResult.Failed(TillError.Timeout))
         f.dispatch(PosEvent.CardLost)
-        val again = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.StartCharge
+        val again = f.retry().single() as PosEffect.StartCharge
         assertEquals(fx.clientRef, again.clientRef); assertTrue(f.state is PosState.Signing)
     }
     @Test fun unresolvedIsStickyAcrossIndefiniteRetryOutcomes() {
@@ -178,7 +183,7 @@ class PosFlowTest {
             ChargeResult.Failed(TillError.Unreachable), ChargeResult.Failed(TillError.Interrupted),
             ChargeResult.Failed(TillError.Timeout), declined(ChargeErrorCode.UNDECIDED), ChargeResult.Failed(TillError.BadResponse("x")))) {
             val (f, fx) = unresolved(declined(ChargeErrorCode.UNDECIDED))
-            f.dispatch(PosEvent.RetryPressed)
+            f.retry()
             f.dispatch(PosEvent.ChargeDone(f.signingId(), r))
             assertEquals(fx.clientRef, (f.state as PosState.Error).unresolvedRef)
             f.dispatch(PosEvent.BackPressed); assertTrue(f.state is PosState.Error)
@@ -189,7 +194,7 @@ class PosFlowTest {
         for (c in listOf(ChargeErrorCode.INSUFFICIENT, ChargeErrorCode.NO_EXACT_PLAN, ChargeErrorCode.DECLINED,
             ChargeErrorCode.BAD_REQUEST, ChargeErrorCode.NO_CARD, ChargeErrorCode.CARD_ERROR)) {
             val (f, _) = unresolved(declined(ChargeErrorCode.UNDECIDED))
-            f.dispatch(PosEvent.RetryPressed)
+            f.retry()
             f.dispatch(PosEvent.ChargeDone(f.signingId(), declined(c)))
             assertNull((f.state as PosState.Error).unresolvedRef)
             f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
@@ -197,7 +202,7 @@ class PosFlowTest {
     }
     @Test fun retrySuccessClearsUnresolved() {
         val (f, _) = unresolved(ChargeResult.Failed(TillError.Timeout))
-        f.dispatch(PosEvent.RetryPressed); f.dispatch(PosEvent.ChargeDone(f.signingId(), ok))
+        f.retry(); f.dispatch(PosEvent.ChargeDone(f.signingId(), ok))
         assertTrue(f.state is PosState.Receipt); assertNull(f.unresolvedRef)
     }
     @Test fun abandonClearsRefAndPad() {
