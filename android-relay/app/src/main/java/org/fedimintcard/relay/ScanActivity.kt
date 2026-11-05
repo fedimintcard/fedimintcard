@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
 import com.google.zxing.BarcodeFormat
@@ -95,8 +96,17 @@ class ScanActivity : Activity(), SurfaceHolder.Callback, Camera.PreviewCallback 
         val c = try { Camera.open() } catch (e: Exception) { hint.text = "Camera unavailable: paste the pairing text instead"; return } ?: return
         try {
             val p = c.parameters
-            val size = p.supportedPreviewSizes.filter { it.width <= 1920 }.maxByOrNull { it.width * it.height }
-            if (size != null) p.setPreviewSize(size.width, size.height)
+            // Portrait: the preview's width runs along the screen's height. Prefer the size whose
+            // shape is closest to the screen's, then the largest, so the letterbox is small.
+            val root = surface.parent as View
+            val screen = if (root.width > 0) root.height.toDouble() / root.width else 16.0 / 9
+            val size = p.supportedPreviewSizes.filter { it.width <= 1920 }
+                .sortedWith(compareBy<Camera.Size> { Math.abs(it.width.toDouble() / it.height - screen) }.thenByDescending { it.width * it.height })
+                .firstOrNull()
+            if (size != null) {
+                p.setPreviewSize(size.width, size.height)
+                fitPreview(root, size.height, size.width)
+            }
             if (Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE in p.supportedFocusModes) p.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
             c.parameters = p
             c.setDisplayOrientation(90) // portrait activity, back camera
@@ -108,6 +118,16 @@ class ScanActivity : Activity(), SurfaceHolder.Callback, Camera.PreviewCallback 
             c.release()
             hint.text = "Camera failed: paste the pairing text instead"
         }
+    }
+
+    /**
+     * Size the preview to the camera's own shape, centred: a SurfaceView stretches the frames to
+     * whatever size it is given, and the screen is taller than any preview size (11/4: stretched).
+     */
+    private fun fitPreview(root: View, w: Int, h: Int) {
+        if (root.width == 0 || root.height == 0) return
+        val scale = minOf(root.width.toDouble() / w, root.height.toDouble() / h)
+        surface.layoutParams = FrameLayout.LayoutParams((w * scale).toInt(), (h * scale).toInt(), Gravity.CENTER)
     }
 
     private fun stopCamera() {
