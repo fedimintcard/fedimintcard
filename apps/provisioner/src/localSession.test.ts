@@ -35,7 +35,9 @@ describe('the flag as App uses it', () => {
     // `api.ts`. With the registry deployed there *is* an origin now, so what
     // this pins is that the app has a real one to sign in to — the guard that
     // keeps a Release build off the fake is the `false` above.
-    expect(registryOrigin('test')).toBe('https://registry.fedimintcard.org');
+    expect(registryOrigin('test')).toBe(
+      'https://fedimintcard-registry-staging.old-cell-30e7.workers.dev',
+    );
     expect(registryOrigin('production')).toBe(
       'https://registry.fedimintcard.org',
     );

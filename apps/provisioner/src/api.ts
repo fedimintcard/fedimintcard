@@ -816,12 +816,13 @@ export class RegistryStoreApi implements CardOps {
  * someone guessed.
  *
  * Deployed 2026-10-31: Worker `fedimintcard-registry`, SQLite-backed Durable
- * Object, custom domain `registry.fedimintcard.org` (TLS valid).
- * `OPERATOR_PASSWORD` is a Worker secret, set with `wrangler secret put`; no
- * password is in this tree.
+ * Object, custom domain `registry.fedimintcard.org` (TLS valid). `test` is the
+ * staging Worker, with its own storage and operators. Operators come from the
+ * `OPERATOR_SETUP` Worker secret on each; no password is in this tree.
  */
 export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
-  test: 'https://registry.fedimintcard.org',
+  // Staging has no custom domain (registry/wrangler.toml `[env.staging]`).
+  test: 'https://fedimintcard-registry-staging.old-cell-30e7.workers.dev',
   production: 'https://registry.fedimintcard.org',
 } as const);
 
