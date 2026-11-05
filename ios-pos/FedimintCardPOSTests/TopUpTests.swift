@@ -14,7 +14,7 @@ final class TopUpFlowTests: XCTestCase {
         let f = PosFlow { self.n += 1; return "ref\(self.n)" }
         f.dispatch(.cardBalanceOpened)
         guard case .startBalanceRead(let rid)? = f.dispatch(.cardPresent).first else { XCTFail("no read"); return f }
-        f.dispatch(.balanceDone(readId: rid, result: .read(CardBalance(liveMsat: 5_000, notes: [], freeSlots: []))))
+        f.dispatch(.balanceDone(readId: rid, result: .read(CardBalance(liveMsat: 5_000, notes: [], freeSlots: [], shortId: "6f94b19b"))))
         return f
     }
 
@@ -22,7 +22,7 @@ final class TopUpFlowTests: XCTestCase {
         let f = shown()
         f.dispatch(.topUpPressed)
         for d in [1, 0, 0] { f.topUpPad.press(d) }
-        guard case .createTopUp(let cid, _, _)? = f.dispatch(.createInvoicePressed).first else { XCTFail("no create"); return f }
+        guard case .createTopUp(let cid, _, _, _)? = f.dispatch(.createInvoicePressed).first else { XCTFail("no create"); return f }
         f.dispatch(.topUpCreated(createId: cid, result: .ok(t)))
         return f
     }
@@ -35,6 +35,37 @@ final class TopUpFlowTests: XCTestCase {
         return lid
     }
 
+    func testTheCardFromTheBalanceReadGoesWithEveryCreate() {
+        let f = shown()
+        f.dispatch(.topUpPressed)
+        for d in [1, 0, 0] { f.topUpPad.press(d) }
+        guard case .createTopUp(let cid, _, _, let card)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        XCTAssertEqual(card, "6f94b19b")
+        // A failed create retried, and a new invoice after expiry, keep the card.
+        f.dispatch(.topUpCreated(createId: cid, result: .failed(.unreachable)))
+        guard case .createTopUp(let cid2, _, _, let card2)? = f.dispatch(.retryPressed).first else { return XCTFail() }
+        XCTAssertEqual(card2, "6f94b19b")
+        f.dispatch(.topUpCreated(createId: cid2, result: .ok(t)))
+        f.dispatch(.topUpPolled(topupId: "t1", result: st("expired")))
+        guard case .createTopUp(_, _, _, let card3)? = f.dispatch(.retryPressed).first else { return XCTFail() }
+        XCTAssertEqual(card3, "6f94b19b")
+    }
+
+    func testAFullCardIsRefusedBeforeAnyInvoice() {
+        let f = shown()
+        f.dispatch(.topUpPressed)
+        for d in [1, 0, 0] { f.topUpPad.press(d) }
+        guard case .createTopUp(let cid, _, _, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        f.dispatch(.topUpCreated(createId: cid, result: .refused(error: "card_full", detail: "no free slot", httpStatus: 409)))
+        guard case .topUpFailed(let fl) = f.state else { return XCTFail("\(f.state)") }
+        XCTAssertEqual(fl.problem, .noRoom); XCTAssertFalse(fl.paid); XCTAssertNil(fl.topUp)
+        let copy = topUpErrorCopy(fl.problem, paid: fl.paid, detail: fl.detail)
+        XCTAssertEqual(copy.0, "This card is full"); XCTAssertEqual(copy.1, "Spend from it first, then top up.")
+        XCTAssertTrue(f.dispatch(.retryPressed).isEmpty)
+        f.dispatch(.donePressed)
+        XCTAssertEqual(f.state, .entering)
+    }
+
     func testTopUpFromTheBalanceScreen() {
         let f = shown()
         f.pad.press(7) // a sale being typed is kept apart
@@ -42,7 +73,7 @@ final class TopUpFlowTests: XCTestCase {
         XCTAssertEqual(f.state, .topUpEntering)
         XCTAssertTrue(f.dispatch(.createInvoicePressed).isEmpty) // nothing typed
         for d in [1, 0, 0] { f.topUpPad.press(d) }
-        guard case .createTopUp(let cid, let msat, let ref)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        guard case .createTopUp(let cid, let msat, let ref, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
         XCTAssertEqual(msat, 100_000)
         XCTAssertEqual(f.state, .topUpCreating(createId: cid, requestedMsat: 100_000, clientRef: ref))
         f.dispatch(.topUpCreated(createId: cid, result: .ok(t)))
@@ -79,25 +110,25 @@ final class TopUpFlowTests: XCTestCase {
         f.dispatch(.topUpPolled(topupId: "t1", result: st("expired")))
         guard case .topUpFailed(let e) = f.state else { return XCTFail() }
         XCTAssertEqual(e.problem, .expired)
-        guard case .createTopUp(_, let msat, let ref2)? = f.dispatch(.retryPressed).first else { return XCTFail() }
+        guard case .createTopUp(_, let msat, let ref2, _)? = f.dispatch(.retryPressed).first else { return XCTFail() }
         XCTAssertNotEqual(ref, ref2); XCTAssertEqual(msat, 100_352)
     }
 
     func testAFailedCreateRetriesWithTheSameRef() {
         let f = shown()
         f.dispatch(.topUpPressed); f.topUpPad.press(5)
-        guard case .createTopUp(let cid, _, let ref)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        guard case .createTopUp(let cid, _, let ref, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
         f.dispatch(.topUpCreated(createId: cid, result: .failed(.timeout)))
         guard case .topUpFailed(let e) = f.state else { return XCTFail() }
         XCTAssertEqual(e.problem, .timeout)
-        guard case .createTopUp(_, let msat, let again)? = f.dispatch(.retryPressed).first else { return XCTFail() }
+        guard case .createTopUp(_, let msat, let again, _)? = f.dispatch(.retryPressed).first else { return XCTFail() }
         XCTAssertEqual(again, ref); XCTAssertEqual(msat, 5_000)
     }
 
     func testBadAmountShowsTheTillsWords() {
         let f = shown()
         f.dispatch(.topUpPressed); f.topUpPad.press(9)
-        guard case .createTopUp(let cid, _, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        guard case .createTopUp(let cid, _, _, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
         f.dispatch(.topUpCreated(createId: cid, result: .refused(error: "bad_amount", detail: "at most 100,000 sats", httpStatus: 400)))
         guard case .topUpFailed(let e) = f.state else { return XCTFail() }
         XCTAssertEqual(e.problem, .badAmount)
@@ -186,6 +217,25 @@ final class TopUpClientTests: XCTestCase {
         XCTAssertEqual(req.headers["Authorization"], "Bearer deadbeef")
         let o = try JSONSerialization.jsonObject(with: try XCTUnwrap(req.body)) as! [String: Any]
         XCTAssertEqual(o["amount_msat"] as? Int, 100_000); XCTAssertEqual(o["client_ref"] as? String, "r1")
+    }
+
+    func testCreateTopUpSendsTheCard() async throws {
+        let ok = #"{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"#
+        let (c, t) = client(200, ok)
+        _ = await c.createTopUp(amountMsat: 100_000, clientRef: "r1", shortId: "6f94b19b")
+        let o = try JSONSerialization.jsonObject(with: try XCTUnwrap(t.requests.first?.body)) as! [String: Any]
+        XCTAssertEqual(o["short_id"] as? String, "6f94b19b")
+        let (c2, t2) = client(200, ok)
+        _ = await c2.createTopUp(amountMsat: 100_000, clientRef: "r1")
+        let o2 = try JSONSerialization.jsonObject(with: try XCTUnwrap(t2.requests.first?.body)) as! [String: Any]
+        XCTAssertNil(o2["short_id"])
+    }
+
+    func testCardBalanceShortId() {
+        guard case .read(let b) = TillParse.cardBalance(status: 200, body: Data(#"{"ok":true,"live_msat":5,"notes":[],"free_slots":[1,4],"short_id":"6f94b19b"}"#.utf8)) else { return XCTFail() }
+        XCTAssertEqual(b.shortId, "6f94b19b")
+        guard case .read(let n) = TillParse.cardBalance(status: 200, body: Data(#"{"ok":true,"live_msat":5,"notes":[],"free_slots":[]}"#.utf8)) else { return XCTFail() }
+        XCTAssertNil(n.shortId)
     }
 
     func testCreateTopUpRefusedAndBad() async {

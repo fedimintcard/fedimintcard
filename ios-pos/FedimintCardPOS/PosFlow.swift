@@ -193,7 +193,7 @@ enum PosEffect {
     case startCharge(chargeId: Int, priceMsat: Int64, clientRef: String, pin: Pin?)
     case startBalanceRead(readId: Int)
     /// `POST /v1/topup`.
-    case createTopUp(createId: Int, amountMsat: Int64, clientRef: String)
+    case createTopUp(createId: Int, amountMsat: Int64, clientRef: String, shortId: String?)
     /// `POST /v1/topup/{id}/load` over the card now linked.
     case loadTopUp(loadId: Int, topupId: String)
 }
@@ -206,6 +206,10 @@ final class PosFlow {
     let pad = AmountPad()
     /// The top-up amount: separate from `pad`, which keeps the sale being typed.
     let topUpPad = AmountPad()
+    /// The card of the last balance read, and the card a top-up started from it is for: sent with
+    /// every create so the till fits the amount to that card's free slots.
+    private var shownCard: String?
+    private(set) var topUpCard: String?
     let pinPad = PinPad()
     private var heldPin: Pin?
     private(set) var state: PosState = .entering
@@ -253,7 +257,7 @@ final class PosFlow {
     private func createTopUp(_ msat: Int64, _ ref: String) -> [PosEffect] {
         let cid = id()
         state = .topUpCreating(createId: cid, requestedMsat: msat, clientRef: ref)
-        return [.createTopUp(createId: cid, amountMsat: msat, clientRef: ref)]
+        return [.createTopUp(createId: cid, amountMsat: msat, clientRef: ref, shortId: topUpCard)]
     }
 
     /// Paid: the NFC sheet asks for the card.
@@ -270,7 +274,7 @@ final class PosFlow {
     private func topUp(_ e: PosEvent, _ s: PosState) -> [PosEffect]? {
         switch (e, s) {
         case (.topUpPressed, .balanceShown):
-            topUpPad.clear(); state = .topUpEntering
+            topUpPad.clear(); topUpCard = shownCard; state = .topUpEntering
         case (.chargeCardPressed, .balanceShown):
             state = .entering
         case (.createInvoicePressed, .topUpEntering):
@@ -279,7 +283,11 @@ final class PosFlow {
             state = .entering
         case (.topUpCreated(let cid, let r), .topUpCreating(let cur, let msat, let ref)) where cid == cur:
             if case .ok(let t) = r { state = .topUpInvoice(t, clientRef: ref) }
-            else { state = .topUpFailed(TopUpFailure(problem: topUpProblem(r), detail: r.refusedDetail, requestedMsat: msat, clientRef: ref)) }
+            else {
+                // A full card refused before any invoice exists: nothing was paid, nothing to retry.
+                let p = topUpProblem(r)
+                state = .topUpFailed(TopUpFailure(problem: p == .cardFull ? .noRoom : p, detail: r.refusedDetail, requestedMsat: msat, clientRef: ref))
+            }
         case (.topUpPolled(let tid, let r), .topUpInvoice(let t0, let ref)) where tid == t0.topupId:
             guard case .ok(let st) = r else { return [] } // a failed poll: poll again
             let t = TopUp(topupId: t0.topupId, amountMsat: st.amountMsat, invoice: t0.invoice, expiresAtMs: t0.expiresAtMs, state: st.state)
@@ -309,7 +317,7 @@ final class PosFlow {
             default: state = paidFailure(topUpProblem(r), r.refusedDetail, t)
             }
         case (.retryPressed, .topUpFailed(let f)):
-            if f.problem == .failed || f.problem == .notPaired { return [] }
+            if f.problem == .failed || f.problem == .notPaired || f.problem == .noRoom { return [] }
             // A new invoice: a new ref, so the till makes a new top-up for the same amount.
             if f.problem == .expired { return createTopUp(f.requestedMsat, newRef()) }
             guard let t = f.topUp else { return createTopUp(f.requestedMsat, f.clientRef) }
@@ -393,7 +401,7 @@ final class PosFlow {
             state = .entering
         case (.balanceDone(let rid, let r), .balanceReading(let cur)) where rid == cur:
             switch r {
-            case .read(let b): state = .balanceShown(readId: cur, liveMsat: b.liveMsat)
+            case .read(let b): shownCard = b.shortId; state = .balanceShown(readId: cur, liveMsat: b.liveMsat)
             case .refused(_, let d): state = .balanceFailed(balanceProblem(r), detail: d)
             case .failed(let te):
                 if case .badResponse(let d) = te { state = .balanceFailed(balanceProblem(r), detail: d) }

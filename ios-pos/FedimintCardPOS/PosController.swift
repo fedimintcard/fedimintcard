@@ -155,10 +155,10 @@ final class PosController: ObservableObject {
                 }
                 self.send(.chargeDone(chargeId: cid, result: r))
             }
-        case .createTopUp(let cid, let msat, let ref):
+        case .createTopUp(let cid, let msat, let ref, let card):
             Task { [weak self] in
                 guard let self else { return }
-                let r = await self.client.createTopUp(amountMsat: msat, clientRef: ref)
+                let r = await self.client.createTopUp(amountMsat: msat, clientRef: ref, shortId: card)
                 self.send(.topUpCreated(createId: cid, result: r))
             }
         case .loadTopUp(let lid, let tid):

@@ -102,9 +102,15 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
             is TillResult.Ok -> parseCardBalance(r.value.status, r.value.body)
         }
 
-    /** Makes a top-up invoice (docs/TOPUP.md). The same [clientRef] answers the same top-up. */
-    fun createTopUp(amountMsat: Long, clientRef: String): TopUpReply<TopUp> {
-        val body = JSONObject().put("amount_msat", amountMsat).put("client_ref", clientRef).toString()
+    /**
+     * Makes a top-up invoice (docs/TOPUP.md). The same [clientRef] answers the same top-up. With
+     * [shortId] the till fits the amount to that card's free slots, or refuses a full card
+     * (`card_full`) before any invoice exists.
+     */
+    fun createTopUp(amountMsat: Long, clientRef: String, shortId: String? = null): TopUpReply<TopUp> {
+        val o = JSONObject().put("amount_msat", amountMsat).put("client_ref", clientRef)
+        if (shortId != null) o.put("short_id", shortId)
+        val body = o.toString()
         return when (val r = call("POST", "/v1/topup", body, QUICK_READ_MS + 20_000)) {
             is TillResult.Err -> TopUpReply.Failed(r.error)
             is TillResult.Ok -> parseTopUp(r.value.status, r.value.body)
@@ -275,7 +281,8 @@ internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = tr
         }
         val f = o.optJSONArray("free_slots")
         val free = if (f == null) emptyList() else (0 until f.length()).map { f.getInt(it) }
-        BalanceResult.Read(CardBalance(o.optL("live_msat"), rows, free))
+        val shortId = if (o.isNull("short_id")) null else o.optString("short_id").ifEmpty { null }
+        BalanceResult.Read(CardBalance(o.optL("live_msat"), rows, free, shortId))
     }
 } catch (e: JSONException) {
     BalanceResult.Failed(TillError.BadResponse(e.message ?: "bad json"))

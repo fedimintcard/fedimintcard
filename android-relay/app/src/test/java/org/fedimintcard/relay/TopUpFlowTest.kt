@@ -16,7 +16,7 @@ class TopUpFlowTest {
         val f = flow()
         f.dispatch(PosEvent.CardPresent)
         val fx = f.dispatch(PosEvent.CardBalanceOpened).single() as PosEffect.StartBalanceRead
-        f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(CardBalance(5_000, emptyList(), emptyList()))))
+        f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(CardBalance(5_000, emptyList(), emptyList(), "6f94b19b"))))
         if (lift) f.dispatch(PosEvent.CardLost)
         return f
     }
@@ -43,6 +43,37 @@ class TopUpFlowTest {
         f.dispatch(PosEvent.TopUpCreated(c.createId, TopUpReply.Ok(t)))
         assertEquals(PosState.TopUpInvoice(t, c.clientRef), f.state)
         assertEquals(7L, f.pad.sats)
+    }
+
+    @Test fun theCardFromTheBalanceReadGoesWithEveryCreate() {
+        val f = shown()
+        f.dispatch(PosEvent.TopUpPressed)
+        "100".forEach { f.topUpPad.press(it - '0') }
+        val c = f.dispatch(PosEvent.CreateInvoicePressed).single() as PosEffect.CreateTopUp
+        assertEquals("6f94b19b", c.shortId)
+        // A failed create retried, and a new invoice after expiry, keep the card.
+        f.dispatch(PosEvent.TopUpCreated(c.createId, TopUpReply.Failed(TillError.Unreachable)))
+        val again = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.CreateTopUp
+        assertEquals("6f94b19b", again.shortId)
+        f.dispatch(PosEvent.TopUpCreated(again.createId, TopUpReply.Ok(t)))
+        f.dispatch(PosEvent.TopUpPolled("t1", st("expired")))
+        val renewed = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.CreateTopUp
+        assertEquals("6f94b19b", renewed.shortId)
+    }
+
+    @Test fun aFullCardIsRefusedBeforeAnyInvoice() {
+        val f = shown()
+        f.dispatch(PosEvent.TopUpPressed)
+        "100".forEach { f.topUpPad.press(it - '0') }
+        val c = f.dispatch(PosEvent.CreateInvoicePressed).single() as PosEffect.CreateTopUp
+        f.dispatch(PosEvent.TopUpCreated(c.createId, TopUpReply.Refused("card_full", "no free slot", 409)))
+        val s = f.state as PosState.TopUpFailed
+        assertEquals(TopUpProblem.NO_ROOM, s.problem)
+        assertFalse(s.paid); assertNull(s.topUp)
+        assertEquals("This card is full" to "Spend from it first, then top up.", topUpErrorCopy(s.problem, s.paid, s.detail))
+        assertTrue(f.dispatch(PosEvent.RetryPressed).isEmpty())
+        f.dispatch(PosEvent.DonePressed)
+        assertEquals(PosState.Entering, f.state)
     }
 
     @Test fun chargeCardGoesToTheKeypad() {

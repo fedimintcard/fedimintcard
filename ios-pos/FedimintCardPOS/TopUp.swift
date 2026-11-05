@@ -34,6 +34,8 @@ enum TopUpProblem: Equatable {
     case expired
     /// The card has no room for the notes; the top-up stays paid.
     case cardFull
+    /// The card has no free slot, found before any invoice was made: nothing was paid.
+    case noRoom
     /// Paid, and the card step was cancelled: the top-up waits in the till until a tap loads it.
     case notLoaded
     case cardMoved, notOurCard, tillUnreachable, timeout, cardService, badAmount, busy, notPaired
@@ -78,6 +80,7 @@ func topUpErrorCopy(_ p: TopUpProblem, paid: Bool, detail: String) -> (String, S
     case .expired: return ("The invoice expired", "Nothing was paid. Make a new invoice to try again.")
     case .notLoaded: return ("Not loaded yet", "The top-up is paid and waiting. Tap the card to load it; Done leaves the payment with the till.")
     case .cardFull: return ("This card is full", "Spend from it, then tap again.\(waiting)")
+    case .noRoom: return ("This card is full", "Spend from it first, then top up.")
     case .cardMoved: return ("The card moved away", "Hold the card still until it's loaded.\(waiting)")
     case .notOurCard: return ("Not a card for this till", "Try the holder's card.\(waiting)")
     case .tillUnreachable: return ("Can't reach the till", "Check that the till is running, then try again.\(waiting)")

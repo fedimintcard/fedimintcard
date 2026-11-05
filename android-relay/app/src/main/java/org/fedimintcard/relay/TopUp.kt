@@ -32,6 +32,8 @@ enum class TopUpProblem {
     EXPIRED,
     /** The card has no room for the notes; the top-up stays paid. */
     CARD_FULL,
+    /** The card has no free slot, found before any invoice was made: nothing was paid. */
+    NO_ROOM,
     CARD_MOVED, NOT_OUR_CARD, TILL_UNREACHABLE, TIMEOUT, CARD_SERVICE, BAD_AMOUNT, BUSY,
     /** Paid, and the card step was cancelled: the top-up waits in the till until a tap loads it. */
     NOT_LOADED,
@@ -71,6 +73,7 @@ fun topUpErrorCopy(p: TopUpProblem, paid: Boolean, detail: String): Pair<String,
         TopUpProblem.EXPIRED -> "The invoice expired" to "Nothing was paid. Make a new invoice to try again."
         TopUpProblem.NOT_LOADED -> "Not loaded yet" to "The top-up is paid and waiting. Tap the card to load it; Done leaves the payment with the till."
         TopUpProblem.CARD_FULL -> "This card is full" to "Spend from it, then tap again.$waiting"
+        TopUpProblem.NO_ROOM -> "This card is full" to "Spend from it first, then top up."
         TopUpProblem.CARD_MOVED -> "The card moved away" to "Hold the card still until it's loaded.$waiting"
         TopUpProblem.NOT_OUR_CARD -> "Not a card for this till" to "Try the holder's card.$waiting"
         TopUpProblem.TILL_UNREACHABLE -> "Can't reach the till" to "Check that the till is running, then try again.$waiting"

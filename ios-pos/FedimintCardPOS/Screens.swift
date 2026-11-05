@@ -365,7 +365,7 @@ struct TopUpErrorScreen: View {
 
     private var retryLabel: String? {
         switch failure.problem {
-        case .failed, .notPaired: return nil
+        case .failed, .notPaired, .noRoom: return nil
         case .expired: return "New invoice"
         default: return failure.topUp == nil ? "Try again" : "Tap again"
         }

@@ -306,7 +306,7 @@ class PosUi(
                 else -> R.string.try_again
             }
         )
-        retry.visibility = if (e.problem == TopUpProblem.FAILED) View.GONE else View.VISIBLE
+        retry.visibility = if (e.problem == TopUpProblem.FAILED || e.problem == TopUpProblem.NO_ROOM) View.GONE else View.VISIBLE
         errBack.visibility = View.VISIBLE
         (errBack as TextView).text = act.getString(R.string.done)
     }

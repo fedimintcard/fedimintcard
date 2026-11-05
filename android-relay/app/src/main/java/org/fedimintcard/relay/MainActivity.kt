@@ -244,7 +244,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             }.start()
             is PosEffect.StartBalanceRead -> readCardBalance(fx.readId)
             is PosEffect.CreateTopUp -> Thread {
-                val r = client.createTopUp(fx.amountMsat, fx.clientRef)
+                val r = client.createTopUp(fx.amountMsat, fx.clientRef, fx.shortId)
                 runOnUiThread { dispatch(PosEvent.TopUpCreated(fx.createId, r)) }
             }.start()
             is PosEffect.LoadTopUp -> Thread {

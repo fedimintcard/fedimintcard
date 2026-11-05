@@ -148,9 +148,13 @@ final class TillClient {
 extension TillClient {
     static let topUpCreateTimeout: TimeInterval = 30
 
-    /// Makes a top-up invoice (docs/TOPUP.md). The same `clientRef` answers the same top-up.
-    func createTopUp(amountMsat: Int64, clientRef: String) async -> TopUpReply<TopUp> {
-        let body = try? JSONSerialization.data(withJSONObject: ["amount_msat": amountMsat, "client_ref": clientRef])
+    /// Makes a top-up invoice (docs/TOPUP.md). The same `clientRef` answers the same top-up. With
+    /// `shortId` the till fits the amount to that card's free slots, or refuses a full card
+    /// (`card_full`) before any invoice exists.
+    func createTopUp(amountMsat: Int64, clientRef: String, shortId: String? = nil) async -> TopUpReply<TopUp> {
+        var o: [String: Any] = ["amount_msat": amountMsat, "client_ref": clientRef]
+        if let shortId { o["short_id"] = shortId }
+        let body = try? JSONSerialization.data(withJSONObject: o)
         switch await call(request("POST", "/v1/topup", body: body, timeout: Self.topUpCreateTimeout)) {
         case .failure(let e): return .failed(e)
         case .success(let r): return TillParse.topUp(status: r.status, body: r.body)
@@ -304,7 +308,8 @@ enum TillParse {
                 CardNote(slot: Int(try reqLong($0, "slot")), msat: try reqLong($0, "msat"), status: optStr($0, "status") ?? "")
             }
             let free = ((o["free_slots"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber)?.intValue }
-            return .read(CardBalance(liveMsat: optLong(o, "live_msat"), notes: rows, freeSlots: free))
+            let shortId = optStr(o, "short_id").flatMap { $0.isEmpty ? nil : $0 }
+            return .read(CardBalance(liveMsat: optLong(o, "live_msat"), notes: rows, freeSlots: free, shortId: shortId))
         } catch {
             if status == 401 { return .refused(code: .unauthorized, detail: "unauthorized") }
             return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))

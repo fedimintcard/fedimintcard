@@ -18,6 +18,9 @@ data class CardBalance(
     val liveMsat: Long,
     val notes: List<CardNote>,
     val freeSlots: List<Int>,
+    /** The card's id on the registry (`short_id`), when the till is on ops: a top-up started from
+     *  the balance screen sends it so the till fits the amount to this card's free slots. */
+    val shortId: String? = null,
 )
 
 data class ChargeReceipt(

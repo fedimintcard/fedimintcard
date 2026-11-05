@@ -116,6 +116,22 @@ class TillClientTest {
         assertEquals("Bearer tok", f.headers["Authorization"])
     }
 
+    @Test fun createTopUpSendsTheCard() {
+        val f = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
+        TillClient({ "http://h:1" }, f, { "tok" }).createTopUp(100_000, "r1", "6f94b19b") as TopUpReply.Ok
+        assertTrue(f.body!!.contains("\"short_id\":\"6f94b19b\""))
+        val g = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
+        TillClient({ "http://h:1" }, g, { "tok" }).createTopUp(100_000, "r1")
+        assertFalse(g.body!!.contains("short_id"))
+    }
+
+    @Test fun cardBalanceShortId() {
+        val r = parseCardBalance(200, """{"ok":true,"live_msat":5,"notes":[],"free_slots":[1,4],"short_id":"6f94b19b"}""") as BalanceResult.Read
+        assertEquals("6f94b19b", r.balance.shortId)
+        val n = parseCardBalance(200, """{"ok":true,"live_msat":5,"notes":[],"free_slots":[]}""") as BalanceResult.Read
+        assertNull(n.balance.shortId)
+    }
+
     @Test fun createTopUpRefused() {
         val r = client(Fake(raw(400, """{"ok":false,"error":"bad_amount","detail":"too much"}"""))).createTopUp(1, "r") as TopUpReply.Refused
         assertEquals("bad_amount", r.error); assertEquals("too much", r.detail); assertEquals(400, r.httpStatus)
