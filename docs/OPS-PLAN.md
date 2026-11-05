@@ -284,6 +284,11 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   a `nohup` line.
 - [ ] Operator setup without `adb` tunnels where possible; drop `android-relay` from the operator
   path once the POS needs nothing from it (O5 row).
+- [ ] **PIN encrypted to the card** (before merchants run tills you don't control): today the
+  PIN crosses POS → till → relay → NFC in a plain VERIFY, so a till, or anyone on that path, sees
+  it. Like the Cashu card's PIN keypair, the applet would hold a PIN key, the POS app would
+  encrypt the PIN to it on the phone, and only the card could read it; the till only relays
+  bytes. Needs an applet change (a new load on every card) and the POS app.
 
 **Ops**
 - [ ] **Restore.** A tested way to load a snapshot into a fresh registry object, drilled on staging
