@@ -21,6 +21,8 @@ export default defineConfig({
           }),
           // A test-only age key pair; its identity is in registry.test.ts.
           BACKUP_RECIPIENT: 'age1thskleqxjwaf5peh9adq5wz5jxmenhrhgwhl0c5j4xgyhwf9tf2q6zh9mt',
+          // A test-only card-manager master (32 bytes); a deployment's is a secret.
+          CARD_MANAGER_MASTER: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
         },
         r2Buckets: ['BACKUPS'],
       },

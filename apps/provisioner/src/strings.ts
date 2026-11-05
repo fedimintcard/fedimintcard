@@ -119,10 +119,11 @@ export const LOOP = {
 export const CALM = {
   pulled: 'The card left the phone before it finished.',
   refused: 'The card answered something this batch did not expect.',
-  wrongKeys: 'The card did not prove the manager keys this batch uses.',
+  wrongKeys: 'The card proved neither its factory keys nor the keys ops holds for it.',
   guarded: 'This card already holds something this app never removes.',
   differentCard: 'The key the card read back is not the one this batch expected.',
   pinNotSet: 'The card was installed, but its keys or its PIN did not finish.',
+  noManagerKeys: 'Ops did not answer this card\'s manager keys, so nothing was written.',
   outboxPending: 'Some rows have not reached the registry yet. They retry on their own.',
 } as const;
 
@@ -134,6 +135,7 @@ export const STATE = {
   guarded: 'Use a blank card. This app never removes a card that already holds keys.',
   differentCard: 'Set this card aside; it was not issued to.',
   pinNotSet: 'This card is unspendable and must not be handed out. Set it aside.',
+  noManagerKeys: 'The card is unchanged. Check the connection, or whose card it is, and tap it again.',
   outboxPending: 'The card work is done; only the registry row waits.',
 } as const;
 
@@ -186,6 +188,94 @@ export const SETTINGS = {
   signOutSub: 'Your settings stay on this phone.',
   signOutBlocked: 'A batch is running. End or leave it before signing out.',
   keepSession: 'Stay signed in',
+  cards: 'Cards',
+  resetTitle: 'Reset a card',
+  resetSub: 'Wipe an empty card and set it up again, with a new PIN',
+  resetBlocked: 'A batch is running. End it before resetting a card.',
+  cardsHelp:
+    'Reset a card that is empty: the card is wiped, set up again with new keys and a new PIN, and comes back as a new card. Ops must show nothing on it, and the holder types their PIN to agree.',
+} as const;
+
+/** Settings → Reset a card (OPS-PLAN O5). */
+export const RESET = {
+  title: 'Reset a card',
+  intro:
+    'Hold the card to the phone. The app reads which card it is and asks ops whether it may be reset. Nothing is changed by this tap.',
+  help:
+    'A reset deletes the card\'s applet and installs it again: the card gets new keys, a new short id and a new PIN, and ops links the old record to the new one. Value on the card would be lost, so ops refuses while it shows a live or pending note, an open charge or an open load. Ops cannot see a load made around it, so the holder\'s PIN is the consent. Other applets on the chip are never touched.',
+  read: 'Read the card',
+  reading: 'Hold the card to the phone…',
+  card: 'Card',
+  pinState: 'PIN',
+  pinStates: {set: 'Set', blocked: 'Blocked', notSet: 'Never set'},
+  ops: 'At ops',
+  opsEmpty: 'Empty',
+  refusedTitle: 'Ops will not reset this card',
+  refusedBody: 'Handle what ops still shows first, then read the card again.',
+  holderPin: 'Holder\'s PIN',
+  holderPinHelp:
+    'The holder types their PIN here. It is sent to the card once, to show they agree, and is not kept. A wrong PIN uses one of the card\'s three tries.',
+  holderPinPlaceholder: 'Holder\'s PIN',
+  blockedTitle: (pin: 'blocked' | 'notSet') =>
+    pin === 'blocked' ? 'This card\'s PIN is blocked' : 'This card never had a PIN set',
+  blockedBody:
+    'The holder cannot agree with their PIN. Ops shows the card empty, but a load made around ops would be lost with the card\'s keys. Reset only if you are sure the card holds nothing.',
+  blockedConfirm: 'I am sure: reset without the PIN',
+  blockedConfirmed: 'Confirmed. Hold the card to the phone to reset it.',
+  reset: 'Reset this card',
+  resetting: 'Keep the card still…',
+  stop: 'Stop',
+  phase: {
+    check: 'Asking ops',
+    consent: 'Checking the holder\'s PIN',
+    chip: 'Reading the chip',
+    install: 'Wiping and installing — keep the card still',
+    rotate: 'Locking the card to its own keys',
+    keys: 'Making the card\'s keys',
+    pin: 'Setting the new PIN',
+  } as const,
+  doneTitle: (id: string) => `Reset · now …${id.slice(-4).toUpperCase()}`,
+  newPin: 'The card\'s new PIN',
+  newPinBody: 'Write it down or hand it over with the card. It is not shown again.',
+  recorded: 'Ops has the new card and links the old one to it.',
+  notRecorded: 'The card is finished, but ops has not recorded it yet. Record it before closing.',
+  record: 'Record now',
+  stranded: (n: number) =>
+    `Ops still held ${n} ${n === 1 ? 'note' : 'notes'} under the old card. They cannot be spent now.`,
+  done: 'Done',
+  another: 'Reset another card',
+  unfinished: (id: string) =>
+    `A reset of card …${id.slice(-4).toUpperCase()} did not finish. Hold the same card to the phone to finish it.`,
+  unfinishedOther: 'Another operator\'s reset did not finish on this phone.',
+  finish: 'Finish the reset',
+  forget: 'Forget the unfinished reset',
+  forgetConfirm:
+    'Only if the card is lost or was reset elsewhere: a wiped card cannot be finished without this record.',
+  noCard: 'No card was read before the scan closed.',
+  notYours: 'Ops has no such card for this operator: it is unknown, or another operator\'s.',
+  stops: {
+    differentCard: 'Not the same card',
+    notResettable: 'Ops will not reset this card',
+    wrongPin: (left: number) => `Wrong PIN · ${left} ${left === 1 ? 'try' : 'tries'} left`,
+    pinBlocked: 'The PIN is blocked',
+    pinRequired: 'The holder\'s PIN is needed',
+    journal: 'The reset could not be saved on this phone; nothing was changed',
+    otherOperator: 'Another operator\'s reset is unfinished on this phone',
+    recordPending: 'Only the record is left',
+    pulled: 'The card left the phone',
+    refused: 'The card refused',
+    wrongKeys: 'Neither the factory keys nor the card\'s own keys work',
+    guarded: 'The card refused',
+    noManagerKeys: 'Ops did not answer the card\'s manager keys',
+    notFinished: 'The card\'s keys or PIN did not finish',
+  },
+  resumable: 'The card may be wiped now. Hold the same card to the phone to finish.',
+  untouched: 'The card is unchanged.',
+  identify: {
+    noApplet: 'This card has no Fedimint applet: there is nothing to reset. A blank card goes through a batch.',
+    unkeyed: 'This card was installed but never keyed. Finish it in a batch instead.',
+    refused: 'The card did not answer as a Fedimint card.',
+  },
 } as const;
 
 /**

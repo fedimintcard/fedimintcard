@@ -20,8 +20,16 @@ These differ only in the statements named, all of them about this card's AIDs:
                          adapted: this card's AIDs and byte-for-byte literals,
                          and the whitelist test names three AIDs
 
+These are ported with changes of their own:
+
+    gp/identity.ts       cashucard's parseCplc and readChipIdentity, without
+                         the expected-id check (ops keys each card's manager
+                         keys on the id instead)
+    gp/test/identity.test.ts
+                         the same J3R180 CPLC capture, and the refusals
+
 Everything else in tools/cardkit is written for this project, and the upstream
-code it does not need (identity, inspect, registry, reset, configuration,
+code it does not need (inspect, registry, reset, configuration,
 holderCommands, the NFC tag and hello applets) was not ported.
 
 Its licence follows verbatim.

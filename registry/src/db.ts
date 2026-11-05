@@ -152,6 +152,24 @@ export const MIGRATIONS: readonly string[] = [
     writes        INTEGER NOT NULL
   );
   `,
+  // v6 (OPS-PLAN O5): each chip's escrowed card-manager keys (`managerKeys.ts`),
+  // the chip a card row was installed on, and a reset's link from the old row
+  // to the new one (`reset.ts`).
+  `
+  CREATE TABLE manager_keys (
+    chip          TEXT    PRIMARY KEY,
+    operator_id   INTEGER NOT NULL,
+    key_version   INTEGER NOT NULL,
+    enc           TEXT    NOT NULL,
+    mac           TEXT    NOT NULL,
+    dek           TEXT    NOT NULL,
+    issued_at     INTEGER NOT NULL,
+    short_id      TEXT
+  );
+  ALTER TABLE cards ADD COLUMN chip TEXT;
+  ALTER TABLE cards ADD COLUMN reset_at INTEGER;
+  ALTER TABLE cards ADD COLUMN replaced_by TEXT;
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

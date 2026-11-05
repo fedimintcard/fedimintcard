@@ -1,6 +1,6 @@
 /**
  * Settings: what the operator sets between batches. The federation (the same
- * picker as NEW BATCH), the registry endpoint, the demo,
+ * picker as NEW BATCH), the registry endpoint, resetting a card, the demo,
  * the session, and About. Reasons sit behind (i) on each header; choices save
  * as they are made, and a short line at the foot confirms each save.
  *
@@ -43,9 +43,11 @@ const REGISTRY_LABEL: Record<RegistryEndpoint, string> = {
 export function SettingsScreen({
   onBack,
   onDemo,
+  onReset,
 }: {
   onBack: () => void;
   onDemo: () => void;
+  onReset: () => void;
 }) {
   const settings = useSettings();
   const app = useStore();
@@ -106,6 +108,21 @@ export function SettingsScreen({
                 testIDOf={e => `settings-registry-${e}`}
               />
             </View>
+          </Card>
+        </View>
+
+        <View style={local.section}>
+          <SectionHeader help={SETTINGS.cardsHelp} testID="settings-cards-help">
+            {SETTINGS.cards}
+          </SectionHeader>
+          <Card>
+            <EntryRow
+              title={SETTINGS.resetTitle}
+              subtitle={running ? SETTINGS.resetBlocked : SETTINGS.resetSub}
+              onPress={onReset}
+              disabled={running}
+              testID="settings-reset-entry"
+            />
           </Card>
         </View>
 

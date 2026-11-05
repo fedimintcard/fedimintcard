@@ -12,5 +12,6 @@ declare namespace Cloudflare {
     readonly OPERATOR_SETUP?: string;
     readonly BACKUPS?: R2Bucket;
     readonly BACKUP_RECIPIENT?: string;
+    readonly CARD_MANAGER_MASTER?: string;
   }
 }

@@ -36,6 +36,7 @@ import React, {
 import {AppState} from 'react-native';
 
 import type {StopKind} from './cardkit';
+import type {CardOps} from './ops';
 import {
   useOptionalBatchPin,
   usePinReveal,
@@ -51,8 +52,9 @@ import {
  * The phases one card goes through, in order. The first eight are cardkit's
  * `FEDIMINT_PLAN` (probe → selectIsd → auth → sweep → installForLoad → load →
  * installOpener/installCard → verify), folded to what the operator sees;
- * `keySetup`, `setPin` and `issue` are this plan's additions (§ 3 S3), because
- * on this card a programmed card is not a usable one.
+ * `rotate` moves the card manager to the card's own keys (OPS-PLAN O5), and
+ * `keySetup` and `setPin` are this plan's additions (§ 3 S3), because on this
+ * card a programmed card is not a usable one.
  */
 export const CARD_PHASES = [
   'probe',
@@ -62,6 +64,7 @@ export const CARD_PHASES = [
   'load',
   'install',
   'verify',
+  'rotate',
   'keySetup',
   'setPin',
   'done',
@@ -84,10 +87,11 @@ export function nextPhase(phase: CardPhase): CardPhase {
 
 /**
  * Cardkit's four stops are carried over unchanged — `StopKind` is imported,
- * never redefined — and the three below are this card's, from § 5's "Stops"
- * table.
+ * never redefined — and the rest are this card's: two from § 5's "Stops"
+ * table, and `noManagerKeys` (OPS-PLAN O5), when ops did not answer the
+ * card's own keys and nothing was written.
  */
-export type CardStop = StopKind | 'differentCard' | 'pinNotSet';
+export type CardStop = StopKind | 'differentCard' | 'pinNotSet' | 'noManagerKeys';
 
 /** Every stop, in § 5's table order. */
 export const CARD_STOPS: readonly CardStop[] = [
@@ -97,6 +101,7 @@ export const CARD_STOPS: readonly CardStop[] = [
   'guarded',
   'differentCard',
   'pinNotSet',
+  'noManagerKeys',
 ];
 
 /**
@@ -112,6 +117,8 @@ const BLOCKS_BATCH: Record<CardStop, boolean> = {
   guarded: false,
   differentCard: false,
   pinNotSet: true,
+  // nothing was written: the next tap asks ops again
+  noManagerKeys: false,
 };
 
 /** The batch can also end on something that is not one card's: unanswered rows. */
@@ -182,6 +189,8 @@ export interface CardOutcome {
   sw?: number;
   /** The engine's own reason. Never a PIN, never a key. */
   reason?: string;
+  /** The chip's CPLC id, once read; the registry row carries it (OPS-PLAN O5). */
+  chip?: string;
 }
 
 /** One card's row on the summary and in the registry (§ 3 S4). */
@@ -355,7 +364,7 @@ export interface Session {
  * tests need. `App.tsx` passes the real client in, and api.ts owns the
  * session's storage; nothing here is persisted.
  */
-export interface StoreApi {
+export interface StoreApi extends Partial<CardOps> {
   readonly serviceUrl: string;
   /**
    * Resolves with the operator's session. Rejects with whatever api.ts throws:
@@ -395,6 +404,12 @@ export interface StoreShape {
   signOut(): void;
   /** Federation names by decoded id, read after sign-in; empty until then. */
   federationNames: Readonly<Record<string, string>>;
+  /**
+   * Ops' card lifecycle calls (manager keys, reset), for the signed-in
+   * operator. Each rejects when this build has no registry to ask, which a
+   * tap reports as a stop rather than going on without the answer.
+   */
+  readonly ops: CardOps;
   /**
    * Start a batch. Exposed on the store as well as on `batch.actions` because
    * `batch` is null until a batch starts: BatchSetup has to call this before
@@ -721,6 +736,19 @@ export function StoreProvider({
     [batch, actions],
   );
 
+  const ops = useMemo<CardOps>(() => {
+    const missing = (call: string) =>
+      Promise.reject(new Error(`${call} needs the registry, and this build has none`));
+    return {
+      managerKeys: (chip, shortId) =>
+        apiRef.current?.managerKeys?.(chip, shortId) ?? missing('the card-manager keys'),
+      resetCheck: shortId =>
+        apiRef.current?.resetCheck?.(shortId) ?? missing('the reset check'),
+      recordReset: (oldShortId, card) =>
+        apiRef.current?.recordReset?.(oldShortId, card) ?? missing('recording a reset'),
+    };
+  }, []);
+
   const value = useMemo<StoreShape>(
     () => ({
       signedIn: session !== null,
@@ -729,6 +757,7 @@ export function StoreProvider({
       signIn,
       signOut,
       federationNames,
+      ops,
       startBatch: actions.start,
       batch: view,
       loop: batch && batch.phase === 'running' ? batch.loop : null,
@@ -739,6 +768,7 @@ export function StoreProvider({
       signIn,
       signOut,
       federationNames,
+      ops,
       actions,
       view,
       batch,

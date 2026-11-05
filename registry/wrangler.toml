@@ -19,6 +19,13 @@ preview_urls = false
 # `recover` with a new nonce resets a named operator's password and revokes
 # their sessions. For `wrangler dev`, put OPERATOR_SETUP in .dev.vars; it does
 # not read the shell environment.
+#
+# Each card's card-manager (GlobalPlatform) keys derive from one master, also a
+# secret (src/managerKeys.ts, OPS-PLAN O5): 32 random bytes as 64 hex characters.
+#   openssl rand -hex 32 | npx wrangler secret put CARD_MANAGER_MASTER
+# Without it /registry/manager-keys answers 503 and the phone installs nothing.
+# Keep a copy offline: the escrow in the backup covers every card already
+# issued, the master is what re-derives a set if the escrow is ever lost.
 
 [[durable_objects.bindings]]
 name = "REGISTRY"

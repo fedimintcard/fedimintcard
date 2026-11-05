@@ -1,7 +1,8 @@
 /**
- * The five routes (docs/PROVISIONER-PLAN.md § 5, "Trimmed surface"): SignIn,
- * BatchSetup, the Loop, BatchSummary, Settings. There is no card browser, no
- * load-test bench and no reset flow; those live in the laptop's `cardctl`.
+ * The six routes (docs/PROVISIONER-PLAN.md § 5, "Trimmed surface", and
+ * OPS-PLAN O5): SignIn, BatchSetup, the Loop, BatchSummary, Settings, and
+ * Reset a card under Settings. There is no card browser and no load-test
+ * bench; those live in the laptop's `cardctl`.
  *
  * Which screen a batch shows is the batch's `phase`, not a route table: the
  * loop runs until END BATCH (`summary`), and the summary is the one screen that
@@ -25,13 +26,14 @@ import {BatchSetupScreen} from './src/screens/BatchSetupScreen';
 import {BatchSummaryScreen} from './src/screens/BatchSummaryScreen';
 import {DemoScreen} from './src/screens/DemoScreen';
 import {LoopScreen} from './src/screens/LoopScreen';
+import {ResetScreen} from './src/screens/ResetScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {SignInScreen} from './src/screens/SignInScreen';
 import {SettingsProvider, useSettings} from './src/settings';
 import {StoreProvider, useStore} from './src/store';
 import type {StoreApi} from './src/store';
 
-type Route = 'home' | 'settings' | 'summary' | 'demo';
+type Route = 'home' | 'settings' | 'summary' | 'demo' | 'reset';
 
 function Navigator(): React.JSX.Element {
   const {batch, signedIn} = useStore();
@@ -66,11 +68,16 @@ function Navigator(): React.JSX.Element {
   // Settings opens over a running batch from the loop's gear, which the loop
   // hides while a card is on the phone; Back returns to the loop. Settings
   // itself refuses the demo and sign-out while a batch runs.
+  // Never over a running batch: Settings disables the entry while one runs.
+  if (route === 'reset' && phase !== 'running') {
+    return <ResetScreen onBack={() => setRoute('settings')} />;
+  }
   if (route === 'settings') {
     return (
       <SettingsScreen
         onBack={() => setRoute('home')}
         onDemo={() => setRoute('demo')}
+        onReset={() => setRoute('reset')}
       />
     );
   }

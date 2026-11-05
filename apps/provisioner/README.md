@@ -2,8 +2,9 @@
 
 The phone-side operator app for programming blank J3R180 JavaCards into Fedimint
 cards, one tap at a time, in batches. It installs the Fedimint card applet over
-NFC, lets the card generate its keys, sets the card's PIN, and loads value onto
-it from the operator's wallet.
+NFC, locks its card manager to the card's own keys from ops, lets the card
+generate its keys and sets the card's PIN. Value comes from the holder's wallet
+(docs/OPS-PLAN.md § 6).
 
 Read `docs/PROVISIONER-PLAN.md` § 5 for what the app is and § 8.6 for the
 identity values below. The engine (`tools/cardkit`) is consumed as an installed
@@ -13,8 +14,9 @@ package; `src/cardkit.ts` is the only module that imports it.
 SignIn → BatchSetup → Loop (one card per tap, with stops) → BatchSummary → Settings
 ```
 
-That is the whole surface. There is no card browser, no load-test bench and no
-reset flow: those live in `host/sidecar` (`cardctl`) on the laptop.
+That is the whole surface, plus Settings → Reset a card (docs/OPS-PLAN.md O5).
+There is no card browser and no load-test bench: those live in `host/sidecar`
+(`cardctl`) on the laptop.
 
 ## Running it
 

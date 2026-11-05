@@ -1,5 +1,12 @@
 import {LOAD_FILE_SHA256} from './cardkit';
 import {decodeInvite} from './federation';
+import type {
+  CardOps,
+  ManagerKeysReply,
+  ResetCardRow,
+  ResetCheck,
+  ResetRecorded,
+} from './ops';
 
 /**
  * The one service the app talks to (docs/OPS-PLAN.md § 3), plus the registry
@@ -11,9 +18,12 @@ import {decodeInvite} from './federation';
  * **Hosted** (`RegistryClient`): operator sessions, batches and the idempotent
  * card rows. Paths are `POST /auth/operator/session`, `POST /registry/batches`,
  * `POST /registry/cards`, `GET /registry/cards?batch_id=`. Cashu's
- * `/provisioning/*` and `/keys/issue` are NOT carried over: this app installs
- * the applet and keys the card from the phone, so the hosted service has no
- * attempt, bind, key-issuing or disposition surface to call.
+ * `/provisioning/*` attempt and bind surface is NOT carried over: this app
+ * installs the applet and keys the card from the phone. What is carried over
+ * is its key issuing, keyed by chip rather than by attempt (OPS-PLAN O5):
+ * `POST /registry/manager-keys` answers a card's own card-manager key set, and
+ * `GET /registry/cards/:id/reset-check` and `POST /registry/cards/:id/reset`
+ * bracket a reset.
  *
  * There is no local client. The sidecar that keyed and loaded cards over a
  * relay left the operator's loop: the phone keys the card in the install tap
@@ -35,7 +45,10 @@ export type ServiceOperation =
   | 'create-batch'
   | 'post-card'
   | 'list-cards'
-  | 'list-federations';
+  | 'list-federations'
+  | 'manager-keys'
+  | 'reset-check'
+  | 'record-reset';
 
 export class ApiServiceError extends Error {
   constructor(
@@ -274,6 +287,11 @@ export interface CardRegistryRow {
    * whose key setup did not finish.
    */
   readonly slot_pubkeys?: readonly string[];
+  /**
+   * The chip's CPLC id (cardkit `readChipIdentity`), which ops keys the card's
+   * manager keys on. Absent on a row from before O5.
+   */
+  readonly chip?: string;
 }
 
 export interface OperatorSession {
@@ -414,6 +432,126 @@ export class RegistryClient extends HttpTransport {
     return names;
   }
 
+  /**
+   * POST /registry/manager-keys — the card's own card-manager key set,
+   * derived and escrowed by ops on the first ask and the same bytes on every
+   * repeat. The reply is checked here, so a malformed set never reaches a
+   * PUT KEY; it is returned to the tap and never stored.
+   */
+  async managerKeys(
+    token: string,
+    chip: string,
+    shortId?: string,
+  ): Promise<ManagerKeysReply> {
+    const json = await this.post('/registry/manager-keys', {
+      token,
+      body: shortId === undefined ? {chip} : {chip, short_id: shortId},
+      operation: 'manager-keys',
+    });
+    const hex16 = (v: unknown) => typeof v === 'string' && /^[0-9a-f]{32}$/.test(v);
+    if (
+      json.chip !== chip ||
+      !Number.isSafeInteger(json.key_version) ||
+      !hex16(json.enc) ||
+      !hex16(json.mac) ||
+      !hex16(json.dek)
+    ) {
+      throw new ApiServiceError(
+        'the card-manager keys are malformed',
+        200,
+        undefined,
+        'manager-keys',
+      );
+    }
+    return {
+      chip,
+      key_version: json.key_version as number,
+      enc: json.enc as string,
+      mac: json.mac as string,
+      dek: json.dek as string,
+    };
+  }
+
+  /** GET /registry/cards/:id/reset-check — what ops holds for the card. */
+  async resetCheck(token: string, shortId: string): Promise<ResetCheck> {
+    const json = await this.get(
+      `/registry/cards/${encodeURIComponent(shortId)}/reset-check`,
+      {token, operation: 'reset-check'},
+    );
+    const count = (v: unknown) => (Number.isSafeInteger(v) ? (v as number) : NaN);
+    const check: ResetCheck = {
+      short_id: String(json.short_id),
+      chip: typeof json.chip === 'string' ? json.chip : null,
+      empty: json.empty === true,
+      resettable: json.resettable === true,
+      reasons: Array.isArray(json.reasons)
+        ? json.reasons.filter((r): r is string => typeof r === 'string')
+        : [],
+      live_notes: count(json.live_notes),
+      live_msat: count(json.live_msat),
+      pending_notes: count(json.pending_notes),
+      pending_msat: count(json.pending_msat),
+      open_charges: count(json.open_charges),
+      open_loads: count(json.open_loads),
+      replaced_by: typeof json.replaced_by === 'string' ? json.replaced_by : null,
+    };
+    if (
+      check.short_id !== shortId ||
+      [
+        check.live_notes,
+        check.pending_notes,
+        check.open_charges,
+        check.open_loads,
+      ].some(Number.isNaN)
+    ) {
+      // A check that does not add up is never read as "empty".
+      throw new ApiServiceError(
+        'the reset check is malformed',
+        200,
+        undefined,
+        'reset-check',
+      );
+    }
+    return check;
+  }
+
+  /**
+   * POST /registry/cards/:id/reset — the new card's row; ops marks the old one
+   * reset and linked to it. Idempotent on the service, so a lost answer is
+   * re-posted with the same body.
+   */
+  async recordReset(
+    token: string,
+    oldShortId: string,
+    card: ResetCardRow,
+  ): Promise<ResetRecorded> {
+    const json = await this.post(
+      `/registry/cards/${encodeURIComponent(oldShortId)}/reset`,
+      {
+        token,
+        body: {
+          short_id: card.short_id,
+          installed_at: card.installed_at,
+          load_sha256: LOAD_FILE_SHA256,
+          pin_set: true,
+          // A reset card's PIN is generated and shown once, like a per-card batch's.
+          pin_policy: 'perCard',
+          notes_issued: 0,
+          slot_pubkeys: [...card.slot_pubkeys],
+          chip: card.chip,
+        },
+        operation: 'record-reset',
+      },
+    );
+    const stranded = json.stranded as {live_notes?: unknown; pending_notes?: unknown} | undefined;
+    const n = (v: unknown) => (Number.isSafeInteger(v) ? (v as number) : 0);
+    return {
+      old_short_id: oldShortId,
+      short_id: card.short_id,
+      stranded_notes: n(stranded?.live_notes) + n(stranded?.pending_notes),
+    };
+  }
+
   /** GET /registry/cards?batch_id= — the summary's refresh. */
   async listCards(token: string, batchId: number): Promise<StoredCard[]> {
     const json = await this.get(
@@ -523,7 +661,7 @@ type StoreSession = import('./store').Session;
  * The outbox holds the rows the registry could not take live, so a programmed
  * card's record survives a network that went away.
  */
-export class RegistryStoreApi {
+export class RegistryStoreApi implements CardOps {
   private readonly outbox: RegistryOutbox;
   /** The batch id the registry answered; every card row names it. */
   private batchId: number | null = null;
@@ -563,6 +701,19 @@ export class RegistryStoreApi {
   /** Federation names by decoded id, as the operator's tills reported them. */
   async federationNames(): Promise<Record<string, string>> {
     return this.client.federationNames(this.token());
+  }
+
+  /** A card's own card-manager keys, for the tap that rotates or resets it. */
+  managerKeys(chip: string, shortId?: string): Promise<ManagerKeysReply> {
+    return this.client.managerKeys(this.token(), chip, shortId);
+  }
+
+  resetCheck(shortId: string): Promise<ResetCheck> {
+    return this.client.resetCheck(this.token(), shortId);
+  }
+
+  recordReset(oldShortId: string, card: ResetCardRow): Promise<ResetRecorded> {
+    return this.client.recordReset(this.token(), oldShortId, card);
   }
 
   /** Open the batch once; a card row cannot be posted before it. */
@@ -643,6 +794,7 @@ export class RegistryStoreApi {
       ...(row.slotKeys && row.slotKeys.length === 8
         ? {slot_pubkeys: [...row.slotKeys]}
         : {}),
+      ...(row.chip ? {chip: row.chip} : {}),
     };
   }
 }

@@ -21,6 +21,8 @@
  *   operator   POST /auth/operator/signout
  *              POST /registry/batches            GET /registry/batches
  *              POST /registry/cards              GET /registry/cards?batch_id=
+ *              POST /registry/manager-keys       {chip, short_id?} -> the card's escrowed GP keys (managerKeys.ts)
+ *              GET  /registry/cards/:id/reset-check   POST /registry/cards/:id/reset   (reset.ts)
  *              POST /tills {name} -> {till_id, token}   GET /tills   DELETE /tills/:id
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
@@ -69,8 +71,19 @@ import {
 } from './cards';
 import {backupStatus, nextBackupAt, runBackup} from './backup';
 import {migrate} from './db';
-import {bearer, fail, isPositiveInt, isShortId, json, objectBody, Unprocessable} from './http';
+import {
+  bearer,
+  fail,
+  isPositiveInt,
+  isShortId,
+  json,
+  objectBody,
+  ServiceUnavailable,
+  Unprocessable,
+} from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
+import {issueManagerKeys} from './managerKeys';
+import {recordReset, resetCheck, wasReset} from './reset';
 
 export interface Env {
   readonly REGISTRY: DurableObjectNamespace;
@@ -84,6 +97,12 @@ export interface Env {
   readonly BACKUPS?: R2Bucket;
   /** The age recipient (age1…) backups are encrypted to; its identity lives outside Cloudflare. */
   readonly BACKUP_RECIPIENT?: string;
+  /**
+   * The master every card's card-manager keys derive from (`managerKeys.ts`):
+   * 32 bytes, hex. A secret: `wrangler secret put CARD_MANAGER_MASTER`. Without
+   * it, `/registry/manager-keys` answers 503 and nothing else changes.
+   */
+  readonly CARD_MANAGER_MASTER?: string;
 }
 
 type Caller = {kind: 'operator'; operatorId: number} | {kind: 'till'; till: Till};
@@ -144,6 +163,7 @@ export class Registry {
       if (e instanceof Conflict) return fail(409, e.message);
       if (e instanceof Unprocessable) return fail(422, e.message);
       if (e instanceof RateLimited) return fail(429, e.message);
+      if (e instanceof ServiceUnavailable) return fail(503, e.message);
       throw e;
     }
   }
@@ -236,6 +256,30 @@ export class Registry {
       if (!body) return fail(400, 'the card row must be an object');
       return json(200, {ok: true, stored: postCard(storage, op, body, now)});
     }
+    if (path === '/registry/manager-keys') {
+      if (method !== 'POST') return fail(405, 'use POST');
+      const body = await objectBody(request);
+      if (!body) return fail(400, 'expected {chip}');
+      // Read per request, so a secret set or removed applies at once.
+      const keys = issueManagerKeys(storage, op, this.env.CARD_MANAGER_MASTER, body, now, id => cardOwner(sql, id));
+      return json(200, {ok: true, ...keys});
+    }
+    const reset = /^\/registry\/cards\/([^/]+)\/(reset-check|reset)$/.exec(path);
+    if (reset) {
+      const shortId = reset[1]!;
+      if (!isShortId(shortId)) return fail(400, 'short_id must be 8 lower-case hex characters');
+      // Another operator's card answers as if it did not exist, as the card routes do.
+      if (cardOwner(sql, shortId) !== op) return fail(404, `no card ${shortId}`);
+      expireLoads(storage, shortId, now);
+      if (reset[2] === 'reset-check') {
+        if (method !== 'GET') return fail(405, 'use GET');
+        return json(200, {ok: true, ...resetCheck(sql, shortId)});
+      }
+      if (method !== 'POST') return fail(405, 'use POST');
+      const body = await objectBody(request);
+      if (!body) return fail(400, 'the new card row must be an object');
+      return json(200, {ok: true, ...recordReset(storage, op, shortId, body, now)});
+    }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.
       const status = backupStatus(sql, Boolean(this.env.BACKUPS && this.env.BACKUP_RECIPIENT), now);
@@ -289,6 +333,10 @@ export class Registry {
     if (caller.kind !== 'till') {
       return fail(403, 'only a till records charges and slot keys');
     }
+    if (wasReset(storage.sql, shortId)) {
+      // Its slot keys were deleted with the applet: nothing new may land under them.
+      return fail(410, `card ${shortId} was reset; it takes no more charges`);
+    }
     const body = await objectBody(request);
     if (!body) return fail(400, 'expected a JSON object');
     if (rest === '/intent' && method === 'POST') {
@@ -315,6 +363,10 @@ export class Registry {
     }
     if (cardOwner(storage.sql, shortId) === null) {
       return fail(404, `no card ${shortId}`);
+    }
+    if (wasReset(storage.sql, shortId)) {
+      // A load under deleted keys could never be spent. The new short id is not said here.
+      return fail(410, `card ${shortId} was reset; load the card's new id`);
     }
     expireLoads(storage, shortId, now);
     const method = request.method;
@@ -343,7 +395,7 @@ export class Registry {
       for (const table of [
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
-        'federation_keys', 'holder_loads', 'holder_budget',
+        'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }

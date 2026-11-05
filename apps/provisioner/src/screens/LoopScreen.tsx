@@ -5,14 +5,17 @@
  * One card per tap, eleven phases, seven stops, and the counter that is the
  * batch's denominator. The phases are `store.tsx`'s `CARD_PHASES`:
  *
- *   probe → selectIsd → auth → sweep → load → install → verify → keySetup →
- *   setPin → issue → done
+ *   probe → selectIsd → auth → sweep → load → install → verify → rotate →
+ *   keySetup → setPin → done
  *
- * The first seven are cardkit's install over the phone's NFC session
- * (`session.ts` → `provision`). `keySetup` and `setPin` follow in the same
- * session (`cardSetup.ts`): a freshly installed applet has eight empty slots,
- * so the phone asks the card to generate its keys, then sets and verifies the
- * PIN. No sidecar, no relay (docs/OPS-PLAN.md § 4). The provisioner loads no
+ * The tap itself is `installTap.ts`: the probe reads the chip and fetches the
+ * card's own card-manager keys from ops; the next seven are cardkit's install
+ * over the phone's NFC session (`session.ts` → `provision`), logged in with
+ * the factory keys or the card's own; `rotate` moves a factory card to its
+ * own keys (OPS-PLAN O5). `keySetup` and `setPin` follow in the same session
+ * (`cardSetup.ts`): a freshly installed applet has eight empty slots, so the
+ * phone asks the card to generate its keys, then sets and verifies the PIN.
+ * No sidecar, no relay (docs/OPS-PLAN.md § 4). The provisioner loads no
  * value; the holder's wallet does (§ 6).
  *
  * The screen computes no card state. Every outcome goes to
@@ -30,8 +33,7 @@ import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {CardFigure} from '../CardFigure';
 
-import {FEDIMINT_PLAN, provision} from '../cardkit';
-import {finishCard, probeApplet, type SetupResult} from '../cardSetup';
+import {installTap} from '../installTap';
 import {generatePin, useBatchPin, usePinReveal} from '../pin';
 import {phaseMessage, setCardMessage, withCard} from '../session';
 import {CALM, LOOP, STATE} from '../strings';
@@ -42,6 +44,7 @@ import {
   type RecordRow,
   shortIdOf,
   useBatch,
+  useStore,
 } from '../store';
 import {
   Card,
@@ -63,6 +66,7 @@ export const STOP_NAMES: Record<CardStop, string> = {
   guarded: 'Card holds something',
   differentCard: 'Different card',
   pinNotSet: 'PIN not set',
+  noManagerKeys: 'No manager keys',
 };
 
 /**
@@ -72,10 +76,13 @@ export const STOP_NAMES: Record<CardStop, string> = {
  */
 function foldedPhase(phase: string): CardPhase {
   switch (phase) {
+    case 'managerKeys':
+      return 'probe';
     case 'probe':
     case 'selectIsd':
     case 'auth':
     case 'sweep':
+    case 'rotate':
       return phase;
     case 'installForLoad':
     case 'load':
@@ -102,6 +109,7 @@ export function LoopScreen({
   onSettings: () => void;
 }) {
   const batch = useBatch();
+  const {ops} = useStore();
   const liveLoop = useLoop();
   const batchPin = useBatchPin();
   const reveal = usePinReveal();
@@ -144,8 +152,9 @@ export function LoopScreen({
     setShownPin(null);
     const controller = new AbortController();
     abort.current = controller;
-    // Set by the engine's first event: from then on a card is on the phone,
-    // and a stop is that card's outcome. Before it, nothing was touched.
+    // Set once the card answered the session's SELECT: from then on a card is
+    // on the phone, and a stop is that card's outcome. Before it, nothing was
+    // touched.
     let touched = false;
     setWaiting(true);
     setBusy(true);
@@ -166,69 +175,48 @@ export function LoopScreen({
     try {
       const {value: run} = await withCard(
         phaseMessage('probe'),
-        async tx => {
-          // Before anything is written: a card that already has keys is never
-          // installed over, since the sweep would delete them with any value
-          // they hold; one with the applet but no keys skips the install.
-          const before = await probeApplet(tx);
-          if (!touched) {
-            touched = true;
-            setWaiting(false);
-          }
-          if (before === 'keyed') {
-            return {
-              installed: {
-                ok: false as const,
-                kind: 'guarded' as const,
-                sw: undefined,
-                reason: 'the card already has keys; this app never installs over them',
-              },
-              setup: null as SetupResult | null,
-            };
-          }
-          const installed =
-            before === 'unkeyed'
-              ? {ok: true as const}
-              : await provision(tx, FEDIMINT_PLAN, {
-                random: length =>
-                  Array.from({length}, () => (Math.random() * 256) | 0),
-                now: Date.now,
-                onEvent: event => {
-                  if (!touched) {
-                    touched = true;
-                    setWaiting(false);
-                  }
-                  if (cancelled.current) {
-                    return;
-                  }
-                  if (event.type === 'phase') {
-                    phase = foldedPhase(event.phase);
-                    actions.setLoop({phase, loadProgress: null});
-                    setLine(phaseMessage(event.phase));
-                  } else if (event.type === 'block') {
-                    phase = 'load';
-                    actions.setLoop({
-                      phase,
-                      loadProgress: {index: event.index, of: event.of},
-                    });
-                    setLine(
-                      `Writing ${Math.round((event.index / event.of) * 100)}%`,
-                    );
-                  }
-                },
-              });
-          if (!installed.ok || cancelled.current) {
-            return {installed, setup: null as SetupResult | null};
-          }
-          // The same session: the card is still on the phone.
-          const setup = await finishCard(tx, pin, step => {
-            if (step === 'keys') {
-              enter('keySetup', LOOP.phaseKeys);
-            } else if (step === 'setPin') {
-              enter('setPin', LOOP.phasePin);
-            }
+        tx => {
+          // The session answered its SELECT before this runs: a card is here.
+          touched = true;
+          setWaiting(false);
+          return installTap(tx, {
+            pin,
+            managerKeys: chip => ops.managerKeys(chip),
+            random: length =>
+              Array.from({length}, () => (Math.random() * 256) | 0),
+            now: Date.now,
+            onPhase: step => {
+              if (!cancelled.current) {
+                enter(foldedPhase(step), phaseMessage(step));
+              }
+            },
+            onEvent: event => {
+              if (cancelled.current) {
+                return;
+              }
+              if (event.type === 'phase') {
+                phase = foldedPhase(event.phase);
+                actions.setLoop({phase, loadProgress: null});
+                setLine(phaseMessage(event.phase));
+              } else if (event.type === 'block') {
+                phase = 'load';
+                actions.setLoop({
+                  phase,
+                  loadProgress: {index: event.index, of: event.of},
+                });
+                setLine(
+                  `Writing ${Math.round((event.index / event.of) * 100)}%`,
+                );
+              }
+            },
+            onSetupStep: step => {
+              if (step === 'keys') {
+                enter('keySetup', LOOP.phaseKeys);
+              } else if (step === 'setPin') {
+                enter('setPin', LOOP.phasePin);
+              }
+            },
           });
-          return {installed, setup};
         },
         Date.now,
         controller.signal,
@@ -236,19 +224,20 @@ export function LoopScreen({
       if (cancelled.current) {
         throw new Error('CardSessionCancelled');
       }
-      const {installed, setup} = run;
+      const {installed, setup, chip} = run;
       if (!installed.ok) {
         actions.recordCard({
           ok: false,
-          phase,
-          stop: installed.kind ?? 'refused',
+          phase: foldedPhase(installed.phase),
+          stop: installed.kind,
           pinPolicy: policy,
           pinState: 'unknown',
           notesIssued: [],
           sw: installed.sw,
           reason: installed.reason,
+          chip,
         });
-        setStopShown(installed.kind ?? 'refused');
+        setStopShown(installed.kind);
         return;
       }
       if (!setup || !setup.ok) {
@@ -263,6 +252,7 @@ export function LoopScreen({
           notesIssued: [],
           sw: setup?.sw ?? undefined,
           reason: setup?.reason ?? 'key setup did not run',
+          chip,
         });
         setStopShown('pinNotSet');
         return;
@@ -279,6 +269,7 @@ export function LoopScreen({
         notesIssued: [],
         pubkey,
         slotKeys: setup.keys,
+        chip,
       });
       if (policy === 'perCard') {
         reveal.grant(id, pin);
@@ -324,7 +315,7 @@ export function LoopScreen({
       setWaiting(false);
       actions.setLoop({cardActive: false, loadProgress: null});
     }
-  }, [actions, batch, batchPin, blockedBy, busy, config, reveal]);
+  }, [actions, batch, batchPin, blockedBy, busy, config, ops, reveal]);
 
   // The shown PIN never outlives the screen.
   useEffect(() => () => reveal.wipe(), [reveal]);

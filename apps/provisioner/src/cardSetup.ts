@@ -20,8 +20,8 @@ export const SLOT_COUNT = 8;
 
 const CLA = 0xb0;
 const INS_GEN_KEY = 0x10;
-const INS_GET_PUB = 0x11;
-const INS_VERIFY_PIN = 0x40;
+export const INS_GET_PUB = 0x11;
+export const INS_VERIFY_PIN = 0x40;
 const INS_SET_PIN = 0x41;
 
 export const SW_OK = 0x9000;
@@ -77,7 +77,7 @@ function hex(sw: number | null): string {
  * the right Le), as the host's `exchange` does. A `6C` on a GEN_KEY is never
  * resent here either: the first attempt may already have made the key.
  */
-async function exchange(
+export async function exchange(
   tx: Transceiver,
   apdu: readonly number[],
 ): Promise<{body: number[]; sw: number | null}> {

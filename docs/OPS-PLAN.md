@@ -206,13 +206,30 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   the same transaction that issues it, so a lost answer re-issues the same bytes. The phone fetches
   the set during the install tap and rotates the card's keys (PUT KEY) after installing, then
   forgets it. The backup then carries the escrow, still age-encrypted. Threat model written down:
-  whoever holds the escrow can manage every card in it.
+  whoever holds the escrow can manage every card in it. **Built 2026-11-04, not deployed, silicon
+  pending**: `registry/src/managerKeys.ts` (`POST /registry/manager-keys {chip, short_id?}`,
+  operator token only; HKDF-SHA256 over `CARD_MANAGER_MASTER`, salt `fedimintcard/card-manager/v1`,
+  info `gp-enc`|`gp-mac`|`gp-dek` + the chip id; the first operator to ask owns the chip, another
+  gets 409; no master → 503), escrow table `manager_keys` in migration 6 and in the backup. Chip id
+  = cardkit's `readChipIdentity` (`tools/cardkit/gp/identity.ts`, cashucard's CPLC id: fabricator,
+  IC type, fabrication date, serial, batch). The install tap is `apps/provisioner/src/installTap.ts`:
+  probe → CPLC → keys from ops → install logged in with factory or own keys (one INITIALIZE UPDATE
+  checked offline against both) → PUT KEY in place (version 01 kept) and a fresh login under the
+  new set → GEN_KEY ×8, SET_PIN, VERIFY_PIN. The card row carries `chip`. Deploy needs
+  `wrangler secret put CARD_MANAGER_MASTER` on staging and production first.
 - [ ] **Reset in the provisioner.** Settings → Reset a card: read slot 0, ask ops for the card
   (another operator's or an unknown card is refused); refuse while ops shows a live or pending
   note, an open charge or an open load; the holder's PIN is required as consent, because ops cannot
   see a load made around it; a blocked PIN needs ops to show the card empty plus a second operator
   confirmation. Then delete and reinstall with the card's own keys from ops, key it, set a new PIN,
-  and mark the old record reset and linked to the new short id.
+  and mark the old record reset and linked to the new short id. **Built 2026-11-04, not deployed,
+  silicon pending**: `apps/provisioner/src/reset.ts` and `screens/ResetScreen.tsx`, two taps (read
+  slot 0 and the PIN's state without spending a try; then slot 0 again, ops' check again,
+  `VERIFY_PIN`, CPLC, keys, journal, cardkit's sweep and install, rotation, new keys and PIN). The
+  journal (AsyncStorage `prov.reset.v1`, no PINs or keys) lets the next tap finish a reset broken
+  after DELETE. Ops: `GET /registry/cards/:id/reset-check`, `POST /registry/cards/:id/reset` (the
+  new row goes into the old card's batch; idempotent; answers anything stranded under the old id);
+  after a reset the old short id answers 410 to holder routes and till writes.
 - [ ] **One tap on iPhone.** Measure install + key rotation + GEN_KEY ×8 + PIN on Max against the
   ~60 s reader session; split into two taps only if it does not fit.
 - [ ] **Cards from before O2** (for example `15989f91`, no slot keys on record): mark them retired.
@@ -286,6 +303,13 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   `GET /registry/backup-status` is 503 before a first success or after 26 hours. Drilled on
   staging: `registry/scripts/backup-drill.mjs` fetched and decrypted one. Not built: a restore
   route; a restore today means a new object loaded from the snapshot by hand.
+- **The card-manager key escrow** (O5). Ops holds every rotated card's ENC/MAC/DEK set, and the
+  nightly backup carries it (still age-encrypted to the off-Cloudflare identity). Whoever holds
+  the escrow, or a backup and its identity, or `CARD_MANAGER_MASTER`, can manage every card in it:
+  delete the applet (and the card's keys with it) and install another. They cannot spend from a
+  card: a note needs the card's slot key, which never leaves it, behind the holder's PIN. The
+  master is a Worker secret with a copy kept offline; losing both master and escrow leaves every
+  rotated card unmanageable, never unspendable.
 - **iOS session length.** Install plus key setup must fit one reader session. O1 measures it.
 
 ## 9. Decisions (owner, 2026-11-04)

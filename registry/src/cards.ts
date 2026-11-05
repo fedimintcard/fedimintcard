@@ -26,6 +26,7 @@ import {
   isShortId,
   NotFound,
 } from './http';
+import {isChip, linkChip} from './managerKeys';
 import {checkNotes, putMintKeys} from './mint';
 
 export const SLOTS = 8;
@@ -131,7 +132,7 @@ export function cardOwner(sql: Sql, shortId: string): number | null {
 /* Card rows                                                                 */
 /* ------------------------------------------------------------------------- */
 
-export interface StoredCard {
+export interface CardBody {
   readonly short_id: string;
   readonly batch_id: number;
   readonly installed_at: number;
@@ -141,10 +142,19 @@ export interface StoredCard {
   readonly notes_issued: number;
   /** The eight slot keys as provisioned; empty for a row from before O2. */
   readonly slot_pubkeys: readonly string[];
-  readonly received_at: number;
+  /**
+   * The chip's CPLC id (`managerKeys.ts`), which keys its card-manager set;
+   * null on a row from before O5.
+   */
+  readonly chip: string | null;
 }
 
-type CardBody = Omit<StoredCard, 'received_at'>;
+export interface StoredCard extends CardBody {
+  readonly received_at: number;
+  /** When the card was reset in the provisioner, and the short id it carries since. */
+  readonly reset_at: number | null;
+  readonly replaced_by: string | null;
+}
 
 /**
  * The card body, or why it is not one. Unknown keys are ignored, so a newer
@@ -152,7 +162,7 @@ type CardBody = Omit<StoredCard, 'received_at'>;
  * older app queued before it sent them; when present it must be all eight
  * x-only keys, and slot 0's last 4 bytes must be the short id.
  */
-function parseCard(r: Record<string, unknown>): CardBody {
+export function parseCard(r: Record<string, unknown>): CardBody {
   if (!isShortId(r.short_id)) {
     throw new BadRequest('short_id must be 8 lower-case hex characters');
   }
@@ -185,6 +195,9 @@ function parseCard(r: Record<string, unknown>): CardBody {
     }
     slots = keys as string[];
   }
+  if (r.chip !== undefined && !isChip(r.chip)) {
+    throw new BadRequest('chip must be the card’s CPLC id, cplc-v1: and 24 lower-case hex characters');
+  }
   return {
     short_id: r.short_id,
     batch_id: r.batch_id,
@@ -194,10 +207,11 @@ function parseCard(r: Record<string, unknown>): CardBody {
     pin_policy: r.pin_policy,
     notes_issued: r.notes_issued,
     slot_pubkeys: slots,
+    chip: r.chip === undefined ? null : r.chip,
   };
 }
 
-function storedCard(sql: Sql, shortId: string): StoredCard | null {
+export function storedCard(sql: Sql, shortId: string): StoredCard | null {
   const row = sql.exec('SELECT * FROM cards WHERE short_id = ?', shortId).toArray()[0];
   if (!row) {
     return null;
@@ -217,12 +231,16 @@ function storedCard(sql: Sql, shortId: string): StoredCard | null {
     pin_policy: String(row.pin_policy) as 'batch' | 'perCard',
     notes_issued: Number(row.notes_issued),
     slot_pubkeys: slots,
+    chip: row.chip === null || row.chip === undefined ? null : String(row.chip),
     received_at: Number(row.received_at),
+    reset_at: row.reset_at === null || row.reset_at === undefined ? null : Number(row.reset_at),
+    replaced_by: row.replaced_by === null || row.replaced_by === undefined ? null : String(row.replaced_by),
   };
 }
 
-function sameCard(a: CardBody, b: CardBody): boolean {
+export function sameCard(a: CardBody, b: CardBody): boolean {
   return (
+    a.chip === b.chip &&
     a.batch_id === b.batch_id &&
     a.installed_at === b.installed_at &&
     a.load_sha256 === b.load_sha256 &&
@@ -253,42 +271,54 @@ export function postCard(
   if (owner !== operatorId) {
     throw new NotFound(`no batch ${card.batch_id} for this operator`);
   }
-  return storage.transactionSync(() => {
-    const existing = storedCard(sql, card.short_id);
-    if (existing) {
-      if (sameCard(existing, card)) {
-        return existing;
-      }
-      throw new Conflict(`card ${card.short_id} is already stored with different contents`);
+  return storage.transactionSync(() => insertCard(sql, operatorId, card, now));
+}
+
+/**
+ * The upsert's body, inside the caller's transaction: the stored row for an
+ * identical body, a Conflict for a different one, else the new row with its
+ * slots and version. A row that names its chip records it against that
+ * chip's escrowed manager keys.
+ */
+export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: number): StoredCard {
+  const existing = storedCard(sql, card.short_id);
+  if (existing) {
+    if (sameCard(existing, card)) {
+      return existing;
     }
+    throw new Conflict(`card ${card.short_id} is already stored with different contents`);
+  }
+  sql.exec(
+    `INSERT INTO cards
+       (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys, chip)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    card.short_id,
+    card.batch_id,
+    card.installed_at,
+    card.load_sha256,
+    card.pin_set ? 1 : 0,
+    card.pin_policy,
+    card.notes_issued,
+    now,
+    card.slot_pubkeys.length > 0 ? JSON.stringify(card.slot_pubkeys) : null,
+    card.chip,
+  );
+  card.slot_pubkeys.forEach((pubkey, slot) => {
     sql.exec(
-      `INSERT INTO cards
-         (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      'INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)',
       card.short_id,
-      card.batch_id,
-      card.installed_at,
-      card.load_sha256,
-      card.pin_set ? 1 : 0,
-      card.pin_policy,
-      card.notes_issued,
-      now,
-      card.slot_pubkeys.length > 0 ? JSON.stringify(card.slot_pubkeys) : null,
+      slot,
+      pubkey,
     );
-    card.slot_pubkeys.forEach((pubkey, slot) => {
-      sql.exec(
-        'INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)',
-        card.short_id,
-        slot,
-        pubkey,
-      );
-    });
-    sql.exec(
-      'INSERT INTO card_versions (short_id, version) VALUES (?, 0)',
-      card.short_id,
-    );
-    return {...card, received_at: now};
   });
+  sql.exec(
+    'INSERT INTO card_versions (short_id, version) VALUES (?, 0)',
+    card.short_id,
+  );
+  if (card.chip !== null) {
+    linkChip(sql, card.chip, card.short_id, operatorId);
+  }
+  return {...card, received_at: now, reset_at: null, replaced_by: null};
 }
 
 export function listCards(

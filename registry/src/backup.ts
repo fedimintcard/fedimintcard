@@ -7,6 +7,11 @@
  * spendable without the card, but it maps cards to balances, so it is
  * encrypted anyway.
  *
+ * It carries the card-manager key escrow (`manager_keys`, OPS-PLAN O5) on
+ * purpose: a restore without it would leave every rotated card unmanageable.
+ * Whoever holds a backup and its age identity can therefore delete and
+ * reinstall the applet on every card in it (never spend from one).
+ *
  * Left out: password and till-token hashes, sessions, the sign-in budget and
  * applied setup commands. After a restore, operators sign in again through an
  * OPERATOR_SETUP `recover` and tills are issued new tokens.
@@ -19,7 +24,7 @@ export const STALE_AFTER_MS = 26 * 60 * 60 * 1000;
 
 const TABLES = [
   'operators', 'batches', 'cards', 'card_slots', 'card_versions', 'notes', 'card_txs',
-  'tills', 'federations', 'federation_keys', 'holder_loads',
+  'tills', 'federations', 'federation_keys', 'holder_loads', 'manager_keys',
 ] as const;
 /** Columns that never leave the object. */
 const SECRET_COLUMNS = new Set(['password_hash', 'token_hash']);

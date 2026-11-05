@@ -10,6 +10,8 @@ export class NotFound extends Error {}
 export class BadRequest extends Error {}
 /** 422: well-formed, but not true (a signature the federation did not make). */
 export class Unprocessable extends Error {}
+/** 503: this deployment lacks what the route needs (a secret not set). */
+export class ServiceUnavailable extends Error {}
 
 export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {

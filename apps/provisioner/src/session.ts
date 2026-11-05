@@ -219,6 +219,10 @@ export function phaseMessage(phase: string): string {
       return 'Installing the applet';
     case 'verify':
       return 'Checking the applet';
+    case 'managerKeys':
+      return 'Reading the chip';
+    case 'rotate':
+      return 'Locking the card to its own keys';
     default:
       return 'Keep the card still';
   }

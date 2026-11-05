@@ -202,8 +202,14 @@ export interface RunOptions {
 export interface ProvisionOptions extends RunOptions {
   /** Remove an installed card applet after its probe. Spare cards only. */
   replace?: boolean;
-  /** The card manager's keys; the factory set by default. */
-  keys?: KeySet;
+  /**
+   * The card manager's keys; the factory set by default. A list is the sets
+   * the card may be on (a card's own set, and the factory set it had before
+   * a rotation): one INITIALIZE UPDATE is checked against each offline, and
+   * EXTERNAL AUTHENTICATE goes out only for the one the card proved, so a
+   * card on either costs no failed login.
+   */
+  keys?: KeySet | readonly KeySet[];
 }
 
 export interface RunResult<P extends string> {
@@ -222,7 +228,10 @@ export interface RunResult<P extends string> {
   blocks?: {at: number; of: number};
 }
 
-export type ProvisionResult = RunResult<Phase>;
+export interface ProvisionResult extends RunResult<Phase> {
+  /** Which of the `keys` the card proved, by index; 0 for a single set. */
+  keySet?: number;
+}
 
 /** How a run ended, before the bookkeeping is added. */
 interface Outcome {
@@ -474,7 +483,13 @@ export async function provision(
   options: ProvisionOptions,
 ): Promise<ProvisionResult> {
   const run = new Run<Phase>(tx, options, plan.guard ? 'probe' : 'selectIsd');
-  const keys = options.keys ?? FACTORY_KEYS;
+  const given = options.keys ?? FACTORY_KEYS;
+  const candidates: readonly KeySet[] = Array.isArray(given)
+    ? given
+    : [given as KeySet];
+  // The set the card proved; the later logins in this run use it alone.
+  let keys: KeySet = candidates[0] ?? FACTORY_KEYS;
+  let keySet: number | undefined;
   const sessionOptions = {macOverModifiedApdu: options.macOverModifiedApdu};
   let session: Session | null = null;
   let blocks: number[][] = [];
@@ -534,11 +549,25 @@ export async function provision(
           : undefined;
     },
     auth: async () => {
-      session = await openSession(
-        run.timed,
-        keys,
-        options.random,
-        sessionOptions,
+      const hs = await initializeUpdate(run.timed, options.random, 0);
+      for (let i = 0; i < candidates.length; i++) {
+        const proved = sessionIfMatches(candidates[i], hs);
+        if (proved) {
+          keys = candidates[i];
+          keySet = i;
+          session = await externalAuthenticate(
+            run.timed,
+            proved,
+            hs,
+            sessionOptions,
+          );
+          return;
+        }
+      }
+      throw new WrongKeys(
+        candidates.length > 1
+          ? `the card proved none of the ${candidates.length} key sets; EXTERNAL AUTHENTICATE was not sent`
+          : undefined,
       );
     },
     sweep: async () => {
@@ -623,7 +652,7 @@ export async function provision(
         await steps[phase]();
       }
     }
-    return run.finish({ok: true});
+    return {...run.finish({ok: true}), keySet};
   } catch (e) {
     if (e instanceof RangeError && blocks.length === 0) {
       return run.fail(
@@ -632,7 +661,7 @@ export async function provision(
         ),
       );
     }
-    return run.fail(e);
+    return {...run.fail(e), keySet};
   }
 }
 
