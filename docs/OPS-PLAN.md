@@ -316,6 +316,25 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   on the Pixel, and `gpp --list` with factory keys refused on it whenever it is provisioned (and
   answering, with nothing of ours listed, between the reset and the new install).
 
+### O6: no Mac in the demo (owner, 2026-11-04)
+
+Goal: the whole demo runs on phones, cards and services nobody touches on stage.
+
+1. **POS link** (`docs/POS-LINK.md`, built `edd83d0`, iOS app `43eb71d`): the phone connects to
+   the till with a paired token; the till sends the card's APDUs down a WebSocket. Removes the
+   `adb` tunnels and lets an iPhone be a POS.
+2. **The till as a StartOS package**: `card-sidecar till serve` packaged for StartOS so a
+   merchant installs a till on their own server. To settle: how phones reach it (StartOS LAN
+   `https` with its root CA on each phone, a clearnet address, or Tor), `wss` for the link, where
+   the pairing QR is shown (a StartOS action), the till's wallet in the package's volume and its
+   backup, and the ops till token entered as a StartOS action.
+3. **Top-up at the POS by Lightning**: a "Top up card" button: amount → the till makes a
+   Lightning invoice through the federation's gateway → the holder pays it from any wallet on
+   their phone → tap → the till loads the card from the eCash it received (the registry's
+   till-funded load). A top-up from the till's own balance (cash at the counter) comes free with it.
+
+Afterwards the Mac's only jobs (till, loader, USB reader) are gone.
+
 ### O3 design (2026-11-04)
 
 - **The intent carries the unsigned transaction.** A fedimint txid hashes inputs, outputs and the
