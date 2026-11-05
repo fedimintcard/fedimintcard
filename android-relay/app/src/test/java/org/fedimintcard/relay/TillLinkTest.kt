@@ -123,6 +123,23 @@ class TillLinkTest {
         server.close()
     }
 
+    @Test fun linkTargetFollowsTheTillScheme() {
+        assertEquals(LinkTarget("192.168.1.20", 9877, false, "/v1/card/link", "192.168.1.20:9877"), linkTarget("http://192.168.1.20:9877"))
+        assertEquals(LinkTarget("till.example.com", 443, true, "/v1/card/link", "till.example.com"), linkTarget("https://till.example.com/"))
+        assertEquals(LinkTarget("till.example.com", 8443, true, "/v1/card/link", "till.example.com:8443"), linkTarget("https://till.example.com:8443"))
+        assertEquals(LinkTarget("h", 80, false, "/v1/card/link", "h"), linkTarget("http://h"))
+        for (bad in listOf("ftp://h", "wss://h", "h:9877")) {
+            try { linkTarget(bad); fail(bad) } catch (_: IOException) {}
+        }
+    }
+
+    @Test fun httpsPairingIsAccepted() {
+        val t = "ab".repeat(32)
+        val p = parsePairing("fedimintcard-till:https://till.example.com?t=$t")
+        assertEquals(Pairing("https://till.example.com", t), p)
+        assertTrue(linkTarget(p!!.url).tls)
+    }
+
     @Test fun pairingText() {
         val t = "ab".repeat(32)
         assertEquals(Pairing("http://192.168.1.20:9877", t), parsePairing("fedimintcard-till:http://192.168.1.20:9877?t=$t"))

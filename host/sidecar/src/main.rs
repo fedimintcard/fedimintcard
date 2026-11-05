@@ -58,13 +58,27 @@ enum TillCmd {
         /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url.
         #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
         ops_token: Option<String>,
+        /// Require the POS token on every request, loopback included, and make the token now if
+        /// there is none. For a till behind a proxy (StartOS), where a phone's request can
+        /// arrive from a local address.
+        #[arg(long, env = "TILL_REQUIRE_POS_TOKEN", value_parser = clap::builder::BoolishValueParser::new())]
+        require_pos_token: bool,
     },
     /// Pair a POS phone: make the POS token if there is none, and print it as a QR code to scan
     /// in the POS app's settings (docs/POS-LINK.md).
     Pair {
-        /// The till's URL as the phone reaches it. Default: http://<first LAN IPv4>:9877.
+        /// The till's URL as the phone reaches it: http:// or https:// (behind a proxy that
+        /// terminates TLS; the phone then uses wss:// for the card link), host and port only.
+        /// Default: http://<first LAN IPv4>:9877.
         #[arg(long)]
         url: Option<String>,
+        /// Print only the pairing text on stdout: no QR code, no notes on stderr.
+        #[arg(long)]
+        text: bool,
+        /// Replace the POS token first. Every paired phone must pair again, and a running till
+        /// keeps the old token until it restarts.
+        #[arg(long)]
+        new_token: bool,
     },
 }
 
@@ -230,7 +244,7 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token }) => {
+        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
@@ -238,17 +252,28 @@ async fn main() -> Result<()> {
                 (Some(url), Some(token)) => Some(OpsConfig { url: url.clone(), token: token.clone() }),
                 _ => None,
             };
-            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops).await?;
+            fedimint_card_sidecar::till::serve(cw, *listen, relay.clone(), ops, *require_pos_token).await?;
         }
-        Cmd::Till(TillCmd::Pair { url }) => {
+        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token }) => {
             use fedimint_card_sidecar::pos;
-            let (token, made) = pos::ensure_token(&cli.data_dir)?;
+            // Check the URL before touching the token, so a typo changes nothing.
             let url = match url {
-                Some(u) => u.clone(),
+                Some(u) => pos::check_till_url(u)?,
                 None => format!("http://{}:9877", pos::lan_ipv4()?),
             };
+            let (token, made) = if *new_token {
+                (pos::rotate_token(&cli.data_dir)?, true)
+            } else {
+                pos::ensure_token(&cli.data_dir)?
+            };
             let text = pos::pair_text(&url, &token);
-            if made {
+            if *text_only {
+                println!("{text}");
+                return Ok(());
+            }
+            if *new_token {
+                eprintln!("replaced the POS token in {}: every phone must pair again", pos::token_path(&cli.data_dir).display());
+            } else if made {
                 eprintln!("made a POS token in {}", pos::token_path(&cli.data_dir).display());
             }
             qr(&text)?;

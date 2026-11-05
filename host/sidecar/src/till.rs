@@ -242,14 +242,21 @@ pub struct TillHandle {
     pin_required: bool,
     /// Open card links from POS phones (`GET /v1/card/link`).
     links: Arc<Links>,
-    /// The POS token: with one, `/v1/*` from anywhere but loopback needs it as a bearer.
-    pos_token: Option<Arc<str>>,
+    /// The POS token: with one, `/v1/*` needs it as a bearer (from loopback too, if set so).
+    pos_auth: crate::pos::PosAuth,
 }
 
 impl TillHandle {
     /// Require `token` as a bearer on every `/v1/*` request not from loopback.
     pub fn with_pos_token(mut self, token: Option<String>) -> Self {
-        self.pos_token = token.map(Arc::from);
+        self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false };
+        self
+    }
+
+    /// Require `token` as a bearer on every `/v1/*` request, from loopback too
+    /// (`till serve --require-pos-token`, for a till behind a proxy).
+    pub fn with_pos_token_everywhere(mut self, token: String) -> Self {
+        self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true };
         self
     }
 
@@ -295,7 +302,7 @@ pub async fn new_with_ops(
         federation_name,
         pin_required: ops.is_some(),
         links: Arc::new(Links::default()),
-        pos_token: None,
+        pos_auth: crate::pos::PosAuth::default(),
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, ops))
 }
@@ -869,7 +876,7 @@ pub async fn charge_with(
 // ------------------------------------------------------------------ HTTP
 
 pub fn router(h: TillHandle) -> Router {
-    let token = h.pos_token.clone();
+    let auth = h.pos_auth.clone();
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
@@ -881,7 +888,7 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/cards/issue", post(cards_issue))
         .route("/v1/card/link", get(card_link))
         .with_state(h)
-        .layer(axum::middleware::from_fn_with_state(token, crate::pos::auth))
+        .layer(axum::middleware::from_fn_with_state(auth, crate::pos::auth))
 }
 
 /// `GET /v1/card/link`: a POS phone's card link (docs/POS-LINK.md).
@@ -1118,10 +1125,28 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 ///
 /// With `ops`, each card job loads that card's state from the registry (see the module docs), and
 /// the federation's name and mint keys are reported to it once at startup.
-pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Option<OpsConfig>) -> Result<()> {
+///
+/// With `require_pos_token`, every `/v1/*` request needs the POS token, loopback included, and
+/// the token is made now if there is none (`till pair` shows it). This is for a till behind a
+/// proxy, where a phone's request can arrive from a local address.
+pub async fn serve(
+    cw: CardWallet,
+    listen: SocketAddr,
+    relay: String,
+    ops: Option<OpsConfig>,
+    require_pos_token: bool,
+) -> Result<()> {
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
     // Off loopback the API needs the POS token (docs/POS-LINK.md); `till pair` makes it.
-    let pos_token = crate::pos::read_token(&dir)?;
+    let pos_token = if require_pos_token {
+        let (t, made) = crate::pos::ensure_token(&dir)?;
+        if made {
+            eprintln!("made a POS token in {}: pair phones with `till pair`", crate::pos::token_path(&dir).display());
+        }
+        Some(t)
+    } else {
+        crate::pos::read_token(&dir)?
+    };
     if !listen.ip().is_loopback() && pos_token.is_none() {
         anyhow::bail!(
             "refusing to listen on {listen} without a POS token: run `card-sidecar till pair` first ({} is missing)",
@@ -1144,11 +1169,28 @@ pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Optio
     let mut cw = cw;
     cw.card = Box::new(NoCard);
     let (handle, actor) = new_with_ops(cw, relay.clone(), sales, opener, ops).await;
-    let auth = if pos_token.is_some() { "POS token required off loopback" } else { "no POS token: loopback only" };
-    let handle = handle.with_pos_token(pos_token);
+    let (auth, handle) = match pos_token {
+        Some(t) if require_pos_token => ("POS token required on every request", handle.with_pos_token_everywhere(t)),
+        Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),
+        None => ("no POS token: loopback only", handle.with_pos_token(None)),
+    };
     eprintln!("till service listening on http://{} (card relay {relay}; {auth})", listener.local_addr()?);
+    // Ctrl-C, or SIGTERM from a service manager (StartOS, systemd): stop taking requests and
+    // let the ones in flight finish.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing the SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     };
     let server = tokio::spawn(std::future::IntoFuture::into_future(
         axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>())

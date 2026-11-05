@@ -33,7 +33,12 @@ in `<data_dir>/till-pos-token` (0600) if there is none and prints the pairing QR
 `fedimintcard-till:<url>?t=<token>`. `till serve --listen` (or `TILL_LISTEN`) on anything but
 loopback is refused until that file exists. With a token, every `/v1/*` request not from loopback
 needs `Authorization: Bearer <token>`; otherwise `401 {"ok":false,"error":"unauthorized"}`.
-Loopback stays open (the CLI, the tests, a USB phone through `adb reverse`).
+Loopback stays open (the CLI, the tests, a USB phone through `adb reverse`), except with
+`till serve --require-pos-token` (or `TILL_REQUIRE_POS_TOKEN=1`): then every `/v1/*` request needs
+the bearer whatever its peer, and the token is made at startup if missing. A till behind a proxy
+(the StartOS package) runs that way, because the proxy's requests come from a local address.
+`till pair --url` takes `http://` or `https://` (host and port only); `--text` prints only the
+pairing text, `--new-token` replaces the token first.
 
 `GET /v1/card/link` upgrades to a WebSocket over which the till sends the card's APDUs to the
 phone holding it. A `POST /v1/charge` or `POST /v1/card/balance` with `X-Card-Link: <id>` uses

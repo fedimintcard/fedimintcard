@@ -17,7 +17,32 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+
+/**
+ * Where the card link goes for a till at [baseUrl]: `http://` → `ws://` (plain TCP), `https://` →
+ * `wss://` (TLS, the certificate checked against [host]), as for a till behind a proxy that
+ * terminates TLS (a StartOS package). [hostHeader] carries the port only when it is not the
+ * scheme's default, as a browser would send it.
+ */
+internal data class LinkTarget(val host: String, val port: Int, val tls: Boolean, val path: String, val hostHeader: String)
+
+@Throws(IOException::class)
+internal fun linkTarget(baseUrl: String): LinkTarget {
+    val u = try { URI(baseUrl.trimEnd('/') + "/v1/card/link") } catch (e: Exception) { throw IOException("bad till URL", e) }
+    val tls = when (u.scheme) {
+        "https" -> true
+        "http" -> false
+        else -> throw IOException("the till URL must be http:// or https://")
+    }
+    val host = u.host?.takeIf { it.isNotEmpty() } ?: throw IOException("the till URL has no host")
+    val default = if (tls) 443 else 80
+    val port = if (u.port > 0) u.port else default
+    val hostHeader = if (port == default) host else "$host:$port"
+    return LinkTarget(host.removePrefix("[").removeSuffix("]"), port, tls, u.rawPath, hostHeader)
+}
 
 /**
  * The card link (docs/POS-LINK.md): while a tap is in progress this phone holds a WebSocket open
@@ -190,20 +215,28 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
         /** Open a link to the till at [baseUrl]. Throws IOException if it cannot (incl. 401). */
         @Throws(IOException::class)
         fun open(baseUrl: String, token: String?, card: CardLink, connectMs: Int = CONNECT_MS): TillLink {
-            val u = URI(baseUrl.trimEnd('/') + "/v1/card/link")
-            val tls = u.scheme == "https"
-            val port = if (u.port > 0) u.port else if (tls) 443 else 80
-            val s = if (tls) SSLSocketFactory.getDefault().createSocket() else Socket()
+            val t = linkTarget(baseUrl)
+            val s = if (t.tls) SSLSocketFactory.getDefault().createSocket() else Socket()
             try {
-                s.connect(InetSocketAddress(u.host, port), connectMs)
+                s.connect(InetSocketAddress(t.host, t.port), connectMs)
+                if (s is SSLSocket) {
+                    // A bare SSLSocket checks the chain but not the name: ask for the HTTPS name
+                    // check (and send SNI, which a proxy routes on) before any byte is written.
+                    val p = s.sslParameters
+                    p.endpointIdentificationAlgorithm = "HTTPS"
+                    if (!isIpLiteral(t.host)) p.serverNames = listOf(SNIHostName(t.host))
+                    s.sslParameters = p
+                    s.soTimeout = connectMs
+                    s.startHandshake()
+                }
                 s.soTimeout = READ_MS
                 s.tcpNoDelay = true
                 val out = s.getOutputStream()
                 val input = s.getInputStream().buffered()
                 val key = Base64.getEncoder().encodeToString(ByteArray(16).also { SecureRandom().nextBytes(it) })
                 val req = StringBuilder()
-                    .append("GET ${u.rawPath} HTTP/1.1\r\n")
-                    .append("Host: ${u.host}:$port\r\n")
+                    .append("GET ${t.path} HTTP/1.1\r\n")
+                    .append("Host: ${t.hostHeader}\r\n")
                     .append("Upgrade: websocket\r\nConnection: Upgrade\r\n")
                     .append("Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n")
                 if (token != null) req.append("Authorization: Bearer $token\r\n")
@@ -248,6 +281,9 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                 throw e as? IOException ?: IOException(e.message, e)
             }
         }
+
+        private fun isIpLiteral(host: String) =
+            host.contains(':') || host.all { it.isDigit() || it == '.' }
 
         private fun readHead(input: InputStream): List<String> {
             val head = ByteArrayOutputStream()

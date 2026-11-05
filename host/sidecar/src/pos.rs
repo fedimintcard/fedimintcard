@@ -36,30 +36,76 @@ pub fn read_token(data_dir: &Path) -> Result<Option<String>> {
 }
 
 /// The POS token, made now (0600) if there is none. The flag says whether it was made.
+///
+/// Two callers at once (a pairing while the till starts) agree on one token: the new token is
+/// written whole to a private temporary file and linked into place only if no token is there yet.
 pub fn ensure_token(data_dir: &Path) -> Result<(String, bool)> {
     if let Some(t) = read_token(data_dir)? {
         return Ok((t, false));
     }
     std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let path = token_path(data_dir);
-    let token = hex::encode(rand::random::<[u8; 32]>());
+    let token = new_token();
+    let tmp = write_private_temp(data_dir, &token)?;
+    // An empty file counts as no token (`read_token`): replace it rather than keep it.
+    let placed = match std::fs::hard_link(&tmp, &path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_token(data_dir)? {
+            Some(_) => false,
+            None => {
+                std::fs::rename(&tmp, &path).with_context(|| format!("creating {}", path.display()))?;
+                return Ok((token, true));
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("creating {}", path.display()));
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if placed {
+        Ok((token, true))
+    } else {
+        let t = read_token(data_dir)?.context("the POS token vanished while it was being made")?;
+        Ok((t, false))
+    }
+}
+
+/// Replace the POS token with a new one. Every paired phone must pair again, and a running till
+/// keeps the old token until it restarts.
+pub fn rotate_token(data_dir: &Path) -> Result<String> {
+    std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+    let token = new_token();
+    let tmp = write_private_temp(data_dir, &token)?;
+    let path = token_path(data_dir);
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(token)
+}
+
+fn new_token() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+/// `token` in a new 0600 file next to the token file, synced. Returns its path.
+fn write_private_temp(data_dir: &Path, token: &str) -> Result<PathBuf> {
+    let tmp = data_dir.join(format!(".{TOKEN_FILE}.{}", hex::encode(rand::random::<[u8; 8]>())));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&path).with_context(|| format!("creating {}", path.display()))?;
+    let mut f = opts.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     #[cfg(unix)]
     {
-        // An empty file left by someone else keeps its mode through `open`; set it explicitly.
+        // The umask can only remove bits, but set the mode explicitly all the same.
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     f.write_all(format!("{token}\n").as_bytes())?;
     f.sync_all()?;
-    Ok((token, true))
+    Ok(tmp)
 }
 
 /// The address the phone should use: the first non-loopback IPv4 address, taken as the one the
@@ -78,6 +124,27 @@ pub fn pair_text(url: &str, token: &str) -> String {
     format!("{PAIR_SCHEME}{}?t={token}", url.trim_end_matches('/'))
 }
 
+/// The till URL a pairing may carry: `http://` or `https://`, a host, an optional port, and
+/// nothing else (no user, path, query or fragment), as both POS apps parse it. `https://` is for
+/// a till behind a proxy that terminates TLS; the phone then opens the card link with `wss://`.
+/// Returns the URL without a trailing slash.
+pub fn check_till_url(url: &str) -> Result<String> {
+    let u = reqwest::Url::parse(url.trim()).with_context(|| format!("{url:?} is not a URL"))?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        bail!("the till URL must start with http:// or https://, not {}://", u.scheme());
+    }
+    if u.host_str().is_none_or(str::is_empty) {
+        bail!("the till URL {url:?} has no host");
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        bail!("the till URL must not carry a user name or password");
+    }
+    if u.path() != "/" || u.query().is_some() || u.fragment().is_some() {
+        bail!("the till URL must be only scheme, host and port (no path, query or fragment)");
+    }
+    Ok(u.as_str().trim_end_matches('/').to_owned())
+}
+
 /// Constant-time equality (the length is not secret).
 pub fn token_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -90,11 +157,21 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, axum::Json(json!({"ok": false, "error": "unauthorized"}))).into_response()
 }
 
-/// Is this request allowed? Loopback peers always are; others need the bearer when a token is
-/// configured. A request with no peer address (none recorded) is not treated as loopback.
-pub fn authorized(token: Option<&str>, peer: Option<SocketAddr>, authorization: Option<&str>) -> bool {
+/// How `/v1/*` is guarded: the POS token, and whether loopback peers are exempt from it.
+#[derive(Clone, Default)]
+pub struct PosAuth {
+    pub token: Option<std::sync::Arc<str>>,
+    /// With a token, require it from loopback peers too. Set behind a proxy (StartOS), where
+    /// every request may arrive from a local address whoever sent it.
+    pub everywhere: bool,
+}
+
+/// Is this request allowed? Without a token, yes. With one, loopback peers are (unless
+/// `everywhere`); others need the bearer. A request with no peer address (none recorded) is not
+/// treated as loopback.
+pub fn authorized(token: Option<&str>, everywhere: bool, peer: Option<SocketAddr>, authorization: Option<&str>) -> bool {
     let Some(token) = token else { return true };
-    if peer.is_some_and(|p| p.ip().is_loopback() || p.ip().to_canonical().is_loopback()) {
+    if !everywhere && peer.is_some_and(|p| p.ip().is_loopback() || p.ip().to_canonical().is_loopback()) {
         return true;
     }
     let Some(given) = authorization.and_then(|h| h.strip_prefix("Bearer ")) else { return false };
@@ -102,10 +179,10 @@ pub fn authorized(token: Option<&str>, peer: Option<SocketAddr>, authorization: 
 }
 
 /// Middleware over `/v1/*`: [`authorized`] with the handle's token and the peer's address.
-pub async fn auth(State(token): State<Option<std::sync::Arc<str>>>, req: Request, next: Next) -> Response {
+pub async fn auth(State(a): State<PosAuth>, req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
-    if authorized(token.as_deref(), peer, header) {
+    if authorized(a.token.as_deref(), a.everywhere, peer, header) {
         next.run(req).await
     } else {
         unauthorized()
@@ -121,14 +198,87 @@ mod tests {
         let lan: SocketAddr = "192.168.1.20:5000".parse().unwrap();
         let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let lo6: SocketAddr = "[::ffff:127.0.0.1]:5000".parse().unwrap();
-        assert!(authorized(None, Some(lan), None));
-        assert!(authorized(Some("ab"), Some(lo), None));
-        assert!(authorized(Some("ab"), Some(lo6), None));
-        assert!(!authorized(Some("ab"), Some(lan), None));
-        assert!(!authorized(Some("ab"), None, None));
-        assert!(!authorized(Some("ab"), Some(lan), Some("Bearer ac")));
-        assert!(!authorized(Some("ab"), Some(lan), Some("ab")));
-        assert!(authorized(Some("ab"), Some(lan), Some("Bearer ab")));
+        assert!(authorized(None, false, Some(lan), None));
+        assert!(authorized(Some("ab"), false, Some(lo), None));
+        assert!(authorized(Some("ab"), false, Some(lo6), None));
+        assert!(!authorized(Some("ab"), false, Some(lan), None));
+        assert!(!authorized(Some("ab"), false, None, None));
+        assert!(!authorized(Some("ab"), false, Some(lan), Some("Bearer ac")));
+        assert!(!authorized(Some("ab"), false, Some(lan), Some("ab")));
+        assert!(authorized(Some("ab"), false, Some(lan), Some("Bearer ab")));
         assert_eq!(pair_text("http://10.0.0.2:9877/", "ff"), "fedimintcard-till:http://10.0.0.2:9877?t=ff");
+    }
+
+    #[test]
+    fn everywhere_takes_away_the_loopback_exemption() {
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lo6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let lan: SocketAddr = "10.0.3.1:5000".parse().unwrap();
+        for peer in [Some(lo), Some(lo6), Some(lan), None] {
+            assert!(!authorized(Some("ab"), true, peer, None), "{peer:?}");
+            assert!(!authorized(Some("ab"), true, peer, Some("Bearer ac")), "{peer:?}");
+            assert!(authorized(Some("ab"), true, peer, Some("Bearer ab")), "{peer:?}");
+        }
+    }
+
+    #[test]
+    fn till_urls() {
+        assert_eq!(check_till_url("https://till.example.com").unwrap(), "https://till.example.com");
+        assert_eq!(check_till_url(" https://till.example.com/ ").unwrap(), "https://till.example.com");
+        assert_eq!(check_till_url("https://till.example.com:8443").unwrap(), "https://till.example.com:8443");
+        assert_eq!(check_till_url("http://192.168.1.20:9877").unwrap(), "http://192.168.1.20:9877");
+        // The default port is dropped, as the phones would see it anyway.
+        assert_eq!(check_till_url("https://till.example.com:443").unwrap(), "https://till.example.com");
+        for bad in [
+            "",
+            "till.example.com",
+            "ftp://till.example.com",
+            "wss://till.example.com",
+            "https://u:p@till.example.com",
+            "https://till.example.com/v1",
+            "https://till.example.com?t=ab",
+            "https://till.example.com#x",
+        ] {
+            assert!(check_till_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rotating_replaces_the_token_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, made) = ensure_token(dir.path()).unwrap();
+        assert!(made);
+        let second = rotate_token(dir.path()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(read_token(dir.path()).unwrap(), Some(second.clone()));
+        assert_eq!(ensure_token(dir.path()).unwrap(), (second, false));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(token_path(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Only the token file is left behind: no temporary files.
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(TOKEN_FILE)]);
+    }
+
+    #[test]
+    fn an_empty_token_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(token_path(dir.path()), "").unwrap();
+        let (t, made) = ensure_token(dir.path()).unwrap();
+        assert!(made);
+        assert_eq!(read_token(dir.path()).unwrap(), Some(t));
+    }
+
+    #[test]
+    fn concurrent_pairings_agree_on_one_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| ensure_token(dir.path()).unwrap().0)).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(tokens.iter().all(|t| t == &tokens[0]), "{tokens:?}");
+        assert_eq!(read_token(dir.path()).unwrap(), Some(tokens[0].clone()));
     }
 }

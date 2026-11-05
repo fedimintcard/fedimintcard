@@ -26,6 +26,15 @@ final class PairingTests: XCTestCase {
                        "wss://till.local/v1/card/link")
     }
 
+    func testHttpsTillBehindAProxy() {
+        // `till pair --url https://<domain>` on a StartOS till: TLS ends at the proxy, port 443.
+        let p = TillPairing.parse("fedimintcard-till:https://till.example.com?t=\(token)")
+        XCTAssertEqual(p, TillPairing(baseURL: "https://till.example.com", token: token))
+        XCTAssertEqual(p?.linkURL?.absoluteString, "wss://till.example.com/v1/card/link")
+        XCTAssertEqual(TillPairing.parse("fedimintcard-till:https://till.example.com:8443?t=\(token)")?.linkURL?.absoluteString,
+                       "wss://till.example.com:8443/v1/card/link")
+    }
+
     func testRejectsGarbage() {
         for s in ["", "fedimintcard-till:", "hello world", "ftp://1.2.3.4:9877?t=ab",
                   "fedimintcard-till:http://1.2.3.4:9877?t=", "fedimintcard-till:http://1.2.3.4:9877?x=ab",

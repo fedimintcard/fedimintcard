@@ -347,7 +347,63 @@ fn pairing_makes_one_private_token() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn serve_refuses_the_lan_without_a_token() -> anyhow::Result<()> {
     let f = fx(&[]).await?;
-    let err = till::serve(f.cw, "0.0.0.0:0".parse()?, "http://127.0.0.1:1".into(), None).await.unwrap_err();
+    let err = till::serve(f.cw, "0.0.0.0:0".parse()?, "http://127.0.0.1:1".into(), None, false).await.unwrap_err();
     assert!(err.to_string().contains("till pair"), "{err:#}");
+    Ok(())
+}
+
+/// `till serve --require-pos-token` (the StartOS package): behind a proxy every request may come
+/// from a local address, so loopback is no exemption.
+#[tokio::test(flavor = "multi_thread")]
+async fn require_pos_token_guards_loopback_too() -> anyhow::Result<()> {
+    let f = fx(&[]).await?;
+    let dir = f.dir.path().to_owned();
+    let sales = SalesStore::open(dir.join("sales.json"))?;
+    let (handle, _actor) = till::new(f.cw, "http://127.0.0.1:1".into(), sales, Box::new(|| anyhow::bail!("unused"))).await;
+    let token = "ab".repeat(32);
+    let app = till::router(handle.with_pos_token_everywhere(token.clone()));
+    for peer in ["127.0.0.1:5000", "[::1]:5000", "10.0.3.1:40000", "192.168.1.50:40000"] {
+        for path in ["/v1/health", "/v1/status", "/v1/sales", "/v1/card/link"] {
+            let denied = call_from(app.clone(), peer, None, path).await;
+            assert_eq!(denied, (401, json!({"ok": false, "error": "unauthorized"})), "{peer} {path}");
+            assert_eq!(call_from(app.clone(), peer, Some(&"cd".repeat(32)), path).await.0, 401, "{peer} {path}");
+        }
+        assert_eq!(call_from(app.clone(), peer, Some(&token), "/v1/health").await.0, 200, "{peer}");
+    }
+    Ok(())
+}
+
+/// The real server, started the way the package starts it: the token is made if missing, and a
+/// request over loopback without it is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_with_require_pos_token_makes_the_token_and_refuses_loopback() -> anyhow::Result<()> {
+    let f = fx(&[]).await?;
+    let dir = f.dir.path().to_owned();
+    assert_eq!(pos::read_token(&dir)?, None);
+    // Find a free port, then let serve bind it on every interface (as the package does).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let listen: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(till::serve(f.cw, listen, "http://127.0.0.1:1".into(), None, true));
+            let url = format!("http://127.0.0.1:{port}/v1/health");
+            let client = reqwest::Client::new();
+            let mut status = None;
+            for _ in 0..100 {
+                if let Ok(r) = client.get(&url).send().await {
+                    status = Some(r.status().as_u16());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(status, Some(401), "loopback without the token");
+            let token = pos::read_token(&dir).unwrap().expect("serve made the POS token");
+            let ok = client.get(&url).bearer_auth(&token).send().await.unwrap();
+            assert_eq!(ok.status().as_u16(), 200);
+            server.abort();
+            drop(f._fed);
+        })
+        .await;
     Ok(())
 }

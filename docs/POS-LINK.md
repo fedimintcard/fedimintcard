@@ -17,11 +17,20 @@ it. Whichever phone started a charge or a balance read supplies that job's card.
   and the same text:
   `fedimintcard-till:http://<mac-lan-ip>:9877?t=<token>`
   The address is the first non-loopback IPv4 address, overridable with `--url`.
+  `--url` takes `http://` or `https://`, host and port only. A till behind a proxy that terminates
+  TLS (the StartOS package) pairs with `https://<domain>`; the phone then opens the card link with
+  `wss://` on the same host and port (`http://` -> `ws://`). Frames and auth are the same either way.
+  `till pair --text` prints only the pairing text, `--new-token` replaces the token first (every
+  phone pairs again; a running till keeps the old token until it restarts).
 - `till serve --listen 0.0.0.0:9877` is refused unless the token file exists. With a token, every
   `/v1/*` request not from loopback must carry `Authorization: Bearer <token>`; wrong or missing ->
   `401 {"ok":false,"error":"unauthorized"}`. Loopback stays open, so the CLI, the tests and a USB
   phone through `adb reverse` work as before. The token is compared in constant time and never
   logged.
+- `till serve --require-pos-token` (or `TILL_REQUIRE_POS_TOKEN=1`) takes the loopback exemption
+  away: every `/v1/*` request needs the bearer, whatever its peer address, and the token is made at
+  startup if there is none. Behind a proxy every request can arrive from a local address, so the
+  StartOS package always sets it.
 - The POS stores the scanned till URL and token (Android: encrypted prefs or the Keystore;
   iOS: Keychain). "Pair with till" in POS settings scans the QR; the URL can also be typed.
 
