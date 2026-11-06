@@ -8,7 +8,9 @@
 //!
 //! 1. Read the short id off the card (slot 0) and the free slot keys from ops
 //!    (`GET /cards/:id/slots`); check each chosen key against the card's own `GET_PUB`, so a wrong
-//!    answer from ops cannot send value to keys the card does not hold.
+//!    answer from ops cannot send value to keys the card does not hold. A loader run by a till
+//!    ([`Loader::with_keyer`]) first keys never-keyed slots of a split-keyed card when the free
+//!    ones are too few (`ops::key_slots`); a holder's own loader has no till token and cannot.
 //! 2. Build the transaction inside a database transaction of the wallet's client
 //!    (`finalize_and_submit_transaction_dbtx`): the txid is fixed, and nothing is sent or spent
 //!    until that database transaction commits.
@@ -40,7 +42,7 @@ use serde_json::{Value, json};
 use tbs::BlindingKey;
 
 use crate::glue::{card_outputs, nonce_for, on_card};
-use crate::ops::{OpsClient, OpsError, short_id_of};
+use crate::ops::{OpsClient, OpsError, RemoteSlot, short_id_of};
 use crate::plan;
 use crate::shares::{self, FETCH_TIMEOUT, blind};
 use crate::state::{LoadNote, write_private_json};
@@ -71,11 +73,17 @@ pub struct CardFull {
     pub short_id: String,
     pub free: usize,
     pub needed: usize,
+    /// Never-keyed slots the card also has, which only a till can key (at a tap).
+    pub unkeyed: usize,
 }
 
 impl std::fmt::Display for CardFull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "card {} has {} free slot(s) and this load needs {}", self.short_id, self.free, self.needed)
+        write!(f, "card {} has {} free slot(s) and this load needs {}", self.short_id, self.free, self.needed)?;
+        if self.unkeyed > 0 {
+            write!(f, " ({} more slot(s) have no key yet; a till keys them at a tap)", self.unkeyed)?;
+        }
+        Ok(())
     }
 }
 
@@ -120,6 +128,8 @@ pub struct Loader<'w> {
     ops: OpsClient,
     journal: PathBuf,
     tag: Option<String>,
+    /// A till's own registry client (with its token), for keying never-keyed slots.
+    keyer: Option<OpsClient>,
     #[doc(hidden)]
     pub crash: Option<LoadCrash>,
 }
@@ -127,7 +137,7 @@ pub struct Loader<'w> {
 impl<'w> Loader<'w> {
     /// A loader paying from `wallet`, against the registry at `ops_url`, journalling in `data_dir`.
     pub fn new(wallet: &'w Wallet, ops_url: &str, data_dir: &Path) -> Result<Self> {
-        Ok(Self { wallet, ops: OpsClient::holder(ops_url)?, journal: data_dir.join(JOURNAL_FILE), tag: None, crash: None })
+        Ok(Self { wallet, ops: OpsClient::holder(ops_url)?, journal: data_dir.join(JOURNAL_FILE), tag: None, keyer: None, crash: None })
     }
 
     /// Mark this loader's loads with `tag` in the journal ([`PendingLoad::tag`]).
@@ -148,6 +158,13 @@ impl<'w> Loader<'w> {
         let mut j = self.read_journal()?;
         f(&mut j.loads);
         write_private_json(&self.journal, &j)
+    }
+
+    /// Let this loader key a split-keyed card's never-keyed slots when a load needs them, through
+    /// `till`, a till's registry client: `POST /slot-keys` takes a till token, not a holder.
+    pub fn with_keyer(mut self, till: OpsClient) -> Self {
+        self.keyer = Some(till);
+        self
     }
 
     /// Loads in flight from earlier runs.
@@ -173,15 +190,30 @@ impl<'w> Loader<'w> {
         // 1. The card and its free slots.
         let slot0 = on_card(|| card.get_pub(0)).context("reading the card's slot 0 key")?;
         let short_id = short_id_of(&slot0);
-        let free = self.ops.free_slots(&short_id).await.context("asking ops for the card's free slots")?;
+        let mut free = self.ops.free_slots(&short_id).await.context("asking ops for the card's free slots")?;
         let ours = self.wallet.federation_id().to_string();
         ensure!(
             free.federation_id == ours,
             "card {short_id} belongs to federation {}, and this wallet is in {ours}",
             free.federation_id
         );
+        if let Some(keyer) = &self.keyer {
+            let n = crate::ops::slots_to_key(notes.len(), free.free.len(), free.unkeyed_slots.len());
+            if n > 0 && free.free.len() + n >= notes.len() {
+                let keyed = crate::ops::key_slots(card, keyer, &short_id, &free.unkeyed_slots[..n]).await?;
+                free.version = keyed.answer.version;
+                free.unkeyed_slots = keyed.answer.unkeyed_slots.clone();
+                free.free.extend(keyed.keys.into_iter().map(|(slot, pubkey)| RemoteSlot { slot, pubkey }));
+                free.free.sort_by_key(|s| s.slot);
+            }
+        }
         if free.free.len() < notes.len() {
-            return Err(anyhow!(CardFull { short_id, free: free.free.len(), needed: notes.len() }));
+            return Err(anyhow!(CardFull {
+                short_id,
+                free: free.free.len(),
+                needed: notes.len(),
+                unkeyed: free.unkeyed_slots.len()
+            }));
         }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
         let bal = self.wallet.balance_msat().await?;

@@ -165,6 +165,19 @@ new notes against the card. In this shape that record goes to ops:
 | `POST /cards/:short_id/load` | holder wallet | the pending notes with their blinding keys, before submitting; version-checked |
 | `POST /cards/:short_id/load/outcome` | holder wallet | the federation's signatures; the notes become live |
 
+**Split keying at the till.** A 32-slot card's install tap keys slots 0–7 only, so its other
+slots start unkeyed. When a tap needs more free slots than the card has keyed, the till keys the
+lowest unkeyed slots then and there (`ops.rs` `key_slots`). That covers a top-up load, a holder
+load the till runs, the till's own load, and a charge whose change needs room. For each slot it
+sends `GET_PUB`, and `GEN_KEY` (P2 `00`, no PIN) on `6985`. It then records all of them in one
+`POST /slot-keys` and continues against the version that call answers. It keys the shortfall
+plus `KEY_AHEAD` (3, about 1 s at ~318 ms a key). The planner's room and a top-up's fit count
+unkeyed slots as free, because the tap that needs them keys them. Keys are never queued: if the
+registry does not answer, the load or charge is refused (`ops_unreachable`) and nothing is sent.
+A key the card made but ops never recorded is found by the next tap's `GET_PUB` and recorded
+as it is. A post whose answer was lost replays. A holder's own loader has no till token and
+cannot key, so it answers `card_full` and says how many slots a till could key.
+
 **Open design item: how ops trusts a load.** A wrong record can't steal anything, because
 only the card can spend. But a bogus load could make a card show money it doesn't have, or
 overwrite real notes. Two options, decided in O4:

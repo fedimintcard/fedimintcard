@@ -642,7 +642,8 @@ async fn actor(
                 (reply, r)
             }
             Job::TopupLoad { topup_id, amount_msat, ops_url, link, topups, reply } => {
-                let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url).await;
+                let keyer = ops.as_ref().map(|o| o.client.clone());
+                let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url, keyer).await;
                 (reply, r)
             }
         };
@@ -674,9 +675,14 @@ async fn topup_load_job(
     id: &str,
     amount_msat: u64,
     ops_url: &str,
+    keyer: Option<crate::ops::OpsClient>,
 ) -> Reply {
     let loader = match crate::holder::Loader::new(wallet, ops_url, dir) {
-        Ok(l) => l.with_tag(id),
+        // With the till's own client, a split-keyed card's unkeyed slots are keyed at this tap.
+        Ok(l) => match keyer {
+            Some(k) => l.with_tag(id).with_keyer(k),
+            None => l.with_tag(id),
+        },
         Err(e) => return error_reply(&e),
     };
     match loader.resume_each().await {
@@ -908,6 +914,8 @@ pub async fn card_balance_job(cw: &mut CardWallet, ops: Option<&Ops>, sales: &Ar
     if let (Some(link), Some(body)) = (cw.ops.as_ref(), r.body.as_object_mut()) {
         if r.status == 200 {
             body.insert("short_id".into(), json!(link.short_id));
+            // Slots with no key yet (split keying): room too, keyed by the tap that needs them.
+            body.insert("unkeyed_slots".into(), json!(link.unkeyed));
         }
     }
     Ops::finish(cw, base).await;
@@ -1540,8 +1548,9 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         }
         let ops = h.conn.lock().unwrap().ops.clone();
         let Some(ops) = ops else { return Reply::fail(503, "ops_not_connected", "this till is not connected to a registry") };
+        // Unkeyed slots (split keying) count as room: the load's tap keys them (`holder.rs`).
         let free = match ops.client.free_slots(id).await {
-            Ok(f) => f.free.len() as u32,
+            Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
             Err(e) => return Reply::fail(503, "ops_unreachable", format!("the card's free slots: {e}")),
         };
         if free == 0 {

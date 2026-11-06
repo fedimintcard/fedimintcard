@@ -445,7 +445,9 @@ pub async fn issue_plan(cw: &CardWallet, amounts: &[u64]) -> Result<Value> {
         "notes": notes,
         "slots": slots.iter().take(notes.len()).copied().collect::<Vec<u8>>(),
         "free_slots": slots.len(),
-        "enough_slots": slots.len() >= notes.len(),
+        // On ops, never-keyed slots of a split-keyed card are keyed by the issue itself.
+        "unkeyed_slots": cw.keyable_slots(),
+        "enough_slots": slots.len() + cw.keyable_slots() >= notes.len(),
         "min_denom_msat": m,
         "below_min_denom": below,
         "wallet_balance_msat": bal,

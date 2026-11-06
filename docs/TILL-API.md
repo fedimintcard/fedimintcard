@@ -150,6 +150,11 @@ Empty body. Reconciles the card's notes with the federation (shares the busy fla
 `200 {"ok":true,"live_msat":N,"notes":[{"slot":0,"msat":N,"status":"live"}],"free_slots":[...]}`
 Same error table as `/v1/charge` where applicable.
 
+On ops the reply also has `short_id` and `unkeyed_slots`. A 32-slot card registered with keys
+for slots 0–7 only has slots with no key yet. `free_slots` lists keyed slots only, and
+`unkeyed_slots` are room as well: the till keys them at the tap that needs them (a load, or a
+charge's change). Room for a top-up is `free_slots.length + unkeyed_slots.length`.
+
 ## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load, GET /v1/topups/waiting
 
 Top-up by Lightning (`docs/TOPUP.md`): the till makes an invoice through the federation's gateway
@@ -159,8 +164,8 @@ On ops only (`503 ops_not_connected` otherwise); `503 lightning_unavailable` whe
 
 `POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>","short_id":"<8 hex, optional>"}`
 rounds `N` to the nearest card amount (at most 3 notes) and answers the top-up. With `short_id`
-(from `/v1/card/balance`) the till reads that card's free slots from ops, rounds to fit them, and
-refuses a card with none (`409 card_full`) before any invoice exists; the card is recorded as the
+(from `/v1/card/balance`) the till reads that card's free slots from ops (keyed and unkeyed), rounds
+to fit them, and refuses a card with none (`409 card_full`) before any invoice exists; the card is recorded as the
 top-up's `for_card`.
 
 `200 {"ok":true,"topup_id":"<16 hex>","amount_msat":N,"invoice":"lnbc…","expires_at_ms":T,"state":"waiting"}`
@@ -175,8 +180,11 @@ when no gateway made an invoice.
 
 `POST /v1/topup/{topup_id}/load` with `X-Card-Link` loads a `paid` top-up onto the card and
 answers it with `"state":"loaded"` and `"load_txid"`. A `loaded` top-up answers again without a
-card. `409 not_paid`, `410 expired`, `409 topup_failed`, `409 card_full` (too few free slots; the
-top-up stays `paid`), and the card errors of `/v1/charge`. Shares the job slot with charges.
+card. `409 not_paid`, `410 expired`, `409 topup_failed`, `409 card_full` (too few free slots even
+after keying unkeyed ones; the top-up stays `paid`), and the card and ops errors of `/v1/charge`.
+Keying a split-keyed card's slots at this tap can also answer `502 ops_unreachable` or
+`409 card_changed` when the registry does not take the keys. The top-up then stays `paid`, and
+the next tap retries. Shares the job slot with charges.
 
 `GET /v1/topups/waiting?short_id=<8 hex>` lists the `paid` top-ups not yet on a card that this card
 may take: made for it (`for_card`) or for no card, oldest first. Without `short_id`, every `paid`

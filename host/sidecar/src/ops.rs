@@ -16,12 +16,24 @@
 //! in the federation, so the next till resubmits those bytes (idempotent) and records what the
 //! federation answers. A till never re-signs another till's charge: the holder at the second till
 //! did not agree to it.
+//!
+//! Split keying (a 32-slot card registered with keys for slots 0-7 only): the registry lists the
+//! card's never-keyed slots as `unkeyed_slots`, and nothing can be loaded into one until it has a
+//! key on record. When a tap needs more free slots than the card has keyed (a load, or a charge
+//! whose change needs room), the till keys the lowest unkeyed slots on the card while it is in the
+//! field ([`key_slots`]: `GET_PUB`, and `GEN_KEY` with P2 = 00 on `6985`; no PIN) and records them
+//! with `POST /cards/:id/slot-keys` before it goes on. It keys the shortfall plus [`KEY_AHEAD`].
+//! Keys are never queued in `ops_outbox`: a tap that cannot record them in ops refuses the work
+//! that needed them. A tap that keyed slots but died before the POST leaves keys on the card that
+//! the next tap's `GET_PUB` finds and records; a POST whose answer was lost is replayed, which the
+//! registry answers without change.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use fedimint_card_host_card::{Card, SW_NO_SPACE, status_word};
 use fedimint_core::secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -33,6 +45,10 @@ use crate::state::{CardState, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingTx
 const OPS_TIMEOUT: Duration = Duration::from_secs(15);
 /// Where the per-card files live inside the data directory.
 pub const CARDS_DIR: &str = "cards";
+/// Unkeyed slots a tap keys beyond what its load or change needs, so the next few taps on the
+/// card need none. A slot's first `GEN_KEY` takes about 318 ms on a J3R180 (docs/CAP-BUILD.md),
+/// so the margin adds at most about 1 s to the tap that keys.
+pub const KEY_AHEAD: usize = 3;
 
 /// `--ops-url` and `--ops-token`. The token is a till token (`till_…`) and is never printed.
 #[derive(Clone)]
@@ -76,7 +92,12 @@ impl std::error::Error for OpsError {}
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteState {
     pub version: u64,
+    /// Keyed slots only; see `unkeyed_slots`.
     pub slots: Vec<RemoteSlot>,
+    /// Slots the card has with no key on record yet (split keying), ascending. Empty from a
+    /// registry older than split keying.
+    #[serde(default)]
+    pub unkeyed_slots: Vec<u8>,
     pub notes: Vec<RemoteNote>,
     pub open_txs: Vec<RemoteTx>,
 }
@@ -192,6 +213,14 @@ impl OpsClient {
         self.call(reqwest::Method::POST, "/federations", Some(&body)).await.map(|_| ())
     }
 
+    /// `POST /cards/:id/slot-keys` (till): the first keys of never-keyed slots, all or nothing.
+    /// The same keys again replay without change.
+    pub async fn slot_keys(&self, short_id: &str, keys: &[(u8, String)]) -> Result<SlotKeysAnswer, OpsError> {
+        let body = json!({"keys": keys.iter().map(|(slot, pubkey)| json!({"slot": slot, "pubkey": pubkey})).collect::<Vec<_>>()});
+        let v = self.call(reqwest::Method::POST, &format!("/cards/{short_id}/slot-keys"), Some(&body)).await?;
+        serde_json::from_value(v).map_err(|e| OpsError::Unreachable(format!("the slot-keys answer did not parse: {e}")))
+    }
+
     /// `GET /cards/:id/slots` (holder): the card's free slot keys, its version and federation.
     pub async fn free_slots(&self, short_id: &str) -> Result<FreeSlots, OpsError> {
         let v = self.call(reqwest::Method::GET, &format!("/cards/{short_id}/slots"), None).await?;
@@ -214,7 +243,66 @@ impl OpsClient {
 pub struct FreeSlots {
     pub version: u64,
     pub federation_id: String,
+    /// Keyed slots whose key never carried a note.
     pub free: Vec<RemoteSlot>,
+    /// Slots with no key on record yet, ascending: a till keys them at a tap ([`key_slots`]).
+    #[serde(default)]
+    pub unkeyed_slots: Vec<u8>,
+}
+
+/// `POST /cards/:id/slot-keys` as the registry answers it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotKeysAnswer {
+    /// The card's version after the keys; the next intent or load is made against it.
+    pub version: u64,
+    #[serde(default)]
+    pub added: Vec<u8>,
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default)]
+    pub unkeyed_slots: Vec<u8>,
+}
+
+/// How many unkeyed slots a tap keys when it needs `need` free slots and has `free` keyed ones:
+/// none when they fit, else the shortfall plus [`KEY_AHEAD`], and never more than `unkeyed`.
+pub fn slots_to_key(need: usize, free: usize, unkeyed: usize) -> usize {
+    if need <= free {
+        return 0;
+    }
+    (need - free + KEY_AHEAD).min(unkeyed)
+}
+
+/// What [`key_slots`] keyed: each slot's key as the card holds it, and the registry's answer.
+#[derive(Debug, Clone)]
+pub struct KeyedSlots {
+    pub keys: Vec<(u8, String)>,
+    pub answer: SlotKeysAnswer,
+}
+
+/// Give `slots` (never keyed in ops) keys on the card in the field, and record them in ops in one
+/// `POST /slot-keys`. Per slot: `GET_PUB`; on `6985` (empty) `GEN_KEY` with P2 = 00, which needs
+/// no PIN; a key already there is one an earlier tap made and could not record, and is used as
+/// it is. The card's private keys never leave it, so any key in an unkeyed slot is the card's own.
+///
+/// Fails without recording anything if the card refuses (`6A84`: out of memory for the slot's
+/// key) or ops does not answer; the keys stay on the card for the next tap to record.
+pub async fn key_slots(card: &mut dyn Card, client: &OpsClient, short_id: &str, slots: &[u8]) -> Result<KeyedSlots> {
+    let mut keys = vec![];
+    for &slot in slots {
+        let pk = match on_card(|| card.get_or_gen(slot)) {
+            Ok(pk) => pk,
+            Err(e) if status_word(&e) == Some(SW_NO_SPACE) => {
+                return Err(e).with_context(|| format!("the card has no memory left for slot {slot}'s key (6A84)"));
+            }
+            Err(e) => return Err(e).with_context(|| format!("keying slot {slot} on the card")),
+        };
+        keys.push((slot, pk.to_string()));
+    }
+    if keys.is_empty() {
+        bail!("no slot to key");
+    }
+    let answer = client.slot_keys(short_id, &keys).await.context("recording the card's new slot keys in ops")?;
+    Ok(KeyedSlots { keys, answer })
 }
 
 /// What a till tells ops about its federation (`POST /federations`): the name, for the
@@ -251,6 +339,8 @@ pub struct OpsLink {
     pub version: u64,
     /// Slot keys as ops last answered them.
     pub remote_slots: Vec<(u8, String)>,
+    /// Slots with no key in ops yet (split keying), as ops last answered them.
+    pub unkeyed: Vec<u8>,
     /// Charges open in ops as last read, plus any this job posted an intent for. Only these get an
     /// outcome: one another till already recorded needs nothing from this one.
     pub open: Vec<String>,
@@ -290,7 +380,7 @@ impl Ops {
     pub async fn attach_id(&self, cw: &mut CardWallet, short_id: &str) -> Result<StateStore> {
         let card = StateStore::open(self.card_path(short_id))?;
         let base = std::mem::replace(&mut cw.store, card);
-        cw.ops = Some(OpsLink { client: self.client.clone(), short_id: short_id.to_owned(), version: 0, remote_slots: vec![], open: vec![] });
+        cw.ops = Some(OpsLink { client: self.client.clone(), short_id: short_id.to_owned(), version: 0, remote_slots: vec![], unkeyed: vec![], open: vec![] });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
             Err(e) => {
@@ -356,6 +446,7 @@ impl CardWallet {
         let remote = link.client.state(&link.short_id).await?;
         link.version = remote.version;
         link.remote_slots = remote.slots.iter().map(|s| (s.slot, s.pubkey.clone())).collect();
+        link.unkeyed = remote.unkeyed_slots.clone();
         link.open = remote.open_txs.iter().map(|t| t.txid.clone()).collect();
         Ok(remote)
     }
@@ -548,6 +639,38 @@ impl CardWallet {
         self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: true, change });
     }
 
+    /// Unkeyed slots this tap may key: those ops reported, none off ops.
+    pub(crate) fn keyable_slots(&self) -> usize {
+        self.ops.as_ref().map_or(0, |l| l.unkeyed.len())
+    }
+
+    /// Make sure the card has `need` free keyed slots, keying unkeyed ones if it has too few
+    /// ([`slots_to_key`], [`key_slots`]). Returns the slots keyed. Off ops, or with enough free
+    /// slots, it does nothing; with too few even after keying it keys nothing and leaves the
+    /// refusal to the caller. Ops not answering is an error: the work that needed the slots is
+    /// refused rather than the keys queued.
+    pub(crate) async fn ops_make_room(&mut self, need: usize) -> Result<Vec<u8>> {
+        let Some(link) = self.ops.clone() else { return Ok(vec![]) };
+        let free = self.store.state.free_slots().len();
+        let n = slots_to_key(need, free, link.unkeyed.len());
+        if n == 0 || free + n < need {
+            return Ok(vec![]);
+        }
+        let want = &link.unkeyed[..n];
+        let keyed = key_slots(self.card.as_mut(), &link.client, &link.short_id, want).await?;
+        let l = self.ops.as_mut().expect("set");
+        l.version = keyed.answer.version;
+        l.unkeyed = keyed.answer.unkeyed_slots.clone();
+        for (slot, pk) in &keyed.keys {
+            l.remote_slots.retain(|(s, _)| s != slot);
+            l.remote_slots.push((*slot, pk.clone()));
+            self.store.state.set_slot_pubkey(*slot, pk.clone());
+        }
+        self.store.save()?;
+        tracing::info!("ops: keyed slots {want:?} of card {} (version {})", link.short_id, keyed.answer.version);
+        Ok(want.to_vec())
+    }
+
     /// Whether this card's slot may be re-keyed. On ops, slot 0's key names the card (its short
     /// id), so it is never renewed: a renewed slot 0 would make the card unknown to every till.
     pub(crate) fn may_renew(&self, slot: u8) -> bool {
@@ -663,9 +786,22 @@ mod tests {
         RemoteState {
             version: 3,
             slots: (0..2).map(|s| RemoteSlot { slot: s, pubkey: format!("{s:02x}").repeat(32) }).collect(),
+            unkeyed_slots: vec![],
             notes,
             open_txs: open,
         }
+    }
+
+    #[test]
+    fn unkeyed_slots_parse_and_default_to_none_from_an_older_registry() {
+        let old: RemoteState = serde_json::from_value(json!({"version": 1, "slots": [], "notes": [], "open_txs": []})).unwrap();
+        assert!(old.unkeyed_slots.is_empty());
+        let new: RemoteState =
+            serde_json::from_value(json!({"version": 1, "slot_count": 32, "slots": [], "unkeyed_slots": [8, 9], "notes": [], "open_txs": []}))
+                .unwrap();
+        assert_eq!(new.unkeyed_slots, vec![8, 9]);
+        let free: FreeSlots = serde_json::from_value(json!({"version": 1, "federation_id": "f", "free": []})).unwrap();
+        assert!(free.unkeyed_slots.is_empty());
     }
 
     #[test]

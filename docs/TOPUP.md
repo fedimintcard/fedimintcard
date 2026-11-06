@@ -20,7 +20,8 @@ uses (`holder.rs`, the registry's `/cards/:id/load` routes). No PIN: nothing lea
 
 ## The amount: nearest card amount
 
-A card holds one note per slot, each a power of two in msat, and has 8 slots. A top-up is at most
+A card holds one note per slot, each a power of two in msat, and has 8 slots (a 2.0 card) or 32
+(a 2.1 card). A top-up is at most
 **3 notes** (`MAX_TOPUP_NOTES`). The till takes the requested msat and picks whichever is nearer of
 the largest value at or below it and the smallest value at or above it with at most 3 set bits (a
 tie goes to the lower), each note a denomination the federation issues and at least its smallest
@@ -36,9 +37,16 @@ at most 3); a card with no free slot is refused with 409 `card_full` before any 
 nobody pays for a load that cannot land. (Without `short_id` the till assumes 3 and the load itself
 answers `card_full`, keeping the top-up `paid`.)
 
+A 32-slot card may be registered with keys for slots 0–7 only (split keying). Its unkeyed slots
+count as free here, because the load's tap keys the ones it needs: the shortfall plus
+`ops::KEY_AHEAD` (3), each a `GEN_KEY` of about 318 ms, recorded in ops in one post before the
+load. If the registry does not take the keys, the load answers 502 `ops_unreachable`, nothing is
+sent and the top-up stays `paid`. The next tap records the keys the card already made.
+
 Charges keep room too: when the cheapest charge plan would leave fewer than 3 free slots
 (`plan::ROOM_AFTER_CHARGE`), the planner spends more of the card's notes so the change comes back
-as fewer, larger notes. Each extra input is one more card signature (about a second), and only on
+as fewer, larger notes. Unkeyed slots count as free here as well. A charge whose change needs
+more keyed slots than the card has keys them at that tap, the same way a load does. Each extra input is one more card signature (about a second), and only on
 a nearly full card.
 
 ## Till routes (POS token as for every `/v1` route)

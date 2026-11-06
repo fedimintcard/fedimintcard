@@ -124,6 +124,28 @@ impl Registry {
         Ok(short_id)
     }
 
+    /// Split keying: a 32-slot card whose install tap keyed slots 0-7 only, registered with those
+    /// eight keys and `slot_count` 32. A till keys 8-31 at later taps.
+    async fn provision_split(&self, card: &Rc<RefCell<SoftCard>>) -> anyhow::Result<String> {
+        assert_eq!(card.borrow().slot_len(), 32);
+        let keys: Vec<XOnlyPublicKey> = (0..8).map(|s| card.borrow_mut().gen_key(s)).collect::<anyhow::Result<_>>()?;
+        open_pin_session(&mut *card.borrow_mut())?;
+        let short_id = short_id_of(&keys[0]);
+        let row = json!({
+            "short_id": short_id,
+            "batch_id": self.batch_id,
+            "installed_at": 1_762_000_000_000u64,
+            "load_sha256": "a".repeat(64),
+            "pin_set": true,
+            "pin_policy": "batch",
+            "notes_issued": 0,
+            "slot_count": 32,
+            "slot_pubkeys": keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        });
+        self.op_post("/registry/cards", row).await?;
+        Ok(short_id)
+    }
+
     async fn state(&self, short_id: &str) -> anyhow::Result<Value> {
         let resp = self.http.get(format!("{}/cards/{short_id}/state", self.url)).bearer_auth(&self.operator).send().await?;
         Ok(resp.error_for_status()?.json().await?)
@@ -558,5 +580,92 @@ async fn a_load_that_never_left_the_wallet_frees_its_slots_on_the_next_run() -> 
     let s = reg.state(&short_id).await?;
     assert_eq!(live_msat(&s), 1 << 16, "{s}");
     assert_eq!(s["notes"].as_array().unwrap().len(), 1, "the first load left no note behind: {s}");
+    Ok(())
+}
+
+// ------------------------------------------------------------------ split keying
+
+fn unkeyed(state: &Value) -> Vec<u64> {
+    state["unkeyed_slots"].as_array().unwrap().iter().map(|s| s.as_u64().unwrap()).collect()
+}
+
+fn key_in(state: &Value, slot: u64) -> Option<String> {
+    state["slots"].as_array().unwrap().iter().find(|s| s["slot"] == slot).map(|s| s["pubkey"].as_str().unwrap().to_owned())
+}
+
+/// A 32-slot card registered with keys for slots 0-7 gets the rest from tills, at the taps that
+/// need them: a charge whose change has no keyed slot to go to, a holder load through a till, and
+/// a till's own load. Each keys the shortfall plus `KEY_AHEAD`, lowest slots first, and a key an
+/// earlier tap made but never recorded is recorded as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -> anyhow::Result<()> {
+    use fedimint_card_sidecar::ops::KEY_AHEAD;
+    let fed = federation().await?;
+    let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
+    let mut till = Till::new(&fed, &reg, "split keying", Amount::from_sats(10_000)).await?;
+    let holder = Holder::new(&fed, Amount::from_sats(100_000)).await?;
+    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let short_id = reg.provision_split(&card).await?;
+    let s = reg.state(&short_id).await?;
+    assert_eq!(s["slot_count"], 32, "{s}");
+    assert_eq!(unkeyed(&s), (8..32).collect::<Vec<u64>>());
+
+    // A holder fills the eight keyed slots (0-7: slot 0 takes a note like any other); their own
+    // loader keys nothing.
+    let eight = (1u64 << 20) - (1 << 12);
+    let r = holder.loader(&reg)?.load(&mut Shared(card.clone()), &[eight]).await?;
+    assert_eq!(r.notes.len(), 8);
+    assert_eq!(unkeyed(&reg.state(&short_id).await?).len(), 24);
+
+    // An earlier tap keyed slot 8 on the card and died before ops heard of it.
+    let earlier = card.borrow_mut().gen_key(8)?.to_string();
+
+    // A charge: the change needs slots, none keyed is free, so the till keys them first.
+    let (status, body) = till.charge(&card, 50_000, "split-1", "1234").await;
+    assert_eq!(status, 200, "{body}");
+    let change = body["change"].as_array().unwrap().len();
+    assert!(change > 0, "a charge with change: {body}");
+    let s = reg.state(&short_id).await?;
+    let keyed_now = (change + KEY_AHEAD) as u64;
+    assert_eq!(unkeyed(&s), (8 + keyed_now..32).collect::<Vec<u64>>(), "{s}");
+    assert_eq!(key_in(&s, 8).as_deref(), Some(earlier.as_str()), "the earlier tap's key, recorded as it is");
+    for slot in 8..8 + keyed_now {
+        assert_eq!(key_in(&s, slot), Some(card.borrow_mut().get_pub(slot as u8)?.to_string()), "slot {slot}");
+    }
+    assert!(body["change"].as_array().unwrap().iter().all(|c| c["slot"].as_u64().unwrap() >= 8), "{body}");
+    assert!(open_txs(&s).is_empty(), "{s}");
+
+    // The same key again replays: nothing changes, not even the version.
+    let v = s["version"].as_u64().unwrap();
+    let again = till.ops.client.slot_keys(&short_id, &[(8, earlier.clone())]).await?;
+    assert!(again.replayed && again.added.is_empty(), "{again:?}");
+    assert_eq!(again.version, v);
+    // Another key on a keyed slot is a renewal, not a first key: 409.
+    let other = card.borrow_mut().get_pub(9)?.to_string();
+    let err = till.ops.client.slot_keys(&short_id, &[(8, other)]).await.expect_err("slot 8 has a key");
+    assert!(matches!(err, fedimint_card_sidecar::ops::OpsError::Changed(_)), "{err}");
+
+    // A holder load through the till: twelve notes, KEY_AHEAD free, so 9 short plus KEY_AHEAD.
+    let before = unkeyed(&reg.state(&short_id).await?);
+    let free = reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?;
+    let free_n = free["free"].as_array().unwrap().len();
+    let load = holder.loader(&reg)?.with_keyer(till.ops.client.clone());
+    let r = load.load(&mut Shared(card.clone()), &[(1 << 24) - (1 << 12)]).await?;
+    assert_eq!(r.notes.len(), 12);
+    let s = reg.state(&short_id).await?;
+    let n = 12 - free_n + KEY_AHEAD;
+    assert_eq!(unkeyed(&s), before[n..].to_vec(), "{s}");
+
+    // The till's own load (a top-up from its wallet) keys the same way.
+    let free_n = reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?["free"]
+        .as_array()
+        .unwrap()
+        .len();
+    let before = unkeyed(&s);
+    let notes = free_n + 2;
+    let amounts: Vec<u64> = (0..notes as u32).map(|i| 1u64 << (12 + i)).collect();
+    till.load(&card, &[amounts.iter().sum()]).await?;
+    let s = reg.state(&short_id).await?;
+    assert_eq!(unkeyed(&s), before[(2 + KEY_AHEAD).min(before.len())..].to_vec(), "{s}");
     Ok(())
 }

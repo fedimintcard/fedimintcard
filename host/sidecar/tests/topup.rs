@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use fedimint_card_host_card::{Card, SoftCard, StatusWord};
 use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::holder::{CardFull, Loader};
-use fedimint_card_sidecar::ops::{Ops, OpsConfig, short_id_of};
+use fedimint_card_sidecar::ops::{Ops, OpsClient, OpsConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Conn, OpsState};
@@ -80,8 +80,9 @@ impl TopupLightning for FakeLn {
 // ------------------------------------------------------------------ the fake registry
 
 /// The holder load routes, answering for one card: its free slots (the first `free` of slots 1 up
-/// to the card's last, which is `keys.len() - 1`),
-/// and every load and outcome it was sent.
+/// to the card's last registered key, which is `keys.len() - 1`, then any slot a till keyed), its
+/// never-keyed slots (`unkeyed`, split keying), and every load, outcome and slot-keys post it was
+/// sent.
 struct FakeRegistry {
     federation_id: String,
     keys: Vec<String>,
@@ -90,17 +91,85 @@ struct FakeRegistry {
     outcomes: Mutex<Vec<Value>>,
     /// Answer this many outcomes 503 first (a registry that fails after the load was sent).
     fail_outcomes: AtomicUsize,
+    /// Slots with no key on record, ascending.
+    unkeyed: Mutex<Vec<u8>>,
+    /// Keys a till added (`POST /slot-keys`), in order.
+    keyed: Mutex<Vec<(u8, String)>>,
+    /// Every `POST /slot-keys` body that was answered 200.
+    key_posts: Mutex<Vec<Value>>,
+    /// Answer this many slot-keys posts 503 first, without recording them.
+    fail_keys: AtomicUsize,
+    /// Bumped by each slot-keys post that added a key; loads must name it.
+    version: AtomicU64,
+}
+
+impl FakeRegistry {
+    fn new(federation_id: String, keys: Vec<String>, free: usize) -> Self {
+        Self {
+            federation_id,
+            keys,
+            free: AtomicUsize::new(free),
+            loads: Mutex::new(vec![]),
+            outcomes: Mutex::new(vec![]),
+            fail_outcomes: AtomicUsize::new(0),
+            unkeyed: Mutex::new(vec![]),
+            keyed: Mutex::new(vec![]),
+            key_posts: Mutex::new(vec![]),
+            fail_keys: AtomicUsize::new(0),
+            version: AtomicU64::new(1),
+        }
+    }
 }
 
 async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> Json<Value> {
     let n = r.free.load(Ordering::SeqCst);
     let used: Vec<u64> = r.loads.lock().unwrap().iter().flat_map(|l| l["notes"].as_array().unwrap().iter().map(|n| n["slot"].as_u64().unwrap()).collect::<Vec<_>>()).collect();
-    let free: Vec<Value> = (1..r.keys.len() as u64)
+    let mut free: Vec<Value> = (1..r.keys.len() as u64)
         .filter(|s| !used.contains(s))
         .take(n)
         .map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]}))
         .collect();
-    Json(json!({"version": 1, "federation_id": r.federation_id, "free": free}))
+    free.extend(
+        r.keyed.lock().unwrap().iter().filter(|(s, _)| !used.contains(&(*s as u64))).map(|(s, k)| json!({"slot": s, "pubkey": k})),
+    );
+    let unkeyed = r.unkeyed.lock().unwrap().clone();
+    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": unkeyed}))
+}
+
+async fn slot_keys(
+    State(r): State<Arc<FakeRegistry>>,
+    Path(_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    if r.fail_keys.load(Ordering::SeqCst) > 0 {
+        r.fail_keys.fetch_sub(1, Ordering::SeqCst);
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
+    }
+    assert_eq!(headers.get("authorization").and_then(|h| h.to_str().ok()), Some("Bearer till_test"), "a till's token");
+    let mut added = vec![];
+    for k in body["keys"].as_array().unwrap() {
+        let (slot, pubkey) = (k["slot"].as_u64().unwrap() as u8, k["pubkey"].as_str().unwrap().to_owned());
+        let mut keyed = r.keyed.lock().unwrap();
+        match keyed.iter().find(|(s, _)| *s == slot) {
+            Some((_, had)) => assert_eq!(had, &pubkey, "another key on a keyed slot"),
+            None => {
+                assert!(r.unkeyed.lock().unwrap().contains(&slot), "slot {slot} is not unkeyed");
+                keyed.push((slot, pubkey));
+                added.push(slot);
+            }
+        }
+    }
+    r.unkeyed.lock().unwrap().retain(|s| !added.contains(s));
+    if !added.is_empty() {
+        r.version.fetch_add(1, Ordering::SeqCst);
+    }
+    r.key_posts.lock().unwrap().push(body);
+    let unkeyed = r.unkeyed.lock().unwrap().clone();
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({"ok": true, "version": r.version.load(Ordering::SeqCst), "added": added, "replayed": added.is_empty(), "unkeyed_slots": unkeyed})),
+    )
 }
 
 async fn load(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
@@ -121,6 +190,7 @@ async fn serve_registry(r: Arc<FakeRegistry>) -> String {
     let app = axum::Router::new()
         .route("/cards/{id}/slots", get(slots))
         .route("/cards/{id}/load", post(load))
+        .route("/cards/{id}/slot-keys", post(slot_keys))
         .route("/cards/{id}/load/outcome", post(outcome))
         .with_state(r);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -176,14 +246,7 @@ async fn start(setup: Setup) -> anyhow::Result<(Fx, impl std::future::Future<Out
         keys.push(card.lock().unwrap().gen_key(s)?);
     }
     let short_id = short_id_of(&keys[0]);
-    let registry = Arc::new(FakeRegistry {
-        federation_id: wallet.federation_id().to_string(),
-        keys: keys.iter().map(|k| k.to_string()).collect(),
-        free: AtomicUsize::new(7),
-        loads: Mutex::new(vec![]),
-        outcomes: Mutex::new(vec![]),
-        fail_outcomes: AtomicUsize::new(0),
-    });
+    let registry = Arc::new(FakeRegistry::new(wallet.federation_id().to_string(), keys.iter().map(|k| k.to_string()).collect(), 7));
     let url = serve_registry(registry.clone()).await;
     let conn = match setup {
         Setup::Local => Conn::new(OpsState::Local, None),
@@ -642,14 +705,8 @@ async fn holder_on(card: &mut SoftCard, funds: u64) -> anyhow::Result<(Federatio
     fund(&client, Amount::from_sats(funds)).await?;
     let wallet = Wallet::from_client(client).await?;
     let keys: Vec<String> = (0..card.slot_len()).map(|s| card.gen_key(s).map(|k| k.to_string())).collect::<anyhow::Result<_>>()?;
-    let registry = Arc::new(FakeRegistry {
-        federation_id: wallet.federation_id().to_string(),
-        free: AtomicUsize::new(keys.len() - 1),
-        keys,
-        loads: Mutex::new(vec![]),
-        outcomes: Mutex::new(vec![]),
-        fail_outcomes: AtomicUsize::new(0),
-    });
+    let free = keys.len() - 1;
+    let registry = Arc::new(FakeRegistry::new(wallet.federation_id().to_string(), keys, free));
     let url = serve_registry(registry).await;
     Ok((fed, wallet, url, tempfile::tempdir()?))
 }
@@ -683,4 +740,194 @@ async fn a_50k_holder_load_is_refused_on_an_eight_slot_card() -> anyhow::Result<
     assert_eq!(r.notes.len(), 3);
     assert!(r.notes.iter().all(|(s, _)| (1..8).contains(s)), "{:?}", r.notes);
     Ok(())
+}
+
+// ------------------------------------------------------------------ split keying
+
+/// The card's key in `slot`, hex, as `GET_PUB` reads it.
+fn card_key(card: &Mutex<SoftCard>, slot: u8) -> Option<String> {
+    card.lock().unwrap().get_pub(slot).ok().map(|k| k.to_string())
+}
+
+/// A 32-slot card registered with keys for slots 0-7 only: the load's tap keys the shortfall plus
+/// `KEY_AHEAD` of the lowest unkeyed slots, records them in one post, and loads against the
+/// version that post answered. The next top-up fits the slots keyed ahead and keys nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_load_keys_a_split_cards_slots_at_the_tap() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        registry.free.store(1, Ordering::SeqCst);
+        *registry.unkeyed.lock().unwrap() = (8..32).collect();
+        assert_eq!(card_key(&card, 8), None, "slot 8 is empty on the card");
+
+        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let id = created["topup_id"].as_str().unwrap().to_owned();
+        ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
+        until_state(addr, &id, "paid").await;
+        let (link, _phone) = open_link(addr, card.clone()).await;
+        let (s, v) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, v["state"].as_str()), (200, Some("loaded")), "{v}");
+
+        // Three notes, one free slot: 2 short, plus KEY_AHEAD.
+        let want = 2 + fedimint_card_sidecar::ops::KEY_AHEAD;
+        let posts = registry.key_posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "one post for all the keys");
+        let keyed = registry.keyed.lock().unwrap().clone();
+        assert_eq!(keyed.iter().map(|(s, _)| *s).collect::<Vec<_>>(), (8..8 + want as u8).collect::<Vec<_>>());
+        for (slot, k) in &keyed {
+            assert_eq!(card_key(&card, *slot).as_deref(), Some(k.as_str()), "slot {slot}: the card's own key");
+        }
+        assert_eq!(card_key(&card, 8 + want as u8), None, "nothing keyed beyond the margin");
+        let loads = registry.loads.lock().unwrap().clone();
+        assert_eq!(loads[0]["version"], 2, "the load names the version the keys answered");
+        let slots: Vec<u64> = loads[0]["notes"].as_array().unwrap().iter().map(|n| n["slot"].as_u64().unwrap()).collect();
+        assert_eq!(slots, vec![1, 8, 9]);
+
+        // The next top-up fits the slots keyed ahead: no keying at that tap.
+        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let id = created["topup_id"].as_str().unwrap().to_owned();
+        ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
+        until_state(addr, &id, "paid").await;
+        let (link, _phone) = open_link(addr, card.clone()).await;
+        let (s, v) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, v["state"].as_str()), (200, Some("loaded")), "{v}");
+        assert_eq!(registry.key_posts.lock().unwrap().len(), 1, "no second keying");
+    })
+    .await;
+    Ok(())
+}
+
+/// A top-up named for a split-keyed card counts its unkeyed slots as room, since the load's tap
+/// keys them; a card with neither free nor unkeyed slots is still refused before any invoice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, registry) = (f.addr, f.registry.clone());
+    with_actor(actor, async move {
+        let create = |body: Value| async move { call(addr, "POST", "/v1/topup", None, Some(body)).await };
+        registry.free.store(0, Ordering::SeqCst);
+        *registry.unkeyed.lock().unwrap() = (8..32).collect();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!((s, v["amount_msat"].as_u64()), (200, Some(100_352)), "three notes fit: {v}");
+
+        *registry.unkeyed.lock().unwrap() = vec![31];
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["amount_msat"].as_u64().unwrap().count_ones(), 1, "one unkeyed slot, one note: {v}");
+
+        registry.unkeyed.lock().unwrap().clear();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
+        assert!(registry.key_posts.lock().unwrap().is_empty(), "making an invoice keys nothing");
+    })
+    .await;
+    Ok(())
+}
+
+/// The registry does not answer the keys: the load is refused (nothing sent, the top-up stays
+/// paid), and the keys the tap made stay on the card. The next tap finds them with `GET_PUB`,
+/// records those same keys, and loads.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_a_tap_made_but_never_recorded_are_recorded_by_the_next_tap() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        registry.free.store(0, Ordering::SeqCst);
+        *registry.unkeyed.lock().unwrap() = (8..32).collect();
+        registry.fail_keys.store(1, Ordering::SeqCst);
+        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let id = created["topup_id"].as_str().unwrap().to_owned();
+        ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
+        until_state(addr, &id, "paid").await;
+
+        let (link, _phone) = open_link(addr, card.clone()).await;
+        let (s, v) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, v["error"].as_str()), (502, Some("ops_unreachable")), "{v}");
+        until_state(addr, &id, "paid").await;
+        assert!(registry.loads.lock().unwrap().is_empty(), "nothing was loaded");
+        assert!(registry.keyed.lock().unwrap().is_empty(), "nothing was recorded");
+        let want = 3 + fedimint_card_sidecar::ops::KEY_AHEAD;
+        let made: Vec<String> = (8..8 + want as u8).map(|s| card_key(&card, s).expect("keyed on the card")).collect();
+
+        let (link, _phone) = open_link(addr, card.clone()).await;
+        let (s, v) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, v["state"].as_str()), (200, Some("loaded")), "{v}");
+        let keyed: Vec<String> = registry.keyed.lock().unwrap().iter().map(|(_, k)| k.clone()).collect();
+        assert_eq!(keyed, made, "the keys the first tap made, not new ones");
+        assert_eq!(card_key(&card, 8 + want as u8), None);
+    })
+    .await;
+    Ok(())
+}
+
+/// A holder's wallet holding `funds` sats (no mint fees) and a fake registry for a fresh 32-slot
+/// `card` registered with keys for slots 0-7 only (split keying), 1-7 free and 8-31 unkeyed.
+async fn holder_on_split(card: &mut SoftCard, funds: u64) -> anyhow::Result<(FederationTest, Wallet, Arc<FakeRegistry>, String, tempfile::TempDir)> {
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).disable_mint_fees().build()).await?;
+    let client = fed.new_client().await;
+    fund(&client, Amount::from_sats(funds)).await?;
+    let wallet = Wallet::from_client(client).await?;
+    let keys: Vec<String> = (0..8).map(|s| card.gen_key(s).map(|k| k.to_string())).collect::<anyhow::Result<_>>()?;
+    let registry = Arc::new(FakeRegistry::new(wallet.federation_id().to_string(), keys, 7));
+    *registry.unkeyed.lock().unwrap() = (8..card.slot_len()).collect();
+    let url = serve_registry(registry.clone()).await;
+    Ok((fed, wallet, registry, url, tempfile::tempdir()?))
+}
+
+/// 50,000 sats (twelve notes) onto a split-keyed card: a holder's own loader cannot key, so it is
+/// refused and says why; the till's loader keys slots 8-15 (5 short plus `KEY_AHEAD`) and loads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result<()> {
+    let mut card = SoftCard::new();
+    let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
+    let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("seven keyed slots");
+    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
+    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 24));
+    assert!(full.to_string().contains("a till keys them"), "{full}");
+    assert!(registry.key_posts.lock().unwrap().is_empty());
+
+    let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
+    let r = Loader::new(&wallet, &url, dir.path())?.with_keyer(till).load(&mut card, &[50_000_000]).await?;
+    assert_eq!(r.notes.len(), 12, "{:?}", r.notes);
+    let slots: Vec<u8> = r.notes.iter().map(|(s, _)| *s).collect();
+    assert_eq!(slots, (1..13).collect::<Vec<u8>>());
+    let keyed: Vec<u8> = registry.keyed.lock().unwrap().iter().map(|(s, _)| *s).collect();
+    assert_eq!(keyed, (8..16).collect::<Vec<u8>>());
+    assert_eq!(*registry.unkeyed.lock().unwrap(), (16..32).collect::<Vec<u8>>());
+    assert!(card.get_pub(16).is_err(), "slot 16 stays empty on the card");
+    Ok(())
+}
+
+/// A load that cannot fit even with every unkeyed slot keyed keys nothing; one that fits the free
+/// slots keys nothing either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_keys_only_when_keying_makes_the_load_fit() -> anyhow::Result<()> {
+    let mut card = SoftCard::new();
+    let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
+    let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
+    *registry.unkeyed.lock().unwrap() = vec![8, 9];
+    let err = Loader::new(&wallet, &url, dir.path())?.with_keyer(till.clone()).load(&mut card, &[50_000_000]).await.expect_err("7 + 2 < 12");
+    assert!(err.downcast_ref::<CardFull>().is_some(), "{err:#}");
+    assert!(registry.key_posts.lock().unwrap().is_empty());
+    assert!(card.get_pub(8).is_err());
+
+    let r = Loader::new(&wallet, &url, dir.path())?.with_keyer(till).load(&mut card, &[(1 << 20) + (1 << 18)]).await?;
+    assert_eq!(r.notes.len(), 2);
+    assert!(registry.key_posts.lock().unwrap().is_empty(), "two notes fit seven free slots");
+    Ok(())
+}
+
+/// The keying arithmetic: nothing when the notes fit, else the shortfall plus `KEY_AHEAD`, never
+/// more slots than are unkeyed. An 8-slot card has none unkeyed, so it never keys.
+#[test]
+fn slots_to_key_is_the_shortfall_plus_the_margin() {
+    use fedimint_card_sidecar::ops::{KEY_AHEAD, slots_to_key};
+    assert_eq!(slots_to_key(3, 3, 24), 0);
+    assert_eq!(slots_to_key(3, 7, 24), 0);
+    assert_eq!(slots_to_key(3, 1, 24), 2 + KEY_AHEAD);
+    assert_eq!(slots_to_key(12, 7, 24), 5 + KEY_AHEAD);
+    assert_eq!(slots_to_key(12, 7, 6), 6);
+    assert_eq!(slots_to_key(12, 7, 0), 0);
 }

@@ -543,6 +543,11 @@ impl CardWallet {
             free = self.store.state.free_slots();
         }
         if free.len() < notes.len() {
+            // A split-keyed card on ops: key never-keyed slots while the card is here.
+            self.ops_make_room(notes.len()).await?;
+            free = self.store.state.free_slots();
+        }
+        if free.len() < notes.len() {
             return Err(plan::PlanError::NoFreeSlots { need: notes.len(), free: free.len() }.into());
         }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
@@ -1378,10 +1383,15 @@ impl CardWallet {
         let fee = self.fee_fn();
         let min_denom = self.wallet.min_denom();
 
+        // Room for change is the free keyed slots plus, on ops, the never-keyed slots this tap can
+        // key (split keying): the plan is made over both, and only the slots the change needs (and
+        // `KEY_AHEAD`) are keyed below. Unkeyed slots left over still count as room for the
+        // planner's `ROOM_AFTER_CHARGE`, since the tap of a later load keys them the same way.
         let attempt = |me: &Self| -> Result<(Vec<NoteRec>, Plan)> {
             let live: Vec<NoteRec> = me.store.state.live_notes().into_iter().cloned().collect();
             let amounts: Vec<u64> = live.iter().map(|n| n.amount_msat).collect();
-            let plan = plan::solve(&amounts, price_msat, me.store.state.free_slots().len(), &fee, min_denom)?;
+            let room = me.store.state.free_slots().len() + me.keyable_slots();
+            let plan = plan::solve(&amounts, price_msat, room, &fee, min_denom)?;
             Ok((live, plan))
         };
         // A card can hold several slots whose keys are spent but not yet renewed, and renewing
@@ -1409,6 +1419,8 @@ impl CardWallet {
         let inputs: Vec<NoteRec> = plan.inputs.iter().map(|&i| live[i].clone()).collect();
         let amounts: Vec<u64> = plan.till.iter().chain(&plan.change).copied().collect();
         self.require_tiers(&amounts)?;
+        // Before the intent: it names the change slots' keys, and ops refuses unkeyed ones.
+        self.ops_make_room(plan.change.len()).await?;
 
         let mut free = self.store.state.free_slots().into_iter();
         let n_till = plan.till.len();
