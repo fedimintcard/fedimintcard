@@ -219,6 +219,12 @@ export interface RecordRow extends CardOutcome {
    * The registry keeps them so a till can find the card's notes (OPS-PLAN § 5).
    */
   slotKeys?: readonly string[];
+  /**
+   * How many slots the card has, 8 or 32, as it answered at the tap. A 32-slot
+   * card's `slotKeys` are slots 0-7 only (split keying, `INSTALL_TAP_KEY_SLOTS`).
+   * Absent on a row from before 32 slots: its key count is its slot count.
+   */
+  slotCount?: number;
   /** The short id this card answered before a resume tap re-keyed it. */
   supersedes?: string;
 }
@@ -272,6 +278,8 @@ export interface CardResult extends CardOutcome {
   pubkey?: readonly number[];
   /** The slot keys, slot 0 first, from a finished key setup. */
   slotKeys?: readonly (readonly number[])[];
+  /** How many slots the card has, 8 or 32, from a finished key setup. */
+  slotCount?: number;
   /**
    * The short id the card answered before a resume tap re-keyed it; the
    * registry closes that row when this one is posted (OPS-PLAN O5).

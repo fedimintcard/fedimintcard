@@ -78,24 +78,25 @@ test('a blank card: installed on the factory keys, rotated to its own, keyed and
   expect(at(PUT_KEY)).toBeLessThan(at(0x10));
 });
 
-test('a blank card with the 32-slot applet: every slot keyed in the install tap, then the PIN', async () => {
+test('a blank card with the 32-slot applet: slots 0-7 keyed in the install tap, then the PIN; 8-31 left for a till', async () => {
   const card = new FakeGpCard({appletSlots: 32});
   const r = await installTap(card.transceive, options().opts);
   expect(r.installed).toEqual({ok: true});
   expect(r.setup).toEqual(
-    expect.objectContaining({ok: true, slotCount: 32, generated: Array.from({length: 32}, (_, i) => i)}),
+    expect.objectContaining({ok: true, slotCount: 32, generated: Array.from({length: 8}, (_, i) => i)}),
   );
-  expect(r.setup?.ok && r.setup.keys).toHaveLength(32);
-  expect(card.applet!.slots.every(s => s !== null)).toBe(true);
+  expect(r.setup?.ok && r.setup.keys).toHaveLength(8);
+  expect(card.applet!.slots.slice(0, 8).every(s => s !== null)).toBe(true);
+  expect(card.applet!.slots.slice(8).every(s => s === null)).toBe(true);
   expect(card.applet!.pin).toBe('482916');
-  // SET_PIN only after the last slot's key.
+  // SET_PIN only after slot 7's key.
   const b0 = card.log.filter(a => a[0] === 0xb0);
-  expect(b0.findIndex(a => a[1] === 0x41)).toBeGreaterThan(b0.findIndex(a => a[1] === 0x10 && a[2] === 31));
+  expect(b0.findIndex(a => a[1] === 0x41)).toBeGreaterThan(b0.findIndex(a => a[1] === 0x10 && a[2] === 7));
 });
 
-test('a 32-slot card whose PIN answer was lost: one VERIFY, all 32 keys read back', async () => {
-  const card = new FakeGpCard({keys: ownKeys(), appletSlots: 32}).withLiftedApplet(32, '135792');
-  const keys = card.applet!.slots.map(s => toHex(s!));
+test('a 32-slot card whose PIN answer was lost: one VERIFY, its 8 keys read back', async () => {
+  const card = new FakeGpCard({keys: ownKeys(), appletSlots: 32}).withLiftedApplet(8, '135792');
+  const keys = card.applet!.slots.slice(0, 8).map(s => toHex(s!));
   const r = await installTap(
     card.transceive,
     options({
@@ -260,8 +261,8 @@ test.each([8, 32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (
   const put = clean.ins().indexOf(PUT_KEY);
   const finish = clean.log.slice(put).filter(a => a[0] === 0xb0).length;
   // The slot-count probe (GET_PUB past slot 7, and past 31 on a 32-slot card),
-  // GET_PUB + GEN_KEY per slot, SET_PIN, VERIFY_PIN.
-  expect(finish).toBe((slots === 8 ? 1 : 2) + slots * 2 + 2);
+  // GET_PUB + GEN_KEY per slot the install tap keys (0-7), SET_PIN, VERIFY_PIN.
+  expect(finish).toBe((slots === 8 ? 1 : 2) + 8 * 2 + 2);
 
   for (let k = 0; k < finish; k++) {
     for (const when of ['before', 'after'] as const) {
@@ -305,8 +306,9 @@ test.each([8, 32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (
       } else if (pinBefore === null) {
         // No PIN: every slot made again, a fresh PIN, a new short id.
         expect([label, r.resumedFrom]).toEqual([label, oldId]);
-        expect(r.setup).toEqual(expect.objectContaining({generated: Array.from({length: slots}, (_, i) => i), slotCount: slots}));
-        expect(card.applet!.slots.every((s, i) => toHex(s!) !== oldSlots[i])).toBe(true);
+        expect(r.setup).toEqual(expect.objectContaining({generated: Array.from({length: 8}, (_, i) => i), slotCount: slots}));
+        expect(card.applet!.slots.slice(0, 8).every((s, i) => toHex(s!) !== oldSlots[i])).toBe(true);
+        expect(card.applet!.slots.slice(8).every(s => s === null)).toBe(true);
         expect(shortIdOfSlot0(card)).not.toBe(oldId);
         expect(card.applet!.pin).toBe('730194');
         expect(resumeCheck).toHaveBeenCalledWith(J3R180_CHIP, oldId);
@@ -315,7 +317,7 @@ test.each([8, 32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (
         expect([label, r.finishedWithAttemptedPin]).toEqual([label, true]);
         expect(r.resumedFrom).toBeUndefined();
         expect(r.setup).toEqual(expect.objectContaining({generated: [], slotCount: slots}));
-        expect(card.applet!.slots.map(s => toHex(s!))).toEqual(oldSlots);
+        expect(card.applet!.slots.map(s => (s ? toHex(s) : null))).toEqual(oldSlots);
         expect(card.applet!.pin).toBe(PIN);
         expect(pinTries(card, from)).toBe(1);
       }

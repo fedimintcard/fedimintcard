@@ -29,18 +29,15 @@ export const SLOT_COUNTS = [8, 32] as const;
 
 /**
  * The install-tap seam: how many slots, from 0, `finishCard` keys in the tap.
- * Today every slot (32 is the most any card has), so a finished card has its
- * whole key set before SET_PIN, which `finishVerified` and the resume rely on.
- *
- * If the 32-slot install tap is too slow on a phone (~125 ms a GEN_KEY), set
- * this to 8: the tap keys slots 0-7, the card is usable at once, and slots
- * 8-31 stay empty for a later tap to generate with GEN_KEY P2 = 00, which the
- * applet allows on an empty slot with or without a PIN. That later step is not
- * written yet: the registry would need to take a 32-slot card's first 8 keys
- * and the rest afterwards (today it records a card's count from how many keys
- * it is sent), and a till or holder load would key a slot before using it.
+ * Split keying: a slot's first GEN_KEY takes ~318 ms on a J3R180
+ * (docs/CAP-BUILD.md), so all 32 would hold the tap for ~10 s. The tap keys
+ * slots 0-7, which is every slot of an 8-slot card, and a 32-slot card is
+ * registered with `slot_count: 32` and those 8 keys. Slots 8-31 stay empty
+ * until a till generates them at a later tap (GEN_KEY P2 = 00, which the
+ * applet allows on an empty slot with or without a PIN) and posts them to the
+ * registry (`POST /cards/:id/slot-keys`).
  */
-export const INSTALL_TAP_KEY_SLOTS = 32;
+export const INSTALL_TAP_KEY_SLOTS = 8;
 
 const CLA = 0xb0;
 export const INS_GEN_KEY = 0x10;
@@ -91,8 +88,9 @@ export type SetupResult =
   | {
       readonly ok: true;
       /**
-       * The x-only public keys, slot 0 first: one per slot, or the first
-       * `INSTALL_TAP_KEY_SLOTS` of them when that is fewer.
+       * The x-only public keys, slot 0 first: the first
+       * `INSTALL_TAP_KEY_SLOTS` slots (all of an 8-slot card's, 0-7 of a
+       * 32-slot card's).
        */
       readonly keys: readonly (readonly number[])[];
       /** How many slots the card has, as it answered `probeSlotCount`. */

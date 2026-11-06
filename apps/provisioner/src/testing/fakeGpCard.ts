@@ -149,8 +149,12 @@ export class FakeGpCard {
     return this;
   }
 
-  /** The Fedimint applet as a finished card has it: every slot keyed and a PIN. */
-  withFinishedApplet(pin = '2468'): this {
+  /**
+   * The Fedimint applet as a finished card has it: a PIN, and the slots the
+   * install tap keys (0-7: every slot of an 8-slot card, the first 8 of a
+   * 32-slot one), or `keyed` of them.
+   */
+  withFinishedApplet(pin = '2468', keyed = Math.min(this.appletSlots, 8)): this {
     this.packages.add(PKG);
     this.instances.set(OPENER, {pkg: PKG, module: OPENER});
     const applet: AppletState = {
@@ -161,7 +165,7 @@ export class FakeGpCard {
       verified: false,
     };
     for (let slot = 0; slot < this.appletSlots; slot++) {
-      applet.slots.push(this.newKey(slot));
+      applet.slots.push(slot < keyed ? this.newKey(slot) : null);
     }
     this.instances.set(CARD, {pkg: PKG, module: CARD, applet});
     return this;

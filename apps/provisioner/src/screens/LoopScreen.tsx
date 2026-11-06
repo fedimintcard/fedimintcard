@@ -332,6 +332,7 @@ export function LoopScreen({
         notesIssued: [],
         pubkey,
         slotKeys: setup.keys,
+        slotCount: setup.slotCount,
         chip,
         supersedes:
           run.resumedFrom !== undefined && run.resumedFrom !== id ? run.resumedFrom : undefined,

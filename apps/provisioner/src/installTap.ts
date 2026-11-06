@@ -5,14 +5,15 @@
  * its keys across taps.
  *
  *   probe → CPLC → keys from ops → install (factory or own keys) → rotate →
- *   GET_PUB past the last slot (the card's count, 8 or 32) → GEN_KEY ×count,
- *   SET_PIN, VERIFY_PIN
+ *   GET_PUB past the last slot (the card's count, 8 or 32) → GEN_KEY on slots
+ *   0-7 (every slot of an 8-slot card; a till keys a 32-slot card's 8-31
+ *   later, split keying) → SET_PIN, VERIFY_PIN
  *
  * A card the probe finds keyed is never installed over. If it is ours with
  * no PIN (a tap lifted during GEN_KEY, SET_PIN or VERIFY_PIN), it is resumed:
  *
  *   probe (slot 0, PIN state) → CPLC → keys from ops → ops' resume check →
- *   one INITIALIZE UPDATE proving the card's own keys → GEN_KEY P2=01 ×count,
+ *   one INITIALIZE UPDATE proving the card's own keys → GEN_KEY P2=01 on 0-7,
  *   SET_PIN, VERIFY_PIN
  *
  * **Card-manager keys.** Ops answers the card's own ENC/MAC/DEK set, escrowed

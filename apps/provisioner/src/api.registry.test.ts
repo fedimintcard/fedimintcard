@@ -85,9 +85,25 @@ test('a finished card carries its slot keys, 8 or 32; sign-out revokes the token
     id: '00000002', at: 4, phase: 'done', ok: true, pinPolicy: 'perCard',
     pinState: 'set', notesIssued: [], pending: false, slotKeys: keys32.slice(0, 9),
   } as any);
+  // Split keying: a 32-slot card from the install tap sends its 8 keys and slot_count 32.
+  await api.postCard({
+    id: '00000003', at: 5, phase: 'done', ok: true, pinPolicy: 'perCard',
+    pinState: 'set', notesIssued: [], pending: false, slotKeys: keys32.slice(0, 8), slotCount: 32,
+  } as any);
+  // An 8-slot card's body is what it always was: 8 keys, no slot_count.
+  await api.postCard({
+    id: '00000004', at: 6, phase: 'done', ok: true, pinPolicy: 'perCard',
+    pinState: 'set', notesIssued: [], pending: false, slotKeys: keys, slotCount: 8,
+  } as any);
   const more = seen.filter(s => s.path === '/registry/cards');
   expect(more[2]!.body.slot_pubkeys).toEqual(keys32);
+  expect(more[2]!.body.slot_count).toBe(32);
   expect('slot_pubkeys' in more[3]!.body).toBe(false);
+  expect(more[4]!.body.slot_pubkeys).toEqual(keys32.slice(0, 8));
+  expect(more[4]!.body.slot_count).toBe(32);
+  expect(more[5]!.body.slot_pubkeys).toEqual(keys);
+  expect('slot_count' in more[5]!.body).toBe(false);
+  expect(Object.keys(more[5]!.body).sort()).toEqual(Object.keys(cards[0]!.body).sort());
 
   await api.signOut();
   const out = seen.find(s => s.path === '/auth/operator/signout');

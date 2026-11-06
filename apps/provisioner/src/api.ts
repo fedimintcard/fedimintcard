@@ -297,11 +297,18 @@ export interface CardRegistryRow {
   /** Notes issued onto the card, satoshi. Zero is a keyed, PIN'd, empty card. */
   readonly notes_issued: number;
   /**
-   * The slot keys, 8 or 32, x-only hex, slot 0 first (OPS-PLAN § 5): the public
-   * half only, which a till needs to find the card's notes. Absent on a row
-   * whose key setup did not finish.
+   * The slot keys, x-only hex, slot 0 first (OPS-PLAN § 5): the public half
+   * only, which a till needs to find the card's notes. All 8 of an 8-slot
+   * card's; slots 0-7 of a 32-slot card's, the rest keyed later by a till.
+   * Absent on a row whose key setup did not finish.
    */
   readonly slot_pubkeys?: readonly string[];
+  /**
+   * 32 for a 32-slot card, whose `slot_pubkeys` cover only a prefix of its
+   * slots. Absent for an 8-slot card, whose body stays what it always was:
+   * the registry reads 8 keys and no count as 8 slots.
+   */
+  readonly slot_count?: 32;
   /**
    * The chip's CPLC id (cardkit `readChipIdentity`), which ops keys the card's
    * manager keys on. Absent on a row from before O5.
@@ -954,9 +961,7 @@ export class RegistryStoreApi implements CardOps, TillOps {
       pin_policy: row.pinPolicy,
       // the loop records each note it wrote; the registry stores the total
       notes_issued: row.notesIssued.reduce((sum, n) => sum + n, 0),
-      ...(row.slotKeys && (SLOT_COUNTS as readonly number[]).includes(row.slotKeys.length)
-        ? {slot_pubkeys: [...row.slotKeys]}
-        : {}),
+      ...slotFields(row.slotKeys, row.slotCount),
       ...(row.chip ? {chip: row.chip} : {}),
       ...(row.supersedes && row.supersedes !== row.id ? {supersedes: row.supersedes} : {}),
     };
@@ -994,4 +999,28 @@ export const REGISTRY_ORIGINS: Readonly<Record<string, string>> = Object.freeze(
 export function registryOrigin(endpoint: string): string | null {
   const origin = REGISTRY_ORIGINS[endpoint];
   return typeof origin === 'string' && origin !== '' ? origin : null;
+}
+
+/**
+ * A row's keys as the registry takes them, or nothing for keys it would
+ * refuse. An 8-slot card sends its 8 keys as it always did; a 32-slot card
+ * sends `slot_count: 32` and keys for slots 0 to k-1, 8 <= k <= 32 (split
+ * keying: the install tap keys 0-7). A row from before `slotCount` was kept
+ * counts its keys.
+ */
+export function slotFields(
+  keys: readonly string[] | undefined,
+  slotCount: number | undefined,
+): {slot_pubkeys?: string[]; slot_count?: 32} {
+  if (!keys) {
+    return {};
+  }
+  const count = slotCount ?? keys.length;
+  if (!(SLOT_COUNTS as readonly number[]).includes(count)) {
+    return {};
+  }
+  if (count === 8) {
+    return keys.length === 8 ? {slot_pubkeys: [...keys]} : {};
+  }
+  return keys.length >= 8 && keys.length <= count ? {slot_pubkeys: [...keys], slot_count: 32} : {};
 }
