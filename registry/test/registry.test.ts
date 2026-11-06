@@ -921,7 +921,9 @@ describe('O4: holder loading', () => {
     const res = await get(`/cards/${shortId}/slots`, null);
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(Object.keys(body).sort()).toEqual(['federation_id', 'free', 'ok', 'version']);
+    expect(Object.keys(body).sort()).toEqual(['federation_id', 'free', 'ok', 'slot_count', 'unkeyed_slots', 'version']);
+    expect(body.slot_count).toBe(8);
+    expect(body.unkeyed_slots).toEqual([]);
     expect(body.federation_id).toBe(FED);
     expect((body.free as {slot: number}[]).map(f => f.slot)).toEqual([0, 1, 3, 4, 5, 6, 7]);
     expect(JSON.stringify(body)).not.toMatch(/amount|signature|notes|2048000/);
@@ -1805,6 +1807,183 @@ describe('32-slot cards', () => {
     const res = await post('/cards/8a8b8c90/load', null, nine);
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('1 to 8 notes');
+  });
+});
+
+describe('split keying: a 32-slot card registered with keys for slots 0-7', () => {
+  const BK = 'e'.repeat(64);
+  const SHORT = '4a4b4c4d';
+  const all = slots(SHORT, 32);
+  const keyNonce = (n: number) => '02' + all[n]!;
+  type SlotsBody = {version: number; slot_count: number; free: {slot: number}[]; unkeyed_slots: number[]};
+  type KeyAnswer = {ok: boolean; version: number; added: number[]; replayed: boolean; unkeyed_slots: number[]};
+
+  async function split(over: Partial<Record<string, unknown>> = {}) {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    const body = card({short_id: SHORT, batch_id: batchId, slot_count: 32, slot_pubkeys: all.slice(0, 8), ...over});
+    const res = await post('/registry/cards', token, body);
+    expect(res.status).toBe(200);
+    return {token, till, batchId, body, stored: ((await res.json()) as {stored: {slot_count: number; slot_pubkeys: string[]}}).stored};
+  }
+  const range = (a: number, b: number) => Array.from({length: b - a}, (_, i) => a + i);
+
+  it('registers slot_count 32 with 8 keys; state and /slots show 8-31 unkeyed and not free', async () => {
+    const {till, token, batchId, body, stored} = await split();
+    expect(stored.slot_count).toBe(32);
+    expect(stored.slot_pubkeys).toHaveLength(8);
+    const s = (await state(till.token, SHORT)) as unknown as {slot_count: number; slots: {slot: number}[]; unkeyed_slots: number[]};
+    expect(s.slot_count).toBe(32);
+    expect(s.slots.map(x => x.slot)).toEqual(range(0, 8));
+    expect(s.unkeyed_slots).toEqual(range(8, 32));
+    const free = (await (await get(`/cards/${SHORT}/slots`, null)).json()) as SlotsBody;
+    expect(free.slot_count).toBe(32);
+    expect(free.free.map(f => f.slot)).toEqual(range(0, 8));
+    expect(free.unkeyed_slots).toEqual(range(8, 32));
+    // The outbox's re-post replays; the same keys as an 8-slot card are a different card.
+    expect((await post('/registry/cards', token, body)).status).toBe(200);
+    expect((await post('/registry/cards', token, {...body, slot_count: 8})).status).toBe(409);
+    expect((await post('/registry/cards', token, card({short_id: SHORT, batch_id: batchId, slot_pubkeys: all.slice(0, 8)}))).status).toBe(409);
+  });
+
+  it('takes slot_count with a prefix of 8 to 32 keys; refuses fewer than 8, more than the count, and a bad count', async () => {
+    const token = await signIn();
+    const batchId = await newBatch(token);
+    const id = '6a6b6c6d';
+    const k = slots(id, 32);
+    const row = (over: Record<string, unknown>) => post('/registry/cards', token, card({short_id: id, batch_id: batchId, ...over}));
+    for (const [count, n] of [[32, 7], [32, 33], [8, 7], [8, 9], [8, 32], [16, 16], ['32', 8]] as const) {
+      const res = await row({slot_count: count, slot_pubkeys: slots(id, n)});
+      expect(res.status, `${count}/${n}`).toBe(400);
+    }
+    // Explicit 8 with 8 keys is what an old client's 8 keys record.
+    expect(((await (await row({slot_count: 8, slot_pubkeys: k.slice(0, 8)})).json()) as {stored: {slot_count: number}}).stored.slot_count).toBe(8);
+    const id2 = '7a7b7c7d';
+    const res = await post('/registry/cards', token, card({short_id: id2, batch_id: batchId, slot_count: 32, slot_pubkeys: slots(id2, 12)}));
+    expect(((await res.json()) as {stored: {slot_count: number}}).stored.slot_count).toBe(32);
+    const s = (await state(token, id2)) as unknown as {unkeyed_slots: number[]};
+    expect(s.unkeyed_slots).toEqual(range(12, 32));
+    // A key named twice is refused.
+    const dup = slots('8a7b7c7d', 8);
+    dup[3] = dup[2]!;
+    expect((await post('/registry/cards', token, card({short_id: '8a7b7c7d', batch_id: batchId, slot_pubkeys: dup}))).status).toBe(400);
+  });
+
+  it('a till keys one slot; the same key again replays; another key is 409; version bumps once', async () => {
+    const {till} = await split();
+    const r1 = await post(`/cards/${SHORT}/slots/8/key`, till.token, {pubkey: all[8]});
+    expect(r1.status).toBe(200);
+    expect(await r1.json()).toEqual({ok: true, version: 1, added: [8], replayed: false, unkeyed_slots: range(9, 32)});
+    const again = await post(`/cards/${SHORT}/slots/8/key`, till.token, {pubkey: all[8]});
+    expect(await again.json()).toEqual({ok: true, version: 1, added: [], replayed: true, unkeyed_slots: range(9, 32)});
+    const other = await post(`/cards/${SHORT}/slots/8/key`, till.token, {pubkey: key(99)});
+    expect(other.status).toBe(409);
+    expect(await other.text()).toContain('renewal');
+    // A provisioned slot is keyed already: also 409.
+    expect((await post(`/cards/${SHORT}/slots/3/key`, till.token, {pubkey: key(98)})).status).toBe(409);
+    const free = (await (await get(`/cards/${SHORT}/slots`, null)).json()) as SlotsBody;
+    expect(free.version).toBe(1);
+    expect(free.free.map(f => f.slot)).toEqual(range(0, 9));
+  });
+
+  it('keys several slots in one call, all or nothing', async () => {
+    const {till} = await split();
+    const batch = range(8, 12).map(slot => ({slot, pubkey: all[slot]}));
+    const ok = (await (await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: batch})).json()) as KeyAnswer;
+    expect(ok).toEqual({ok: true, version: 1, added: [8, 9, 10, 11], replayed: false, unkeyed_slots: range(12, 32)});
+    // One bad entry (slot 8 with another key) refuses the whole call: 12 stays unkeyed.
+    const mixed = await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [{slot: 12, pubkey: all[12]}, {slot: 8, pubkey: key(97)}]});
+    expect(mixed.status).toBe(409);
+    expect(((await state(till.token, SHORT)) as unknown as {unkeyed_slots: number[]}).unkeyed_slots).toEqual(range(12, 32));
+    // A replayed prefix with one new slot adds just the new one.
+    const more = (await (await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [{slot: 11, pubkey: all[11]}, {slot: 12, pubkey: all[12]}]})).json()) as KeyAnswer;
+    expect(more).toMatchObject({version: 2, added: [12], replayed: false});
+    // The rest, 13-31, in one call.
+    const rest = (await (await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: range(13, 32).map(slot => ({slot, pubkey: all[slot]}))})).json()) as KeyAnswer;
+    expect(rest).toMatchObject({version: 3, unkeyed_slots: []});
+    expect((await state(till.token, SHORT)).slots.map(s => s.pubkey)).toEqual(all);
+  });
+
+  it('validates: slot in range, pubkey format, no duplicates, no key already on the card', async () => {
+    const {till} = await split();
+    expect((await post(`/cards/${SHORT}/slots/32/key`, till.token, {pubkey: all[31]})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: 'AB'.repeat(32)})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: '02' + all[9]})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: []})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [{slot: 9, pubkey: all[9]}, {slot: 9, pubkey: all[10]}]})).status).toBe(400);
+    expect((await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [{slot: 9, pubkey: all[9]}, {slot: 10, pubkey: all[9]}]})).status).toBe(400);
+    const taken = await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: all[2]});
+    expect(taken.status).toBe(409);
+    expect(await taken.text()).toContain('another slot');
+    // Nothing above changed the card.
+    expect((await state(till.token, SHORT)).version).toBe(0);
+  });
+
+  it('an 8-slot card has nothing to key: slot 8 is out of range, slot 0-7 are keyed', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    await post('/registry/cards', token, card({short_id: '9a9b9c9d', batch_id: batchId}));
+    const s = (await state(till.token, '9a9b9c9d')) as unknown as {slot_count: number; unkeyed_slots: number[]};
+    expect(s).toMatchObject({slot_count: 8, unkeyed_slots: []});
+    const res = await post('/cards/9a9b9c9d/slots/8/key', till.token, {pubkey: key(96)});
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('0 to 7');
+    expect((await post('/cards/9a9b9c9d/slots/7/key', till.token, {pubkey: key(96)})).status).toBe(409);
+  });
+
+  it('auth: a till or an operator of the card; no token 401, another operator’s till 404', async () => {
+    const {token} = await split();
+    expect((await post(`/cards/${SHORT}/slots/8/key`, null, {pubkey: all[8]})).status).toBe(401);
+    await hook('/test/operator', {name: 'other', password: PASSWORD});
+    const otherOp = await signIn('other');
+    const otherTill = await newTill(otherOp, 'elsewhere');
+    expect((await post(`/cards/${SHORT}/slots/8/key`, otherTill.token, {pubkey: all[8]})).status).toBe(404);
+    expect((await post(`/cards/${SHORT}/slots/8/key`, otherOp, {pubkey: all[8]})).status).toBe(404);
+    const byOperator = (await (await post(`/cards/${SHORT}/slots/8/key`, token, {pubkey: all[8]})).json()) as KeyAnswer;
+    expect(byOperator).toMatchObject({version: 1, added: [8]});
+    // An operator still cannot charge or renew.
+    expect((await call('PUT', `/cards/${SHORT}/slots/8`, token, {version: 1, old_pubkey: all[8], pubkey: key(95)})).status).toBe(403);
+  });
+
+  it('refuses a card with no PIN (409), as every till write does', async () => {
+    const {till} = await split({pin_set: false});
+    expect((await post(`/cards/${SHORT}/slots/8/key`, till.token, {pubkey: all[8]})).status).toBe(409);
+  });
+
+  it('no load or change into an unkeyed slot until it is keyed; then both work', async () => {
+    const {till} = await split();
+    const holderLoad = (slot: number, version: number, t = txid(40)) => ({
+      version,
+      txid: t,
+      notes: [{slot, amount_msat: 1_000, nonce: keyNonce(slot), blinding_key: BK, out_idx: 0}],
+    });
+    const refused = await post(`/cards/${SHORT}/load`, null, holderLoad(20, 0));
+    expect(refused.status).toBe(409);
+    expect(await refused.text()).toContain('no key in slot 20');
+    await hook('/test/note', {short_id: SHORT, nonce: keyNonce(0), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+    const change = (version: number, t = txid(41)) =>
+      intent(version, {txid: t, inputs: [keyNonce(0)], change: [{slot: 21, amount_msat: 24_000, nonce: keyNonce(21), blinding_key: BK, out_idx: 1}]});
+    const noChange = await post(`/cards/${SHORT}/intent`, till.token, change(0));
+    expect(noChange.status).toBe(409);
+    expect(await noChange.text()).toContain('no key in slot 21');
+
+    const keyed = (await (await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [{slot: 20, pubkey: all[20]}, {slot: 21, pubkey: all[21]}]})).json()) as KeyAnswer;
+    expect(keyed.version).toBe(1);
+    expect((await post(`/cards/${SHORT}/intent`, till.token, change(1))).status).toBe(200);
+    expect((await post(`/cards/${SHORT}/load`, null, holderLoad(20, 2))).status).toBe(200);
+    // Renewing a never-keyed slot is not the way to key it.
+    const renew = await call('PUT', `/cards/${SHORT}/slots/30`, till.token, {version: 3, old_pubkey: all[30], pubkey: key(94)});
+    expect(renew.status).toBe(404);
+    expect(await renew.text()).toContain('/slots/30/key');
+  });
+
+  it('refuses a key a note was once recorded under', async () => {
+    const {till} = await split();
+    await hook('/test/note', {short_id: SHORT, nonce: keyNonce(9), slot: 9, amount_msat: 1_000, signature: 'c'.repeat(96)});
+    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: all[9]})).status).toBe(409);
   });
 });
 

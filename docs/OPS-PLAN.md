@@ -96,7 +96,8 @@ operator sign-in, one SQLite Durable Object and an idempotent `/registry/cards`.
 
 **New tables**
 
-- `card_slots(short_id, slot, pubkey)`, written once at provisioning.
+- `card_slots(short_id, slot, pubkey)`, written at provisioning. A 32-slot card may be registered
+  with keys for slots 0–7 only; a till adds the rest at a later tap (split keying, below).
 - `notes(short_id, slot, amount_msat, nonce, signature, blinding_key, status, txid, out_idx)`,
   with `status` live, pending, spent or dead, as in `state.rs`.
 - `card_txs(short_id, txid, client_ref, tx_hex, inputs, change, status, till_id, ts)`.
@@ -107,8 +108,11 @@ operator sign-in, one SQLite Durable Object and an idempotent `/registry/cards`.
 
 | Route | Who | Does |
 |---|---|---|
-| `POST /registry/cards` (extended) | operator | adds `slot_pubkeys[8]`; identical body 200, changed 409, as now |
-| `GET /cards/:short_id/state` | till | slots, live and pending notes, open txs, `version` |
+| `POST /registry/cards` (extended) | operator | adds `slot_pubkeys` and `slot_count` (8 or 32): 8 keys for an 8-slot card, 8 to 32 keys (slots 0 to k−1) for a 32-slot one; with no `slot_count`, 8 keys mean 8 slots and 32 keys 32; identical body 200, changed 409, as now |
+| `GET /cards/:short_id/state` | till or operator | `slot_count`, keyed `slots`, `unkeyed_slots`, live and pending notes, open txs, `version` |
+| `POST /cards/:short_id/slots/:n/key` `{pubkey}` | till or operator | the first key of a slot that never had one (split keying); same key again replays, another key 409 (that is a renewal, `PUT /slots/:n`); bumps `version`, answers `{version, added, replayed, unkeyed_slots}` |
+| `POST /cards/:short_id/slot-keys` `{keys: [{slot, pubkey}]}` | till or operator | the same for up to 32 slots, all or nothing |
+| `PUT /cards/:short_id/slots/:n` | till | a renewed key for a spent slot: `{version, old_pubkey, pubkey}` |
 | `POST /cards/:short_id/intent` | till | records a charge before the card signs: tx hash, inputs, change outputs with blinding keys, `client_ref`; requires the `version` it read, else 409 |
 | `POST /cards/:short_id/outcome` | till | accepted or rejected, the change notes' signatures; marks inputs spent; bumps `version` |
 | `POST /tills`, `DELETE /tills/:id` | operator | issues and revokes a till token |
@@ -157,7 +161,7 @@ new notes against the card. In this shape that record goes to ops:
 
 | Route | Who | Does |
 |---|---|---|
-| `GET /cards/:short_id/slots` | holder wallet | the free slot keys to load into, and `version` |
+| `GET /cards/:short_id/slots` | holder wallet | the free slot keys to load into, `version`, `slot_count` and `unkeyed_slots` (a holder cannot key those; a till does at a tap) |
 | `POST /cards/:short_id/load` | holder wallet | the pending notes with their blinding keys, before submitting; version-checked |
 | `POST /cards/:short_id/load/outcome` | holder wallet | the federation's signatures; the notes become live |
 

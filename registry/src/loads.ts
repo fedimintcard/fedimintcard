@@ -24,7 +24,7 @@
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, requireVersion, slotCount, versionOf} from './cards';
+import {bump, requireVersion, slotCount, unkeyedSlots, versionOf} from './cards';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
 import {cardFederation, checkNotes, isTier, mintKeysFor} from './mint';
@@ -115,18 +115,27 @@ function spendIn(sql: Sql, shortId: string, now: number): void {
 /**
  * `GET /cards/:short_id/slots`: the slots a wallet may load into. Only slots whose current key
  * never carried a note (so none pending either). No balances and no notes: anyone with the short
- * id may ask.
+ * id may ask. `unkeyed_slots` are slots the card has but no key is on record for yet (a 32-slot
+ * card registered with 8 keys): nothing can be loaded into them until a till keys them at a tap.
  */
 export function freeSlots(sql: Sql, shortId: string) {
   const fed = cardFederation(sql, shortId);
   if (!fed) {
     throw new NotFound(`no card ${shortId}`);
   }
-  const free = [...currentKeys(sql, shortId)]
+  const keys = currentKeys(sql, shortId);
+  const count = slotCount(sql, shortId);
+  const free = [...keys]
     .filter(([, pubkey]) => !keyUsed(sql, shortId, '02' + pubkey))
     .sort(([a], [b]) => a - b)
     .map(([slot, pubkey]) => ({slot, pubkey}));
-  return {version: versionOf(sql, shortId), federation_id: fed.federation_id, free};
+  return {
+    version: versionOf(sql, shortId),
+    federation_id: fed.federation_id,
+    slot_count: count,
+    free,
+    unkeyed_slots: unkeyedSlots(count, keys.keys()),
+  };
 }
 
 function parseLoad(r: Record<string, unknown>, slots: number): {txid: string; notes: LoadNote[]} {
@@ -194,7 +203,7 @@ export function recordLoad(
     for (const n of load.notes) {
       const pubkey = slots.get(n.slot);
       if (pubkey === undefined) {
-        throw new Conflict(`card ${shortId} has no key in slot ${n.slot}`);
+        throw new Conflict(`card ${shortId} has no key in slot ${n.slot} yet; a till keys it at a tap`);
       }
       if (n.nonce !== '02' + pubkey) {
         throw new Conflict(`the note for slot ${n.slot} is not under the card's key for that slot`);

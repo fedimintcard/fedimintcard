@@ -35,6 +35,12 @@ import {checkNotes, putMintKeys} from './mint';
  * from how many keys it sent.
  */
 export const SLOT_COUNTS = [8, 32] as const;
+/**
+ * The fewest keys a registration carries: slots 0-7, which the install tap
+ * always generates. A 32-slot card may arrive with only these; a till keys
+ * the rest later, at a tap, through `addSlotKeys`.
+ */
+export const MIN_REGISTERED_KEYS = 8;
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
 const MAX_TX_HEX = 64 * 1024;
 
@@ -147,7 +153,11 @@ export interface CardBody {
   readonly notes_issued: number;
   /** The slot keys as provisioned, 8 or 32; empty for a row from before O2. */
   readonly slot_pubkeys: readonly string[];
-  /** How many slots the card has: the keys' count, or 8 for a row without keys. */
+  /**
+   * How many slots the card has, 8 or 32: the body's `slot_count`, else the keys' count,
+   * else 8 for a row without keys. A 32-slot card may be registered with keys for a prefix
+   * of its slots only (at least 8); the rest are keyed later (`addSlotKeys`).
+   */
   readonly slot_count: number;
   /**
    * The chip's CPLC id (`managerKeys.ts`), which keys its card-manager set;
@@ -170,8 +180,12 @@ export interface StoredCard extends CardBody {
 /**
  * The card body, or why it is not one. Unknown keys are ignored, so a newer
  * app does not break an older server. `slot_pubkeys` is optional for rows an
- * older app queued before it sent them; when present it must be all 8 or all
- * 32 x-only keys (the card's slot count), and slot 0's last 4 bytes must be the short id.
+ * older app queued before it sent them; slot 0's last 4 bytes must be the short id.
+ *
+ * `slot_count` (8 or 32) is optional for older apps. Without it the keys must
+ * be all 8 or all 32, and their count is the slot count. With it, an 8-slot
+ * card sends exactly 8 keys and a 32-slot card sends keys for slots 0 to k-1,
+ * 8 <= k <= 32: the install tap keys 0-7 and a till keys the rest.
  */
 export function parseCard(r: Record<string, unknown>): CardBody {
   if (!isShortId(r.short_id)) {
@@ -195,15 +209,31 @@ export function parseCard(r: Record<string, unknown>): CardBody {
   if (!isCount(r.notes_issued)) {
     throw new BadRequest('notes_issued must be a non-negative integer');
   }
+  const declared = r.slot_count;
+  if (declared !== undefined && !(SLOT_COUNTS as readonly unknown[]).includes(declared)) {
+    throw new BadRequest('slot_count must be 8 or 32');
+  }
   let slots: string[] = [];
   if (r.slot_pubkeys !== undefined) {
     const keys = r.slot_pubkeys;
-    if (
-      !Array.isArray(keys) ||
-      !(SLOT_COUNTS as readonly number[]).includes(keys.length) ||
-      !keys.every(k => isHex(k, 32))
+    if (!Array.isArray(keys) || !keys.every(k => isHex(k, 32))) {
+      throw new BadRequest('slot_pubkeys must be x-only keys, 64 lower-case hex each');
+    }
+    if (declared === undefined) {
+      if (!(SLOT_COUNTS as readonly number[]).includes(keys.length)) {
+        throw new BadRequest('slot_pubkeys must be 8 or 32 keys, or name slot_count');
+      }
+    } else if (
+      keys.length < MIN_REGISTERED_KEYS ||
+      keys.length > (declared as number) ||
+      (declared === 8 && keys.length !== 8)
     ) {
-      throw new BadRequest('slot_pubkeys must be 8 or 32 x-only keys, 64 lower-case hex each');
+      throw new BadRequest(
+        `a ${declared as number}-slot card sends ${declared === 8 ? 'exactly 8' : `8 to ${declared as number}`} slot_pubkeys`,
+      );
+    }
+    if (new Set(keys).size !== keys.length) {
+      throw new BadRequest('slot_pubkeys name a key twice');
     }
     if ((keys[0] as string).slice(-8) !== r.short_id) {
       throw new BadRequest('short_id must be the last 4 bytes of slot 0’s key');
@@ -222,7 +252,7 @@ export function parseCard(r: Record<string, unknown>): CardBody {
     pin_policy: r.pin_policy,
     notes_issued: r.notes_issued,
     slot_pubkeys: slots,
-    slot_count: slots.length > 0 ? slots.length : 8,
+    slot_count: declared !== undefined ? (declared as number) : slots.length > 0 ? slots.length : 8,
     chip: r.chip === undefined ? null : r.chip,
   };
 }
@@ -265,6 +295,7 @@ export function sameCard(a: CardBody, b: CardBody): boolean {
     a.pin_set === b.pin_set &&
     a.pin_policy === b.pin_policy &&
     a.notes_issued === b.notes_issued &&
+    a.slot_count === b.slot_count &&
     a.slot_pubkeys.length === b.slot_pubkeys.length &&
     a.slot_pubkeys.every((k, i) => k === b.slot_pubkeys[i])
   );
@@ -415,6 +446,16 @@ export function slotCount(sql: Sql, shortId: string): number {
   return row ? Number(row.slot_count) : 8;
 }
 
+/**
+ * The slots below `count` with no key on record, ascending: a 32-slot card
+ * registered with 8 keys has 8-31 here until a till keys them. Nothing may be
+ * loaded into one; a till may key it (`addSlotKeys`).
+ */
+export function unkeyedSlots(count: number, keyed: Iterable<number>): number[] {
+  const have = new Set(keyed);
+  return Array.from({length: count}, (_, i) => i).filter(i => !have.has(i));
+}
+
 export function cardState(sql: Sql, shortId: string) {
   const slots = sql
     .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ? ORDER BY slot', shortId)
@@ -463,11 +504,13 @@ export function cardState(sql: Sql, shortId: string) {
       created_at: Number(r.created_at),
       ...(JSON.parse(String(r.body)) as {tx_hex: string | null; inputs: string[]; change: ChangeOut[]}),
     }));
+  const count = slotCount(sql, shortId);
   return {
     short_id: shortId,
     version: versionOf(sql, shortId),
-    slot_count: slotCount(sql, shortId),
+    slot_count: count,
     slots,
+    unkeyed_slots: unkeyedSlots(count, slots.map(s => s.slot)),
     notes,
     open_txs: open,
   };
@@ -606,7 +649,7 @@ export function recordIntent(
     );
     for (const c of intent.body.change) {
       if (!slots.has(c.slot)) {
-        throw new Conflict(`card ${shortId} has no key in slot ${c.slot}`);
+        throw new Conflict(`card ${shortId} has no key in slot ${c.slot} yet; key it first (POST /slots/${c.slot}/key)`);
       }
       const held = sql
         .exec(
@@ -882,7 +925,7 @@ export function renewSlot(
       .exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot = ?', shortId, slot)
       .toArray()[0] as {pubkey: string} | undefined;
     if (!row) {
-      throw new NotFound(`card ${shortId} has no slot ${slot} on record`);
+      throw new NotFound(`card ${shortId} has no key in slot ${slot} on record; a first key is POST /slots/${slot}/key`);
     }
     if (row.pubkey !== r.old_pubkey) {
       throw new Conflict(`slot ${slot} of card ${shortId} does not hold that key`);
@@ -904,5 +947,114 @@ export function renewSlot(
       slot,
     );
     return {version: bump(sql, shortId)};
+  });
+}
+
+/** Most keys one `addSlotKeys` call takes: every slot of the largest card. */
+const MAX_KEYS_PER_CALL = 32;
+
+/**
+ * The body of the slot-keying routes, as `{slot, pubkey}` pairs. The single
+ * form (`POST /slots/:n/key`) is `{pubkey}` with the slot from the path; the
+ * batch form (`POST /slot-keys`) is `{keys: [{slot, pubkey}, ...]}`.
+ */
+export function parseSlotKeys(r: Record<string, unknown>, pathSlot?: number): {slot: number; pubkey: string}[] {
+  const raw: unknown[] =
+    pathSlot !== undefined
+      ? [{slot: pathSlot, pubkey: r.pubkey}]
+      : Array.isArray(r.keys)
+        ? r.keys
+        : [];
+  if (raw.length === 0 || raw.length > MAX_KEYS_PER_CALL) {
+    throw new BadRequest(
+      pathSlot !== undefined ? 'expected {pubkey}' : `keys must list 1 to ${MAX_KEYS_PER_CALL} {slot, pubkey}`,
+    );
+  }
+  const keys = raw.map(k => {
+    const o = k as Record<string, unknown>;
+    if (typeof o !== 'object' || o === null || !Number.isSafeInteger(o.slot) || !isHex(o.pubkey, 32)) {
+      throw new BadRequest('each key needs slot and pubkey, an x-only key, 64 lower-case hex');
+    }
+    return {slot: o.slot as number, pubkey: o.pubkey};
+  });
+  if (new Set(keys.map(k => k.slot)).size !== keys.length) {
+    throw new BadRequest('keys name a slot twice');
+  }
+  if (new Set(keys.map(k => k.pubkey)).size !== keys.length) {
+    throw new BadRequest('keys name a pubkey twice');
+  }
+  return keys;
+}
+
+/**
+ * Keys for slots that never had one: a 32-slot card registered with keys for
+ * slots 0-7 only gets the rest from a till, which generates them at a tap
+ * (GEN_KEY, P2 = 00). All or nothing, in one transaction.
+ *
+ * - A slot must be below the card's slot count (400).
+ * - A slot that already holds the same key is a replay and changes nothing; one
+ *   holding another key is 409: replacing a key is a renewal (`renewSlot`).
+ * - A key already on another slot of the card, or one a note was ever recorded
+ *   under, is 409.
+ * - Slot 0's key must end in the short id (409), though registration always keys it.
+ *
+ * No `version` is asked: filling an empty slot cannot clash with a charge,
+ * which only uses keyed slots. The version is bumped when anything was added,
+ * and the answer carries it, so the till charges against it next.
+ */
+export function addSlotKeys(
+  storage: DurableObjectStorage,
+  shortId: string,
+  keys: readonly {slot: number; pubkey: string}[],
+): {version: number; added: number[]; replayed: boolean; unkeyed_slots: number[]} {
+  const sql = storage.sql;
+  const count = slotCount(sql, shortId);
+  for (const k of keys) {
+    if (k.slot < 0 || k.slot >= count) {
+      throw new BadRequest(`slot must be 0 to ${count - 1}`);
+    }
+  }
+  return storage.transactionSync(() => {
+    const current = new Map(
+      sql
+        .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ?', shortId)
+        .toArray()
+        .map(r => [Number(r.slot), String(r.pubkey)] as const),
+    );
+    const onCard = new Set(current.values());
+    const added: {slot: number; pubkey: string}[] = [];
+    for (const k of keys) {
+      const have = current.get(k.slot);
+      if (have !== undefined) {
+        if (have !== k.pubkey) {
+          throw new Conflict(`slot ${k.slot} of card ${shortId} already has a key; a new one is a renewal (PUT /slots/${k.slot})`);
+        }
+        continue;
+      }
+      if (onCard.has(k.pubkey)) {
+        throw new Conflict(`that key is already on another slot of card ${shortId}`);
+      }
+      if (sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, '02' + k.pubkey).toArray().length > 0) {
+        throw new Conflict(`a note was already recorded under the key for slot ${k.slot}`);
+      }
+      if (k.slot === 0 && k.pubkey.slice(-8) !== shortId) {
+        throw new Conflict('slot 0’s key must end in the card’s short id');
+      }
+      added.push(k);
+    }
+    for (const k of added) {
+      sql.exec('INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)', shortId, k.slot, k.pubkey);
+    }
+    const version = added.length > 0 ? bump(sql, shortId) : versionOf(sql, shortId);
+    const keyed = sql
+      .exec('SELECT slot FROM card_slots WHERE short_id = ?', shortId)
+      .toArray()
+      .map(r => Number(r.slot));
+    return {
+      version,
+      added: added.map(k => k.slot).sort((a, b) => a - b),
+      replayed: added.length === 0,
+      unkeyed_slots: unkeyedSlots(count, keyed),
+    };
   });
 }

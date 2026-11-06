@@ -36,7 +36,9 @@
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
  *   operator   GET  /cards/:short_id/state
- *   or till
+ *   or till    POST /cards/:short_id/slots/:n/key   {pubkey}: the first key of a never-keyed slot
+ *              POST /cards/:short_id/slot-keys      {keys: [{slot, pubkey}]}: the same, several at once
+ *                                                (a 32-slot card registered with keys for 0-7; cards.ts addSlotKeys)
  *   till       POST /cards/:short_id/intent      the charge, unsigned, before the card signs;
  *                                                 with no inputs, a load from the till's wallet
  *              POST /cards/:short_id/submitted   the signed bytes, before the till sends them
@@ -62,6 +64,7 @@ import {
   type Till,
 } from './auth';
 import {
+  addSlotKeys,
   BadRequest,
   cardOwner,
   cardState,
@@ -71,6 +74,7 @@ import {
   listCards,
   listFederationNames,
   NotFound,
+  parseSlotKeys,
   postCard,
   putFederationName,
   recordIntent,
@@ -380,8 +384,10 @@ export class Registry {
     if (rest === '/state' && method === 'GET') {
       return json(200, {ok: true, ...cardState(storage.sql, shortId)});
     }
-    if (caller.kind !== 'till') {
-      return fail(403, 'only a till records charges and slot keys');
+    const firstKey = /^\/slots\/(\d{1,2})\/key$/.exec(rest);
+    const keying = method === 'POST' && (firstKey !== null || rest === '/slot-keys');
+    if (caller.kind !== 'till' && !keying) {
+      return fail(403, 'only a till records charges and renews slot keys');
     }
     const closed = closedReason(storage.sql, shortId);
     if (closed?.reset) {
@@ -398,6 +404,14 @@ export class Registry {
     }
     const body = await objectBody(request);
     if (!body) return fail(400, 'expected a JSON object');
+    if (keying) {
+      const keys = parseSlotKeys(body, firstKey ? Number(firstKey[1]) : undefined);
+      return json(200, {ok: true, ...addSlotKeys(storage, shortId, keys)});
+    }
+    // Refused above already; repeated so the type knows the caller is a till.
+    if (caller.kind !== 'till') {
+      return fail(403, 'only a till records charges and renews slot keys');
+    }
     if (rest === '/intent' && method === 'POST') {
       return json(200, {ok: true, ...recordIntent(storage, shortId, caller.till.till_id, body, now)});
     }
