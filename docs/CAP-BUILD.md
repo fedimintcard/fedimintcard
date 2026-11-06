@@ -97,3 +97,29 @@ default-block-size load about half the time and then needs a power cycle; `--bs 
 Root cause and fix: writing the curve parameters into every slot's key objects in the constructor is
 what exceeds the install budget; with the parameters written at GEN_KEY instead, 8 slots install
 (load file 4,643 bytes). The 16-slot build was not retried after this fix.
+
+## 32 slots on silicon (2026-11-05)
+
+Applet 2.1 (`020c0d0`: 32 slots, keys built at each slot's first GEN_KEY, STATE_KEY) on a
+blank NXP J3R180 (serial 09336120) through the ACR122U, `--bs 64`. CAP 34,824 bytes.
+
+| | Persistent free | Transient COD | Transient COR |
+|---|---|---|---|
+| Blank card | 163,744 | 3,990 | 3,984 |
+| Opener + applet installed | 155,816 | 2,980 | 3,984 |
+| All 32 slots keyed | 131,880 | 2,980 | 3,984 |
+
+Free memory is JCOP's `GET DATA DF25` on the ISD (`80CA00FE02DF2500`). The install, with the
+AES-256 state secret built in the constructor, passed first time. Each slot's key pair costs about
+748 bytes; 32 slots take 23,936.
+
+| Command | Time on the ACR122U |
+|---|---|
+| GEN_KEY, first time for a slot (builds the key objects) | 299–337 ms, ~318 ms typical; 32 slots ≈ 10.2 s |
+| GEN_KEY overwrite (P2=01) | 231 ms |
+| GET_PUB | 27 ms |
+| SIGN (slot 31) | 847 ms; the BIP-340 signature verifies off-card |
+| STATE_KEY | 42 ms; the same 32 bytes across selections |
+
+Slot 32 answers `6B00`. STATE_KEY answers `6984` before a PIN is set and `6A94` before this
+selection's VERIFY_PIN, as SIGN does. GEN_KEY on a keyed slot without P2=01 answers `6985`.
