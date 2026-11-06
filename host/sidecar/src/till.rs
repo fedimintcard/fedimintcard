@@ -122,7 +122,10 @@ pub fn classify(err: &anyhow::Error) -> Class {
         if let Some(p) = cause.downcast_ref::<PlanError>() {
             return match p {
                 PlanError::Insufficient { .. } => c(402, "insufficient"),
-                PlanError::NoExactPlan { .. } | PlanError::TooManyNotes(_) | PlanError::NoFreeSlots { .. } => {
+                PlanError::NoExactPlan { .. }
+                | PlanError::TooManyNotes(_)
+                | PlanError::TooManyInputs { .. }
+                | PlanError::NoFreeSlots { .. } => {
                     c(422, "no_exact_plan")
                 }
             };

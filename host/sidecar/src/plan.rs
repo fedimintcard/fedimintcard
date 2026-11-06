@@ -17,7 +17,7 @@
 //! The till may be overpaid by at most [`MAX_TILL_OVERPAY`] msat. That slack is what lets small
 //! change be absorbed instead of minted as a dust note.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Largest amount (msat) by which the till may be paid more than the price.
 pub const MAX_TILL_OVERPAY: u64 = 2_048;
@@ -32,6 +32,11 @@ const BUDGET: u64 = 6_000_000;
 /// change comes back as fewer, larger notes. Costs a card signature (about a second) per extra
 /// input, and only when the card is nearly full.
 pub const ROOM_AFTER_CHARGE: usize = 3;
+/// Most live notes a card holds: one per slot on the 32-slot applet. More is an inconsistent state.
+pub const MAX_CARD_NOTES: usize = 32;
+/// Most card notes one charge spends. Each input is one card signature (about 850 ms on a
+/// J3R180), and a tap has to stay short.
+pub const MAX_INPUTS: usize = 3;
 
 /// How far a plan leaves the card short of [`ROOM_AFTER_CHARGE`] free slots, assuming the spent
 /// inputs' slots are renewed after the charge (`glue.rs` renews until a slot is free).
@@ -63,6 +68,9 @@ pub enum PlanError {
     Insufficient { have: u64, need: u64 },
     /// More live notes than a card can hold.
     TooManyNotes(usize),
+    /// No [`MAX_INPUTS`] of the card's notes cover the price and fees; more would make the tap
+    /// too long.
+    TooManyInputs { price: u64, max_inputs: usize },
     /// Funds exist, but no exact-balance layout fits the free slots and the overpay limit.
     NoExactPlan { price: u64, free_slots: usize },
     /// A topup needs more empty slots than the card has.
@@ -76,6 +84,11 @@ impl std::fmt::Display for PlanError {
                 write!(f, "insufficient funds on the card: have {have} msat, need at least {need} msat")
             }
             PlanError::TooManyNotes(n) => write!(f, "{n} live notes is more than a card can hold; state file is inconsistent"),
+            PlanError::TooManyInputs { price, max_inputs } => write!(
+                f,
+                "a spend of {price} msat needs more than {max_inputs} of the card's notes; \
+                 spend a smaller amount, or cash out and reload to merge notes"
+            ),
             PlanError::NoExactPlan { price, free_slots } => write!(
                 f,
                 "no exact-balance spend of {price} msat with {free_slots} free slot(s); \
@@ -115,11 +128,17 @@ fn flat_fee(fee: FeeFn) -> Option<u64> {
 /// Fewest notes (at most `max_notes`) whose creation cost `sum(a + fee(a))` is exactly `target`.
 /// Returns amounts descending. `Some(vec![])` for `target == 0`.
 pub fn min_notes(target: u64, max_notes: usize, fee: FeeFn, min_denom: u64) -> Option<Vec<u64>> {
+    min_notes_with(target, max_notes, fee, min_denom, flat_fee(fee))
+}
+
+/// [`min_notes`] with `flat_fee(fee)` already worked out: the planner calls this once per
+/// candidate, and `flat_fee` alone is 51 fee evaluations.
+fn min_notes_with(target: u64, max_notes: usize, fee: FeeFn, min_denom: u64, flat: Option<u64>) -> Option<Vec<u64>> {
     debug_assert!(min_denom.is_power_of_two());
     if target == 0 {
         return Some(vec![]);
     }
-    if let Some(c) = flat_fee(fee) {
+    if let Some(c) = flat {
         for k in 1..=max_notes {
             let Some(total) = target.checked_sub(c.checked_mul(k as u64)?) else { break };
             if total % min_denom != 0 {
@@ -254,8 +273,8 @@ fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
 /// denomination) when an exact balance exists that way; since fees are not multiples of
 /// `min_denom` that is rare, and the planner then retries allowing any tier and sets `dust`.
 /// Objective, in order: leave [`ROOM_AFTER_CHARGE`] free slots if any plan can (else get as close
-/// as possible), fewest change notes, fewest inputs (each costs one card signature, about a second
-/// on silicon), smallest overpay.
+/// as possible), fewest change notes, fewest output notes, fewest inputs (each costs one card
+/// signature, about a second on silicon; at most [`MAX_INPUTS`]), smallest overpay.
 pub fn solve(
     notes: &[u64],
     price: u64,
@@ -263,12 +282,17 @@ pub fn solve(
     fee: FeeFn,
     min_denom: u64,
 ) -> Result<Plan, PlanError> {
-    // Every floor that balances is a candidate. Card slots are scarce (8), so the fewest change
+    // Every floor that balances is a candidate. Card slots are scarce (8 or 32), so the fewest change
     // notes wins, then the fewest output notes (each costs a fee), fewest inputs, smallest overpay. A high floor can force dozens of
     // notes when fees are not multiples of it, so "no dust" is not allowed to beat "few notes".
     let mut best: Option<Plan> = None;
     let mut first_err = None;
+    let mut tried = Vec::new();
     for floor in floors(min_denom, false).into_iter().chain(floors(min_denom, true)) {
+        if tried.contains(&floor) {
+            continue; // `min_denom == 1`: the last-resort floor is the one already searched
+        }
+        tried.push(floor);
         if floor == 1 && min_denom > 1 && best.is_some() {
             break; // 1 msat notes only when nothing larger balances
         }
@@ -308,13 +332,20 @@ fn solve_with(
         return Err(PlanError::NoExactPlan { price, free_slots });
     }
     let n = notes.len();
-    if n > 20 {
+    if n > MAX_CARD_NOTES {
         return Err(PlanError::TooManyNotes(n));
     }
     let have: u64 = notes.iter().sum();
     let min_need = price + fee_sum(&binary(price), fee);
     if have < min_need {
         return Err(PlanError::Insufficient { have, need: min_need });
+    }
+    // Cheapest till side at any floor: no input set worth less (after its own fees) can pay.
+    let min_till_any = (price..=price + MAX_TILL_OVERPAY).map(|t| t + fee_sum(&binary(t), fee)).min().unwrap_or(u64::MAX);
+    let mut nets: Vec<u64> = notes.iter().map(|&a| a.saturating_sub(fee(a))).collect();
+    nets.sort_unstable_by(|a, b| b.cmp(a));
+    if nets.iter().take(MAX_INPUTS).sum::<u64>() < min_till_any {
+        return Err(PlanError::TooManyInputs { price, max_inputs: MAX_INPUTS });
     }
 
     // Till candidates: totals that are multiples of `min_denom`, price <= t <= price + MAX.
@@ -328,66 +359,195 @@ fn solve_with(
         return Err(PlanError::NoExactPlan { price, free_slots });
     };
 
+    // Notes of equal amount are interchangeable, so the search runs over how many notes of each
+    // amount go in (a multiset of at most MAX_INPUTS amounts), not over subsets of notes: at most
+    // C(d + 2, 3) candidates for d distinct amounts, about 4,000 for a full 32-slot card, against
+    // 2^32 subsets. Input sets with the same size and the same value after fees are the same plan
+    // to every term of the objective, so only the first of each is searched.
+    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (i, &a) in notes.iter().enumerate() {
+        match groups.iter_mut().find(|g| g.0 == a) {
+            Some(g) => g.1.push(i),
+            None => groups.push((a, vec![i])),
+        }
+    }
+    let mut picks = Vec::new();
+    multisets(&groups, 0, MAX_INPUTS, &mut Vec::new(), &mut picks);
+    picks.sort_by_key(|p| p.len()); // stable: fewest inputs first, as before
+    let mut seen = HashSet::new();
+    // Without a flat fee, change is not closed-form. Rather than solve for the change of every
+    // (input set, overpay) pair, the search lists, per input set and change count k, the k-note
+    // change amounts whose cost falls in the window the till candidates leave, and looks each one
+    // up by the till cost it implies. The first k with a hit is the fewest change notes for that
+    // input set; among its hits the smallest overpay wins.
+    let mut by_cost: HashMap<u64, u64> = HashMap::new(); // till cost -> smallest overpay
+    for (o, tc) in &till_cost {
+        by_cost.entry(*tc).or_insert(*o);
+    }
+    let max_till = till_cost.iter().map(|c| c.1).max().unwrap_or(min_till);
+    let weights: Vec<u64> = (0..=MAX_EXP).map(|e| weight(1u64 << e, fee)).collect();
+    let floor_exp = min_denom.trailing_zeros() as i32;
+
     let flat = flat_fee(fee);
     let mut budget = BUDGET;
-    let mut best: Option<(usize, usize, usize, u64, Vec<usize>)> = None; // (room short, change notes, inputs, overpay, indices)
-    // Every input size is searched, not just the sizes up to the first fitted one: a price the
-    // small sizes cannot pay must still find its plan among the larger ones, and a sale refused
-    // for lack of a plan is a customer turned away at the counter. `budget` bounds the work.
-    'sizes: for size in 1..=n {
-        // Enumerate combinations of `size` notes with Gosper's hack.
-        let mut mask: u32 = (1u32 << size) - 1;
-        while mask < (1u32 << n) {
-            let idx: Vec<usize> = (0..n).filter(|i| mask >> i & 1 == 1).collect();
-            let gross: u64 = idx.iter().map(|&i| notes[i]).sum();
-            let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
-            if let Some(avail) = gross.checked_sub(in_fees) {
-                if avail >= min_till {
-                    for (o, tc) in &till_cost {
-                        let Some(r) = avail.checked_sub(*tc) else { continue };
-                        if budget == 0 {
-                            break 'sizes;
-                        }
-                        // `free_slots` is a hard ceiling, never a tuning knob: change needing more
-                        // slots than the card has cannot be signed at all. Among plans that fit,
-                        // fewer change notes still wins, so once one exists only a strictly smaller
-                        // one is worth finding — but the ceiling itself is always `free_slots`.
-                        // While the best plan still leaves the card short of room, a plan with as
-                        // many change notes (or more) but more inputs can beat it, so no pruning.
-                        let cap = match &best {
-                            Some((0, cc, ..)) => cc.saturating_sub(1),
-                            _ => free_slots,
-                        };
-
-                        budget = budget.saturating_sub(1 + if flat.is_some() { 0 } else { 64 });
-                        let Some(change) = min_notes(r, cap, fee, min_denom) else { continue };
-                        let cand = (room_short(free_slots, size, change.len()), change.len(), size, *o);
-                        let better = match &best {
-                            None => true,
-                            Some((rs, cc, ni, ov, _)) => cand < (*rs, *cc, *ni, *ov),
-                        };
-                        if better {
-                            best = Some((cand.0, change.len(), size, *o, idx.clone()));
-                        }
-                    }
-                }
-            }
-            // next combination
-            let c = mask & mask.wrapping_neg();
-            let r = mask + c;
-            mask = (((r ^ mask) >> 2) / c) | r;
+    // The objective of `solve`, in its order: (room short, change notes, output notes, inputs,
+    // overpay). Output notes are the till's `binary(price + overpay)` plus the change.
+    let key = |size: usize, change: usize, o: u64| {
+        (room_short(free_slots, size, change), change, (price + o).count_ones() as usize + change, size, o)
+    };
+    let mut best: Option<(Key, Vec<usize>, Vec<u64>)> = None; // (key, input indices, change)
+    // Every input size up to MAX_INPUTS is searched, not just the sizes up to the first fitted
+    // one: a price the small sizes cannot pay must still find its plan among the larger ones, and
+    // a sale refused for lack of a plan is a customer turned away at the counter. `budget` bounds
+    // the work.
+    let mut sets: Vec<(usize, u64, Vec<usize>)> = Vec::new(); // (inputs, value after fees, indices)
+    for pick in &picks {
+        let size = pick.len();
+        let mut idx: Vec<usize> = Vec::with_capacity(size);
+        for (k, &g) in pick.iter().enumerate() {
+            // The j-th use of group g takes its j-th note.
+            let j = pick[..k].iter().filter(|&&h| h == g).count();
+            idx.push(groups[g].1[j]);
+        }
+        idx.sort_unstable();
+        let gross: u64 = idx.iter().map(|&i| notes[i]).sum();
+        let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
+        let Some(avail) = gross.checked_sub(in_fees) else { continue };
+        if avail >= min_till && seen.insert((size, avail)) {
+            sets.push((size, avail, idx));
         }
     }
 
-    let Some((_, _, _, overpay, idx)) = best else {
+    // `free_slots` is a hard ceiling, never a tuning knob: change needing more slots than the card
+    // has cannot be signed at all. Below it, `change_cap` is the most change notes a plan with a
+    // given number of inputs can have and not lose to the best plan so far on the first two terms;
+    // both grow with the change count, so nothing past it is searched.
+    if flat.is_some() {
+        'sets: for (size, avail, idx) in &sets {
+            let mut cap = change_cap(free_slots, *size, best.as_ref().map(|b| &b.0));
+            for (o, tc) in &till_cost {
+                let Some(cap_now) = cap else { break };
+                let Some(r) = avail.checked_sub(*tc) else { continue };
+                if budget == 0 {
+                    break 'sets;
+                }
+                budget -= 1;
+                let Some(change) = min_notes_with(r, cap_now, fee, min_denom, flat) else { continue };
+                let cand = key(*size, change.len(), *o);
+                if best.as_ref().is_none_or(|b| cand < b.0) {
+                    best = Some((cand, idx.clone(), change));
+                    cap = change_cap(free_slots, *size, best.as_ref().map(|b| &b.0));
+                }
+            }
+        }
+    } else {
+        // Change count by change count across every input set, so no set is searched for more
+        // change notes than the best plan so far needs.
+        'levels: for k in 0..=free_slots {
+            let mut alive = false;
+            for (size, avail, idx) in &sets {
+                if change_cap(free_slots, *size, best.as_ref().map(|b| &b.0)).is_none_or(|c| c < k) {
+                    continue;
+                }
+                alive = true;
+                let (lo, hi) = (avail.saturating_sub(max_till), avail - min_till);
+                let top = (63 - hi.max(1).leading_zeros() as i32).min(MAX_EXP as i32);
+                let mut hit: Option<(Key, Vec<u64>)> = None;
+                let mut nodes = 0u64;
+                let mut out = Vec::new();
+                let bound = best.as_ref().map(|b| b.0);
+                change_in_window(top, floor_exp, k, 0, lo, hi, &weights, &mut out, &mut nodes, &mut |sum, notes| {
+                    let Some(&o) = by_cost.get(&(avail - sum)) else { return };
+                    let cand = key(*size, k, o);
+                    if bound.is_none_or(|b| cand < b) && hit.as_ref().is_none_or(|h| cand < h.0) {
+                        hit = Some((cand, notes.to_vec()));
+                    }
+                });
+                budget = budget.saturating_sub(nodes);
+                if let Some((cand, change)) = hit {
+                    best = Some((cand, idx.clone(), change));
+                }
+                if budget == 0 {
+                    break 'levels;
+                }
+            }
+            if !alive {
+                break;
+            }
+        }
+    }
+
+    let Some(((.., overpay), idx, mut change)) = best else {
         return Err(PlanError::NoExactPlan { price, free_slots });
     };
-    let gross: u64 = idx.iter().map(|&i| notes[i]).sum();
-    let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
     let till = binary(price + overpay);
-    let r = gross - in_fees - (price + overpay) - fee_sum(&till, fee);
-    let change = min_notes(r, free_slots, fee, min_denom).expect("found during search");
+    change.sort_unstable_by(|a, b| b.cmp(a));
     Ok(Plan { inputs: idx, till, change, overpay, dust: false })
+}
+
+/// Every multiset of exactly `items` notes of exponents `floor..=e` whose creation cost
+/// `sum + sum(weights)` lies in `lo..=hi`; `visit` gets each cost and its notes. Weights must not
+/// fall as the exponent rises. `nodes` counts the work.
+#[allow(clippy::too_many_arguments)]
+fn change_in_window(
+    e: i32,
+    floor: i32,
+    items: usize,
+    sum: u64,
+    lo: u64,
+    hi: u64,
+    weights: &[u64],
+    out: &mut Vec<u64>,
+    nodes: &mut u64,
+    visit: &mut dyn FnMut(u64, &[u64]),
+) {
+    *nodes += 1;
+    if items == 0 {
+        if (lo..=hi).contains(&sum) {
+            visit(sum, out);
+        }
+        return;
+    }
+    if e < floor || *nodes > BUDGET {
+        return;
+    }
+    let (w_hi, w_lo) = (weights[e as usize], weights[floor as usize]);
+    if sum + items as u64 * w_lo > hi || sum + items as u64 * w_hi < lo {
+        return;
+    }
+    let max_c = ((hi - sum) / w_hi).min(items as u64) as usize;
+    for c in (0..=max_c).rev() {
+        out.extend(std::iter::repeat_n(1u64 << e, c));
+        change_in_window(e - 1, floor, items - c, sum + c as u64 * w_hi, lo, hi, weights, out, nodes, visit);
+        out.truncate(out.len() - c);
+    }
+}
+
+/// A plan's rank in `solve_with`: (room short, change notes, output notes, inputs, overpay).
+type Key = (usize, usize, usize, usize, u64);
+
+/// Most change notes a plan with `size` inputs may have and not lose to `best` on room short and
+/// change notes. `None` when no change count can.
+fn change_cap(free_slots: usize, size: usize, best: Option<&Key>) -> Option<usize> {
+    let Some(&(rs, cc, ..)) = best else { return Some(free_slots) };
+    (0..=free_slots).rev().find(|&c| (room_short(free_slots, size, c), c) <= (rs, cc))
+}
+
+/// Every multiset of at most `left` group indices, starting at group `from`, that no group
+/// supplies more notes to than it has. Each is a non-decreasing list of group indices.
+fn multisets(groups: &[(u64, Vec<usize>)], from: usize, left: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    if left == 0 {
+        return;
+    }
+    for g in from..groups.len() {
+        if cur.iter().filter(|&&h| h == g).count() >= groups[g].1.len() {
+            continue;
+        }
+        cur.push(g);
+        out.push(cur.clone());
+        multisets(groups, g, left - 1, cur, out);
+        cur.pop();
+    }
 }
 
 impl Plan {
@@ -649,8 +809,65 @@ mod tests {
 
     #[test]
     fn too_many_notes_is_an_error_not_a_panic() {
-        let notes = vec![1024u64; 21];
-        assert!(matches!(solve(&notes, 1000, 4, &zero, 1), Err(PlanError::TooManyNotes(21))));
+        let notes = vec![1024u64; MAX_CARD_NOTES + 1];
+        assert!(matches!(solve(&notes, 1000, 4, &zero, 1), Err(PlanError::TooManyNotes(33))));
+    }
+
+    #[test]
+    fn more_than_max_inputs_is_refused_by_name() {
+        // Four 1024 msat notes are needed for 3500 msat; three may be spent.
+        let notes = [1024u64; 8];
+        assert_eq!(solve(&notes, 3500, 4, &zero, 1), Err(PlanError::TooManyInputs { price: 3500, max_inputs: MAX_INPUTS }));
+        // Three cover 3000 msat.
+        let p = check(&notes, 3000, 4, &zero);
+        assert_eq!(p.inputs.len(), 3);
+    }
+
+    #[test]
+    fn plans_never_exceed_max_inputs() {
+        let notes = [1u64 << 16; 6];
+        for price in [10_000u64, 70_000, 150_000, 190_000] {
+            for fee in [&zero as FeeFn, &base100, &ppm1000] {
+                if let Ok(p) = solve(&notes, price, 8, fee, min_econ(fee)) {
+                    assert!(p.inputs.len() <= MAX_INPUTS, "{p:?}");
+                    assert!(p.balances(&notes, fee));
+                }
+            }
+        }
+    }
+
+    /// A full 32-slot card (a 131,072 sat load plus change of every size), and the same card with
+    /// slots free, plan fast. The time limit is for release builds; debug builds only check the
+    /// plans.
+    #[test]
+    fn full_card_of_32_notes_plans_quickly() {
+        let mut notes: Vec<u64> = binary(131_072_000);
+        let mut e = 10;
+        while notes.len() < MAX_CARD_NOTES {
+            notes.push(1 << e);
+            e = if e == 26 { 10 } else { e + 1 };
+        }
+        let mut planned = 0;
+        for fee in [&zero as FeeFn, &base100, &ppm1000] {
+            for (held, free) in [(32usize, 0usize), (30, 2), (24, 8)] {
+                let notes = &notes[..held];
+                // Prices a few inputs pay exactly, and arbitrary ones.
+                let prices = [notes[0] - 1_000, notes[1] + notes[5] - 3_000, notes[2] + notes[7] + notes[20] - 1_500, 777_000, 12_345_678, 29_999_000];
+                for price in prices {
+                    let t = std::time::Instant::now();
+                    let r = solve(notes, price, free, fee, min_econ(fee));
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    if let Ok(p) = &r {
+                        assert!(p.balances(notes, fee) && p.inputs.len() <= MAX_INPUTS && p.change.len() <= free, "{p:?}");
+                        planned += 1;
+                    }
+                    if !cfg!(debug_assertions) {
+                        assert!(ms < 50.0, "{price} msat on {held} notes took {ms:.1} ms ({r:?})");
+                    }
+                }
+            }
+        }
+        assert!(planned >= 20, "only {planned} of 54 charges planned");
     }
 
     // ---- nearest_card_amount (docs/TOPUP.md)
