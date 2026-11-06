@@ -56,7 +56,7 @@ provisioning: the applet arrives with keys and the mint association is made else
 This card's install is thinner and shorter (4.6 KB vs. a metered 82-block load, no
 tag applet, no `GET_INFO` guard applet), but a programmed card is still not a usable
 card. The applet has no `GET_INFO`, no PIN, no owner key and no note list: it holds
-8 keys and signs. Everything else lives in `card_state.json` on the host. A card is
+its slot keys (8 on a 2.0 card, 32 on a 2.1 card) and signs. Everything else lives in `card_state.json` on the host. A card is
 ready when the host knows its keys and the card holds notes.
 
 That gives three shapes. **Decided: B**, with the operator's PIN requirement folded in.
@@ -322,7 +322,7 @@ Phases, in the operator's words:
 | issue | `Loading n of m notes` | local sidecar issues the batch's amounts to the card's keys |
 | done | `Done · …9c2f` | short id = last 4 bytes of slot-0 x-only key, as Cashu's; a generated PIN shows here once |
 
-`keySetup` matters: a freshly installed applet has 8 empty slots and is useless. The
+`keySetup` matters: a freshly installed applet has empty slots (8 on a 2.0 card, 32 on a 2.1 card) and is useless. The
 cards must be programmed *and* keyed, and keying is 8 × ~125 ms GEN_KEYs. `setPin`
 matters just as much under the PIN-mandatory decision: without it the card would be
 unspendable by design.
@@ -673,7 +673,7 @@ result worth having; a workaround that hides it is not.
 | **A PIN-gated `SIGN` breaks the till and the demo** | `6A 94` is the word cashucard already uses for "PIN not given", so the POS and the demo treat it as the normal pre-PIN answer, not as an error; P4's done-when is a real POS charge |
 | **A `pinNotSet` card reaches a holder unspendable** | the card is recorded as programmed-only and never counted as provisioned; P6's campaign requires zero such cards in 50 |
 | **A hosted registry widens what leaves the device** | only short id, batch, PIN policy name and state leave; keys, ecash and PIN values never do (§ 4); both stores' disclosures say so (§ 7) |
-| Change pool / denominations make "issue" a toy (8 slots) | the batch's issue plan is previewed (`plan.rs` refuses plans it cannot make exact); the app shows the plan, not just success |
+| Change pool / denominations make "issue" a toy (8 slots on a 2.0 card; 32 on a 2.1 card) | the batch's issue plan is previewed (`plan.rs` refuses plans it cannot make exact); the app shows the plan, not just success |
 | Porting cardkit drifts from Cashu's | the port keeps the engine's tests; a differential test runs the same APDUs against the Java bridge |
 | Store review of a hardware app | demo mode is a full simulation, reviewed on both phones |
 | `apps/provisioner` and `android-relay` diverge into two NFC stacks | one shared transport shim, chosen in § 8.2 |

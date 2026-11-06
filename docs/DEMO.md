@@ -35,7 +35,7 @@ No Fedi code changed. The Fedi app only ever sees ecash strings it already under
 
 ## Kit
 
-- NXP J3R180 card with the 8-slot `fedimint-card` applet installed (`docs/CAP-BUILD.md`).
+- NXP J3R180 card with the 32-slot (2.1) `fedimint-card` applet installed (`docs/CAP-BUILD.md`).
 - Till: Pixel with the "Fedimint Card POS" app (`android-relay/README.md`) on USB, plus the till
   service on the laptop (`card-sidecar till serve`, API in `docs/TILL-API.md`). Two adb tunnels,
   re-run both after any USB reconnect:
@@ -68,7 +68,7 @@ card's three retries. Check it before the demo, never during.
 ```sh
 $CS --data-dir $D join <invite code>        # first time only
 $CS --data-dir $D info                      # federation name, versions, fee, balances
-$CS --data-dir $D card setup                # generates keys in the 8 slots
+$CS --data-dir $D card setup                # generates keys in slots 0-7 (a till keys the rest later)
 ```
 
 `info` must show the mint module as kind `mint` and a core consensus of 2.1 or later.

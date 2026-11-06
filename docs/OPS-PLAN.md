@@ -70,9 +70,9 @@ transceiver is already open in `withCard`, `session.ts`):
    ("card already has a PIN"), not a pass.
 4. `VERIFY_PIN` (INS `40`) once, to prove the PIN took.
 5. Short id = last 4 bytes of the slot-0 key, lower-case hex.
-6. The registry row gains the eight slot pubkeys (§ 5).
+6. The registry row gains the slot pubkeys the install tap keyed (slots 0–7; § 5) and the card's `slot_count`.
 
-Timing: `GEN_KEY` is 125 ms on a J3R180 (`SPIKE.md:37`), so eight keys add about 1 s to the
+Timing: `GEN_KEY` is 125 ms on a J3R180 (`SPIKE.md:37`), so the eight install-tap keys add about 1 s to the
 tap. That fits inside iOS's reader session. P-O1 measures the whole tap on both phones.
 
 The loop's phases become `probe → selectIsd → auth → sweep → load → install → verify →
@@ -241,7 +241,7 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   is finished by tapping the same card again, in this batch or a later one: the probe reads slot 0
   and the PIN's state without a try; with no PIN, ops' `POST /registry/resume-check {chip,
   short_id}` must show nothing under that id and no other open card on the chip, one INITIALIZE
-  UPDATE must prove the card's own keys, and then all eight slots are generated again (GEN_KEY
+  UPDATE must prove the card's own keys, and then the install-tap slots (0–7) are generated again (GEN_KEY
   P2 `01`, which the applet allows only while no PIN is set), a fresh PIN set and verified. The
   new row names the old short id as `supersedes`; ops closes that row (`cards.replaced_by`) in the
   same transaction, refusing if it holds value, has its PIN set or is another operator's or chip's,
