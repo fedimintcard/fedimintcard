@@ -164,6 +164,8 @@ const INSTALL_ORDER = [
   0x11,
   0x11,
   0x11, // GET_PUB slots 0..7
+  0x11, // and slot 31
+  0x11, // and slot 32, past the last
   0xa4,
   0xca, // SELECT the card manager, FF21 again
 ];
@@ -526,14 +528,20 @@ describe('provision: the Fedimint card', () => {
     assertInstalled(card);
   });
 
-  it('verifies every slot, so an applet that kept a key across a reinstall is seen', () => {
+  it('verifies the install-tap slots and the last, so an applet that kept a key across a reinstall is seen', () => {
     const gets = PLAN.checks.filter(c => c.apdu[1] === 0x11);
     assert.deepEqual(
       gets.map(c => c.apdu[2]),
-      [0, 1, 2, 3, 4, 5, 6, 7],
+      [0, 1, 2, 3, 4, 5, 6, 7, 31, 32],
     );
-    // an unused slot is this applet's success: 6985, which Check.sw names
-    assert.ok(gets.every(c => c.sw === 0x6985 && c.data === undefined));
+    // an unused slot is this applet's success: 6985, which Check.sw names;
+    // slot 32 is past the last of a 32-slot build, so 6B00
+    const inRange = gets.filter(c => c.apdu[2] < 32);
+    assert.ok(inRange.every(c => c.sw === 0x6985 && c.data === undefined));
+    assert.deepEqual(
+      gets.filter(c => c.apdu[2] === 32).map(c => c.sw),
+      [0x6b00],
+    );
   });
 
   it('verifies only after the sweep, so a key left by an earlier run is cleared before the check', async () => {
@@ -566,14 +574,14 @@ describe('provision: the Fedimint card', () => {
 
   it('fails verify when a slot answers a key: the check is not satisfied by any 9000', () => {
     // Check.sw names the expected refusal, so the plan cannot pass a keyed slot.
-    const gets = PLAN.checks.filter(c => c.apdu[1] === 0x11);
+    const gets = PLAN.checks.filter(c => c.apdu[1] === 0x11 && c.apdu[2] < 32);
     assert.ok(
       gets.every(c => c.sw === 0x6985 && c.length === undefined),
       'a keyed slot answers 9000 with 65 bytes, which is not the expected 6985',
     );
   });
 
-  it('fails verify when SELECT lands on the opener: 9000 with no data is not 02 00', async () => {
+  it('fails verify when SELECT lands on the opener: 9000 with no data is not 02 01', async () => {
     const card = new FakeCard();
     const tx: Transceiver = async apdu => {
       // a card whose card applet was not instantiated: the whole-AID SELECT
@@ -586,7 +594,7 @@ describe('provision: the Fedimint card', () => {
     const r = await provision(tx, PLAN, options());
     assert.equal(r.ok, false);
     assert.equal(r.phase, 'verify');
-    assert.match(r.reason ?? '', /answered .*not 0200/);
+    assert.match(r.reason ?? '', /answered .*not 0201/);
   });
 });
 
@@ -622,7 +630,7 @@ describe('provision: the fake card', () => {
     // and the card applet, whose AID also begins with the package's, still answers as itself
     assert.deepEqual(
       await card.transceive(selectAid(CARD_AID)),
-      [0x02, 0x00, 0x90, 0x00],
+      [0x02, 0x01, 0x90, 0x00],
     );
   });
 

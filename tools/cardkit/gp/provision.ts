@@ -157,12 +157,16 @@ export function fedimintPlan(loadFile: LoadFileAsset): Plan {
     ],
     sweep: [CARD_AID, OPENER_AID, FEDIMINT_PACKAGE_AID],
     checks: [
-      {apdu: selectAid(CARD_AID), data: [0x02, 0x00]},
-      // Every slot, so an applet that kept a key across a reinstall is seen.
-      ...[0, 1, 2, 3, 4, 5, 6, 7].map(slot => ({
+      {apdu: selectAid(CARD_AID), data: [0x02, 0x01]},
+      // The slots the install tap keys, and the last one, so an applet that kept a key across a
+      // reinstall is seen. Not all 32: each GET_PUB is a round trip in the install tap, and a
+      // fresh instance builds every slot's key objects anew at its first GEN_KEY.
+      ...[0, 1, 2, 3, 4, 5, 6, 7, 31].map(slot => ({
         apdu: [GET_PUB[0], GET_PUB[1], slot, 0x00, 0x00],
         sw: 0x6985,
       })),
+      // And one past the last: a 32-slot build, not an older 8-slot one.
+      {apdu: [GET_PUB[0], GET_PUB[1], 32, 0x00, 0x00], sw: 0x6b00},
     ],
   };
 }

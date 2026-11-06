@@ -18,7 +18,7 @@
  *   `failedAuthLimit`, as the chip does for good.
  *
  * The applet under this card is FedimintCardApplet, as it answers on the wire:
- * SELECT sends the two version bytes `02 00` and no FCI; GET_PUB (B0 11) on a
+ * SELECT sends the two version bytes `02 01` and no FCI; GET_PUB (B0 11) on a
  * slot with no key answers 6985; SIGN (B0 12) is refused before the PIN. The
  * fake dispatches on the **module** the selected instance was made from, not
  * on INS, because SELECT is global: the opener is a real instance of this
@@ -43,7 +43,7 @@ export const OPENER_MODULE = 'F0464D434152444D';
 const K40 = fromHex('404142434445464748494A4B4C4D4E4F');
 
 /** SLOTS in FedimintCardApplet. */
-export const SLOTS = 8;
+export const SLOTS = 32;
 
 export interface StaticKeys {
   enc: Bytes;
@@ -262,7 +262,7 @@ export class FakeCard {
     const inst = this.instances.get(target)!;
     if (inst.module === CARD_MODULE) {
       // FedimintCardApplet: selectingApplet() sends VERSION_MAJOR, VERSION_MINOR and nothing else
-      return sw(0x9000, [0x02, 0x00]);
+      return sw(0x9000, [0x02, 0x01]);
     }
     // the opener: an Applet with no process(), so the toolkit answers 9000 with no data
     return sw(0x9000);
@@ -290,7 +290,7 @@ export class FakeCard {
 
   private genKey(state: CardAppletState, slot: number): Bytes {
     if (slot >= SLOTS) {
-      return sw(0x6a86);
+      return sw(0x6b00); // ISO7816.SW_WRONG_P1P2, as the applet's slot() answers
     }
     // FedimintCardApplet refuses a slot that already holds a key
     if (state.used[slot]) {
@@ -309,7 +309,10 @@ export class FakeCard {
   }
 
   private getPub(state: CardAppletState, slot: number): Bytes {
-    if (slot >= SLOTS || !state.used[slot]) {
+    if (slot >= SLOTS) {
+      return sw(0x6b00);
+    }
+    if (!state.used[slot]) {
       // ISO7816.SW_CONDITIONS_NOT_SATISFIED: the slot has no key
       return sw(0x6985);
     }
