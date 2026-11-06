@@ -123,3 +123,17 @@ AES-256 state secret built in the constructor, passed first time. Each slot's ke
 
 Slot 32 answers `6B00`. STATE_KEY answers `6984` before a PIN is set and `6A94` before this
 selection's VERIFY_PIN, as SIGN does. GEN_KEY on a keyed slot without P2=01 answers `6985`.
+
+### The install tap on phones (split keying, 2026-11-05)
+
+The provisioner from `spike/32-slots` (cardkit `f8b80be`, `INSTALL_TAP_KEY_SLOTS = 8`) against the
+staging registry, one card per batch, on the same J3R180:
+
+| Phone | Card | Tap, card detected to last APDU | Result |
+|---|---|---|---|
+| Pixel 8 Pro | blank | 6.0 s (Android NFC log) | programmed, `…9FAC`, one tap |
+| iPhone 13 Pro Max | the Pixel's card, applet swept first | 5.35 s, 75 APDUs (nfcd log) | programmed, `…C038`, one tap |
+
+Both include the load (25 LOAD blocks), both installs, keys for slots 0–7, SET_PIN and the
+post-install checks. Keying all 32 would add about 7.6 s (24 × 318 ms), which is why the other 24
+are keyed by the till at the taps that need them (`4c19cff`).
