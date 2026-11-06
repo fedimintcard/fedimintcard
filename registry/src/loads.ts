@@ -24,7 +24,7 @@
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, requireVersion, SLOTS, versionOf} from './cards';
+import {bump, requireVersion, slotCount, versionOf} from './cards';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
 import {cardFederation, checkNotes, isTier, mintKeysFor} from './mint';
@@ -129,12 +129,12 @@ export function freeSlots(sql: Sql, shortId: string) {
   return {version: versionOf(sql, shortId), federation_id: fed.federation_id, free};
 }
 
-function parseLoad(r: Record<string, unknown>): {txid: string; notes: LoadNote[]} {
+function parseLoad(r: Record<string, unknown>, slots: number): {txid: string; notes: LoadNote[]} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
-  if (!Array.isArray(r.notes) || r.notes.length === 0 || r.notes.length > SLOTS) {
-    throw new BadRequest(`notes must list 1 to ${SLOTS} notes`);
+  if (!Array.isArray(r.notes) || r.notes.length === 0 || r.notes.length > slots) {
+    throw new BadRequest(`notes must list 1 to ${slots} notes`);
   }
   const notes: LoadNote[] = r.notes.map(n => {
     const o = n as Record<string, unknown>;
@@ -143,13 +143,13 @@ function parseLoad(r: Record<string, unknown>): {txid: string; notes: LoadNote[]
       o === null ||
       !Number.isSafeInteger(o.slot) ||
       (o.slot as number) < 0 ||
-      (o.slot as number) >= SLOTS ||
+      (o.slot as number) >= slots ||
       !isPositiveInt(o.amount_msat) ||
       !isHex(o.nonce, 33) ||
       !isHex(o.blinding_key, 32) ||
       !isCount(o.out_idx)
     ) {
-      throw new BadRequest('each note needs slot 0-7, amount_msat, nonce, blinding_key and out_idx');
+      throw new BadRequest(`each note needs slot 0-${slots - 1}, amount_msat, nonce, blinding_key and out_idx`);
     }
     return {slot: o.slot as number, amount_msat: o.amount_msat, nonce: o.nonce, blinding_key: o.blinding_key, out_idx: o.out_idx};
   });
@@ -173,9 +173,9 @@ export function recordLoad(
   r: Record<string, unknown>,
   now: number,
 ): {version: number; replayed: boolean; expires_at: number} {
-  const load = parseLoad(r);
-  const body = JSON.stringify(load.notes);
   const sql = storage.sql;
+  const load = parseLoad(r, slotCount(sql, shortId));
+  const body = JSON.stringify(load.notes);
   return storage.transactionSync(() => {
     const prior = sql.exec('SELECT * FROM holder_loads WHERE txid = ?', load.txid).toArray()[0] as LoadRow | undefined;
     if (prior) {

@@ -407,7 +407,7 @@ export class Registry {
     if (rest === '/outcome' && method === 'POST') {
       return json(200, {ok: true, ...recordOutcome(storage, shortId, body, now)});
     }
-    const slot = /^\/slots\/(\d)$/.exec(rest);
+    const slot = /^\/slots\/(\d{1,2})$/.exec(rest);
     if (slot && method === 'PUT') {
       return json(200, {ok: true, ...renewSlot(storage, shortId, Number(slot[1]), body)});
     }

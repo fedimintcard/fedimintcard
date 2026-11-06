@@ -3,7 +3,7 @@
  *
  * Card state is what the sidecar's `card_state.json` held
  * (`host/sidecar/src/state.rs`), per card instead of one file per data dir:
- * the eight slot keys, the notes behind them, and each charge a till made.
+ * the slot keys (8 or 32), the notes behind them, and each charge a till made.
  * None of it is spendable here. A note is spent only with a BIP340 signature
  * from its slot key, which never leaves the card, behind the card's PIN. The
  * blinding keys of pending change notes unblind a signature; the note still
@@ -29,7 +29,12 @@ import {
 import {isChip, linkChip} from './managerKeys';
 import {checkNotes, putMintKeys} from './mint';
 
-export const SLOTS = 8;
+/**
+ * The slot counts a card can have: 8 for every applet before 2.1, 32 from
+ * 2.1 on. Each card's own count is `cards.slot_count`, set at registration
+ * from how many keys it sent.
+ */
+export const SLOT_COUNTS = [8, 32] as const;
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
 const MAX_TX_HEX = 64 * 1024;
 
@@ -140,8 +145,10 @@ export interface CardBody {
   readonly pin_set: boolean;
   readonly pin_policy: 'batch' | 'perCard';
   readonly notes_issued: number;
-  /** The eight slot keys as provisioned; empty for a row from before O2. */
+  /** The slot keys as provisioned, 8 or 32; empty for a row from before O2. */
   readonly slot_pubkeys: readonly string[];
+  /** How many slots the card has: the keys' count, or 8 for a row without keys. */
+  readonly slot_count: number;
   /**
    * The chip's CPLC id (`managerKeys.ts`), which keys its card-manager set;
    * null on a row from before O5.
@@ -163,8 +170,8 @@ export interface StoredCard extends CardBody {
 /**
  * The card body, or why it is not one. Unknown keys are ignored, so a newer
  * app does not break an older server. `slot_pubkeys` is optional for rows an
- * older app queued before it sent them; when present it must be all eight
- * x-only keys, and slot 0's last 4 bytes must be the short id.
+ * older app queued before it sent them; when present it must be all 8 or all
+ * 32 x-only keys (the card's slot count), and slot 0's last 4 bytes must be the short id.
  */
 export function parseCard(r: Record<string, unknown>): CardBody {
   if (!isShortId(r.short_id)) {
@@ -191,8 +198,12 @@ export function parseCard(r: Record<string, unknown>): CardBody {
   let slots: string[] = [];
   if (r.slot_pubkeys !== undefined) {
     const keys = r.slot_pubkeys;
-    if (!Array.isArray(keys) || keys.length !== SLOTS || !keys.every(k => isHex(k, 32))) {
-      throw new BadRequest('slot_pubkeys must be 8 x-only keys, 64 lower-case hex each');
+    if (
+      !Array.isArray(keys) ||
+      !(SLOT_COUNTS as readonly number[]).includes(keys.length) ||
+      !keys.every(k => isHex(k, 32))
+    ) {
+      throw new BadRequest('slot_pubkeys must be 8 or 32 x-only keys, 64 lower-case hex each');
     }
     if ((keys[0] as string).slice(-8) !== r.short_id) {
       throw new BadRequest('short_id must be the last 4 bytes of slot 0’s key');
@@ -211,6 +222,7 @@ export function parseCard(r: Record<string, unknown>): CardBody {
     pin_policy: r.pin_policy,
     notes_issued: r.notes_issued,
     slot_pubkeys: slots,
+    slot_count: slots.length > 0 ? slots.length : 8,
     chip: r.chip === undefined ? null : r.chip,
   };
 }
@@ -235,6 +247,7 @@ export function storedCard(sql: Sql, shortId: string): StoredCard | null {
     pin_policy: String(row.pin_policy) as 'batch' | 'perCard',
     notes_issued: Number(row.notes_issued),
     slot_pubkeys: slots,
+    slot_count: Number(row.slot_count),
     chip: row.chip === null || row.chip === undefined ? null : String(row.chip),
     received_at: Number(row.received_at),
     reset_at: row.reset_at === null || row.reset_at === undefined ? null : Number(row.reset_at),
@@ -303,8 +316,8 @@ export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: nu
   }
   sql.exec(
     `INSERT INTO cards
-       (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys, chip)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys, chip, slot_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     card.short_id,
     card.batch_id,
     card.installed_at,
@@ -315,6 +328,7 @@ export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: nu
     now,
     card.slot_pubkeys.length > 0 ? JSON.stringify(card.slot_pubkeys) : null,
     card.chip,
+    card.slot_count,
   );
   card.slot_pubkeys.forEach((pubkey, slot) => {
     sql.exec(
@@ -391,6 +405,16 @@ export interface NoteView {
   readonly out_idx: number | null;
 }
 
+/**
+ * The card's own slot count (`cards.slot_count`). A short id with no row
+ * answers 8, the count every card before 2.1 has; the caller's own lookup
+ * refuses an unknown card.
+ */
+export function slotCount(sql: Sql, shortId: string): number {
+  const row = sql.exec('SELECT slot_count FROM cards WHERE short_id = ?', shortId).toArray()[0];
+  return row ? Number(row.slot_count) : 8;
+}
+
 export function cardState(sql: Sql, shortId: string) {
   const slots = sql
     .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ? ORDER BY slot', shortId)
@@ -442,6 +466,7 @@ export function cardState(sql: Sql, shortId: string) {
   return {
     short_id: shortId,
     version: versionOf(sql, shortId),
+    slot_count: slotCount(sql, shortId),
     slots,
     notes,
     open_txs: open,
@@ -456,7 +481,7 @@ interface ChangeOut {
   readonly out_idx: number;
 }
 
-function parseIntent(r: Record<string, unknown>) {
+function parseIntent(r: Record<string, unknown>, slots: number) {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -493,13 +518,13 @@ function parseIntent(r: Record<string, unknown>) {
       o === null ||
       !Number.isSafeInteger(o.slot) ||
       (o.slot as number) < 0 ||
-      (o.slot as number) >= SLOTS ||
+      (o.slot as number) >= slots ||
       !isPositiveInt(o.amount_msat) ||
       !isHex(o.nonce, 33) ||
       !isHex(o.blinding_key, 32) ||
       !isCount(o.out_idx)
     ) {
-      throw new BadRequest('each change output needs slot 0-7, amount_msat, nonce, blinding_key and out_idx');
+      throw new BadRequest(`each change output needs slot 0-${slots - 1}, amount_msat, nonce, blinding_key and out_idx`);
     }
     return {
       slot: o.slot as number,
@@ -535,8 +560,8 @@ export function recordIntent(
   r: Record<string, unknown>,
   now: number,
 ): {version: number; replayed: boolean} {
-  const intent = parseIntent(r);
   const sql = storage.sql;
+  const intent = parseIntent(r, slotCount(sql, shortId));
   return storage.transactionSync(() => {
     const prior = sql
       .exec('SELECT short_id, client_ref, body FROM card_txs WHERE txid = ?', intent.txid)
@@ -838,8 +863,9 @@ export function renewSlot(
   slot: number,
   r: Record<string, unknown>,
 ): {version: number} {
-  if (!Number.isSafeInteger(slot) || slot < 0 || slot >= SLOTS) {
-    throw new BadRequest('slot must be 0 to 7');
+  const slots = slotCount(storage.sql, shortId);
+  if (!Number.isSafeInteger(slot) || slot < 0 || slot >= slots) {
+    throw new BadRequest(`slot must be 0 to ${slots - 1}`);
   }
   // Slot 0's key names the card: its short id is the key's last 4 bytes, so
   // a renewed slot 0 would leave every till unable to find the card.

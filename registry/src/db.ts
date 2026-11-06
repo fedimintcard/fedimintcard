@@ -204,6 +204,22 @@ export const MIGRATIONS: readonly string[] = [
     claims        INTEGER NOT NULL
   );
   `,
+  // v9 (32 slots): each card's own slot count, 8 for every card provisioned
+  // before it, and `card_slots` rebuilt because SQLite cannot alter v2's
+  // CHECK (slot BETWEEN 0 AND 7). The rows are copied as they are; the table
+  // has no index beyond its key and nothing references it.
+  `
+  ALTER TABLE cards ADD COLUMN slot_count INTEGER NOT NULL DEFAULT 8 CHECK (slot_count IN (8, 32));
+  CREATE TABLE card_slots_v9 (
+    short_id      TEXT    NOT NULL,
+    slot          INTEGER NOT NULL CHECK (slot BETWEEN 0 AND 31),
+    pubkey        TEXT    NOT NULL,
+    PRIMARY KEY (short_id, slot)
+  );
+  INSERT INTO card_slots_v9 (short_id, slot, pubkey) SELECT short_id, slot, pubkey FROM card_slots;
+  DROP TABLE card_slots;
+  ALTER TABLE card_slots_v9 RENAME TO card_slots;
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

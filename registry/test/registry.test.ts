@@ -28,9 +28,9 @@ function key(seed: number, tail = 'deadbeef'): string {
   return seed.toString(16).padStart(2, '0').repeat(28) + tail;
 }
 
-/** Eight slot keys for a card whose short id is `shortId`. */
-function slots(shortId: string): string[] {
-  return Array.from({length: 8}, (_, i) => key(i + 1, i === 0 ? shortId : `0000000${i}`));
+/** Slot keys (8 by default, or 32) for a card whose short id is `shortId`. */
+function slots(shortId: string, count = 8): string[] {
+  return Array.from({length: count}, (_, i) => key(i + 1, i === 0 ? shortId : i.toString(16).padStart(8, '0')));
 }
 
 const nonce = (n: number) => '02' + n.toString(16).padStart(2, '0').repeat(32);
@@ -1703,6 +1703,111 @@ describe('O5: finishing a card lifted after its rotation', () => {
   });
 });
 
+describe('32-slot cards', () => {
+  const BK = 'e'.repeat(64);
+  const keyNonce32 = (shortId: string, n: number) => '02' + slots(shortId, 32)[n]!;
+
+  async function card32(shortId = '3a3b3c3d') {
+    const token = await signIn();
+    const till = await newTill(token);
+    const batchId = await newBatch(token);
+    const res = await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId, slot_pubkeys: slots(shortId, 32)}));
+    expect(res.status).toBe(200);
+    return {token, till, batchId, shortId, stored: ((await res.json()) as {stored: {slot_count: number; slot_pubkeys: string[]}}).stored};
+  }
+
+  it('registers 32 keys and records 32 slots; an 8-key row records 8, a keyless row 8', async () => {
+    const {token, till, batchId, shortId, stored} = await card32();
+    expect(stored.slot_count).toBe(32);
+    expect(stored.slot_pubkeys).toHaveLength(32);
+    const s = await state(till.token, shortId);
+    expect(s.slots.map(x => x.slot)).toEqual(Array.from({length: 32}, (_, i) => i));
+    expect((s as unknown as {slot_count: number}).slot_count).toBe(32);
+
+    const eight = await post('/registry/cards', token, card({short_id: '8a8b8c8d', batch_id: batchId}));
+    expect(((await eight.json()) as {stored: {slot_count: number}}).stored.slot_count).toBe(8);
+    const {slot_pubkeys: _drop, ...older} = card({short_id: '0a0a0a0a', batch_id: batchId});
+    const keyless = await post('/registry/cards', token, older);
+    expect(((await keyless.json()) as {stored: {slot_count: number}}).stored.slot_count).toBe(8);
+    // The identical 32-key body replays; the same keys cut to 8 are a different card.
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId, slot_pubkeys: slots(shortId, 32)}))).status).toBe(200);
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: batchId, slot_pubkeys: slots(shortId, 32).slice(0, 8)}))).status).toBe(409);
+  });
+
+  it('refuses any key count but 8 or 32', async () => {
+    const token = await signIn();
+    const batchId = await newBatch(token);
+    for (const n of [1, 7, 9, 16, 31, 33]) {
+      const res = await post('/registry/cards', token, card({short_id: '5a5b5c5d', batch_id: batchId, slot_pubkeys: slots('5a5b5c5d', n)}));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('bounds a charge’s change by the card’s own count: slot 31 on a 32-slot card, slot 8 nowhere on an 8-slot one', async () => {
+    const {till, shortId} = await card32();
+    await hook('/test/note', {short_id: shortId, nonce: nonce(1), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+    const bad = await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [{slot: 32, amount_msat: 24_000, nonce: nonce(2), blinding_key: BK, out_idx: 1}]}));
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain('slot 0-31');
+    const ok = await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [{slot: 31, amount_msat: 24_000, nonce: nonce(2), blinding_key: BK, out_idx: 1}]}));
+    expect(ok.status).toBe(200);
+    expect((await state(till.token, shortId)).notes.find(n => n.slot === 31)?.status).toBe('pending');
+
+    const token = await signIn();
+    const {shortId: eight} = await cardWithNote(token, '8a8b8c8e');
+    const res = await post(`/cards/${eight}/intent`, till.token, intent(0, {txid: txid(8), change: [{slot: 8, amount_msat: 24_000, nonce: nonce(3), blinding_key: BK, out_idx: 1}]}));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('slot 0-7');
+  });
+
+  it('renews a two-digit slot on a 32-slot card; slot 8 of an 8-slot card is out of range', async () => {
+    const {till, batchId, token, shortId} = await card32();
+    const old = slots(shortId, 32)[20]!;
+    const ok = await call('PUT', `/cards/${shortId}/slots/20`, till.token, {version: 0, old_pubkey: old, pubkey: key(90)});
+    expect(await ok.json()).toEqual({ok: true, version: 1});
+    expect((await state(till.token, shortId)).slots[20]!.pubkey).toBe(key(90));
+    expect((await call('PUT', `/cards/${shortId}/slots/32`, till.token, {version: 1, old_pubkey: old, pubkey: key(91)})).status).toBe(400);
+
+    await post('/registry/cards', token, card({short_id: '8a8b8c8f', batch_id: batchId}));
+    const res = await call('PUT', '/cards/8a8b8c8f/slots/8', till.token, {version: 0, old_pubkey: key(9), pubkey: key(92)});
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('0 to 7');
+  });
+
+  it('lists all 32 free slots and takes a 12-note holder load, which an 8-slot card could not hold', async () => {
+    const {till, shortId} = await card32();
+    const free = (await (await get(`/cards/${shortId}/slots`, null)).json()) as {free: {slot: number}[]};
+    expect(free.free.map(f => f.slot)).toEqual(Array.from({length: 32}, (_, i) => i));
+    const picked = Array.from({length: 12}, (_, i) => 20 + i); // slots 20-31
+    const body = {
+      version: 0,
+      txid: txid(30),
+      notes: picked.map((slot, i) => ({slot, amount_msat: 1_000, nonce: keyNonce32(shortId, slot), blinding_key: BK, out_idx: i})),
+    };
+    expect((await post(`/cards/${shortId}/load`, null, body)).status).toBe(200);
+    const outcome = {txid: txid(30), notes: picked.map(slot => ({nonce: keyNonce32(shortId, slot), signature: sign(keyNonce32(shortId, slot), 1_000)}))};
+    expect((await post(`/cards/${shortId}/load/outcome`, null, outcome)).status).toBe(200);
+    expect((await state(till.token, shortId)).notes.filter(n => n.status === 'live').map(n => n.slot)).toEqual(picked);
+
+    // Out of range is refused before the card's keys are read: slot 32 here, slot 8 and a ninth note on 8 slots.
+    const over = {version: 2, txid: txid(31), notes: [{slot: 32, amount_msat: 1_000, nonce: nonce(4), blinding_key: BK, out_idx: 0}]};
+    expect((await post(`/cards/${shortId}/load`, null, over)).status).toBe(400);
+    const token = await signIn();
+    const batchId = await newBatch(token);
+    await post('/registry/cards', token, card({short_id: '8a8b8c90', batch_id: batchId}));
+    const slot8 = {version: 0, txid: txid(32), notes: [{slot: 8, amount_msat: 1_000, nonce: nonce(5), blinding_key: BK, out_idx: 0}]};
+    expect((await post('/cards/8a8b8c90/load', null, slot8)).status).toBe(400);
+    const nine = {
+      version: 0,
+      txid: txid(33),
+      notes: Array.from({length: 9}, (_, i) => ({slot: i, amount_msat: 1_000, nonce: nonce(10 + i), blinding_key: BK, out_idx: i})),
+    };
+    const res = await post('/cards/8a8b8c90/load', null, nine);
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('1 to 8 notes');
+  });
+});
+
 describe('migrations', () => {
   it('adopts the first deployment’s tables and rows, and gives its batches to operator 1', async () => {
     const legacy = env.REGISTRY.get(env.REGISTRY.idFromName('legacy-upgrade'));
@@ -1727,6 +1832,49 @@ describe('migrations', () => {
       expect(sql.exec('SELECT short_id, slot_pubkeys FROM cards').one()).toEqual({short_id: '0abcdef1', slot_pubkeys: null});
       migrate(state.storage); // a second run is a no-op
       expect(sql.exec('SELECT COUNT(*) AS n FROM cards').one()).toEqual({n: 1});
+    });
+  });
+
+  it('v9 gives existing cards 8 slots and rebuilds card_slots for 0-31 without losing a row', async () => {
+    const v8 = env.REGISTRY.get(env.REGISTRY.idFromName('v8-upgrade'));
+    await runInDurableObject(v8, async (_instance, state) => {
+      const sql = state.storage.sql;
+      for (const t of sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray()) {
+        sql.exec(`DROP TABLE IF EXISTS "${String(t.name)}"`);
+      }
+      // Exactly the schema v8 had, with two 8-slot cards on it, one renewed.
+      for (const m of MIGRATIONS.slice(0, 8)) sql.exec(m);
+      sql.exec('CREATE TABLE schema_version (version INTEGER NOT NULL)');
+      sql.exec('INSERT INTO schema_version (version) VALUES (8)');
+      sql.exec("INSERT INTO batches (federation_id, count, pin_policy, load_sha256, created_at) VALUES (?, 2, 'batch', ?, 1)", FED, SHA);
+      const rows: [string, number, string][] = [];
+      for (const id of ['11aa22bb', '33cc44dd']) {
+        const keys = slots(id);
+        sql.exec(
+          "INSERT INTO cards (short_id, batch_id, installed_at, load_sha256, pin_set, pin_policy, notes_issued, received_at, slot_pubkeys) VALUES (?, 1, 1, ?, 1, 'batch', 0, 2, ?)",
+          id, SHA, JSON.stringify(keys),
+        );
+        keys.forEach((k, slot) => rows.push([id, slot, slot === 5 && id === '33cc44dd' ? key(70) : k]));
+      }
+      for (const [id, slot, k] of rows) sql.exec('INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)', id, slot, k);
+      expect(() => sql.exec("INSERT INTO card_slots (short_id, slot, pubkey) VALUES ('11aa22bb', 8, 'x')")).toThrow(/CHECK/);
+
+      migrate(state.storage);
+      expect(sql.exec('SELECT version FROM schema_version').one()).toEqual({version: MIGRATIONS.length});
+      expect(sql.exec('SELECT short_id, slot_count FROM cards ORDER BY short_id').toArray()).toEqual([
+        {short_id: '11aa22bb', slot_count: 8},
+        {short_id: '33cc44dd', slot_count: 8},
+      ]);
+      const after = sql.exec('SELECT short_id, slot, pubkey FROM card_slots ORDER BY short_id, slot').toArray();
+      expect(after.map(r => [r.short_id, r.slot, r.pubkey])).toEqual(rows);
+      // The rebuilt table takes slots to 31, refuses 32, and keeps its key.
+      sql.exec("INSERT INTO card_slots (short_id, slot, pubkey) VALUES ('11aa22bb', 31, 'x')");
+      expect(() => sql.exec("INSERT INTO card_slots (short_id, slot, pubkey) VALUES ('11aa22bb', 32, 'x')")).toThrow(/CHECK/);
+      expect(() => sql.exec("INSERT INTO card_slots (short_id, slot, pubkey) VALUES ('11aa22bb', 0, 'y')")).toThrow(/UNIQUE|PRIMARY/);
+      expect(() => sql.exec("UPDATE cards SET slot_count = 16 WHERE short_id = '11aa22bb'")).toThrow(/CHECK/);
+      expect(sql.exec("SELECT name FROM sqlite_master WHERE name = 'card_slots_v9'").toArray()).toEqual([]);
+      migrate(state.storage); // a second run is a no-op
+      expect(sql.exec('SELECT COUNT(*) AS n FROM card_slots').one()).toEqual({n: 17});
     });
   });
 });

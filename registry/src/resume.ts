@@ -2,7 +2,7 @@
  * Finishing a card whose install tap was lifted after the card-manager
  * rotation, while its slot keys or its PIN were being written (OPS-PLAN O5).
  * The card is ours and on its own keys, with our applet and no PIN; the
- * phone re-keys all eight slots, sets a fresh PIN and posts the finished card
+ * phone re-keys every slot, sets a fresh PIN and posts the finished card
  * under its new short id.
  *
  *   POST /registry/resume-check {chip, short_id}   may the card on this chip, read as short_id, be finished?
