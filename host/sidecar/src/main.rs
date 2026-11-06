@@ -48,7 +48,12 @@ enum LnCmd {
     Gateways,
     /// Make an invoice for `amount_msat`, print it, and wait (up to 10 minutes) until it is paid
     /// and the eCash is in the wallet.
-    Receive { amount_msat: u64 },
+    Receive {
+        amount_msat: u64,
+        /// Use this gateway (its id, as `ln gateways` prints it) instead of letting the client pick.
+        #[arg(long)]
+        gateway: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,7 +158,8 @@ enum CardCmd {
         amount_msat: Vec<u64>,
     },
     /// Load the card from this wallet through ops, as a holder's wallet would (OPS-PLAN § 6):
-    /// one note per set bit of each amount, into the free slots ops reports. Needs no PIN.
+    /// one note per set bit of each amount, into the free slots ops reports. Needs no PIN. With
+    /// this till's claimed token for the same registry, it keys unkeyed slots the load needs.
     Load {
         #[arg(required = true)]
         amount_msat: Vec<u64>,
@@ -229,12 +235,23 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Ln(LnCmd::Receive { amount_msat }) => {
+        Cmd::Ln(LnCmd::Receive { amount_msat, gateway }) => {
             use futures::StreamExt as _;
             let w = Wallet::open(&cli.data_dir).await?;
             let ln = w.lightning()?;
             ln.update_gateway_cache().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            let gw = ln.select_available_gateway(None, None).await.map_err(|e| anyhow::anyhow!("no gateway: {e:?}"))?;
+            let want = match gateway {
+                Some(id) => Some(
+                    ln.list_gateways()
+                        .await
+                        .into_iter()
+                        .map(|g| g.info)
+                        .find(|g| g.gateway_id.to_string() == *id)
+                        .with_context(|| format!("no gateway {id} in the federation (see `ln gateways`)"))?,
+                ),
+                None => None,
+            };
+            let gw = ln.select_available_gateway(want, None).await.map_err(|e| anyhow::anyhow!("no gateway: {e:?}"))?;
             eprintln!("gateway {} ({})", gw.gateway_id, gw.api);
             let desc = lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
             let (op, invoice, _) = ln
@@ -374,7 +391,14 @@ async fn main() -> Result<()> {
             // would cost the holder a try).
             let w = Wallet::open(&cli.data_dir).await?;
             let mut card = open_from_env().context("opening the card")?;
-            let loader = fedimint_card_sidecar::holder::Loader::new(&w, ops_url, &cli.data_dir)?;
+            let mut loader = fedimint_card_sidecar::holder::Loader::new(&w, ops_url, &cli.data_dir)?;
+            // A till's own wallet loading a split-keyed card can key its unkeyed slots with the
+            // token an approved claim left, when it is for this registry (`holder.rs`).
+            if let Some(cfg) = fedimint_card_sidecar::claim::read_ops(&cli.data_dir)? {
+                if cfg.url.trim_end_matches('/') == ops_url.trim_end_matches('/') {
+                    loader = loader.with_keyer(fedimint_card_sidecar::ops::OpsClient::new(&cfg)?);
+                }
+            }
             let r = loader.load(card.as_mut(), amount_msat).await?;
             if r.resumed > 0 {
                 println!("finished {} load(s) an earlier run left", r.resumed);
