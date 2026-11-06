@@ -482,6 +482,43 @@ final class SchnorrHW {
         sha256.doFinal(msg, msgOff, msgLen, out, outOff);
     }
 
+    /** Fills {@code len} bytes of {@code buf} from the secure RNG. */
+    void random(byte[] buf, short off, short len) {
+        rng.generateData(buf, off, len);
+    }
+
+    /**
+     * HMAC-SHA256 (RFC 2104) with a 32-byte key, on the shared SHA-256 instance.
+     *
+     * @param key   32-byte key at {@code keyOff}
+     * @param msg   message, {@code msgLen} bytes at {@code msgOff}
+     * @param work  96 bytes of scratch at {@code workOff}: the padded key block, then the inner
+     *              hash. The caller wipes it.
+     * @param out   receives the 32-byte MAC at {@code outOff}; must not overlap {@code work}
+     */
+    void hmacSha256(byte[] key, short keyOff,
+                    byte[] msg, short msgOff, short msgLen,
+                    byte[] work, short workOff,
+                    byte[] out, short outOff) {
+        short inner = (short) (workOff + 64);
+        padKey(key, keyOff, work, workOff, (byte) 0x36);
+        sha256.reset();
+        sha256.update(work, workOff, (short) 64);
+        sha256.doFinal(msg, msgOff, msgLen, work, inner);
+        padKey(key, keyOff, work, workOff, (byte) 0x5C);
+        sha256.reset();
+        sha256.update(work, workOff, (short) 64);
+        sha256.doFinal(work, inner, (short) 32, out, outOff);
+    }
+
+    /** work[0..63] = (key || 32 zero bytes) XOR pad. */
+    private static void padKey(byte[] key, short keyOff, byte[] work, short workOff, byte pad) {
+        for (short i = 0; i < 32; i++) {
+            work[(short) (workOff + i)] = (byte) (key[(short) (keyOff + i)] ^ pad);
+        }
+        Util.arrayFillNonAtomic(work, (short) (workOff + 32), (short) 32, pad);
+    }
+
     // ── Modular arithmetic ────────────────────────────────────────────────
 
     /**

@@ -31,11 +31,11 @@ class GenKeyGetPubTest {
     }
 
     @Test
-    void sixteenSlotsGiveSixteenDistinctKeys() {
+    void everySlotGivesADistinctKey() {
         CardTestSupport c = new CardTestSupport();
         Set<String> seen = new HashSet<>();
-        for (int s = 0; s < 8; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
-        assertEquals(8, seen.size());
+        for (int s = 0; s < FedimintCardApplet.SLOTS; s++) assertTrue(seen.add(Bip340.hex(c.genKey(s))));
+        assertEquals(FedimintCardApplet.SLOTS, seen.size());
     }
 
     @Test

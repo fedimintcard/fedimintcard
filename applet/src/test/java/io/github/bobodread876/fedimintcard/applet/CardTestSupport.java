@@ -17,7 +17,7 @@ import javax.smartcardio.ResponseAPDU;
 final class CardTestSupport {
     static final String AID_HEX = "F0464D4341524401";
     static final int CLA = 0xB0;
-    static final int GEN_KEY = 0x10, GET_PUB = 0x11, SIGN = 0x12;
+    static final int GEN_KEY = 0x10, GET_PUB = 0x11, SIGN = 0x12, STATE_KEY = 0x13;
     static final int VERIFY_PIN = 0x40, SET_PIN = 0x41, CHANGE_PIN = 0x42;
 
     /** A PIN every helper uses unless a test says otherwise: inside the 4..8 byte bounds. */
@@ -162,6 +162,10 @@ final class CardTestSupport {
     void installKey(int slot, BigInteger d) throws ReflectiveOperationException {
         byte[] s = Bip340.bytes32(d);
         byte[] w = Bip340.uncompressed(Bip340.pubkey(d));
+        // Slots get their key objects at first GEN_KEY (keysFor); build them the same way here.
+        java.lang.reflect.Method keysFor = applet().getClass().getDeclaredMethod("keysFor", short.class);
+        keysFor.setAccessible(true);
+        keysFor.invoke(applet(), (short) slot);
         ((ECPrivateKey[]) field("privs"))[slot].setS(s, (short) 0, (short) 32);
         ((ECPublicKey[]) field("pubs"))[slot].setW(w, (short) 0, (short) 65);
         ((boolean[]) field("used"))[slot] = true;

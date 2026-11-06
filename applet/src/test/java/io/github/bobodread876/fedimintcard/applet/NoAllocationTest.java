@@ -37,9 +37,12 @@ class NoAllocationTest {
      * its static fields are built when the applet is installed, never on a command path, and the
      * domain-parameter constants ({@code P}, {@code A}, {@code B}, {@code N}, {@code G}) are
      * exactly that: {@code new byte[32]} once, at install.
+     *
+     * <p>{@code keysFor} builds one slot's key pair at that slot's first GEN_KEY and never again,
+     * so it allocates at most {@code SLOTS} times in the applet's life: bounded, not a leak.
      */
     static final Map<String, Set<String>> ALLOWED = Map.of(
-        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>"),
+        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor"),
         "SchnorrHW.java", Set.of("SchnorrHW", "init"),
         "Opener.java", Set.of("Opener", "install"));
 

@@ -548,7 +548,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         ResponseAPDU r = c.select();
         assertSw(0x9000, r);
-        assertArrayEquals(new byte[] { 0x02, 0x00 }, r.getData());
+        assertArrayEquals(new byte[] { 0x02, 0x01 }, r.getData());
     }
 
     /** A verified PIN ends with the selection: another applet selected, then this one, asks again. */

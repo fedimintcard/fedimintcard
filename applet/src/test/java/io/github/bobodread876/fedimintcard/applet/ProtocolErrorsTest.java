@@ -16,15 +16,15 @@ class ProtocolErrorsTest {
     @Test
     void unknownInsIs6D00() {
         CardTestSupport c = new CardTestSupport();
-        assertSw(0x6D00, c.tx(0xB0, 0x13, 0, 0, null));
+        assertSw(0x6D00, c.tx(0xB0, 0x14, 0, 0, null));
         assertSw(0x6D00, c.tx(0xB0, 0x00, 0, 0, null));
     }
 
     @Test
     void badP1P2Is6B00() {
         CardTestSupport c = new CardTestSupport();
-        assertSw(0x6B00, c.tx(0xB0, 0x10, 8, 0, null));
-        assertSw(0x6B00, c.tx(0xB0, 0x10, 8, 1, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 32, 0, null));
+        assertSw(0x6B00, c.tx(0xB0, 0x10, 32, 1, null));
         assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 2, null));
         assertSw(0x6B00, c.tx(0xB0, 0x10, 0, 0xFF, null));
         assertSw(0x6B00, c.tx(0xB0, 0x11, 0xFF, 0, null));
@@ -42,7 +42,7 @@ class ProtocolErrorsTest {
             0x00, 0xA4, 0x04, 0x00, Bip340.hex(CardTestSupport.AID_HEX)));
         assertSw(0x9000, r);
         // P1b: SELECT answers the applet version, 2 bytes, instead of a bare 9000.
-        assertArrayEquals(new byte[] { 0x02, 0x00 }, r.getData());
+        assertArrayEquals(new byte[] { 0x02, 0x01 }, r.getData());
     }
 
     @Test

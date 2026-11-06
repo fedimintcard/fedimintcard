@@ -4,9 +4,11 @@ import javacard.framework.APDU;
 import javacard.framework.Applet;
 import javacard.framework.ISO7816;
 import javacard.framework.ISOException;
+import javacard.framework.SystemException;
 import javacard.framework.JCSystem;
 import javacard.framework.OwnerPIN;
 import javacard.framework.Util;
+import javacard.security.AESKey;
 import javacard.security.ECPrivateKey;
 import javacard.security.ECPublicKey;
 import javacard.security.KeyBuilder;
@@ -50,14 +52,15 @@ public final class FedimintCardApplet extends Applet {
     static final byte INS_GEN_KEY = (byte) 0x10;
     static final byte INS_GET_PUB = (byte) 0x11;
     static final byte INS_SIGN = (byte) 0x12;
+    static final byte INS_STATE_KEY = (byte) 0x13;
     static final byte INS_VERIFY_PIN = (byte) 0x40;
     static final byte INS_SET_PIN = (byte) 0x41;
     static final byte INS_CHANGE_PIN = (byte) 0x42;
-    static final short SLOTS = 8;
+    static final short SLOTS = 32;
 
     /** SELECT answers this major and {@link #VERSION_MINOR}; see the class javadoc. */
     static final byte VERSION_MAJOR = 0x02;
-    static final byte VERSION_MINOR = 0x00;
+    static final byte VERSION_MINOR = 0x01;
 
     /** PIN size bounds (bytes; the applet never interprets them) and the retry limit. */
     static final byte PIN_MIN = 4;
@@ -116,17 +119,17 @@ public final class FedimintCardApplet extends Applet {
     private final SchnorrHW schnorr;
     private final OwnerPIN pin;
     private byte pinState;
+    /**
+     * The card secret behind STATE_KEY: 32 random bytes made at install, kept in a key object so
+     * the chip protects it at rest like the slot keys. It never leaves the card; only the HMAC
+     * derived from it does.
+     */
+    private final AESKey secret;
 
     private FedimintCardApplet() {
-        for (short i = 0; i < SLOTS; i++) {
-            privs[i] = (ECPrivateKey) KeyBuilder.buildKey(
-                KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
-            pubs[i] = (ECPublicKey) KeyBuilder.buildKey(
-                KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
-            // Domain parameters are written at GEN_KEY, not here: the J3R180 runs the
-            // constructor inside a bounded commit buffer and refuses INSTALL (6F00) when
-            // more slots' parameters are written at once (16 slots failed, 8 passed).
-        }
+        // A slot's key objects are built at its first GEN_KEY (keysFor), not here: the J3R180
+        // runs the constructor inside a bounded commit buffer and refuses INSTALL (6F00) when it
+        // builds too much at once (16 slots' keys failed, 8 passed).
         gen = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         setParams((ECPrivateKey) gen.getPrivate(), (ECPublicKey) gen.getPublic());
         tmp = JCSystem.makeTransientByteArray((short) 65, JCSystem.CLEAR_ON_DESELECT);
@@ -138,6 +141,10 @@ public final class FedimintCardApplet extends Applet {
         // A new instance starts on the not-set path, as the check in set() expects.
         pin = new OwnerPIN(PIN_TRIES, PIN_MAX);
         pinState = PIN_STATE_NOT_SET;
+        secret = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
+        schnorr.random(tmp, (short) 0, (short) 32);
+        secret.setKey(tmp, (short) 0);
+        Util.arrayFillNonAtomic(tmp, (short) 0, (short) 32, (byte) 0);
     }
 
     public static void install(byte[] b, short o, byte l) {
@@ -207,6 +214,9 @@ public final class FedimintCardApplet extends Applet {
                 break;
             case INS_SIGN:
                 sign(apdu, buf);
+                break;
+            case INS_STATE_KEY:
+                stateKey(apdu, buf);
                 break;
             case INS_VERIFY_PIN:
                 verifyPin(apdu, buf);
@@ -410,6 +420,32 @@ public final class FedimintCardApplet extends Applet {
         return (short) (buf[ISO7816.OFFSET_LC] & 0xFF);
     }
 
+    /** HMAC message for STATE_KEY: ASCII "fedimintcard/state/v1". */
+    private static final byte[] STATE_LABEL = {
+        'f','e','d','i','m','i','n','t','c','a','r','d','/','s','t','a','t','e','/','v','1' };
+
+    /**
+     * STATE_KEY: answers HMAC-SHA256(secret, "fedimintcard/state/v1"), the same 32 bytes for the
+     * life of the applet. Behind the PIN like SIGN (6A94 without this selection's VERIFY_PIN).
+     * P1 and P2 must be 0. The secret is read into {@code tmp} and the HMAC worked in the APDU
+     * buffer (bytes 32..127); both are wiped before the answer is sent from bytes 0..31.
+     */
+    private void stateKey(APDU apdu, byte[] buf) {
+        checkPinReady();
+        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
+        }
+        try {
+            secret.getKey(tmp, (short) 0);
+            schnorr.hmacSha256(tmp, (short) 0, STATE_LABEL, (short) 0, (short) STATE_LABEL.length,
+                buf, (short) 32, buf, (short) 0);
+        } finally {
+            Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+            Util.arrayFillNonAtomic(buf, (short) 32, (short) 96, (byte) 0);
+        }
+        apdu.setOutgoingAndSend((short) 0, (short) 32);
+    }
+
     /** Checks P1/P2, returns the slot. P2 must be 0, or 1 when {@code allowOverwrite}. */
     private static short slot(byte[] buf, boolean allowOverwrite) {
         short p1 = buf[ISO7816.OFFSET_P1];
@@ -432,8 +468,30 @@ public final class FedimintCardApplet extends Applet {
         apdu.setOutgoingAndSend((short) 0, (short) 32);
     }
 
+    /**
+     * Builds slot {@code s}'s key objects the first time it is keyed, once per slot for the life of
+     * the applet: at most {@link #SLOTS} pairs, so this is bounded and never a per-tap leak. A card
+     * out of persistent memory answers 6A84 and the slot stays empty.
+     */
+    private void keysFor(short s) {
+        if (privs[s] != null) {
+            return;
+        }
+        try {
+            ECPublicKey pub = (ECPublicKey) KeyBuilder.buildKey(
+                KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+            ECPrivateKey priv = (ECPrivateKey) KeyBuilder.buildKey(
+                KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+            pubs[s] = pub;
+            privs[s] = priv;
+        } catch (SystemException e) {
+            ISOException.throwIt(ISO7816.SW_FILE_FULL);
+        }
+    }
+
     private void genKey(APDU apdu, byte[] buf) {
         short s = slot(buf, true);
+        keysFor(s);
         boolean overwrite = buf[ISO7816.OFFSET_P2] == 1;
         if (apdu.setIncomingAndReceive() != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
