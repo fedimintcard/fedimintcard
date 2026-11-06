@@ -263,7 +263,12 @@ export class FakeGpCard {
       return sw(0x6a82);
     }
     this.selected = aid;
-    return aid === CARD ? ok([0x02, 0x00]) : ok();
+    if (aid !== CARD) {
+      return ok();
+    }
+    // The applet's version: 2.1 has 32 slots, 2.0 had 8.
+    const slots = this.instances.get(aid)?.applet?.slots.length ?? 8;
+    return ok([0x02, slots === 32 ? 0x01 : 0x00]);
   }
 
   private derive(seq: number[]) {
@@ -463,7 +468,8 @@ export class FakeGpCard {
       ...(module === CARD
         ? {
             applet: {
-              slots: new Array(this.appletSlots).fill(null),
+              // What INSTALL puts on the card is the load file the app carries: applet 2.1.
+              slots: new Array(32).fill(null),
               pin: null,
               tries: 3,
               blocked: false,

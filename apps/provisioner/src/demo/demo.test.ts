@@ -118,8 +118,8 @@ describe('the runs themselves', () => {
     expect(run.result?.ok).toBe(false);
     expect(run.result?.kind).toBe('pulled');
     expect(run.result?.phase).toBe('load');
-    // 23 blocks (docs/CAP-BUILD.md): the lift is before the end
-    expect(run.result?.blocks).toEqual({at: 12, of: 23});
+    // 25 blocks (applet 2.1, tools/cardkit/make-assets.py): the lift is before the end
+    expect(run.result?.blocks).toEqual({at: 12, of: 25});
     expect(stopFor(run)).toBe('pulled');
   });
 
@@ -202,7 +202,7 @@ describe('the fake card is a card, not a shortcut', () => {
     expect(events).toContain('phase:load');
     expect(events).toContain('block');
     // a phase event per phase, and one block event per LOAD that was confirmed
-    expect(events.filter(e => e === 'block')).toHaveLength(23);
+    expect(events.filter(e => e === 'block')).toHaveLength(25);
     expect(run.result?.timings.every(t => t.apdus >= 0)).toBe(true);
     expect(run.result?.apdus.length).toBeGreaterThan(0);
   });
@@ -232,7 +232,7 @@ describe('the fake card is a card, not a shortcut', () => {
     // SELECT the card applet answers the applet's version, which is what the
     // plan's check reads; Cashu answers 02 01 here
     const sel = await tx([0x00, 0xa4, 0x04, 0x00, 0x08, 0xf0, 0x46, 0x4d, 0x43, 0x41, 0x52, 0x44, 0x01, 0x00]);
-    expect(sel).toEqual([0x02, 0x00, 0x90, 0x00]);
+    expect(sel).toEqual([0x02, 0x01, 0x90, 0x00]);
     // GET_PUB 0 on an unkeyed slot: 69 85, never Cashu's 30-byte GET_INFO
     const pub = await tx([0xb0, 0x11, 0x00, 0x00, 0x00]);
     expect(pub).toEqual([0x69, 0x85]);

@@ -119,10 +119,10 @@ function containsAid(payload: number[], aid: readonly number[]): boolean {
 }
 
 /**
- * The applet's own answer to a selected card, at its version: `02 00` from
+ * The applet's own answer to a selected card, at its version: `02 01` (applet 2.1) from
  * VERSION_MAJOR/VERSION_MINOR, which cardkit's fedimint plan checks on SELECT.
  */
-const APLET_VERSION = [0x02, 0x00];
+const APLET_VERSION = [0x02, 0x01];
 
 /**
  * A `Transceiver` wired to a fake card in `profile`. `speed` scales every delay
@@ -233,12 +233,13 @@ export function fakeCard(
       }
 
       case 0x11: {
-        // the applet's GET_PUB (CLA B0): `69 85` until the slot is keyed
+        // the applet's GET_PUB (CLA B0): `69 85` until the slot is keyed, `6B 00`
+        // past applet 2.1's 32 slots
         await at(DELAYS.plainApdu);
         if (apdu[0] !== 0xb0 || installed === 'none') {
           return sw(0x6d00);
         }
-        return sw(0x6985);
+        return sw(apdu[2] >= 32 ? 0x6b00 : 0x6985);
       }
 
       case 0x50: {

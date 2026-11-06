@@ -254,7 +254,8 @@ function resumeOptions(
   return {...base, resumeCheck};
 }
 
-test.each([8, 32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (%i slots): the next tap finishes the card, no failed login, at most one PIN try', async slots => {
+// An install puts applet 2.1 on the card, so a freshly installed card always has 32 slots.
+test.each([32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (%i slots): the next tap finishes the card, no failed login, at most one PIN try', async slots => {
   // The finish's APDUs on the wire, after the rotation: SELECT, then the B0 commands.
   const clean = new FakeGpCard({appletSlots: slots});
   await installTap(clean.transceive, resumeOptions().opts);
