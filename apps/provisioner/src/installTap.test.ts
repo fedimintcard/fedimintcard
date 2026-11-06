@@ -78,6 +78,36 @@ test('a blank card: installed on the factory keys, rotated to its own, keyed and
   expect(at(PUT_KEY)).toBeLessThan(at(0x10));
 });
 
+test('a blank card with the 32-slot applet: every slot keyed in the install tap, then the PIN', async () => {
+  const card = new FakeGpCard({appletSlots: 32});
+  const r = await installTap(card.transceive, options().opts);
+  expect(r.installed).toEqual({ok: true});
+  expect(r.setup).toEqual(
+    expect.objectContaining({ok: true, slotCount: 32, generated: Array.from({length: 32}, (_, i) => i)}),
+  );
+  expect(r.setup?.ok && r.setup.keys).toHaveLength(32);
+  expect(card.applet!.slots.every(s => s !== null)).toBe(true);
+  expect(card.applet!.pin).toBe('482916');
+  // SET_PIN only after the last slot's key.
+  const b0 = card.log.filter(a => a[0] === 0xb0);
+  expect(b0.findIndex(a => a[1] === 0x41)).toBeGreaterThan(b0.findIndex(a => a[1] === 0x10 && a[2] === 31));
+});
+
+test('a 32-slot card whose PIN answer was lost: one VERIFY, all 32 keys read back', async () => {
+  const card = new FakeGpCard({keys: ownKeys(), appletSlots: 32}).withLiftedApplet(32, '135792');
+  const keys = card.applet!.slots.map(s => toHex(s!));
+  const r = await installTap(
+    card.transceive,
+    options({
+      resumeCheck: async (chip: string, shortId: string) => ({short_id: shortId, chip, known: false, resumable: true, reasons: []}),
+      attemptedPin: chip => (chip === J3R180_CHIP ? '135792' : null),
+    }).opts,
+  );
+  expect(r.finishedWithAttemptedPin).toBe(true);
+  expect(r.setup?.ok && r.setup.keys.map(toHex)).toEqual(keys);
+  expect(r.setup).toEqual(expect.objectContaining({generated: [], slotCount: 32}));
+});
+
 test('a tap broken after PUT KEY: the next tap finds the card on its own keys and finishes it', async () => {
   const card = new FakeGpCard();
   card.pull(apdu => apdu[1] === PUT_KEY, 'after');
@@ -192,7 +222,7 @@ test('ops’ keys are checked: a reply for another chip is no answer', async () 
 });
 
 /* ------------------------------------------------------------------------- */
-/* A tap lifted during GEN_KEY ×8, SET_PIN or VERIFY_PIN, and its resume     */
+/* A tap lifted during GEN_KEY, SET_PIN or VERIFY_PIN, and its resume        */
 /* ------------------------------------------------------------------------- */
 
 const GEN_KEY = 0x10;
@@ -223,17 +253,19 @@ function resumeOptions(
   return {...base, resumeCheck};
 }
 
-test('a tap lifted at any APDU of GEN_KEY ×8, SET_PIN or VERIFY_PIN: the next tap finishes the card, no failed login, at most one PIN try', async () => {
+test.each([8, 32])('a tap lifted at any APDU of GEN_KEY, SET_PIN or VERIFY_PIN (%i slots): the next tap finishes the card, no failed login, at most one PIN try', async slots => {
   // The finish's APDUs on the wire, after the rotation: SELECT, then the B0 commands.
-  const clean = new FakeGpCard();
+  const clean = new FakeGpCard({appletSlots: slots});
   await installTap(clean.transceive, resumeOptions().opts);
   const put = clean.ins().indexOf(PUT_KEY);
   const finish = clean.log.slice(put).filter(a => a[0] === 0xb0).length;
-  expect(finish).toBe(8 * 2 + 2); // GET_PUB + GEN_KEY per slot, SET_PIN, VERIFY_PIN
+  // The slot-count probe (GET_PUB past slot 7, and past 31 on a 32-slot card),
+  // GET_PUB + GEN_KEY per slot, SET_PIN, VERIFY_PIN.
+  expect(finish).toBe((slots === 8 ? 1 : 2) + slots * 2 + 2);
 
   for (let k = 0; k < finish; k++) {
     for (const when of ['before', 'after'] as const) {
-      const card = new FakeGpCard();
+      const card = new FakeGpCard({appletSlots: slots});
       let rotated = false;
       let seen = 0;
       card.pull(apdu => {
@@ -271,9 +303,9 @@ test('a tap lifted at any APDU of GEN_KEY ×8, SET_PIN or VERIFY_PIN: the next t
         expect([label, r.resumedFrom]).toEqual([label, undefined]);
         expect(card.applet!.pin).toBe('730194');
       } else if (pinBefore === null) {
-        // No PIN: all eight slots made again, a fresh PIN, a new short id.
+        // No PIN: every slot made again, a fresh PIN, a new short id.
         expect([label, r.resumedFrom]).toEqual([label, oldId]);
-        expect(r.setup).toEqual(expect.objectContaining({generated: [0, 1, 2, 3, 4, 5, 6, 7]}));
+        expect(r.setup).toEqual(expect.objectContaining({generated: Array.from({length: slots}, (_, i) => i), slotCount: slots}));
         expect(card.applet!.slots.every((s, i) => toHex(s!) !== oldSlots[i])).toBe(true);
         expect(shortIdOfSlot0(card)).not.toBe(oldId);
         expect(card.applet!.pin).toBe('730194');
@@ -282,7 +314,7 @@ test('a tap lifted at any APDU of GEN_KEY ×8, SET_PIN or VERIFY_PIN: the next t
         // SET_PIN took and its answer was lost: one VERIFY with the PIN sent, the keys kept.
         expect([label, r.finishedWithAttemptedPin]).toEqual([label, true]);
         expect(r.resumedFrom).toBeUndefined();
-        expect(r.setup).toEqual(expect.objectContaining({generated: []}));
+        expect(r.setup).toEqual(expect.objectContaining({generated: [], slotCount: slots}));
         expect(card.applet!.slots.map(s => toHex(s!))).toEqual(oldSlots);
         expect(card.applet!.pin).toBe(PIN);
         expect(pinTries(card, from)).toBe(1);
@@ -406,5 +438,5 @@ test('the batch keeps its place for a card the next tap can finish, and only for
   expect(holdsPlace(result({installed: {ok: false, kind: 'needsReset', phase: 'verifyPin'}}))).toBe(false);
   expect(holdsPlace(result({setup: {ok: false, step: 'keys', sw: 0x6f00, reason: 'x'}}))).toBe(true);
   expect(holdsPlace(result({setup: {ok: false, step: 'verifyPin', sw: 0x6f00, reason: 'x'}}))).toBe(false);
-  expect(holdsPlace(result({setup: {ok: true, keys: [], generated: []}}))).toBe(false);
+  expect(holdsPlace(result({setup: {ok: true, keys: [], generated: [], slotCount: 8}}))).toBe(false);
 });

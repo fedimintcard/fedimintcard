@@ -13,7 +13,7 @@
  * over the phone's NFC session (`session.ts` → `provision`), logged in with
  * the factory keys or the card's own; `rotate` moves a factory card to its
  * own keys (OPS-PLAN O5). `keySetup` and `setPin` follow in the same session
- * (`cardSetup.ts`): a freshly installed applet has eight empty slots, so the
+ * (`cardSetup.ts`): a freshly installed applet has empty slots (8 or 32), so the
  * phone asks the card to generate its keys, then sets and verifies the PIN.
  * No sidecar, no relay (docs/OPS-PLAN.md § 4). The provisioner loads no
  * value; the holder's wallet does (§ 6).

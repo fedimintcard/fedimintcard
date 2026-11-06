@@ -1,14 +1,28 @@
 import {CARD_AID} from './cardkit';
 import {FakeGpCard} from './testing/fakeGpCard';
-import {finishCard, pinApdu, keyApdu, probeApplet, probeCard, selectApdu, SLOT_COUNT} from './cardSetup';
+import {
+  finishCard,
+  finishVerified,
+  INSTALL_TAP_KEY_SLOTS,
+  pinApdu,
+  keyApdu,
+  probeApplet,
+  probeCard,
+  probeSlotCount,
+  selectApdu,
+} from './cardSetup';
 import {shortIdOf} from './store';
 
 /**
  * The applet's key and PIN commands as FedimintCardApplet.java answers them:
  * GET_PUB 6985 on an empty slot, GEN_KEY P2=00 refused on a used slot,
- * SET_PIN once (6985 after), VERIFY_PIN 63CX on a wrong PIN.
+ * SET_PIN once (6985 after), VERIFY_PIN 63CX on a wrong PIN, and 6B00 for a
+ * slot past the last (`count`, 8 unless told).
  */
-function applet(opts: {preset?: Record<number, number[]>; pinSet?: boolean; failGen?: number} = {}) {
+function applet(
+  opts: {preset?: Record<number, number[]>; pinSet?: boolean; failGen?: number; count?: number; probeAnswer?: number} = {},
+) {
+  const count = opts.count ?? 8;
   const slots = new Map<number, number[]>(Object.entries(opts.preset ?? {}).map(([k, v]) => [Number(k), v]));
   let pin: string | null = opts.pinSet ? '9999' : null;
   let selected = false;
@@ -25,6 +39,9 @@ function applet(opts: {preset?: Record<number, number[]>; pinSet?: boolean; fail
     }
     if (!selected || cla !== 0xb0) {
       return sw(0x6e00);
+    }
+    if ((ins === 0x10 || ins === 0x11) && p1 >= count) {
+      return sw(opts.probeAnswer ?? 0x6b00);
     }
     switch (ins) {
       case 0x11:
@@ -62,7 +79,7 @@ test('the APDUs are the host card client\'s', () => {
   expect(pinApdu(0x41, '1234')).toEqual([0xb0, 0x41, 0x00, 0x00, 4, 0x31, 0x32, 0x33, 0x34]);
 });
 
-test('a fresh applet gets eight keys and the PIN, verified', async () => {
+test('a fresh 8-slot applet gets eight keys and the PIN, verified', async () => {
   const card = applet();
   const steps: string[] = [];
   const r = await finishCard(card.tx, '482916', s => steps.push(s));
@@ -70,8 +87,11 @@ test('a fresh applet gets eight keys and the PIN, verified', async () => {
   if (!r.ok) {
     return;
   }
-  expect(r.keys).toHaveLength(SLOT_COUNT);
+  expect(r.keys).toHaveLength(8);
+  expect(r.slotCount).toBe(8);
   expect(r.generated).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  // The count came from the card: one GET_PUB past slot 7, and no APDU for a slot past it after.
+  expect(card.log.filter(a => a[0] === 0xb0 && a[2] >= 8)).toEqual([[0xb0, 0x11, 8, 0x00, 0x00]]);
   expect(r.keys[0]).toEqual(card.slots.get(0));
   expect(card.pin()).toBe('482916');
   expect(steps).toEqual(['select', 'keys', 'setPin', 'verifyPin']);
@@ -133,4 +153,86 @@ test('a re-key is refused by a card with a PIN, and probeCard reads the PIN stat
   expect(await probeCard(new FakeGpCard().withLiftedApplet(2).transceive)).toEqual(
     expect.objectContaining({kind: 'keyed', pin: 'notSet'}),
   );
+});
+
+const range = (n: number, from = 0) => Array.from({length: n - from}, (_, i) => from + i);
+
+test('probeSlotCount reads 8 or 32 from where the card first answers 6B00, writing nothing', async () => {
+  /** The applet, selected, as probeSlotCount finds it inside finishCard. */
+  const selected = async (opts: Parameters<typeof applet>[0]) => {
+    const card = applet(opts);
+    await card.tx(selectApdu());
+    return card;
+  };
+  expect(await probeSlotCount((await selected({count: 8})).tx)).toEqual({ok: true, count: 8});
+  const card = await selected({count: 32});
+  expect(await probeSlotCount(card.tx)).toEqual({ok: true, count: 32});
+  expect(card.log.slice(1).map(a => [a[1], a[2]])).toEqual([[0x11, 8], [0x11, 32]]);
+  expect(card.slots.size).toBe(0);
+  // A count this app does not know (64 slots), or an answer that is no slot's, is not guessed at.
+  expect(await probeSlotCount((await selected({count: 64})).tx)).toMatchObject({
+    ok: false,
+    reason: expect.stringContaining('more than this app knows'),
+  });
+  expect(await probeSlotCount((await selected({count: 8, probeAnswer: 0x6a80})).tx)).toMatchObject({ok: false, sw: 0x6a80});
+});
+
+test('a fresh 32-slot applet gets 32 keys before the PIN', async () => {
+  expect(INSTALL_TAP_KEY_SLOTS).toBe(32);
+  const card = applet({count: 32});
+  const r = await finishCard(card.tx, '482916');
+  expect(r.ok).toBe(true);
+  if (!r.ok) {
+    return;
+  }
+  expect(r.slotCount).toBe(32);
+  expect(r.keys).toHaveLength(32);
+  expect(r.generated).toEqual(range(32));
+  expect(r.keys[31]).toEqual(card.slots.get(31));
+  const setPin = card.log.findIndex(a => a[1] === 0x41);
+  expect(setPin).toBeGreaterThan(card.log.findIndex(a => a[1] === 0x10 && a[2] === 31));
+  expect(card.pin()).toBe('482916');
+});
+
+test('an 8-slot card that was partly keyed keeps its keys and gets the rest', async () => {
+  const kept = Array.from({length: 32}, () => 0xcd);
+  const card = applet({count: 8, preset: {0: kept, 1: kept}});
+  const r = await finishCard(card.tx, '482916');
+  expect(r.ok && r.slotCount).toBe(8);
+  expect(r.ok && r.generated).toEqual(range(8, 2));
+});
+
+test('the install-tap seam: keySlots 8 on a 32-slot card keys slots 0-7 only, and says the card has 32', async () => {
+  const card = applet({count: 32});
+  const r = await finishCard(card.tx, '482916', undefined, {keySlots: 8});
+  expect(r).toEqual(expect.objectContaining({ok: true, slotCount: 32, generated: range(8)}));
+  expect(r.ok && r.keys).toHaveLength(8);
+  expect(card.log.some(a => a[1] === 0x10 && a[2] >= 8)).toBe(false);
+  expect(card.pin()).toBe('482916');
+});
+
+test('a card whose slot count is unknown stops at keys, nothing generated and no PIN', async () => {
+  const card = applet({count: 64});
+  const r = await finishCard(card.tx, '482916');
+  expect(r).toMatchObject({ok: false, step: 'keys'});
+  expect(card.log.some(a => a[1] === 0x10)).toBe(false);
+  expect(card.pin()).toBeNull();
+});
+
+test('a re-key covers every slot of a 32-slot card', async () => {
+  const card = new FakeGpCard({appletSlots: 32}).withLiftedApplet(12);
+  const before = card.applet!.slots.slice(0, 12).map(s => s!.join(','));
+  // A lifted card on its own keys: SELECT the applet and finish it as the resume does.
+  const r = await finishCard(card.transceive, '135790', undefined, {rekey: true});
+  expect(r).toEqual(expect.objectContaining({ok: true, slotCount: 32, generated: range(32)}));
+  expect(card.applet!.slots.slice(0, 12).every((s, i) => s!.join(',') !== before[i])).toBe(true);
+  expect(card.applet!.slots.every(s => s !== null)).toBe(true);
+});
+
+test('finishVerified reads back all 32 keys of a finished 32-slot card, generating none', async () => {
+  const card = new FakeGpCard({appletSlots: 32}).withFinishedApplet('2468');
+  const keys = card.applet!.slots.map(s => s!);
+  const r = await finishVerified(card.transceive, '2468');
+  expect(r).toEqual(expect.objectContaining({ok: true, slotCount: 32, generated: []}));
+  expect(r.ok && r.keys).toEqual(keys);
 });

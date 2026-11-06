@@ -5,13 +5,14 @@
  * its keys across taps.
  *
  *   probe → CPLC → keys from ops → install (factory or own keys) → rotate →
- *   GEN_KEY ×8, SET_PIN, VERIFY_PIN
+ *   GET_PUB past the last slot (the card's count, 8 or 32) → GEN_KEY ×count,
+ *   SET_PIN, VERIFY_PIN
  *
  * A card the probe finds keyed is never installed over. If it is ours with
  * no PIN (a tap lifted during GEN_KEY, SET_PIN or VERIFY_PIN), it is resumed:
  *
  *   probe (slot 0, PIN state) → CPLC → keys from ops → ops' resume check →
- *   one INITIALIZE UPDATE proving the card's own keys → GEN_KEY P2=01 ×8,
+ *   one INITIALIZE UPDATE proving the card's own keys → GEN_KEY P2=01 ×count,
  *   SET_PIN, VERIFY_PIN
  *
  * **Card-manager keys.** Ops answers the card's own ENC/MAC/DEK set, escrowed
@@ -30,7 +31,7 @@
  * rotation still proves. One that broke after it, before the first GEN_KEY,
  * leaves the card on its own keys with empty slots, which ops answers again
  * byte for byte, so the next tap proves those and goes on to the keys and the
- * PIN. One that broke during GEN_KEY ×8, SET_PIN or VERIFY_PIN leaves some or
+ * PIN. One that broke during GEN_KEY, SET_PIN or VERIFY_PIN leaves some or
  * all slots keyed:
  *
  * - **No PIN on the card** (read without spending a try): the card cannot
@@ -38,17 +39,17 @@
  *   it has no PIN-set row for. The next tap asks ops that it holds nothing
  *   under the short id the card answers and records no other open card on the
  *   chip, proves the card's own keys from one INITIALIZE UPDATE (no EXTERNAL
- *   AUTHENTICATE unless proved), then generates all eight slots again (the
+ *   AUTHENTICATE unless proved), then generates every slot again (the
  *   applet allows P2=01 only while no PIN is set), sets a fresh PIN and
  *   verifies it. The card gets a new short id; the row it is posted with
  *   names the old one (`resumedFrom`), and ops closes that in the same write.
  *   A tap lifted during the resume leaves the same state, so the next one
  *   does the same again.
  * - **A PIN on the card** (SET_PIN took, its answer was lost): SET_PIN goes
- *   out only after all eight slots answered a key, so the key set is whole.
+ *   out only after every slot answered a key, so the key set is whole.
  *   With the PIN this phone sent to this chip still in memory, the next tap
  *   makes the same checks, sends one VERIFY_PIN and, only if it is taken,
- *   reads the eight keys back: no key is generated, the short id is the one
+ *   reads the keys back: no key is generated, the short id is the one
  *   the card answers. Without that PIN, or if the card refuses it, the tap
  *   stops `needsReset` (no try spent without it, one at most with it): the
  *   card goes through Settings → Reset a card, which asks no PIN for a card

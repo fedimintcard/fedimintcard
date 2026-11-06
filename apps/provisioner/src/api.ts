@@ -1,4 +1,5 @@
 import {LOAD_FILE_SHA256} from './cardkit';
+import {SLOT_COUNTS} from './cardSetup';
 import {decodeInvite} from './federation';
 import type {
   CardOps,
@@ -296,7 +297,7 @@ export interface CardRegistryRow {
   /** Notes issued onto the card, satoshi. Zero is a keyed, PIN'd, empty card. */
   readonly notes_issued: number;
   /**
-   * The eight slot keys, x-only hex, slot 0 first (OPS-PLAN § 5): the public
+   * The slot keys, 8 or 32, x-only hex, slot 0 first (OPS-PLAN § 5): the public
    * half only, which a till needs to find the card's notes. Absent on a row
    * whose key setup did not finish.
    */
@@ -953,7 +954,7 @@ export class RegistryStoreApi implements CardOps, TillOps {
       pin_policy: row.pinPolicy,
       // the loop records each note it wrote; the registry stores the total
       notes_issued: row.notesIssued.reduce((sum, n) => sum + n, 0),
-      ...(row.slotKeys && row.slotKeys.length === 8
+      ...(row.slotKeys && (SLOT_COUNTS as readonly number[]).includes(row.slotKeys.length)
         ? {slot_pubkeys: [...row.slotKeys]}
         : {}),
       ...(row.chip ? {chip: row.chip} : {}),

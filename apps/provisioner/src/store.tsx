@@ -215,7 +215,7 @@ export interface RecordRow extends CardOutcome {
   /** A registry write is outstanding; the summary shows it and retry re-posts. */
   pending: boolean;
   /**
-   * The card's eight slot keys, x-only hex, slot 0 first, when key setup ran.
+   * The card's slot keys (8 or 32), x-only hex, slot 0 first, when key setup ran.
    * The registry keeps them so a till can find the card's notes (OPS-PLAN § 5).
    */
   slotKeys?: readonly string[];
@@ -270,7 +270,7 @@ export interface BatchSummary {
 export interface CardResult extends CardOutcome {
   /** A successful run's card key. Absent when the run failed before KEY_SETUP. */
   pubkey?: readonly number[];
-  /** All eight slot keys, slot 0 first, from a finished key setup. */
+  /** The slot keys, slot 0 first, from a finished key setup. */
   slotKeys?: readonly (readonly number[])[];
   /**
    * The short id the card answered before a resume tap re-keyed it; the

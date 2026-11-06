@@ -100,10 +100,13 @@ export class FakeGpCard {
   private gone = false;
 
   readonly cplc: number[];
+  /** How many slots an applet installed on this card has: 8 before applet 2.1, 32 from it. */
+  readonly appletSlots: number;
 
   constructor(
-    options: {keys?: KeySet; failedAuthLimit?: number; cplc?: number[]} = {},
+    options: {keys?: KeySet; failedAuthLimit?: number; cplc?: number[]; appletSlots?: number} = {},
   ) {
+    this.appletSlots = options.appletSlots ?? 8;
     const k = options.keys ?? FACTORY_KEYS;
     this.cplc = options.cplc ?? J3R180_CPLC;
     this.keys = {
@@ -133,7 +136,7 @@ export class FakeGpCard {
     this.packages.add(PKG);
     this.instances.set(OPENER, {pkg: PKG, module: OPENER});
     const applet: AppletState = {
-      slots: new Array(8).fill(null),
+      slots: new Array(this.appletSlots).fill(null),
       pin,
       tries: 3,
       blocked: false,
@@ -146,7 +149,7 @@ export class FakeGpCard {
     return this;
   }
 
-  /** The Fedimint applet as a finished card has it: eight keys and a PIN. */
+  /** The Fedimint applet as a finished card has it: every slot keyed and a PIN. */
   withFinishedApplet(pin = '2468'): this {
     this.packages.add(PKG);
     this.instances.set(OPENER, {pkg: PKG, module: OPENER});
@@ -157,7 +160,7 @@ export class FakeGpCard {
       blocked: false,
       verified: false,
     };
-    for (let slot = 0; slot < 8; slot++) {
+    for (let slot = 0; slot < this.appletSlots; slot++) {
       applet.slots.push(this.newKey(slot));
     }
     this.instances.set(CARD, {pkg: PKG, module: CARD, applet});
@@ -456,7 +459,7 @@ export class FakeGpCard {
       ...(module === CARD
         ? {
             applet: {
-              slots: new Array(8).fill(null),
+              slots: new Array(this.appletSlots).fill(null),
               pin: null,
               tries: 3,
               blocked: false,
@@ -498,6 +501,10 @@ export class FakeGpCard {
     }
     const lc = apdu.length > 5 ? apdu[4] : 0;
     const data = apdu.slice(5, 5 + lc);
+    // A slot past the last answers 6B00 before anything else (FedimintCardApplet.slot).
+    if ((ins === 0x10 || ins === 0x11) && p1 >= a.slots.length) {
+      return sw(0x6b00);
+    }
     switch (ins) {
       case 0x11:
         return a.slots[p1] ? ok(a.slots[p1]!) : sw(0x6985);

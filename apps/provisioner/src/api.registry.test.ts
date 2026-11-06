@@ -44,7 +44,7 @@ test('a batch or a card before sign-in is refused, not sent', async () => {
     .rejects.toThrow(/before an operator signed in/);
 });
 
-test('a finished card carries its eight slot keys; sign-out revokes the token on the registry', async () => {
+test('a finished card carries its slot keys, 8 or 32; sign-out revokes the token on the registry', async () => {
   const seen: {path: string; body: any; auth?: string}[] = [];
   const origin = 'https://registry.test';
   const fetcher = async (url: string, init?: RequestInit) => {
@@ -75,6 +75,19 @@ test('a finished card carries its eight slot keys; sign-out revokes the token on
   const cards = seen.filter(s => s.path === '/registry/cards');
   expect(cards[0]!.body.slot_pubkeys).toEqual(keys);
   expect('slot_pubkeys' in cards[1]!.body).toBe(false);
+  // A 32-slot card sends all 32; a count no applet has is not sent at all.
+  const keys32 = Array.from({length: 32}, (_, i) => i.toString(16).padStart(2, '0').repeat(32));
+  await api.postCard({
+    id: '00000001', at: 3, phase: 'done', ok: true, pinPolicy: 'perCard',
+    pinState: 'set', notesIssued: [], pending: false, slotKeys: keys32,
+  } as any);
+  await api.postCard({
+    id: '00000002', at: 4, phase: 'done', ok: true, pinPolicy: 'perCard',
+    pinState: 'set', notesIssued: [], pending: false, slotKeys: keys32.slice(0, 9),
+  } as any);
+  const more = seen.filter(s => s.path === '/registry/cards');
+  expect(more[2]!.body.slot_pubkeys).toEqual(keys32);
+  expect('slot_pubkeys' in more[3]!.body).toBe(false);
 
   await api.signOut();
   const out = seen.find(s => s.path === '/auth/operator/signout');
