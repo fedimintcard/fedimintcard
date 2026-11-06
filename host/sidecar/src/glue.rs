@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use fedimint_card_host_card::{Card, SLOTS, SW_CONDITIONS_NOT_SATISFIED, status_word};
+use fedimint_card_host_card::{Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, past_last_slot, status_word};
 use fedimint_client::transaction::{ClientOutput, ClientOutputBundle, TransactionBuilder};
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -315,7 +315,8 @@ impl CardWallet {
 
     // ---------------------------------------------------------------- card setup
 
-    /// Make sure every slot has a key and cache the public keys.
+    /// Make sure every slot the card has (8 on a 2.0 card, 32 on 2.1; the walk stops at `6B00`)
+    /// has a key, and cache the public keys.
     ///
     /// Plain setup keeps keys already on the card. A slot that has a key but no record in the
     /// state file is of unknown provenance: it is recorded as such, never used as a note nonce,
@@ -341,14 +342,27 @@ impl CardWallet {
             let existing = match on_card(|| self.card.get_pub(slot)) {
                 Ok(pk) => Some(pk),
                 Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => None,
-                Err(e) if status_word(&e) == Some(0x6B00) => {
+                // Past the card's last slot: a 2.0 card ends at 8, a 2.1 card at 32. The card,
+                // not a constant, says how many slots there are.
+                Err(e) if past_last_slot(&e) => {
                     self.store.save()?;
-                    bail!("the card has only {slot} slot(s) (status 6B00 for slot {slot}); flash the {SLOTS}-slot applet");
+                    ensure!(
+                        slot >= MIN_SLOTS,
+                        "the card has only {slot} slot(s) (status 6B00 for slot {slot}); flash the {SLOTS}-slot applet"
+                    );
+                    break;
                 }
                 Err(e) => return Err(e).with_context(|| format!("slot {slot}")),
             };
             let pk = match (existing, fresh) {
-                (None, _) => on_card(|| self.card.gen_key(slot)).with_context(|| format!("slot {slot}"))?,
+                (None, _) => match on_card(|| self.card.gen_key(slot)) {
+                    Ok(pk) => pk,
+                    Err(e) if status_word(&e) == Some(SW_NO_SPACE) => {
+                        self.store.save()?;
+                        bail!("the card is out of memory for slot {slot}'s key (status 6A84); it cannot be issued");
+                    }
+                    Err(e) => return Err(e).with_context(|| format!("slot {slot}")),
+                },
                 (Some(old), true) => {
                     let rec = PendingOverwrite { slot, old_pubkey: old.to_string() };
                     self.store.state.pending_overwrites.push(rec.clone());

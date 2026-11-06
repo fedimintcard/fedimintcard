@@ -14,6 +14,7 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use fedimint_card_host_card::{Card, SoftCard, StatusWord};
 use fedimint_card_sidecar::glue::CardWallet;
+use fedimint_card_sidecar::holder::{CardFull, Loader};
 use fedimint_card_sidecar::ops::{Ops, OpsConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
@@ -78,7 +79,8 @@ impl TopupLightning for FakeLn {
 
 // ------------------------------------------------------------------ the fake registry
 
-/// The holder load routes, answering for one card: its free slots (the first `free` of slots 1..8),
+/// The holder load routes, answering for one card: its free slots (the first `free` of slots 1 up
+/// to the card's last, which is `keys.len() - 1`),
 /// and every load and outcome it was sent.
 struct FakeRegistry {
     federation_id: String,
@@ -93,7 +95,7 @@ struct FakeRegistry {
 async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> Json<Value> {
     let n = r.free.load(Ordering::SeqCst);
     let used: Vec<u64> = r.loads.lock().unwrap().iter().flat_map(|l| l["notes"].as_array().unwrap().iter().map(|n| n["slot"].as_u64().unwrap()).collect::<Vec<_>>()).collect();
-    let free: Vec<Value> = (1..8u64)
+    let free: Vec<Value> = (1..r.keys.len() as u64)
         .filter(|s| !used.contains(s))
         .take(n)
         .map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]}))
@@ -626,5 +628,59 @@ async fn a_load_cut_short_after_it_was_sent_is_finished_not_repeated() -> anyhow
         assert_eq!(registry.outcomes.lock().unwrap().len(), 1);
     })
     .await;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ the holder load, by card size
+
+/// A holder's wallet holding `funds` sats (no mint fees, as on the production federation), and a
+/// fake registry for `card`, keyed in every slot it has, with every slot but 0 free.
+async fn holder_on(card: &mut SoftCard, funds: u64) -> anyhow::Result<(FederationTest, Wallet, String, tempfile::TempDir)> {
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).disable_mint_fees().build()).await?;
+    let client = fed.new_client().await;
+    fund(&client, Amount::from_sats(funds)).await?;
+    let wallet = Wallet::from_client(client).await?;
+    let keys: Vec<String> = (0..card.slot_len()).map(|s| card.gen_key(s).map(|k| k.to_string())).collect::<anyhow::Result<_>>()?;
+    let registry = Arc::new(FakeRegistry {
+        federation_id: wallet.federation_id().to_string(),
+        free: AtomicUsize::new(keys.len() - 1),
+        keys,
+        loads: Mutex::new(vec![]),
+        outcomes: Mutex::new(vec![]),
+        fail_outcomes: AtomicUsize::new(0),
+    });
+    let url = serve_registry(registry).await;
+    Ok((fed, wallet, url, tempfile::tempdir()?))
+}
+
+/// 50,000 sats is twelve notes: a fresh 32-slot card takes them in one load.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_50k_holder_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
+    let mut card = SoftCard::new();
+    assert_eq!(card.slot_len(), 32);
+    let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
+    let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await?;
+    assert_eq!(r.notes.len(), 12, "{:?}", r.notes);
+    assert_eq!(r.notes.iter().map(|(_, a)| a).sum::<u64>(), 50_000_000);
+    assert!(r.notes.iter().all(|(s, _)| (1..32).contains(s)), "{:?}", r.notes);
+    Ok(())
+}
+
+/// The same load on a 2.0 card (eight slots, seven free) is refused before anything is built, as
+/// it always was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_50k_holder_load_is_refused_on_an_eight_slot_card() -> anyhow::Result<()> {
+    let mut card = SoftCard::with_slots(8);
+    let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
+    let before = wallet.balance_msat().await?;
+    let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("twelve notes, seven slots");
+    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
+    assert_eq!((full.free, full.needed), (7, 12));
+    assert_eq!(wallet.balance_msat().await?, before, "nothing was paid");
+    // A load that fits still loads.
+    let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
+    assert_eq!(r.notes.len(), 3);
+    assert!(r.notes.iter().all(|(s, _)| (1..8).contains(s)), "{:?}", r.notes);
     Ok(())
 }

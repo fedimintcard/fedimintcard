@@ -100,9 +100,44 @@ fn soft_card_slot_semantics() {
     assert_eq!(status_word(&c.gen_key(0).unwrap_err()), Some(0x6985), "no overwrite");
     let b = c.gen_key(1).unwrap();
     assert_ne!(a, b);
-    assert_eq!(status_word(&c.gen_key(8).unwrap_err()), Some(0x6B00), "slot out of range");
-    assert_eq!(status_word(&c.gen_key_overwrite(8).unwrap_err()), Some(0x6B00), "overwrite out of range");
+    assert_eq!(status_word(&c.gen_key(32).unwrap_err()), Some(0x6B00), "slot out of range");
+    assert_eq!(status_word(&c.gen_key_overwrite(32).unwrap_err()), Some(0x6B00), "overwrite out of range");
+    assert!(c.gen_key(31).is_ok(), "slot 31 exists");
+    assert_eq!(c.get_pub(31).unwrap(), c.get_pub(31).unwrap());
+}
+
+/// A 2.0 card, like prod card `15989f91`: eight slots, and slot 8 is past the end.
+#[test]
+fn soft_card_with_eight_slots() {
+    let mut c = SoftCard::with_slots(MIN_SLOTS);
+    assert_eq!(c.slot_len(), 8);
     assert!(c.gen_key(7).is_ok(), "slot 7 exists");
+    assert_eq!(status_word(&c.gen_key(8).unwrap_err()), Some(0x6B00), "slot out of range");
+    assert_eq!(status_word(&c.get_pub(8).unwrap_err()), Some(0x6B00));
+}
+
+#[test]
+fn slot_count_comes_from_the_card() {
+    assert_eq!(SLOTS, 32);
+    // Empty and keyed slots both count; the walk stops at 6B00.
+    let mut c = SoftCard::new();
+    c.gen_key(5).unwrap();
+    assert_eq!(slot_count(&mut c).unwrap(), 32);
+    let mut c = SoftCard::with_slots(8);
+    assert_eq!(slot_count(&mut c).unwrap(), 8);
+    let mut c = SoftCard::with_slots(20);
+    assert_eq!(slot_count(&mut c).unwrap(), 20);
+    // Fewer than a 2.0 card has is not one of ours.
+    let err = slot_count(&mut SoftCard::with_slots(4)).unwrap_err();
+    assert!(err.to_string().contains("only 4 slot(s)"), "{err}");
+    // No applet: the walk reports the chip's refusal, not a size.
+    let mut c = SoftCard::blank();
+    assert_eq!(status_word(&slot_count(&mut c).unwrap_err()), Some(0x6E00));
+    // Over the APDU framing too.
+    let mut c = fake(false);
+    assert_eq!(slot_count(&mut c).unwrap(), 32);
+    let mut c = CardClient::new(FakeApplet { card: SoftCard::with_slots(8), chain: true, pending: None, log: vec![] });
+    assert_eq!(slot_count(&mut c).unwrap(), 8);
 }
 
 #[test]

@@ -17,8 +17,20 @@ pub mod pcsc_backend;
 
 pub use bridge::{BridgeError, BridgeTransport};
 
-/// Number of key slots on the applet.
-pub const SLOTS: u8 = 8;
+/// The most key slots an applet has (applet 2.1). The host never asks beyond it.
+///
+/// A card's own count comes from the card, never from this constant: walk `GET_PUB` up from slot
+/// 0 until the applet answers [`SW_SLOT_OUT_OF_RANGE`] (see [`past_last_slot`]). Applet 2.0 cards,
+/// prod card `15989f91` among them, have [`MIN_SLOTS`] and keep working.
+pub const SLOTS: u8 = 32;
+/// Key slots on applet 2.0, the fewest any card we issued has. A card answering
+/// [`SW_SLOT_OUT_OF_RANGE`] below this is not one of ours.
+pub const MIN_SLOTS: u8 = 8;
+/// Status word for a slot past the card's last one.
+pub const SW_SLOT_OUT_OF_RANGE: u16 = 0x6B00;
+/// `GEN_KEY` on a 2.1 card out of persistent memory: the slot's key objects could not be built
+/// and the slot stays empty.
+pub const SW_NO_SPACE: u16 = 0x6A84;
 /// Status word the applet answers for an empty slot (or an occupied slot on GEN_KEY).
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 /// The applet's PIN bounds (`FedimintCardApplet.java:63-64`). A shorter or longer PIN is refused
@@ -68,6 +80,30 @@ impl std::error::Error for StatusWord {}
 /// Returns the status word if `err` came from the card refusing a command.
 pub fn status_word(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<StatusWord>().map(|s| s.0)
+}
+
+/// Whether `err` is the card saying the slot asked for is past its last one: the end of a slot
+/// walk, not a failure.
+pub fn past_last_slot(err: &anyhow::Error) -> bool {
+    status_word(err) == Some(SW_SLOT_OUT_OF_RANGE)
+}
+
+/// How many key slots the card in the field has: `GET_PUB` from slot 0 up until
+/// [`SW_SLOT_OUT_OF_RANGE`], at most [`SLOTS`]. An empty slot (`6985`) counts; any other refusal
+/// is returned. Fails on a card with fewer than [`MIN_SLOTS`].
+pub fn slot_count(card: &mut dyn Card) -> Result<u8> {
+    for slot in 0..SLOTS {
+        match card.get_pub(slot) {
+            Ok(_) => {}
+            Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => {}
+            Err(e) if past_last_slot(&e) => {
+                ensure!(slot >= MIN_SLOTS, "the card has only {slot} slot(s) (status 6B00 for slot {slot}); flash the {SLOTS}-slot applet");
+                return Ok(slot);
+            }
+            Err(e) => return Err(e).with_context(|| format!("slot {slot}")),
+        }
+    }
+    Ok(SLOTS)
 }
 
 /// The PIN the fixtures and tests provision on a card they own.
@@ -281,10 +317,12 @@ impl<T: Transport> Card for CardClient<T> {
 
 /// In-process stand-in for the applet, with the same slot semantics (including `6985`) and the
 /// same PIN state machine: `SET_PIN` once, three tries, `6984` before a PIN exists, `6983` after
-/// it is out of tries.
+/// it is out of tries. [`SoftCard::new`] is a 2.1 card with [`SLOTS`] slots;
+/// [`SoftCard::with_slots`] makes one of any size, such as a 2.0 card with [`MIN_SLOTS`].
 #[derive(Default)]
 pub struct SoftCard {
-    slots: [Option<Keypair>; SLOTS as usize],
+    /// One entry per slot the card has; a slot past the end answers `6B00`.
+    slots: Vec<Option<Keypair>>,
     pin: Option<Vec<u8>>,
     tries_left: u8,
     /// Whether this session has verified the PIN, which is what lets `SIGN` run. Cleared by
@@ -296,12 +334,22 @@ pub struct SoftCard {
 
 impl SoftCard {
     pub fn new() -> Self {
-        Self { tries_left: 3, installed: true, ..Default::default() }
+        Self::with_slots(SLOTS)
+    }
+
+    /// An installed card with `n` key slots: slot `n` and up answer `6B00`.
+    pub fn with_slots(n: u8) -> Self {
+        Self { slots: vec![None; n as usize], tries_left: 3, installed: true, ..Default::default() }
     }
 
     /// A card with no applet on it: SELECT answers `6A82`, and every slot is empty.
     pub fn blank() -> Self {
-        Self { tries_left: 3, installed: false, ..Default::default() }
+        Self { installed: false, ..Self::new() }
+    }
+
+    /// How many key slots this card has.
+    pub fn slot_len(&self) -> u8 {
+        self.slots.len() as u8
     }
 
     /// A card whose applet is there but has never been pinned.
@@ -322,15 +370,13 @@ impl SoftCard {
     /// Key every slot with keys no wallet recorded — another machine's card. The slots are full,
     /// so `card setup` would find nothing to generate and `keySetup` must refuse.
     pub fn install_foreign_keys(&mut self) {
-        for slot in 0..SLOTS {
-            if self.slots[slot as usize].is_none() {
-                self.slots[slot as usize] = Some(Keypair::new(SECP256K1, &mut rand::thread_rng()));
-            }
+        for s in self.slots.iter_mut().filter(|s| s.is_none()) {
+            *s = Some(Keypair::new(SECP256K1, &mut rand::thread_rng()));
         }
     }
 
     fn slot(&self, slot: u8) -> Result<&Option<Keypair>> {
-        self.slots.get(slot as usize).ok_or_else(|| StatusWord(0x6B00).into())
+        self.slots.get(slot as usize).ok_or_else(|| StatusWord(SW_SLOT_OUT_OF_RANGE).into())
     }
 }
 

@@ -184,7 +184,7 @@ async fn precheck_on_an_installed_card_reports_keys_and_refuses_replace() -> any
     let (shared, card) = blank_card();
     let mut f = fx_with(card, Amount::from_sats(10_000)).await?;
     installed_card(&mut f);
-    let keys: Vec<u8> = (0..8).collect();
+    let keys: Vec<u8> = (0..32).collect();
     let (h, actor) = serve(f, shared.clone()).await;
     let mut actor = Box::pin(actor);
 
@@ -193,6 +193,7 @@ async fn precheck_on_an_installed_card_reports_keys_and_refuses_replace() -> any
     assert_eq!(body["kind"], "installed");
     assert_eq!(body["applet_present"], true, "{body}");
     assert_eq!(body["keyed_slots"], serde_json::json!(keys));
+    assert_eq!(body["slots"], 32, "the card's own size: {body}");
     assert_eq!(body["safe_to_replace"], false, "a keyed card must ask before a sweep");
     assert_eq!(body["live_msat"], 0);
     Ok(())
@@ -207,10 +208,10 @@ async fn key_setup_is_idempotent() -> anyhow::Result<()> {
 
     let (code, first) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
     assert_eq!(code, 200, "{first}");
-    assert_eq!(first["keys"].as_array().unwrap().len(), 8);
+    assert_eq!(first["keys"].as_array().unwrap().len(), 32, "a 2.1 card registers 32 keys");
     assert_eq!(first["pin_set"], true, "{first}");
     assert_eq!(first["pin"], "set_now");
-    assert_eq!(first["generated"], serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(first["generated"], serde_json::json!((0..32).collect::<Vec<u8>>()));
     let short = first["short_id"].as_str().unwrap().to_string();
     assert_eq!(short.len(), 8);
 
@@ -222,6 +223,37 @@ async fn key_setup_is_idempotent() -> anyhow::Result<()> {
     assert_eq!(second["generated"], serde_json::json!([]), "a repeat generated nothing");
     assert_eq!(second["pin"], "set");
     assert_eq!(second["pin_set"], true);
+    Ok(())
+}
+
+/// A 2.0 card (eight slots, like prod card `15989f91`): precheck reports its size, and key setup
+/// keys and registers eight slots without reading slot 8's `6B00` as a foreign key.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eight_slot_card_is_set_up_with_eight_keys() -> anyhow::Result<()> {
+    let shared = Rc::new(RefCell::new(SoftCard::with_slots(8)));
+    let f = fx_with(Box::new(Shared(shared.clone())), Amount::from_sats(10_000)).await?;
+    let (h, actor) = serve(f, shared.clone()).await;
+    let mut actor = Box::pin(actor);
+
+    let (code, pre) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/precheck", "");
+    assert_eq!(code, 200, "{pre}");
+    assert_eq!(pre["kind"], "blank", "{pre}");
+    assert_eq!(pre["slots"], 8, "{pre}");
+    assert_eq!(pre["empty_slots"], serde_json::json!((0..8).collect::<Vec<u8>>()));
+
+    let (code, first) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
+    assert_eq!(code, 200, "{first}");
+    assert_eq!(first["keys"].as_array().unwrap().len(), 8);
+    assert_eq!(first["generated"], serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7]));
+    let (code, second) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
+    assert_eq!(code, 200, "{second}");
+    assert_eq!(second["keys"], first["keys"]);
+    assert_eq!(second["generated"], serde_json::json!([]));
+
+    let (code, pre) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/precheck", "");
+    assert_eq!(code, 200, "{pre}");
+    assert_eq!(pre["kind"], "installed", "{pre}");
+    assert_eq!(pre["slots"], 8);
     Ok(())
 }
 

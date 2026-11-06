@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use fedimint_card_host_card::{open_from_env, open_pin_session};
+use fedimint_card_host_card::{Card, SLOTS, SoftCard, open_from_env, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, nonce_for, on_card};
 use fedimint_card_sidecar::plan;
 use fedimint_card_sidecar::state::{HostKind, NoteStatus, StateStore};
@@ -49,6 +49,11 @@ async fn fund(client: &ClientHandleArc, amount: Amount) -> anyhow::Result<()> {
 }
 
 async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
+    fx_card(fees, funds, open_from_env()?).await
+}
+
+/// [`fx`] on a card of the caller's choosing, such as a soft 2.0 card with eight slots.
+async fn fx_card(fees: bool, funds: Amount, card: Box<dyn Card>) -> anyhow::Result<Fx> {
     assert!(
         std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
         "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend"
@@ -64,7 +69,6 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let card = open_from_env()?;
     let mut cw = CardWallet::new(wallet, store, card);
     on_card(|| ()); // keep the helper exercised on every backend
     // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
@@ -587,10 +591,55 @@ async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_limits_follow_the_card_size() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    assert_eq!(fedimint_card_host_card::SLOTS, 8);
+    assert_eq!(SLOTS, 32);
+    assert_eq!(f.cw.store.state.free_slots().len(), 32);
+    f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
+    assert_eq!(f.cw.store.state.free_slots().len(), 29);
+    drop(f.fed);
+    Ok(())
+}
+
+/// A 2.0 card (prod card `15989f91` is one): the slot walk stops at its 6B00, so the wallet sees
+/// eight slots, loads and charges as before, and refuses a load that needs more notes than that.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eight_slot_card_behaves_as_before() -> anyhow::Result<()> {
+    let mut f = fx_card(false, Amount::from_sats(60_000), Box::new(SoftCard::with_slots(8))).await?;
+    let slots: Vec<u8> = f.cw.store.state.slots.iter().map(|s| s.slot).collect();
+    assert_eq!(slots, (0..8).collect::<Vec<u8>>(), "one key per slot the card has, no more");
     assert_eq!(f.cw.store.state.free_slots().len(), 8);
+    // A repeat setup finds the same eight keys and does not trip over slot 8.
+    assert_eq!(f.cw.card_setup(false)?.len(), 8);
+
+    // 50,000 sats is twelve notes: more than the card can hold, so nothing is issued.
+    let err = f.cw.topup(&[50_000_000]).await.expect_err("twelve notes on eight slots");
+    assert!(
+        matches!(err.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoFreeSlots { need: 12, free: 8 })),
+        "{err:#}"
+    );
+    assert_eq!(f.cw.store.state.live_total_msat(), 0);
+
     f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
     assert_eq!(f.cw.store.state.free_slots().len(), 5);
+    let r = f.cw.spend(100_000).await?;
+    assert!(r.inputs.iter().chain(&r.change).all(|(slot, _)| *slot < 8), "{r:?}");
+    drop(f.fed);
+    Ok(())
+}
+
+/// A fresh 2.1 card: 32 keys, and a 50,000-sat load (twelve notes) fits with room to spare.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_50k_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
+    let mut f = fx_card(false, Amount::from_sats(60_000), Box::new(SoftCard::new())).await?;
+    assert_eq!(f.cw.store.state.slots.len(), 32, "a key in every slot");
+    assert_eq!(f.cw.store.state.free_slots().len(), 32);
+    assert_eq!(plan::binary(50_000_000).len(), 12);
+    let notes = f.cw.topup(&[50_000_000]).await?;
+    assert_eq!(notes.len(), 12);
+    assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000);
+    assert_eq!(f.cw.store.state.free_slots().len(), 20);
+    // And it spends: the change lands in slots past the old eighth.
+    let r = f.cw.spend(12_345_000).await?;
+    assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000 - 12_345_000 - r.overpay_msat, "{r:?}");
     drop(f.fed);
     Ok(())
 }
@@ -601,9 +650,9 @@ async fn fresh_setup_rekeys_and_refuses_with_live_notes() -> anyhow::Result<()> 
     let old: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
     f.cw.card_setup(true)?;
     let new: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
-    assert_eq!(new.len(), 8);
+    assert_eq!(new.len(), SLOTS as usize);
     assert!(old.iter().zip(&new).all(|(a, b)| a != b), "every slot has a new key");
-    assert_eq!(f.cw.store.state.free_slots().len(), 8);
+    assert_eq!(f.cw.store.state.free_slots().len(), SLOTS as usize);
     f.cw.topup(&[1 << 18]).await?;
     let err = f.cw.card_setup(true).expect_err("live note");
     assert!(err.to_string().contains("live or pending"), "{err}");
@@ -619,7 +668,7 @@ async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::R
     // A card whose slots all hold keys this state file never saw.
     let mut card = open_from_env()?;
     let mut foreign = vec![];
-    for slot in 0..fedimint_card_host_card::SLOTS {
+    for slot in 0..SLOTS {
         foreign.push(on_card(|| card.get_or_gen(slot))?.to_string());
     }
     let dir = tempfile::tempdir()?;
@@ -628,7 +677,7 @@ async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::R
     f.cw.card_setup(false)?;
     open_pin_session(f.cw.card.as_mut())?;
     assert!(f.cw.store.state.free_slots().is_empty(), "unknown keys are not free");
-    assert_eq!(f.cw.store.state.overwritable_slots().len(), 8);
+    assert_eq!(f.cw.store.state.overwritable_slots().len(), SLOTS as usize);
 
     f.cw.topup(&[1 << 18]).await?;
     let used = f.cw.store.state.live_notes()[0].slot;

@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use fedimint_card_host_card::{
-    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
+    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_SLOT_OUT_OF_RANGE, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
     SW_NO_PIN_SET, SW_PIN_BLOCKED, SW_PIN_REQUIRED, status_word,
 };
 use serde::Deserialize;
@@ -79,6 +79,9 @@ pub struct Precheck {
     /// SELECT of our AID answered `0200`. The app's `applet_present`. Distinct from `applet`:
     /// a card can select (it is installed) while the PIN probes say nothing useful.
     pub applet_present: bool,
+    /// How many key slots the card has: where its `GET_PUB` walk met `6B00` (8 on a 2.0 card, 32
+    /// on a 2.1 card), or [`SLOTS`] when no applet is installed yet.
+    pub slots: u8,
     /// Notes this wallet recorded on the keys the card is holding: what a sweep would destroy.
     /// Read from the state file, never asked of the federation, so precheck stays instant.
     pub live_notes: Vec<(u8, u64)>,
@@ -128,7 +131,7 @@ impl Precheck {
             "foreign_slots": self.foreign_slots,
             "free_slots": self.free_slots,
             "live_notes": self.live_notes.iter().map(|(s, a)| json!({"slot": s, "msat": a})).collect::<Vec<_>>(),
-            "slots": SLOTS,
+            "slots": self.slots,
         })
     }
 }
@@ -144,6 +147,7 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
     let mut empty = vec![];
     let mut foreign = vec![];
     let mut applet = AppletState::Unknown;
+    let mut slots = SLOTS;
 
     // SELECT decides whether the slot walk is meaningful at all: a card without our applet has no
     // dispatcher for CLA `B0`, so every GET_PUB answers `6E00` (CLA not supported) and the walk
@@ -162,6 +166,11 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
                 keys.push((slot, hexpk));
             }
             Err(e) => match status_word(&e) {
+                // Past the card's last slot: the walk is done, and this is the card's size.
+                Some(SW_SLOT_OUT_OF_RANGE) => {
+                    slots = slot;
+                    break;
+                }
                 Some(SW_CONDITIONS_NOT_SATISFIED) | Some(SW_FILE_NOT_FOUND) => empty.push(slot),
                 // No dispatcher for `B0` at all: a card with no applet, so every slot is empty.
                 Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED) => empty.push(slot),
@@ -225,6 +234,7 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
         free_slots: cw.store.state.free_slots(),
         applet,
         applet_present,
+        slots,
         live_notes,
     })
 }
@@ -304,8 +314,12 @@ impl KeySetupOutcome {
 /// observes which ones were absent first so the reply can say what changed. Never `--fresh`:
 /// re-keying destroys live notes, and a provisioner that did that would silently burn value.
 pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutcome> {
+    // Walk up to the card's last slot (`6B00`): a 2.0 card has 8, a 2.1 card 32. Reading past it
+    // as "a key we did not produce" would refuse every 2.0 card.
     let before: Vec<Option<String>> = (0..SLOTS)
-        .map(|slot| match on_card(|| cw.card.get_pub(slot)) {
+        .map(|slot| on_card(|| cw.card.get_pub(slot)))
+        .take_while(|r| !r.as_ref().is_err_and(|e| status_word(e) == Some(SW_SLOT_OUT_OF_RANGE)))
+        .map(|r| match r {
             Ok(pk) => Some(pk.to_string()),
             Err(e) if status_word(&e) == Some(SW_CONDITIONS_NOT_SATISFIED) => None,
             // No applet to dispatch `B0`: every slot is empty, because there are no slots yet.

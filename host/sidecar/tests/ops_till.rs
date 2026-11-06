@@ -17,7 +17,8 @@
 //! point this at the staging or production registry: it writes rows there.
 //!
 //! The federation is the in-process fixture of `till_service.rs`; the card is a [`SoftCard`],
-//! registered with its eight keys as the provisioner registers one, and loaded through the till's
+//! registered with a key for every slot it has (32 on a 2.1 card, 8 on a 2.0 one) as the
+//! provisioner registers one, and loaded through the till's
 //! own `topup` (a load, recorded in ops as an intent with no inputs).
 
 use std::cell::RefCell;
@@ -100,10 +101,11 @@ impl Registry {
         Ops::new(&cfg, dir)
     }
 
-    /// Key a blank card, set its PIN, and register its row with the eight keys.
+    /// Key a blank card, set its PIN, and register its row with a key per slot the card has.
     async fn provision(&self, card: &Rc<RefCell<SoftCard>>) -> anyhow::Result<String> {
         let mut keys = vec![];
-        for slot in 0..8 {
+        let n = card.borrow().slot_len();
+        for slot in 0..n {
             keys.push(card.borrow_mut().gen_key(slot)?);
         }
         open_pin_session(&mut *card.borrow_mut())?;
