@@ -61,7 +61,7 @@ export const SETUP = {
   perCardSub: 'Shown with each finished card. Write it down before the next.',
   limit: 'Offline limit',
   limitHelp:
-    'What a card may spend in a day when the till cannot reach the internet, in sat. The card enforces it itself and cannot be talked past it. 0 means no limit.\n\nEvery card in this batch gets it, once, as it is set up; it cannot be changed afterwards.',
+    'What a card may spend in a day, in sat, counting each note it spends whole. The card enforces it itself, online and offline, and cannot be talked past it. 0 means no limit: leave it for cards used where the till is online, and set one for a village batch that will pay offline.\n\nEvery card in this batch gets it, once, as it is set up; it cannot be changed afterwards.',
   limitLabel: 'Sat per day',
   limitValue: (sat: number) => (sat === 0 ? 'No limit' : `${sat.toLocaleString('en-US')} sat a day`),
   pinBatchShort: 'One for the batch',

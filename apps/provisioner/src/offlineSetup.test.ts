@@ -1,5 +1,11 @@
 import {fromHex, toHex} from './cardkit';
 import {limitApdu, DEFAULT_DAILY_LIMIT_SAT, type OfflineSetup} from './cardSetup';
+
+const VILLAGE_LIMIT_SAT = 10_000;
+
+test('a batch has no daily limit unless one is set', () => {
+  expect(DEFAULT_DAILY_LIMIT_SAT).toBe(0);
+});
 import {LOOP, registryHeldWhat} from './strings';
 import {holdsPlace, installTap, type TapOptions} from './installTap';
 import {shortIdOf} from './store';
@@ -45,7 +51,8 @@ function setup(over: Partial<OfflineSetup> = {}) {
   const certify = jest.fn(async (attestPub: readonly number[], slot0: readonly number[]) =>
     certFor(attestPub, slot0),
   );
-  const offline: OfflineSetup = {limitMsat: DEFAULT_DAILY_LIMIT_SAT * 1000, certify, registryKey: REGISTRY_KEY, ...over};
+  // a village batch's limit; the default is none (DEFAULT_DAILY_LIMIT_SAT, checked below)
+  const offline: OfflineSetup = {limitMsat: VILLAGE_LIMIT_SAT * 1000, certify, registryKey: REGISTRY_KEY, ...over};
   return {certify, offline};
 }
 

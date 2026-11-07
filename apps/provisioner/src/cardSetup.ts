@@ -56,7 +56,8 @@ export const INS_SET_REGISTRY_KEY = 0x34;
 /** The most a certificate can be (FedimintCardApplet.CERT_MAX). */
 export const CERT_MAX = 160;
 /** The default offline limit for a day, in sat; 0 is none (SET_LIMIT). */
-export const DEFAULT_DAILY_LIMIT_SAT = 10_000;
+// No limit by default (owner, 2026-11-07): a limit is for village batches that pay offline.
+export const DEFAULT_DAILY_LIMIT_SAT = 0;
 
 export const SW_OK = 0x9000;
 /** GET_PUB: the slot is empty. SET_PIN: a PIN is already set. */

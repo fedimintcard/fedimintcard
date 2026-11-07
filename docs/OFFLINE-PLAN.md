@@ -114,7 +114,7 @@ F0 and F1 are worth doing even if the rest waits: they harden what is in product
 4. **Order: F0 to F6 straight through**, stopping only when stuck.
 
 Still open, defaults used until the owner says otherwise: the limits (a per-card daily offline
-limit set per batch in the Setup app, default 10,000 sat; a till's unsettled limit, default
+limit set per batch in the Setup app, default none (owner, 2026-11-07: set one for village batches); a till's unsettled limit, default
 100,000 sat); applet 2.2 needs re-provisioning, so cards in the field stay online-only until they
 are reset and set up again.
 

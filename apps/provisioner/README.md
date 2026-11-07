@@ -18,7 +18,7 @@ SignIn → BatchSetup → Loop (one card per tap, with stops) → BatchSummary �
 
 The install tap, after the card manager is locked to the card's own keys: GEN_KEY on
 slots 0-7, then `SET_LIMIT` (the batch's offline limit per day, set in BatchSetup,
-default 10,000 sat, 0 for none), `ATTEST_INIT` (the card makes a P-256 key),
+default 0, none; set one for a village batch that pays offline), `ATTEST_INIT` (the card makes a P-256 key),
 `POST /registry/cards/:short_id/attestation` with the operator session (the registry
 answers the certificate), `SET_CERT`, `SET_REGISTRY_KEY` (the registry's certificate
 key from the public `GET /registry/cert-key`, fetched once per batch before the first

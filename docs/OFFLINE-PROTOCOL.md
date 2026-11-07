@@ -104,7 +104,7 @@ Online, a 3.0 card's `SIGN` counts against its daily limit too, so the till chec
 ## 5. Apps (F5)
 
 - **Setup app**: installs 3.0 (cardkit's load file regenerated); after the keys and before the PIN:
-  SET_LIMIT (a batch setting, default 10,000 sat), ATTEST_INIT, `POST …/attestation`, SET_CERT.
+  SET_LIMIT (a batch setting, default 0 = none; set for village batches), ATTEST_INIT, `POST …/attestation`, SET_CERT.
 - **POS**: a charge answered with `offline: true` shows "Paid offline"; the till's status shows
   what is waiting to sync.
 
