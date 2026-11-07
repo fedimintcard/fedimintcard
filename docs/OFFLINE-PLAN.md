@@ -156,9 +156,13 @@ tests.
 - **Fee margin** on offline charges, so a fee change before the sync does not reject them.
 - **Spare slots offline.** A fresh card ran out of keyed spare slots after two charges with change.
   Online tills should key more ahead; an offline till may re-key the slots its own queued charges
-  spent.
+  spent. *Built (online half):* every online tap keeps a 3.0 card at 6 fresh keyed slots, at most 2
+  keys a tap, settled SPENT slots renewed before new slots are keyed (`docs/TILL-API.md`, "Spare
+  slots for offline change"). Re-keying offline is still open.
 - **Messages.** The POS says "card needs a top up" for "no slot for change"; the Setup app says
-  "the card left the phone" for a registry refusal.
+  "the card left the phone" for a registry refusal. *Built (POS half):* the till refuses with
+  `offline_no_change_room` and a price the card can pay; both POS apps show "This card can't take
+  change while offline. Try N sats". The Setup app's message is still open.
 - **The daily limit counts online charges too, by gross input** (as cashucard's): with notes up
   to 16,777 sat, one charge can use most of a 20,000 sat day. Owner decision pending.
 - **A note pending under another till's unresolved online charge** makes an offline report a
