@@ -70,7 +70,7 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
   is where block headers for the cards' clocks come from (every 10 minutes, kept in
   `block-header.json`); `--offline-cap-msat` (default 100,000,000) and `--offline-cap-count`
   (default 200) cap what the till holds unsettled from offline charges; `--spare-target`
-  (`TILL_SPARE_TARGET`, default 6) and `--spare-keys-per-tap` (`TILL_SPARE_KEYS_PER_TAP`,
+  (`TILL_SPARE_TARGET`, default 12) and `--spare-keys-per-tap` (`TILL_SPARE_KEYS_PER_TAP`,
   default 2) set the spare reserve online taps keep a 3.0 card at, so it can take change offline. Charges taken offline
   wait in `offline_queue.json` (0600) and are sent every 30 s while the till is on ops; the
   registry's certificate key is kept as `cert_key` in `till-ops.json`. Back up both with the

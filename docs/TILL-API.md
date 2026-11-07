@@ -75,7 +75,7 @@ carried a note, and no till can key one without the registry; a freshly loaded c
 few (the F6 drill's card ran out after two charges with change). So every online tap of a 3.0
 card on ops (a charge, a balance, a load), after the releases and the notes it writes and before
 anything is planned, tops up a spare reserve: when the card has fewer than `--spare-target`
-(`TILL_SPARE_TARGET`, default 6; 0 turns it off) fresh keyed slots, the till keys more, at most
+(`TILL_SPARE_TARGET`, default 12; 0 turns it off) fresh keyed slots, the till keys more, at most
 `--spare-keys-per-tap` (`TILL_SPARE_KEYS_PER_TAP`, default 2) in one tap, since a key takes about
 320 ms on the card. A tap that already sent releases or wrote notes keys fewer (about 100 ms per
 release and 40 ms per note come out of that budget). SPENT slots whose notes are settled (spent

@@ -991,6 +991,11 @@ async fn without_spare_slots_an_offline_charge_needing_change_is_refused_with_a_
 async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyhow::Result<()> {
     let mut t = Till::new(OfflineConfig::default()).await?;
     assert_eq!(t.cw.spares, SpareConfig { target: SPARE_TARGET, max_per_tap: MAX_KEY_PER_TAP });
+    assert_eq!(SPARE_TARGET, 12);
+    // The drill's numbers (13 keyed after the load, 3 of them spare) are a target of 6; at the
+    // default of 12 the load's own tap already keys spares. The rule is the same.
+    const TARGET: usize = 6;
+    t.cw.spares = SpareConfig { target: TARGET, max_per_tap: MAX_KEY_PER_TAP };
     let (card, id) = drill_card(&mut t).await?;
 
     // Taps with nothing else to do: +2, then +1 to the target, then nothing.
@@ -1004,7 +1009,7 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
         keyed.push(added);
     }
     assert_eq!(keyed, vec![2, 1, 0]);
-    assert_eq!(fresh_on(&t, &id, &card), SPARE_TARGET);
+    assert_eq!(fresh_on(&t, &id, &card), TARGET);
     {
         // The registry has the card's keys, and lists the rest as unkeyed.
         let g = t.reg.cards.lock().unwrap();
@@ -1048,7 +1053,7 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
     let unkeyed_before = unkeyed_of(&t.reg.cards.lock().unwrap()[&id]);
     let start = t.reg.renewals.lock().unwrap().len();
     let mut taps = 0;
-    while fresh_on(&t, &id, &card) < SPARE_TARGET && taps < 6 {
+    while fresh_on(&t, &id, &card) < TARGET && taps < 6 {
         let (before, renewals) = (fresh_on(&t, &id, &card), t.reg.renewals.lock().unwrap().len());
         t.attach_tap(&card).await?;
         let renewed = t.reg.renewals.lock().unwrap().len() - renewals;

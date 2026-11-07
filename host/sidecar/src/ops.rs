@@ -53,7 +53,7 @@ pub const KEY_AHEAD: usize = 3;
 /// Fresh keyed slots (keyed, never carried a note, KEYED on the card) an online tap keeps a 3.0
 /// card at, so it can take change offline (docs/OFFLINE-PLAN.md § 10 "Spare slots offline"):
 /// offline, change goes only to such slots, and no till can key one without the registry.
-pub const SPARE_TARGET: usize = 6;
+pub const SPARE_TARGET: usize = 12;
 /// Most slots one tap keys for that reserve. A `GEN_KEY` takes about 320 ms on a J3R180.
 pub const MAX_KEY_PER_TAP: usize = 2;
 /// What the reserve's budget counts, per card command (J3R180 estimates: a `GEN_KEY` measured
@@ -1078,10 +1078,10 @@ mod tests {
     #[test]
     fn the_spare_reserve_keys_the_shortfall_within_the_taps_budget() {
         let cfg = SpareConfig::default();
-        assert_eq!((cfg.target, cfg.max_per_tap), (6, 2));
-        assert_eq!(spares_to_key(6, cfg, 0, 0), 0, "full");
-        assert_eq!(spares_to_key(9, cfg, 0, 0), 0);
-        assert_eq!(spares_to_key(5, cfg, 0, 0), 1, "the shortfall");
+        assert_eq!((cfg.target, cfg.max_per_tap), (12, 2));
+        assert_eq!(spares_to_key(12, cfg, 0, 0), 0, "full");
+        assert_eq!(spares_to_key(15, cfg, 0, 0), 0);
+        assert_eq!(spares_to_key(11, cfg, 0, 0), 1, "the shortfall");
         assert_eq!(spares_to_key(0, cfg, 0, 0), 2, "never more than the cap");
         // A tap busy with a release or a few notes has room for one key; with more, none.
         assert_eq!(spares_to_key(0, cfg, 1, 0), 1);
