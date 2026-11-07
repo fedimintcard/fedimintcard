@@ -92,6 +92,15 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
 
 The charge answer gains `"offline": true` for a charge taken offline (HTTP 200, as a paid charge).
 
+As built (host/sidecar `offline.rs`, `clock.rs`; docs/TILL-API.md): offline charges need a till on
+ops (the certificate key and the report route are the registry's). `offline` in `/v1/status` also
+counts `double_spent` and `refused` (reports the registry refused for another reason). The queue is
+`<data_dir>/offline_queue.json`; it is written before `SET_CHANGE`, with every secret, so an entry
+cut off before the card's answer is finished from the card's stored signatures at its next offline
+tap. Change goes only to KEYED slots the till's copy of the card does not know to hold a note.
+Online, a 3.0 card's `SIGN` counts against its daily limit too, so the till checks the limit
+(`GET_STATE`) before an intent and answers `card_limit` instead of leaving a half-signed charge.
+
 ## 5. Apps (F5)
 
 - **Setup app**: installs 3.0 (cardkit's load file regenerated); after the keys and before the PIN:

@@ -4,7 +4,7 @@ Rust side of the spike: a `Card` transport and federation tests that spend a not
 
 | Crate | What |
 |---|---|
-| `card/` (`fedimint-card-host-card`) | `Card` trait (`gen_key`, `get_pub`, `sign`); `CardClient<T: Transport>`; backends `SoftCard` (in-process), `BridgeTransport` (HTTP, `ureq`), `PcscTransport` (feature `pcsc`) |
+| `card/` (`fedimint-card-host-card`) | `Card` trait (`gen_key`, `get_pub`, `sign`, and applet 3.0's `set_note`, `get_slot`, `get_state`, `set_change`, `set_limit`, `set_header`, `attest_init`, `set_cert`, `get_cert`, `attest`; `applet_version`); `CardClient<T: Transport>`; backends `SoftCard` (in-process; `SoftCard::new()` is 2.1, `SoftCard::v3()` follows applet 3.0), `BridgeTransport` (HTTP, `ureq`), `PcscTransport` (feature `pcsc`); `v3` (3.0 answers, header work, the registry's certificate) |
 | `fed-tests/` (`fedimint-card-fed-tests`) | 4-guardian in-process federation (`fedimint-testing`), hand-built transactions, steps 3-6 as `cargo test` |
 
 ## Pin
@@ -65,6 +65,14 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
 * `sales.json` in the data dir (mode 0600) is a convenience ledger for the app and for
   `client_ref` replays. The money truth is the federation and `card_state.json`.
 * No authentication: keep it on loopback (a warning is printed otherwise).
+* Applet 3.0 cards and offline charges (`docs/TILL-API.md`, `docs/OFFLINE-PROTOCOL.md` § 4):
+  `--esplora-url` (`TILL_ESPLORA_URL`, default `https://mempool.space/api`, empty to turn off)
+  is where block headers for the cards' clocks come from (every 10 minutes, kept in
+  `block-header.json`); `--offline-cap-msat` (default 100,000,000) and `--offline-cap-count`
+  (default 200) cap what the till holds unsettled from offline charges. Charges taken offline
+  wait in `offline_queue.json` (0600) and are sent every 30 s while the till is on ops; the
+  registry's certificate key is kept as `cert_key` in `till-ops.json`. Back up both with the
+  wallet: the queue is the merchant's money until it is sent.
 
 ## Findings (step 5 transaction)
 
