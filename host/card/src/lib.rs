@@ -7,13 +7,16 @@
 //! * [`CardClient`] implements it over any APDU [`Transport`] (bridge or PC/SC).
 //! * [`SoftCard`] implements it in-process with real keys, for tests without a card.
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
 
 pub mod bridge;
 #[cfg(feature = "pcsc")]
 pub mod pcsc_backend;
+pub mod v3;
+
+pub use v3::{AppletVersion, CardStatus, Certificate, Opening, SlotInfo, SlotState};
 
 pub use bridge::{BridgeError, BridgeTransport};
 
@@ -76,6 +79,17 @@ impl std::fmt::Display for StatusWord {
     }
 }
 impl std::error::Error for StatusWord {}
+
+/// A backend that cannot send raw APDUs (the trait's default `apdu`).
+#[derive(Debug, Clone, Copy)]
+pub struct NoRawApdu;
+
+impl std::fmt::Display for NoRawApdu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this card backend cannot send raw APDUs")
+    }
+}
+impl std::error::Error for NoRawApdu {}
 
 /// Returns the status word if `err` came from the card refusing a command.
 pub fn status_word(err: &anyhow::Error) -> Option<u16> {
@@ -186,7 +200,7 @@ pub trait Card {
     ///
     /// Backends that cannot speak raw APDUs keep this failing loudly rather than pretending.
     fn apdu(&mut self, _apdu: &[u8]) -> Result<Vec<u8>> {
-        Err(anyhow!("this card backend cannot send raw APDUs"))
+        Err(NoRawApdu.into())
     }
 
     /// Select the applet by AID. `Ok(())` means `9000`.
@@ -210,6 +224,93 @@ pub trait Card {
     fn verify_pin(&mut self, pin: &[u8]) -> Result<()> {
         self.apdu(&pin_apdu(INS_VERIFY_PIN, pin)?).map(|_| ())
     }
+
+    // ------------------------------------------------------------ applet 3.0 (v3.rs)
+
+    /// The applet's version. A backend that kept `SELECT`'s answer gives it; otherwise the card is
+    /// asked `GET_STATE`, which a 3.0 applet answers and a 2.x one refuses (`6D00`), so the PIN
+    /// session is left alone (a `SELECT` would end it). A card that cannot be asked is taken for
+    /// 2.x: it then gets none of 3.0's commands.
+    fn applet_version(&mut self) -> Result<AppletVersion> {
+        match self.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])) {
+            Ok(_) => Ok(AppletVersion::V3_0),
+            Err(e) if matches!(status_word(&e), Some(SW_INS_NOT_SUPPORTED) | Some(SW_CLA_NOT_SUPPORTED)) => Ok(AppletVersion::V2_1),
+            Err(e) if e.downcast_ref::<NoRawApdu>().is_some() => Ok(AppletVersion::V2_1),
+            Err(e) => Err(e).context("asking the card for its version (GET_STATE)"),
+        }
+    }
+
+    /// `SET_NOTE`: the note on a KEYED slot, or the finished change on a CHANGE slot (same amount,
+    /// else `6A80`). No PIN.
+    fn set_note(&mut self, slot: u8, amount_msat: u64, sig48: &[u8; 48]) -> Result<()> {
+        let mut d = amount_msat.to_be_bytes().to_vec();
+        d.extend_from_slice(sig48);
+        self.apdu(&v3_apdu(v3::INS_SET_NOTE, slot, &d)).map(|_| ())
+    }
+
+    /// `GET_SLOT`: state, key, note, spent hash, opening. No PIN.
+    fn get_slot(&mut self, slot: u8) -> Result<SlotInfo> {
+        SlotInfo::parse(&self.apdu(&v3_apdu(v3::INS_GET_SLOT, slot, &[]))?)
+    }
+
+    /// `GET_STATE`: every slot's state, the clock, the limit, what attestation has. No PIN.
+    fn get_state(&mut self) -> Result<CardStatus> {
+        CardStatus::parse(&self.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[]))?)
+    }
+
+    /// `SET_CHANGE`: a KEYED slot is owed change of `amount_msat` from output `opening`.
+    fn set_change(&mut self, slot: u8, amount_msat: u64, opening: &Opening) -> Result<()> {
+        let mut d = amount_msat.to_be_bytes().to_vec();
+        d.extend_from_slice(&opening.to_bytes());
+        self.apdu(&v3_apdu(v3::INS_SET_CHANGE, slot, &d)).map(|_| ())
+    }
+
+    /// `SET_LIMIT`: the day's limit in msat (0: none). Only before `SET_PIN`.
+    fn set_limit(&mut self, limit_msat: u64) -> Result<()> {
+        self.apdu(&v3_apdu(v3::INS_SET_LIMIT, 0, &limit_msat.to_be_bytes())).map(|_| ())
+    }
+
+    /// `SET_HEADER`: a Bitcoin block header; answers the card's clock after it.
+    fn set_header(&mut self, header: &[u8; 80]) -> Result<u32> {
+        let out = self.apdu(&v3_apdu(v3::INS_SET_HEADER, 0, header))?;
+        ensure!(out.len() == 4, "SET_HEADER answered {} bytes, not 4", out.len());
+        Ok(u32::from_be_bytes(out[..4].try_into().expect("4")))
+    }
+
+    /// `ATTEST_INIT`: (re)make the attestation key; its public point, 65 bytes uncompressed.
+    fn attest_init(&mut self) -> Result<Vec<u8>> {
+        let out = self.apdu(&v3_apdu(v3::INS_ATTEST_INIT, 0, &[]))?;
+        ensure!(out.len() == 65 && out[0] == 0x04, "ATTEST_INIT answered no uncompressed P-256 point");
+        Ok(out)
+    }
+
+    /// `SET_CERT`: the registry's certificate, once, before `SET_PIN`.
+    fn set_cert(&mut self, cert: &[u8]) -> Result<()> {
+        ensure!((1..=v3::CERT_MAX).contains(&cert.len()), "a certificate is 1 to {} bytes", v3::CERT_MAX);
+        self.apdu(&v3_apdu(v3::INS_SET_CERT, 0, cert)).map(|_| ())
+    }
+
+    /// `GET_CERT`. `6A83` when the card has none.
+    fn get_cert(&mut self) -> Result<Vec<u8>> {
+        self.apdu(&v3_apdu(v3::INS_GET_CERT, 0, &[]))
+    }
+
+    /// `ATTEST`: ECDSA-SHA256 (DER) over the label, `challenge` and slot 0's key.
+    fn attest(&mut self, challenge: &[u8; 32]) -> Result<Vec<u8>> {
+        self.apdu(&v3_apdu(v3::INS_ATTEST, 0, challenge))
+    }
+}
+
+/// A 3.0 command: the applet's CLA, `ins`, P1 = `p1`, P2 = 0, the data with its Lc when there is
+/// any, and Le = 0.
+pub fn v3_apdu(ins: u8, p1: u8, data: &[u8]) -> Vec<u8> {
+    let mut a = vec![CLA, ins, p1, 0x00];
+    if !data.is_empty() {
+        a.push(data.len() as u8);
+        a.extend_from_slice(data);
+    }
+    a.push(0x00);
+    a
 }
 
 /// `SET_PIN`/`VERIFY_PIN` APDU: the applet's CLA `B0` (not ISO `00`), P1 = P2 = 0, the PIN as Lc
@@ -240,16 +341,21 @@ pub trait Transport {
 
 pub struct CardClient<T: Transport> {
     transport: T,
+    /// What the last `select` answered, when it was a version (two bytes).
+    selected: Option<AppletVersion>,
 }
 
 impl<T: Transport> CardClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self { transport, selected: None }
     }
 
-    /// Select the applet. Needed on a real card; harmless on the bridge.
+    /// Select the applet. Needed on a real card; harmless on the bridge. The applet answers its
+    /// version, kept for [`Card::applet_version`].
     pub fn select(&mut self) -> Result<()> {
-        self.exchange(&SELECT_APDU).map(|_| ())
+        let out = self.exchange(&SELECT_APDU)?;
+        self.selected = AppletVersion::from_select(&out);
+        Ok(())
     }
 
     pub fn into_transport(self) -> T {
@@ -303,7 +409,25 @@ impl<T: Transport> Card for CardClient<T> {
     }
 
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
-        self.exchange(apdu)
+        let out = self.exchange(apdu)?;
+        if apdu.get(..SELECT_APDU.len() - 1) == Some(&SELECT_APDU[..SELECT_APDU.len() - 1]) {
+            self.selected = AppletVersion::from_select(&out);
+        }
+        Ok(out)
+    }
+
+    fn applet_version(&mut self) -> Result<AppletVersion> {
+        match self.selected {
+            Some(v) => Ok(v),
+            None => {
+                let v = match self.exchange(&v3_apdu(v3::INS_GET_STATE, 0, &[])) {
+                    Ok(_) => AppletVersion::V3_0,
+                    Err(e) if matches!(status_word(&e), Some(SW_INS_NOT_SUPPORTED) | Some(SW_CLA_NOT_SUPPORTED)) => AppletVersion::V2_1,
+                    Err(e) => return Err(e).context("asking the card for its version (GET_STATE)"),
+                };
+                Ok(v)
+            }
+        }
     }
 
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
@@ -319,6 +443,11 @@ impl<T: Transport> Card for CardClient<T> {
 /// same PIN state machine: `SET_PIN` once, three tries, `6984` before a PIN exists, `6983` after
 /// it is out of tries. [`SoftCard::new`] is a 2.1 card with [`SLOTS`] slots;
 /// [`SoftCard::with_slots`] makes one of any size, such as a 2.0 card with [`MIN_SLOTS`].
+///
+/// [`SoftCard::v3`] is an applet 3.0 card (`FedimintCardApplet.java`, docs/OFFLINE-PROTOCOL.md
+/// § 1), followed exactly: slot states, sign once per slot (the same hash may be signed again),
+/// notes and change, the day's limit on a clock that only a Bitcoin header with the work moves,
+/// and a P-256 attestation key with its certificate.
 #[derive(Default)]
 pub struct SoftCard {
     /// One entry per slot the card has; a slot past the end answers `6B00`.
@@ -330,6 +459,47 @@ pub struct SoftCard {
     validated: bool,
     /// Whether the applet is installed. A blank card answers `6A82` to SELECT.
     installed: bool,
+    /// What SELECT answers. 3.0 and later get [`Self::v3`]'s rules.
+    version: AppletVersion,
+    /// 3.0: per slot, its state, note, spent hash and opening (one entry per slot).
+    v3: Vec<V3Slot>,
+    clock: Clock,
+    cert: Vec<u8>,
+    attest: Option<p256::ecdsa::SigningKey>,
+}
+
+impl Default for AppletVersion {
+    fn default() -> Self {
+        AppletVersion::V2_1
+    }
+}
+
+/// A 3.0 slot beside its key: what the applet keeps in `state`, `notes`, `spentHash`, `openings`.
+#[derive(Clone)]
+struct V3Slot {
+    state: SlotState,
+    note: [u8; v3::NOTE_LEN],
+    spent: [u8; 32],
+    /// The one signature the slot gave, answered again for the same hash (applet `332a45f`).
+    sig: [u8; 64],
+    opening: [u8; v3::OPEN_LEN],
+}
+
+impl V3Slot {
+    fn empty() -> Self {
+        Self { state: SlotState::Empty, note: [0; v3::NOTE_LEN], spent: [0; 32], sig: [0; 64], opening: [0; v3::OPEN_LEN] }
+    }
+}
+
+/// The applet's clock record.
+#[derive(Default, Clone, Copy)]
+struct Clock {
+    now: u32,
+    window: u32,
+    /// The hardest `bits` taken (little-endian, as in a header); zeros before the first header.
+    bits: [u8; 4],
+    limit: u64,
+    spent: u64,
 }
 
 impl SoftCard {
@@ -339,7 +509,18 @@ impl SoftCard {
 
     /// An installed card with `n` key slots: slot `n` and up answer `6B00`.
     pub fn with_slots(n: u8) -> Self {
-        Self { slots: vec![None; n as usize], tries_left: 3, installed: true, ..Default::default() }
+        Self {
+            slots: vec![None; n as usize],
+            tries_left: 3,
+            installed: true,
+            v3: vec![V3Slot::empty(); n as usize],
+            ..Default::default()
+        }
+    }
+
+    /// An applet 3.0 card: 32 slots and the 3.0 rules.
+    pub fn v3() -> Self {
+        Self { version: AppletVersion::V3_0, ..Self::with_slots(SLOTS) }
     }
 
     /// A card with no applet on it: SELECT answers `6A82`, and every slot is empty.
@@ -350,6 +531,11 @@ impl SoftCard {
     /// How many key slots this card has.
     pub fn slot_len(&self) -> u8 {
         self.slots.len() as u8
+    }
+
+    /// The version SELECT answers.
+    pub fn version(&self) -> AppletVersion {
+        self.version
     }
 
     /// A card whose applet is there but has never been pinned.
@@ -370,13 +556,245 @@ impl SoftCard {
     /// Key every slot with keys no wallet recorded — another machine's card. The slots are full,
     /// so `card setup` would find nothing to generate and `keySetup` must refuse.
     pub fn install_foreign_keys(&mut self) {
-        for s in self.slots.iter_mut().filter(|s| s.is_none()) {
-            *s = Some(Keypair::new(SECP256K1, &mut rand::thread_rng()));
+        for (s, v) in self.slots.iter_mut().zip(self.v3.iter_mut()) {
+            if s.is_none() {
+                *s = Some(Keypair::new(SECP256K1, &mut rand::thread_rng()));
+                v.state = SlotState::Keyed;
+            }
+        }
+    }
+
+    /// Tests: the card's state of `slot` as GET_SLOT would answer it (3.0).
+    pub fn slot_state(&self, slot: u8) -> Option<SlotState> {
+        self.v3.get(slot as usize).map(|v| v.state)
+    }
+
+    /// Tests: a clone of this card's keys and notes as an attacker who extracted them would have
+    /// it, with fresh PIN state and no attestation key of the card's own (a clone cannot copy it).
+    pub fn extract_clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            pin: self.pin.clone(),
+            tries_left: 3,
+            validated: false,
+            installed: true,
+            version: self.version,
+            v3: self
+                .v3
+                .iter()
+                .map(|v| {
+                    // The attacker resets spent slots to the notes they held.
+                    let mut c = v.clone();
+                    if c.state == SlotState::Spent {
+                        c.state = SlotState::Note;
+                        c.spent = [0; 32];
+                        c.sig = [0; 64];
+                    }
+                    c
+                })
+                .collect(),
+            clock: Clock { spent: 0, ..self.clock },
+            cert: self.cert.clone(),
+            attest: Some(p256::ecdsa::SigningKey::random(&mut rand::thread_rng())),
         }
     }
 
     fn slot(&self, slot: u8) -> Result<&Option<Keypair>> {
         self.slots.get(slot as usize).ok_or_else(|| StatusWord(SW_SLOT_OUT_OF_RANGE).into())
+    }
+
+    fn is_v3(&self) -> bool {
+        self.version.sign_once()
+    }
+
+    /// The applet's `PIN_STATE_NOT_SET`.
+    fn pin_not_set(&self) -> bool {
+        self.pin.is_none() && self.tries_left > 0
+    }
+
+    /// The applet's `dayAfter`: the window and amount after spending `amount`, or 6A95.
+    fn day_after(&self, amount: u64) -> Result<(u32, u64)> {
+        let c = self.clock;
+        let (mut window, mut spent) = (c.window, c.spent);
+        if c.now != 0 {
+            if window == 0 {
+                window = c.now;
+            } else if window.checked_add(v3::DAY_SECONDS).is_some_and(|end| c.now >= end) {
+                window = c.now;
+                spent = 0;
+            }
+        }
+        let (s, wrapped) = spent.overflowing_add(amount);
+        if c.limit != 0 && (wrapped || s > c.limit) {
+            return Err(StatusWord(v3::SW_OVER_LIMIT).into());
+        }
+        Ok((window, s))
+    }
+
+    fn set_header_v3(&mut self, h: &[u8]) -> Result<Vec<u8>> {
+        let h: &[u8; 80] = h.try_into().map_err(|_| StatusWord(v3::SW_WRONG_LENGTH))?;
+        let little_work = || -> anyhow::Error { StatusWord(v3::SW_LITTLE_WORK).into() };
+        let wrong_data = || -> anyhow::Error { StatusWord(v3::SW_WRONG_DATA).into() };
+        let bits: [u8; 4] = h[72..76].try_into().expect("4");
+        let hash = v3::header_work_hash(h);
+        let target = v3::target_of(&bits).ok_or_else(wrong_data)?;
+        if hash > target {
+            return Err(little_work());
+        }
+        let floor = v3::target_of(&v3::FLOOR_BITS).expect("the floor parses");
+        if target > floor {
+            return Err(little_work());
+        }
+        let seen = self.clock.bits != [0; 4];
+        if seen {
+            let hardest = v3::target_of(&self.clock.bits).ok_or_else(wrong_data)?;
+            if target > v3::times_four(&hardest) {
+                return Err(little_work());
+            }
+        }
+        let time = v3::header_time(h);
+        if time > self.clock.now {
+            let harder = !seen || target < v3::target_of(&self.clock.bits).ok_or_else(wrong_data)?;
+            self.clock.now = time;
+            if harder {
+                self.clock.bits = bits;
+            }
+        }
+        Ok(self.clock.now.to_be_bytes().to_vec())
+    }
+
+    /// The 3.0 commands' APDU layer (`process` in the applet), after the CLA and SELECT.
+    fn apdu_v3(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        let ins = apdu[1];
+        let body = apdu_body(apdu)?;
+        let len_is = |n: usize| -> Result<()> {
+            if body.len() == n { Ok(()) } else { Err(StatusWord(v3::SW_WRONG_LENGTH).into()) }
+        };
+        // The applet's `slot()`: P1 a slot, P2 zero.
+        let slot = || -> Result<usize> {
+            let p1 = apdu[2] as usize;
+            if p1 >= self.slots.len() || apdu[3] != 0 {
+                return Err(StatusWord(SW_SLOT_OUT_OF_RANGE).into());
+            }
+            Ok(p1)
+        };
+        let refuse = || -> anyhow::Error { StatusWord(SW_CONDITIONS_NOT_SATISFIED).into() };
+        match ins {
+            v3::INS_SET_NOTE => {
+                let s = slot()?;
+                len_is(v3::NOTE_LEN)?;
+                let v = &mut self.v3[s];
+                match v.state {
+                    SlotState::Change if v.note[..8] != body[..8] => return Err(StatusWord(v3::SW_WRONG_DATA).into()),
+                    SlotState::Change | SlotState::Keyed => {}
+                    _ => return Err(refuse()),
+                }
+                if body[..8] == [0; 8] {
+                    return Err(StatusWord(v3::SW_WRONG_DATA).into());
+                }
+                v.note.copy_from_slice(body);
+                v.state = SlotState::Note;
+                v.opening = [0; v3::OPEN_LEN];
+                Ok(vec![])
+            }
+            v3::INS_GET_SLOT => {
+                let s = slot()?;
+                len_is(0)?;
+                let v = &self.v3[s];
+                let mut out = vec![v.state.byte()];
+                match (&self.slots[s], v.state) {
+                    (Some(kp), st) if st != SlotState::Empty => out.extend_from_slice(&kp.x_only_public_key().0.serialize()),
+                    _ => out.extend_from_slice(&[0; 32]),
+                }
+                out.extend_from_slice(&v.note);
+                out.extend_from_slice(&v.spent);
+                out.extend_from_slice(&v.opening);
+                Ok(out)
+            }
+            v3::INS_GET_STATE => {
+                len_is(0)?;
+                let mut out: Vec<u8> = self.v3.iter().map(|v| v.state.byte()).collect();
+                out.resize(32, 0);
+                out.extend_from_slice(&self.clock.now.to_be_bytes());
+                out.extend_from_slice(&self.clock.window.to_be_bytes());
+                out.extend_from_slice(&self.clock.limit.to_be_bytes());
+                out.extend_from_slice(&self.clock.spent.to_be_bytes());
+                out.push(self.cert.len() as u8);
+                out.push(u8::from(self.attest.is_some()));
+                Ok(out)
+            }
+            v3::INS_SET_CHANGE => {
+                let s = slot()?;
+                len_is(8 + v3::OPEN_LEN)?;
+                if self.v3[s].state != SlotState::Keyed {
+                    return Err(refuse());
+                }
+                if body[..8] == [0; 8] {
+                    return Err(StatusWord(v3::SW_WRONG_DATA).into());
+                }
+                let v = &mut self.v3[s];
+                v.note = [0; v3::NOTE_LEN];
+                v.note[..8].copy_from_slice(&body[..8]);
+                v.opening.copy_from_slice(&body[8..]);
+                v.state = SlotState::Change;
+                Ok(vec![])
+            }
+            v3::INS_SET_LIMIT => {
+                len_is(8)?;
+                if !self.pin_not_set() {
+                    return Err(refuse());
+                }
+                self.clock.limit = u64::from_be_bytes(body.try_into().expect("8"));
+                Ok(vec![])
+            }
+            v3::INS_SET_HEADER => {
+                len_is(v3::HEADER_LEN)?;
+                let h = body.to_vec();
+                self.set_header_v3(&h)
+            }
+            v3::INS_ATTEST_INIT => {
+                len_is(0)?;
+                if !self.pin_not_set() || !self.cert.is_empty() {
+                    return Err(refuse());
+                }
+                let key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+                let w = key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+                self.attest = Some(key);
+                Ok(w)
+            }
+            v3::INS_SET_CERT => {
+                if body.is_empty() || body.len() > v3::CERT_MAX {
+                    return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+                }
+                if !self.pin_not_set() || !self.cert.is_empty() || self.attest.is_none() {
+                    return Err(refuse());
+                }
+                self.cert = body.to_vec();
+                Ok(vec![])
+            }
+            v3::INS_GET_CERT => {
+                len_is(0)?;
+                if self.cert.is_empty() {
+                    return Err(StatusWord(v3::SW_RECORD_NOT_FOUND).into());
+                }
+                Ok(self.cert.clone())
+            }
+            v3::INS_ATTEST => {
+                len_is(32)?;
+                let (Some(key), false, Some(Some(kp))) = (&self.attest, self.cert.is_empty(), self.slots.first()) else {
+                    return Err(refuse());
+                };
+                if self.v3[0].state == SlotState::Empty {
+                    return Err(refuse());
+                }
+                use p256::ecdsa::signature::Signer as _;
+                let challenge: [u8; 32] = body.try_into().expect("32");
+                let msg = v3::attest_message(&challenge, &kp.x_only_public_key().0.serialize());
+                let sig: p256::ecdsa::Signature = key.sign(&msg);
+                Ok(sig.to_der().as_bytes().to_vec())
+            }
+            _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
+        }
     }
 }
 
@@ -418,20 +836,34 @@ impl Card for SoftCard {
         }
         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
         self.slots[slot as usize] = Some(kp);
+        self.v3[slot as usize] = V3Slot { state: SlotState::Keyed, ..V3Slot::empty() };
         Ok(kp.x_only_public_key().0)
     }
 
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
         self.require_installed()?;
-        self.slot(slot)?;
-        // Replacing a key destroys whatever is locked to it, so once the card has a PIN the
-        // overwrite needs `SIGN`'s PIN session. Before the first `SET_PIN` nothing can be spent,
-        // so provisioning re-keys freely.
-        if self.pin.is_some() || self.tries_left == 0 {
+        let occupied = self.slot(slot)?.is_some();
+        if self.is_v3() {
+            // 3.0: a slot holding a note, or owed change, holds value and is never re-keyed; a
+            // KEYED or SPENT one takes the PIN once the card has one. An empty slot is keyed as
+            // by a plain GEN_KEY.
+            if occupied {
+                if matches!(self.v3[slot as usize].state, SlotState::Note | SlotState::Change) {
+                    return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+                }
+                if !self.pin_not_set() {
+                    self.require_pin_session()?;
+                }
+            }
+        } else if self.pin.is_some() || self.tries_left == 0 {
+            // Replacing a key destroys whatever is locked to it, so once the card has a PIN the
+            // overwrite needs `SIGN`'s PIN session. Before the first `SET_PIN` nothing can be
+            // spent, so provisioning re-keys freely.
             self.require_pin_session()?;
         }
         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
         self.slots[slot as usize] = Some(kp);
+        self.v3[slot as usize] = V3Slot { state: SlotState::Keyed, ..V3Slot::empty() };
         Ok(kp.x_only_public_key().0)
     }
 
@@ -448,14 +880,42 @@ impl Card for SoftCard {
         // The gate comes first, as on the applet: without the PIN, a reader learns nothing
         // about the slots.
         self.require_pin_session()?;
-        match self.slot(slot)? {
-            Some(kp) => Ok(SECP256K1.sign_schnorr(&Message::from_digest(*msg32), kp)),
-            None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
+        let Some(kp) = *self.slot(slot)? else {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        };
+        let sig = || SECP256K1.sign_schnorr(&Message::from_digest(*msg32), &kp);
+        if !self.is_v3() {
+            return Ok(sig());
+        }
+        let v = &self.v3[slot as usize];
+        match v.state {
+            // The one transaction this slot signed, asked again: the stored signature, byte for
+            // byte (the applet computes one signature per key in its life). Spends nothing new.
+            SlotState::Spent if &v.spent == msg32 => Ok(Signature::from_slice(&v.sig).expect("stored signature")),
+            SlotState::Note => {
+                let amount = u64::from_be_bytes(v.note[..8].try_into().expect("8"));
+                let (window, spent) = self.day_after(amount)?;
+                let s = sig();
+                let v = &mut self.v3[slot as usize];
+                v.spent = *msg32;
+                v.sig = s.serialize();
+                v.state = SlotState::Spent;
+                self.clock.window = window;
+                self.clock.spent = spent;
+                Ok(s)
+            }
+            _ => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
         }
     }
 
-    /// The APDU layer, modelled on the applet's dispatch: SELECT by AID, `GET DATA FF21`, and the
-    /// three PIN commands. Unknown instructions answer `6D00`, like the applet.
+    fn applet_version(&mut self) -> Result<AppletVersion> {
+        self.require_installed()?;
+        Ok(self.version)
+    }
+
+    /// The APDU layer, modelled on the applet's dispatch: SELECT by AID, `GET DATA FF21`, the
+    /// three PIN commands and, on a 3.0 card, its commands. Unknown instructions answer `6D00`,
+    /// like the applet.
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         ensure!(apdu.len() >= 4, "APDU shorter than its header");
         let (cla, ins) = (apdu[0], apdu[1]);
@@ -470,7 +930,9 @@ impl Card for SoftCard {
                 }
                 // A session lives inside a selection: a fresh SELECT needs its own VERIFY_PIN.
                 self.validated = false;
-                Ok(vec![])
+                // A 3.0 applet answers its version. The 2.x stand-in has always answered no
+                // data, and the hosts take that for 2.x.
+                Ok(if self.is_v3() { vec![self.version.major, self.version.minor] } else { vec![] })
             }
             (CLA_ISO, 0xCA) if apdu[2] == 0xFF && apdu[3] == 0x21 => {
                 // TLV: 81 applications, 82 non-volatile, 83 volatile. One free slot's worth.
@@ -515,9 +977,23 @@ impl Card for SoftCard {
                 }
                 Err(StatusWord(0x63C0 | u16::from(self.tries_left)).into())
             }
+            (CLA, _) if self.is_v3() => self.apdu_v3(apdu),
             _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }
     }
+}
+
+/// The data field of a command that may have none: `[CLA INS P1 P2]`, `[… Le]`, or
+/// `[… Lc data… (Le)]`. A field shorter than its Lc is `6700`.
+fn apdu_body(apdu: &[u8]) -> Result<&[u8]> {
+    if apdu.len() <= 5 {
+        return Ok(&[]);
+    }
+    let lc = apdu[4] as usize;
+    if apdu.len() < 5 + lc {
+        return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+    }
+    Ok(&apdu[5..5 + lc])
 }
 
 /// The AID bytes `SELECT` names, without the header/Lc that precede them.
