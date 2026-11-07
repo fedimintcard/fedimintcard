@@ -2402,6 +2402,7 @@ dependencies = [
  "futures",
  "hex",
  "lightning-invoice",
+ "p256",
  "qrcode",
  "rand 0.8.8",
  "reqwest 0.12.28",

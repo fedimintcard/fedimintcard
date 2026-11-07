@@ -293,8 +293,27 @@ impl<'w> Loader<'w> {
         if self.crash == Some(LoadCrash::AfterCommit) {
             bail!("simulated crash after commit");
         }
-        match self.finish(&pending).await? {
-            Some(live) => Ok(LoadReport { short_id, txid: pending.txid, notes: live, resumed }),
+        match self.finish_signed(&pending).await? {
+            Some(sigs) => {
+                // A 3.0 card holds its notes: write them in this tap. A failure is only a
+                // warning; the next till to attach the card writes them.
+                let notes: Vec<(u8, XOnlyPublicKey, u64, String)> = pending
+                    .notes
+                    .iter()
+                    .zip(&sigs)
+                    .filter_map(|(n, sig)| {
+                        let key = outs.iter().find(|o| o.slot == n.slot)?.nonce.0.x_only_public_key().0;
+                        Some((n.slot, key, n.amount_msat, sig.clone()))
+                    })
+                    .collect();
+                if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once()) {
+                    if let Err(e) = crate::glue::write_notes(card, &notes) {
+                        tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
+                    }
+                }
+                let live = pending.notes.iter().map(|n| (n.slot, n.amount_msat)).collect();
+                Ok(LoadReport { short_id, txid: pending.txid, notes: live, resumed })
+            }
             None => bail!("the federation did not take load {}; nothing moved", pending.txid),
         }
     }
@@ -319,6 +338,11 @@ impl<'w> Loader<'w> {
     /// The federation's answer for `p`, recorded in ops, and the journal entry removed. `None`:
     /// the load never became money.
     async fn finish(&self, p: &PendingLoad) -> Result<Option<Vec<(u8, u64)>>> {
+        Ok(self.finish_signed(p).await?.map(|_| p.notes.iter().map(|n| (n.slot, n.amount_msat)).collect()))
+    }
+
+    /// [`Self::finish`], answering each note's signature (hex) in the order of `p.notes`.
+    async fn finish_signed(&self, p: &PendingLoad) -> Result<Option<Vec<String>>> {
         let client = &self.wallet.client;
         let op = OperationId(
             hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?,
@@ -366,7 +390,11 @@ impl<'w> Loader<'w> {
             Err(e) => return Err(e).context("recording the load's outcome in ops"),
         }
         self.update_journal(|l| l.retain(|q| q.txid != p.txid))?;
-        Ok(accepted.then(|| p.notes.iter().map(|n| (n.slot, n.amount_msat)).collect()))
+        let sigs = outcome["notes"]
+            .as_array()
+            .map(|a| a.iter().map(|n| n["signature"].as_str().unwrap_or_default().to_owned()).collect())
+            .unwrap_or_default();
+        Ok(accepted.then_some(sigs))
     }
 }
 

@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use fedimint_card_host_card::{Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, past_last_slot, status_word};
+use fedimint_card_host_card::{Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, SlotState, StatusWord, past_last_slot, status_word};
 use fedimint_client::transaction::{ClientOutput, ClientOutputBundle, TransactionBuilder};
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -273,11 +273,17 @@ pub struct CardWallet {
     /// The holder's PIN for this job (`POST /v1/charge` `pin`). When unset the PIN session uses
     /// `CARD_PIN`, which is for the CLI and the tests.
     pub pin: Option<Vec<u8>>,
+    /// The newest block header the till keeps, shown to a 3.0 card whose clock is older
+    /// (`crate::clock`). `None`: the card's clock is left alone.
+    pub headers: Option<std::sync::Arc<crate::clock::Headers>>,
+    /// Transactions `resolve_pending` abandoned (rejected, or never sent) during this wallet's
+    /// life, oldest first. The offline sender reads it to tell a rejected offline charge.
+    pub abandoned: Vec<String>,
 }
 
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
-        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None, ops: None, pin: None }
+        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None, ops: None, pin: None, headers: None, abandoned: vec![] }
     }
 
     /// Open the card's PIN session for this selection.
@@ -665,6 +671,7 @@ impl CardWallet {
         for (i, o) in outs.iter().enumerate() {
             self.finalize_card_note(&nonce_hex(o.nonce), OutPoint { txid, out_idx: i as u64 }, FETCH_TIMEOUT).await?;
         }
+        self.sync_card_notes();
         self.ops_sync().await;
         Ok(outs.iter().map(|o| (o.slot, o.amount)).collect())
     }
@@ -713,9 +720,18 @@ impl CardWallet {
     /// Records of a transaction that never became money: its pending outputs die, the inputs
     /// (still live) are untouched.
     fn abandon_group(&mut self, txid: &str) {
+        self.abandoned.push(txid.to_owned());
         // On ops: the charge is recorded rejected, so its change notes die there too.
         self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: false, change: vec![] });
-        for n in self.store.state.notes.iter_mut().filter(|n| n.status == NoteStatus::Pending && n.txid.as_deref() == Some(txid)) {
+        let inputs: Vec<String> =
+            self.store.state.pending_txs.iter().filter(|p| p.txid == txid).flat_map(|p| p.inputs.clone()).collect();
+        for n in self
+            .store
+            .state
+            .notes
+            .iter_mut()
+            .filter(|n| n.status == NoteStatus::Pending && n.txid.as_deref() == Some(txid) && !inputs.contains(&n.nonce))
+        {
             n.status = NoteStatus::Dead;
             n.blinding_key = None;
         }
@@ -742,12 +758,16 @@ impl CardWallet {
     async fn collect_group(&mut self, txid: &str, timeout: Duration, rec: &mut Recovered) -> Result<bool> {
         let mut all = true;
         // Card notes.
+        // A note a charge spends is not one of its outputs, even where the registry marks it
+        // pending under the charge's txid (an offline charge's inputs, `offline-charges`).
+        let spending: Vec<String> = self.store.state.pending_txs.iter().flat_map(|p| p.inputs.clone()).collect();
         let pending: Vec<NoteRec> = self
             .store
             .state
             .notes
             .iter()
             .filter(|n| n.status == NoteStatus::Pending && n.txid.as_deref() == Some(txid))
+            .filter(|n| !spending.contains(&n.nonce))
             .cloned()
             .collect();
         for n in pending {
@@ -854,6 +874,7 @@ impl CardWallet {
                 .notes
                 .iter()
                 .filter(|n| n.status == NoteStatus::Pending)
+                .filter(|n| !self.store.state.pending_txs.iter().any(|p| p.inputs.contains(&n.nonce)))
                 .filter_map(|n| n.txid.clone()),
         );
         groups.sort();
@@ -1167,6 +1188,11 @@ impl CardWallet {
         };
         let txid = tx.tx_hash();
         let group = txid.to_string();
+        // 0. A 3.0 card signs only a slot that holds its note, and only within its day's limit:
+        //    write any note it lacks (SET_NOTE) and check the limit before anything is recorded.
+        if self.card_sign_once() {
+            self.prepare_inputs_v3(inputs, txid.to_byte_array())?;
+        }
 
         // 1. Persist every secret needed to collect the outputs, and where each one will be,
         //    before anything is signed.
@@ -1462,6 +1488,8 @@ impl CardWallet {
             }
         };
         warnings.extend(rec.errors.iter().cloned());
+        // The change is live: on a 3.0 card it is written in this tap (SET_NOTE).
+        self.sync_card_notes();
         let renewed = match self.renew_spent_slots().await {
             Ok(r) => r,
             Err(e) => {
@@ -1565,6 +1593,141 @@ impl CardWallet {
         }
         let (notes, face) = self.wallet.export(amount, false, true).await?;
         Ok(Some((notes.to_string(), face.msats)))
+    }
+}
+
+// -------------------------------------------------------------------- applet 3.0
+
+/// The 48 bytes a note's stored signature (consensus hex) is on the card.
+pub fn sig48_of(hex_sig: &str) -> Result<[u8; 48]> {
+    hex::decode(hex_sig).ok().and_then(|b| b.try_into().ok()).context("a note signature that is not 48 bytes")
+}
+
+/// Write live notes to a 3.0 card that lacks them (`SET_NOTE`): each `(slot, x-only key,
+/// msat, signature hex)` whose slot is KEYED, or CHANGE owed that amount, under that key. A slot
+/// holding anything else, or another key, is left alone. Answers how many were written; a card
+/// error stops it and is returned.
+pub fn write_notes(card: &mut dyn Card, notes: &[(u8, XOnlyPublicKey, u64, String)]) -> Result<usize> {
+    if notes.is_empty() {
+        return Ok(0);
+    }
+    let st = on_card(|| card.get_state())?;
+    let mut n = 0;
+    for (slot, key, amount, sig) in notes {
+        let Some(state) = st.states.get(*slot as usize) else { continue };
+        if !matches!(state, SlotState::Keyed | SlotState::Change) {
+            continue;
+        }
+        let info = on_card(|| card.get_slot(*slot))?;
+        if info.xonly != Some(*key) || (info.state == SlotState::Change && info.amount_msat != *amount) {
+            tracing::warn!("slot {slot}: the card holds another key or another change than the note; not written");
+            continue;
+        }
+        let sig = sig48_of(sig)?;
+        on_card(|| card.set_note(*slot, *amount, &sig)).with_context(|| format!("SET_NOTE on slot {slot}"))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+impl CardWallet {
+    /// Whether the card in the field is applet 3.0 (each slot signs once; notes on the card).
+    /// A card that cannot say is taken for 2.x.
+    pub fn card_sign_once(&mut self) -> bool {
+        match on_card(|| self.card.applet_version()) {
+            Ok(v) => v.sign_once(),
+            Err(e) => {
+                tracing::warn!("the card's version: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Before SIGN on a 3.0 card: every input slot holds its note (a KEYED or CHANGE slot gets it
+    /// with SET_NOTE), none has signed another transaction, and the day's limit takes them all.
+    fn prepare_inputs_v3(&mut self, inputs: &[NoteRec], txid: [u8; 32]) -> Result<()> {
+        let mut counted = vec![];
+        for n in inputs {
+            let key = XOnlyPublicKey::from(nonce_from_hex(&n.nonce)?.0);
+            let info = on_card(|| self.card.get_slot(n.slot)).with_context(|| format!("GET_SLOT {}", n.slot))?;
+            if info.xonly != Some(key) {
+                return Err(SpendFault::WrongCard(format!("slot {} holds another key than its note's", n.slot)).into());
+            }
+            match info.state {
+                SlotState::Note => {
+                    ensure!(info.amount_msat == n.amount_msat, "slot {} holds a note of {} msat, not {}", n.slot, info.amount_msat, n.amount_msat);
+                    counted.push(n.amount_msat);
+                }
+                SlotState::Keyed | SlotState::Change => {
+                    let sig = sig48_of(n.signature.as_deref().context("live note without signature")?)?;
+                    on_card(|| self.card.set_note(n.slot, n.amount_msat, &sig)).with_context(|| format!("SET_NOTE on slot {}", n.slot))?;
+                    counted.push(n.amount_msat);
+                }
+                SlotState::Spent if info.spent_hash == txid => {}
+                SlotState::Spent => bail!(
+                    "slot {} has already signed another transaction (an offline charge not yet settled?); its note cannot pay this one",
+                    n.slot
+                ),
+                SlotState::Empty => return Err(SpendFault::WrongCard(format!("slot {} is empty on the card", n.slot)).into()),
+            }
+        }
+        let st = on_card(|| self.card.get_state())?;
+        if !st.limit_allows(&counted) {
+            return Err(anyhow::Error::new(StatusWord(fedimint_card_host_card::v3::SW_OVER_LIMIT))
+                .context("the card's daily limit does not take this charge; nothing was signed"));
+        }
+        Ok(())
+    }
+
+    /// On a 3.0 card, write every live note of this state that the card lacks (a load or change
+    /// finished at another tap, or by a till that could not reach the card). Never fails the job.
+    pub fn sync_card_notes(&mut self) -> usize {
+        if !self.card_sign_once() {
+            return 0;
+        }
+        let st = &self.store.state;
+        let notes: Vec<(u8, XOnlyPublicKey, u64, String)> = st
+            .slots
+            .iter()
+            .flat_map(|s| st.notes_on_current_key(s.slot))
+            .filter(|n| n.status == NoteStatus::Live)
+            .filter_map(|n| {
+                let key = XOnlyPublicKey::from(nonce_from_hex(&n.nonce).ok()?.0);
+                Some((n.slot, key, n.amount_msat, n.signature.clone()?))
+            })
+            .collect();
+        match write_notes(self.card.as_mut(), &notes) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("writing notes to the card: {e:#}");
+                0
+            }
+        }
+    }
+
+    /// Show a 3.0 card the till's newest block header when the card's clock is older. Never
+    /// fails the job.
+    pub fn sync_card_clock(&mut self) {
+        let Some(h) = self.headers.as_ref().and_then(|h| h.latest()) else { return };
+        if !self.card_sign_once() {
+            return;
+        }
+        let r: Result<()> = (|| {
+            let st = on_card(|| self.card.get_state())?;
+            if st.now < fedimint_card_host_card::v3::header_time(&h) {
+                on_card(|| self.card.set_header(&h))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            tracing::warn!("the card's clock: {e:#}");
+        }
+    }
+
+    /// What a tap does first on a 3.0 card: its clock, then the notes it lacks.
+    pub fn card_tick(&mut self) {
+        self.sync_card_clock();
+        self.sync_card_notes();
     }
 }
 

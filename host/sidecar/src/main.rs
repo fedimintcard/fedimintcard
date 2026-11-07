@@ -82,6 +82,16 @@ enum TillCmd {
         /// arrive from a local address.
         #[arg(long, env = "TILL_REQUIRE_POS_TOKEN", value_parser = clap::builder::BoolishValueParser::new())]
         require_pos_token: bool,
+        /// Esplora API for Bitcoin block headers, the clock of a 3.0 card's daily offline limit
+        /// (fetched every 10 minutes; an empty value turns it off).
+        #[arg(long, env = "TILL_ESPLORA_URL", default_value = fedimint_card_sidecar::clock::DEFAULT_ESPLORA)]
+        esplora_url: String,
+        /// Most value, in msat, this till holds in offline charges not yet settled.
+        #[arg(long, env = "TILL_OFFLINE_CAP_MSAT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_MSAT)]
+        offline_cap_msat: u64,
+        /// Most offline charges this till holds not yet settled.
+        #[arg(long, env = "TILL_OFFLINE_CAP_COUNT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_COUNT)]
+        offline_cap_count: usize,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -329,17 +339,22 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token }) => {
+        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
-            fedimint_card_sidecar::till::serve_with(
+            let opts = fedimint_card_sidecar::till::ServeOptions {
+                esplora_url: Some(esplora_url.clone()).filter(|u| !u.trim().is_empty()),
+                offline: fedimint_card_sidecar::offline::OfflineConfig { cap_msat: *offline_cap_msat, cap_count: *offline_cap_count },
+            };
+            fedimint_card_sidecar::till::serve_opts(
                 cw,
                 *listen,
                 relay.clone(),
                 ops_url.clone(),
                 ops_token.clone(),
                 *require_pos_token,
+                opts,
             )
             .await?;
         }

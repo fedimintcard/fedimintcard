@@ -94,6 +94,15 @@ pub struct Class {
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
     for cause in err.chain() {
+        if let Some(o) = cause.downcast_ref::<crate::offline::OfflineError>() {
+            use crate::offline::OfflineError as E;
+            return match o {
+                E::Unsupported(_) => c(409, "offline_unsupported_card"),
+                E::NotReady(_) => c(503, "offline_not_ready"),
+                E::NotGenuine(_) => c(403, "card_not_genuine"),
+                E::Cap(_) => c(503, "offline_cap_reached"),
+            };
+        }
         if let Some(o) = cause.downcast_ref::<OpsError>() {
             return match o {
                 OpsError::Changed(_) => c(409, "card_changed"),
@@ -106,6 +115,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
             match *sw {
                 0x63C0..=0x63CF => return c(403, "wrong_pin"),
                 SW_PIN_BLOCKED => return c(423, "pin_blocked"),
+                fedimint_card_host_card::v3::SW_OVER_LIMIT => return c(402, "card_limit"),
                 _ => {}
             }
         }
@@ -416,6 +426,8 @@ enum Job {
         reply: oneshot::Sender<Reply>,
     },
     Balance { link: Option<Link>, reply: oneshot::Sender<Reply> },
+    /// Send charges taken offline (docs/OFFLINE-PROTOCOL.md § 4.5).
+    SendOffline { reply: oneshot::Sender<Reply> },
     Precheck { reply: oneshot::Sender<Reply> },
     KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
     Issue { amounts: Vec<u64>, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
@@ -453,9 +465,32 @@ pub struct TillHandle {
     pos_auth: crate::pos::PosAuth,
     /// Top-ups by Lightning ([`Self::with_topups`]); without them the top-up routes answer 503.
     topups: Option<Arc<Topups>>,
+    /// Offline charges ([`Self::with_offline`]); shared with the actor.
+    offline: SharedOffline,
 }
 
+/// The till's offline charges, once [`TillHandle::with_offline`] set them.
+pub type SharedOffline = Arc<Mutex<Option<Arc<crate::offline::Offline>>>>;
+
 impl TillHandle {
+    /// Take 3.0 cards offline when the registry or the federation does not answer, and send what
+    /// was taken once they do (docs/OFFLINE-PROTOCOL.md § 4).
+    pub fn with_offline(self, off: Arc<crate::offline::Offline>) -> Self {
+        *self.offline.lock().unwrap() = Some(off);
+        self
+    }
+
+    /// Send the charges taken offline now, as the background sender does: one job, answered with
+    /// what it did.
+    pub async fn send_offline(&self) -> Reply {
+        run_job(self, None, |reply| Job::SendOffline { reply }).await
+    }
+
+    /// Whether a job is in flight.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// Require `token` as a bearer on every `/v1/*` request not from loopback.
     pub fn with_pos_token(mut self, token: Option<String>) -> Self {
         self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false };
@@ -528,6 +563,7 @@ pub async fn new_with_conn(
     let inflight = Arc::new(Mutex::new(None));
     let pending_refs = Arc::new(Mutex::new(refs_now(&cw, ops.as_ref())));
     let federation_name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
+    let offline: SharedOffline = Arc::new(Mutex::new(None));
     let handle = TillHandle {
         tx,
         busy: busy.clone(),
@@ -541,8 +577,9 @@ pub async fn new_with_conn(
         links: Arc::new(Links::default()),
         pos_auth: crate::pos::PosAuth::default(),
         topups: None,
+        offline: offline.clone(),
     };
-    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn))
+    (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn, offline))
 }
 
 /// `client_ref`s of unresolved charges: in the wallet's file, or on ops in every card file.
@@ -563,6 +600,7 @@ async fn actor(
     sales: Arc<Mutex<SalesStore>>,
     opener: CardOpener,
     conn: SharedConn,
+    offline: SharedOffline,
 ) {
     ensure_hook(&mut cw, &sales);
     // The data directory: the holder loader journals top-up loads there.
@@ -570,13 +608,21 @@ async fn actor(
     while let Some(job) = rx.recv().await {
         // Read per job: the claim poller may have put the till on ops since the last one.
         let ops = conn.lock().unwrap().ops.clone();
+        let off = offline.lock().unwrap().clone();
         let (reply_tx, reply) = match job {
+            Job::SendOffline { reply } => {
+                let r = match (ops.as_ref(), off.as_ref()) {
+                    (Some(o), Some(f)) => send_offline_job(&mut cw, o, f, &sales).await,
+                    _ => Reply::ok(json!({"ok": true, "reported": [], "settled": [], "double_spent": [], "refused": [], "errors": []})),
+                };
+                (reply, r)
+            }
             Job::Charge { price, client_ref, pin, link, reply } => {
                 let r = match on_card(|| open_for(&opener, link.as_ref())) {
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
-                        charge_job(&mut cw, ops.as_ref(), price, client_ref, &sales).await
+                        charge_job_with(&mut cw, ops.as_ref(), off.as_deref(), price, client_ref, &sales).await
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
@@ -875,7 +921,12 @@ async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<Stri
 pub async fn balance_job(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) -> Reply {
     ensure_hook(cw, sales);
     let r = match cw.verify_card() {
-        Ok(()) => match cw.balance().await {
+        Ok(()) => match {
+            if cw.ops.is_none() {
+                cw.card_tick();
+            }
+            cw.balance().await
+        } {
             Ok(rep) => balance_reply(&rep),
             Err(e) => error_reply(&e),
         },
@@ -896,17 +947,138 @@ pub async fn charge_job(
     client_ref: Option<String>,
     sales: &Arc<Mutex<SalesStore>>,
 ) -> Reply {
+    charge_job_with(cw, ops, None, price, client_ref, sales).await
+}
+
+/// [`charge_job`] for a till that takes cards offline (`off`): when the registry or the
+/// federation does not answer within 2 s, a 3.0 card is charged offline
+/// ([`crate::offline::charge`]); while both answer, charges taken offline for any card are reported
+/// first, so the registry knows which notes they spent.
+pub async fn charge_job_with(
+    cw: &mut CardWallet,
+    ops: Option<&Ops>,
+    off: Option<&crate::offline::Offline>,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+) -> Reply {
     let Some(ops) = ops else { return charge_with(cw, price, client_ref, sales).await };
     if let Some(bad) = validate_price(price) {
         return bad;
     }
+    if let Some(off) = off {
+        let (reg, fed) = off.reach.probe(Some(ops), &cw.wallet, &off.dir).await;
+        if reg != Some(true) || !fed {
+            return offline_charge(cw, ops, off, price, client_ref, sales).await;
+        }
+        let mut sent = crate::offline::Sent::default();
+        crate::offline::report(off, ops, None, &mut sent).await;
+        mark_offline_sales(off, sales, &sent);
+    }
     let base = match ops.attach(cw).await {
         Ok(b) => b,
-        Err(e) => return error_reply(&e),
+        Err(e) => {
+            if let (Some(off), true) = (off, crate::ops::unanswered(&e)) {
+                // The probe said up a moment ago; the registry went quiet since.
+                off.reach.registry_down();
+                return offline_charge(cw, ops, off, price, client_ref, sales).await;
+            }
+            return error_reply(&e);
+        }
     };
     let r = charge_with(cw, price, client_ref, sales).await;
     Ops::finish(cw, base).await;
     r
+}
+
+/// The offline path of a charge: take it, record the sale (`offline`), answer 200 with
+/// `"offline": true`.
+async fn offline_charge(
+    cw: &mut CardWallet,
+    ops: &Ops,
+    off: &crate::offline::Offline,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+) -> Reply {
+    // A repeat of a sale already taken (offline or not) is that sale.
+    if let Some(r) = replay(sales, client_ref.as_deref(), price) {
+        return r;
+    }
+    let started = Instant::now();
+    let taken = match crate::offline::charge(cw, off, ops, price, client_ref.as_deref()).await {
+        Ok(t) => t.charge,
+        Err(e) => {
+            tracing::warn!("offline charge of {price} msat refused: {e:#}");
+            return error_reply(&e);
+        }
+    };
+    let mut rec = SaleRec {
+        id: 0,
+        ts_unix_ms: taken.ts_unix_ms,
+        price_msat: taken.price_msat,
+        received_msat: 0,
+        overpaid_msat: taken.overpay_msat,
+        fees_msat: taken.fees_msat,
+        txid: taken.txid.clone(),
+        inputs: taken.inputs.iter().map(|i| SlotMsat { slot: i.slot, msat: i.amount_msat }).collect(),
+        change: taken.change.iter().map(|c| SlotMsat { slot: c.slot, msat: c.amount_msat }).collect(),
+        collection_pending: true,
+        client_ref,
+        duration_ms: started.elapsed().as_millis() as u64,
+        warnings: vec![],
+        offline: true,
+        double_spent: false,
+    };
+    match sales.lock().unwrap().append(rec.clone()) {
+        Ok(saved) => rec = saved,
+        Err(e) => rec.warnings.push(format!("sale not recorded in sales.json: {e:#}")),
+    }
+    Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms))
+}
+
+/// Bring the sales of offline charges in line with what the sender found.
+fn mark_offline_sales(off: &crate::offline::Offline, sales: &Mutex<SalesStore>, sent: &crate::offline::Sent) {
+    let mut s = sales.lock().unwrap();
+    for t in &sent.double_spent {
+        if let Err(e) = s.update(t, |r| r.double_spent = true) {
+            tracing::warn!("marking sale {t} double spent: {e:#}");
+        }
+    }
+    for t in &sent.settled {
+        let r = s.update(t, |r| {
+            if r.collection_pending {
+                r.collection_pending = false;
+                if r.received_msat == 0 {
+                    r.received_msat = r.price_msat + r.overpaid_msat;
+                }
+            }
+        });
+        if let Err(e) = r {
+            tracing::warn!("settling sale {t}: {e:#}");
+        }
+    }
+    let _ = off;
+}
+
+/// The sender as one job: report queued charges, then settle reported ones through the
+/// federation (docs/OFFLINE-PROTOCOL.md § 4.5).
+pub async fn send_offline_job(cw: &mut CardWallet, ops: &Ops, off: &crate::offline::Offline, sales: &Arc<Mutex<SalesStore>>) -> Reply {
+    ensure_hook(cw, sales);
+    let mut sent = crate::offline::Sent::default();
+    crate::offline::report(off, ops, None, &mut sent).await;
+    crate::offline::settle(cw, off, ops, &mut sent).await;
+    sync_sales(cw, sales);
+    cw.recovered_cashouts.clear();
+    mark_offline_sales(off, sales, &sent);
+    Reply::ok(json!({
+        "ok": true,
+        "reported": sent.reported,
+        "settled": sent.settled,
+        "double_spent": sent.double_spent,
+        "refused": sent.refused,
+        "errors": sent.errors,
+    }))
 }
 
 /// `POST /v1/card/balance` with the card in `cw.card`, through ops when it is configured.
@@ -984,6 +1156,17 @@ fn balance_reply(r: &BalanceReport) -> Reply {
 }
 
 fn charge_body(s: &SaleRec, warnings: &[String], duration_ms: u64) -> Value {
+    let mut b = charge_body_plain(s, warnings, duration_ms);
+    if s.offline {
+        b["offline"] = json!(true);
+    }
+    if s.double_spent {
+        b["double_spent"] = json!(true);
+    }
+    b
+}
+
+fn charge_body_plain(s: &SaleRec, warnings: &[String], duration_ms: u64) -> Value {
     json!({
         "ok": true,
         "sale_id": s.id,
@@ -1050,6 +1233,8 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
         client_ref: Some(p.client_ref.clone()),
         duration_ms: 0,
         warnings: vec![],
+        offline: false,
+        double_spent: false,
     }
 }
 
@@ -1182,6 +1367,10 @@ pub async fn charge_with(
     if let Err(e) = cw.verify_card() {
         return error_reply(&e);
     }
+    // On ops the attach did this already.
+    if cw.ops.is_none() {
+        cw.card_tick();
+    }
     let started = Instant::now();
     let result = cw.spend_ref(price, client_ref.as_deref()).await;
     // Whatever happened, recovered ecash is never part of an API answer (it is in cashouts.log).
@@ -1208,6 +1397,8 @@ pub async fn charge_with(
         client_ref,
         duration_ms: started.elapsed().as_millis() as u64,
         warnings: r.warnings.clone(),
+        offline: false,
+        double_spent: false,
     };
     // The money has moved: a ledger failure must not turn a paid sale into an error. The store
     // keeps the sale in memory, so a repeat still replays it.
@@ -1282,6 +1473,19 @@ async fn status(State(h): State<TillHandle>) -> Reply {
     if let (Some(b), Value::Object(c)) = (body.as_object_mut(), h.conn.lock().unwrap().status_json()) {
         b.extend(c);
     }
+    // Reachability (probed with 2 s timeouts, kept 10 s) and the offline queue.
+    let ops = h.conn.lock().unwrap().ops.clone();
+    let off = h.offline.lock().unwrap().clone();
+    let (reg, fed) = match &off {
+        Some(o) => o.reach.probe(ops.as_ref(), &h.wallet, &o.dir).await,
+        None => crate::offline::Reach::default().probe(ops.as_ref(), &h.wallet, Path::new("")).await,
+    };
+    body["registry_reachable"] = json!(reg);
+    body["federation_reachable"] = json!(fed);
+    body["offline"] = match &off {
+        Some(o) => o.status_json(),
+        None => Value::Null,
+    };
     Reply::ok(body)
 }
 
@@ -1655,6 +1859,8 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
                 "received_msat": r.received_msat, "overpaid_msat": r.overpaid_msat,
                 "fees_msat": r.fees_msat, "txid": r.txid, "inputs": r.inputs,
                 "change": r.change, "client_ref": r.client_ref,
+                "offline": r.offline, "double_spent": r.double_spent,
+                "collection_pending": r.collection_pending,
             })
         })
         .collect();
@@ -1708,6 +1914,29 @@ pub async fn serve_with(
     ops_url: Option<String>,
     ops_token: Option<String>,
     require_pos_token: bool,
+) -> Result<()> {
+    serve_opts(cw, listen, relay, ops_url, ops_token, require_pos_token, ServeOptions::default()).await
+}
+
+/// What `till serve` adds for offline payments (docs/OFFLINE-PROTOCOL.md § 4).
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions {
+    /// The Esplora API block headers come from (`--esplora-url`); `None`: the card's clock only
+    /// moves with a header already kept in the data directory.
+    pub esplora_url: Option<String>,
+    /// The till's caps on unsettled offline charges.
+    pub offline: crate::offline::OfflineConfig,
+}
+
+/// [`serve_with`], with the offline options.
+pub async fn serve_opts(
+    cw: CardWallet,
+    listen: SocketAddr,
+    relay: String,
+    ops_url: Option<String>,
+    ops_token: Option<String>,
+    require_pos_token: bool,
+    opts: ServeOptions,
 ) -> Result<()> {
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
     // Off loopback the API needs the POS token (docs/POS-LINK.md); `till pair` makes it.
@@ -1768,8 +1997,35 @@ pub async fn serve_with(
     let opener: CardOpener = Box::new(move || open_relay_card(&relay_for_jobs));
     let mut cw = cw;
     cw.card = Box::new(NoCard);
+    // The card's clock: the newest block header, refreshed in the background.
+    let headers = crate::clock::Headers::new(opts.esplora_url.clone(), &dir);
+    let header_task = headers.spawn(crate::clock::REFRESH_EVERY);
+    cw.headers = Some(headers);
     let wallet = cw.wallet.clone();
-    let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn).await;
+    let offline = crate::offline::Offline::open(&dir, opts.offline)?;
+    let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;
+    let handle = handle.with_offline(offline.clone());
+    // The sender: while on ops, every so often, send what was taken offline (one job, never
+    // while another is in flight).
+    let sender = {
+        let h = handle.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::offline::SEND_EVERY).await;
+                let on_ops = conn.lock().unwrap().ops.is_some();
+                let waiting = offline.queue.lock().unwrap().file.charges.iter().any(|c| {
+                    matches!(c.state, crate::offline::ChargeState::Queued | crate::offline::ChargeState::Reported)
+                });
+                if on_ops && waiting && !h.is_busy() {
+                    let r = h.send_offline().await;
+                    if r.status != 200 && r.body["error"] != "busy" {
+                        tracing::warn!("offline sender: {}", r.body);
+                    }
+                }
+            }
+        })
+    };
     // Top-ups by Lightning, when the federation's ln module is there (docs/TOPUP.md).
     let handle = match wallet.lightning() {
         Ok(_) => {
@@ -1809,9 +2065,18 @@ pub async fn serve_with(
             .with_graceful_shutdown(shutdown),
     ));
     // The actor ends once the server has dropped the router (and with it every handle).
+    // The sender holds a handle, so it stops with the server, or the actor would never end.
+    let server = async {
+        let r = server.await;
+        sender.abort();
+        r
+    };
     let (served, ()) = tokio::join!(server, actor);
     if let Some(p) = poller {
         p.abort();
+    }
+    if let Some(t) = header_task {
+        t.abort();
     }
     served.context("till server task")??;
     Ok(())

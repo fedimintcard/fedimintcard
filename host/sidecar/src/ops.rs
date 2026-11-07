@@ -204,6 +204,51 @@ impl OpsClient {
         Self::version(&self.call(reqwest::Method::PUT, &format!("/cards/{short_id}/slots/{slot}"), Some(body)).await?)
     }
 
+    /// `GET /registry/cert-key` within `timeout`: whether the registry answered at all, and its
+    /// certificate key (hex) when it has one. Also the till's reachability probe.
+    pub async fn cert_key(&self, timeout: Duration) -> Result<Option<String>, OpsError> {
+        let resp = self
+            .http
+            .get(format!("{}/registry/cert-key", self.url))
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| OpsError::Unreachable(format!("/registry/cert-key: {e}")))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        match status {
+            200 => Ok(v["key"].as_str().filter(|k| k.len() == 130).map(str::to_owned)),
+            // The registry itself, without a certificate key (or an older one without the route).
+            503 | 404 if v.get("reason").is_some() || v.get("ok").is_some() => Ok(None),
+            s if s >= 500 => Err(OpsError::Unreachable(format!("/registry/cert-key: {s}"))),
+            _ => Ok(None),
+        }
+    }
+
+    /// `POST /cards/:id/offline-charges` (docs/OFFLINE-PROTOCOL.md § 3): an offline charge,
+    /// reported after the fact.
+    pub async fn offline_charge(&self, short_id: &str, body: &Value) -> Result<OfflineAnswer, OpsError> {
+        let resp = self
+            .http
+            .post(format!("{}/cards/{short_id}/offline-charges", self.url))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| OpsError::Unreachable(format!("/offline-charges: {e}")))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        let reason = v["reason"].as_str().unwrap_or("no reason given").to_owned();
+        match status {
+            200..=299 => Ok(OfflineAnswer::Recorded(Self::version(&v)?)),
+            409 if reason == "double_spend" => Ok(OfflineAnswer::DoubleSpend(v["conflicts"].clone())),
+            409 => Err(OpsError::Changed(reason)),
+            404 => Err(OpsError::UnknownCard(reason)),
+            s if s >= 500 => Err(OpsError::Unreachable(format!("/offline-charges: {s} {reason}"))),
+            s => Err(OpsError::Refused(s, reason)),
+        }
+    }
+
     /// `POST /federations`: what a till read from the federation's config ([`FederationReport`]).
     pub async fn federation(&self, report: &FederationReport) -> Result<(), OpsError> {
         let mut body = json!({"federation_id": report.federation_id, "tbs_pks": report.tbs_pks});
@@ -236,6 +281,15 @@ impl OpsClient {
     pub async fn load_outcome(&self, short_id: &str, body: &Value) -> Result<u64, OpsError> {
         Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/load/outcome"), Some(body)).await?)
     }
+}
+
+/// What `POST /cards/:id/offline-charges` answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OfflineAnswer {
+    /// Every input was live: recorded as an open, signed charge.
+    Recorded(u64),
+    /// Some input was not live (`409 double_spend`): the registry's `conflicts`.
+    DoubleSpend(Value),
 }
 
 /// `GET /cards/:id/slots` as the registry answers it.
@@ -373,7 +427,10 @@ impl Ops {
     /// `cw` is left as it was.
     pub async fn attach(&self, cw: &mut CardWallet) -> Result<StateStore> {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
-        self.attach_id(cw, &short_id_of(&pk)).await
+        let base = self.attach_id(cw, &short_id_of(&pk)).await?;
+        // A 3.0 card: its clock, and any live note it lacks (a load or change finished elsewhere).
+        cw.card_tick();
+        Ok(base)
     }
 
     /// [`attach`](Self::attach) for a card named by its short id, without reading the card.
@@ -628,7 +685,10 @@ impl CardWallet {
             return;
         }
         let st = &self.store.state;
-        let mine = st.notes.iter().filter(|n| n.txid.as_deref() == Some(txid));
+        // The charge's own inputs are not its outputs, though the registry lists an offline
+        // charge's inputs as pending under its txid.
+        let inputs: Vec<&String> = st.pending_txs.iter().filter(|p| p.txid == txid).flat_map(|p| &p.inputs).collect();
+        let mine = st.notes.iter().filter(|n| n.txid.as_deref() == Some(txid) && !inputs.contains(&&n.nonce));
         if mine.clone().any(|n| n.status == NoteStatus::Pending) {
             return;
         }
