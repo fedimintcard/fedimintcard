@@ -217,6 +217,7 @@ test('the attestation call posts the card’s key with the operator session and 
   const seen: {path: string; body: any; auth?: string}[] = [];
   const origin = 'https://registry.test';
   const attestPub = '04' + 'ab'.repeat(64);
+  const SLOT0 = 'ab'.repeat(28) + '0a0b0c0d';
   let cert: unknown = '01' + 'cd'.repeat(129);
   const fetcher = async (url: string, init?: RequestInit) => {
     const path = String(url).replace(origin, '');
@@ -231,21 +232,21 @@ test('the attestation call posts the card’s key with the operator session and 
     throw new Error('unexpected ' + path);
   };
   const api = new RegistryStoreApi(new RegistryClient({baseUrl: origin, fetcher}), origin);
-  expect(() => api.attestCard('0a0b0c0d', attestPub)).toThrow(/before an operator signed in/);
+  expect(() => api.attestCard('0a0b0c0d', attestPub, SLOT0)).toThrow(/before an operator signed in/);
   await api.signIn('dread', 'pw');
-  expect(await api.attestCard('0a0b0c0d', attestPub)).toBe(cert);
+  expect(await api.attestCard('0a0b0c0d', attestPub, SLOT0)).toBe(cert);
   expect(seen.at(-1)).toEqual({
     path: '/registry/cards/0a0b0c0d/attestation',
-    body: {attest_pub: attestPub},
+    body: {attest_pub: attestPub, slot0: SLOT0},
     auth: 'Bearer op_tok',
   });
   // a certificate that is not hex, or longer than the card can hold, is no certificate
   cert = 'zz';
-  await expect(api.attestCard('0a0b0c0d', attestPub)).rejects.toThrow(/malformed/);
+  await expect(api.attestCard('0a0b0c0d', attestPub, SLOT0)).rejects.toThrow(/malformed/);
   cert = '01'.repeat(161);
-  await expect(api.attestCard('0a0b0c0d', attestPub)).rejects.toThrow(/malformed/);
+  await expect(api.attestCard('0a0b0c0d', attestPub, SLOT0)).rejects.toThrow(/malformed/);
   cert = undefined;
-  await expect(api.attestCard('0a0b0c0d', attestPub)).rejects.toThrow(/malformed/);
+  await expect(api.attestCard('0a0b0c0d', attestPub, SLOT0)).rejects.toThrow(/malformed/);
   // a refusal (409: the card has live notes under another key) is an error, not a certificate
-  await expect(api.attestCard('0a0b0c0e', attestPub)).rejects.toThrow();
+  await expect(api.attestCard('0a0b0c0e', attestPub, SLOT0)).rejects.toThrow();
 });

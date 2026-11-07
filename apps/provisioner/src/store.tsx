@@ -808,8 +808,8 @@ export function StoreProvider({
         apiRef.current?.resumeCheck?.(chip, shortId) ?? missing('the resume check'),
       resetCheck: (shortId, chip) =>
         apiRef.current?.resetCheck?.(shortId, chip) ?? missing('the reset check'),
-      attestCard: (shortId, attestPub) =>
-        apiRef.current?.attestCard?.(shortId, attestPub) ?? missing('the card certificate'),
+      attestCard: (shortId, attestPub, slot0) =>
+        apiRef.current?.attestCard?.(shortId, attestPub, slot0) ?? missing('the card certificate'),
       completeReset: completion =>
         apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };

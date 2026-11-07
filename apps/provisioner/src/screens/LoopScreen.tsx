@@ -224,7 +224,7 @@ export function LoopScreen({
             offline: {
               limitMsat: dailyLimitOf(config) * 1000,
               certify: async (attestPub, slot0) =>
-                fromHex(await ops.attestCard(shortIdOf(slot0), toHex([...attestPub]))),
+                fromHex(await ops.attestCard(shortIdOf(slot0), toHex([...attestPub]), toHex([...slot0]))),
             },
             attemptedPin: chip => attempted.forChip(chip),
             onChip: chip => {

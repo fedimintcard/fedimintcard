@@ -528,13 +528,15 @@ export class RegistryClient extends HttpTransport {
   /**
    * POST /registry/cards/:short_id/attestation — the certificate over a
    * card's attestation key (docs/OFFLINE-PROTOCOL.md § 3). The same key again
-   * answers the same certificate, so a lifted tap's retry is safe. The reply
-   * is checked here: a certificate the card would refuse never reaches it.
+   * answers the same certificate, so a lifted tap's retry is safe. The tap
+   * asks before the card is registered, so it names slot 0's key, which the
+   * registry certifies and holds for the card's registration. The reply is
+   * checked here: a certificate the card would refuse never reaches it.
    */
-  async attestCard(token: string, shortId: string, attestPub: string): Promise<string> {
+  async attestCard(token: string, shortId: string, attestPub: string, slot0: string): Promise<string> {
     const json = await this.post(`/registry/cards/${encodeURIComponent(shortId)}/attestation`, {
       token,
-      body: {attest_pub: attestPub},
+      body: {attest_pub: attestPub, slot0},
       operation: 'attestation',
     });
     const cert = json.cert;
@@ -888,8 +890,8 @@ export class RegistryStoreApi implements CardOps, TillOps {
     return this.client.resumeCheck(this.token(), chip, shortId);
   }
 
-  attestCard(shortId: string, attestPub: string): Promise<string> {
-    return this.client.attestCard(this.token(), shortId, attestPub);
+  attestCard(shortId: string, attestPub: string, slot0: string): Promise<string> {
+    return this.client.attestCard(this.token(), shortId, attestPub, slot0);
   }
 
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {
