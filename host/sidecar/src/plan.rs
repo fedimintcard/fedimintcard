@@ -16,6 +16,16 @@
 //!
 //! The till may be overpaid by at most [`MAX_TILL_OVERPAY`] msat. That slack is what lets small
 //! change be absorbed instead of minted as a dust note.
+//!
+//! From core consensus 2.1 a federation also takes a transaction that pays more than its outputs
+//! and fees (`fedimint-server/src/consensus/transaction.rs`, `FundingVerifier::verify_funding`:
+//! inputs below outputs plus fees are refused always, inputs above them only before 2.1); the
+//! surplus is burned. [`solve_with_margin`] plans such a transaction for an offline charge, so a
+//! fee rise between signing and sending is paid out of the surplus (a *fee margin*):
+//!
+//! ```text
+//! sum(inputs) == sum(outputs) + sum(fee(input)) + sum(fee(output)) + surplus
+//! ```
 
 use std::collections::{HashMap, HashSet};
 
@@ -57,6 +67,9 @@ pub struct Plan {
     pub change: Vec<u64>,
     /// `sum(till) - price`.
     pub overpay: u64,
+    /// msat the inputs pay beyond the outputs and their fees: burned by the federation (a fee
+    /// margin, [`solve_with_margin`]). 0 for an exact balance.
+    pub surplus: u64,
     /// True if some output is below the federation's smallest economical denomination, which
     /// the planner only allows when no dust-free exact balance exists.
     pub dust: bool,
@@ -282,6 +295,21 @@ pub fn solve(
     fee: FeeFn,
     min_denom: u64,
 ) -> Result<Plan, PlanError> {
+    solve_surplus(notes, price, free_slots, fee, min_denom, 0, 0)
+}
+
+/// [`solve`] for a transaction whose inputs pay exactly `surplus` msat more than its outputs and
+/// their fees, overpaying the till by at least `min_overpay`. Only for a federation at core
+/// consensus 2.1 or later; the objective is [`solve`]'s.
+fn solve_surplus(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    surplus: u64,
+    min_overpay: u64,
+) -> Result<Plan, PlanError> {
     // Every floor that balances is a candidate. Card slots are scarce (8 or 32), so the fewest change
     // notes wins, then the fewest output notes (each costs a fee), fewest inputs, smallest overpay. A high floor can force dozens of
     // notes when fees are not multiples of it, so "no dust" is not allowed to beat "few notes".
@@ -296,7 +324,7 @@ pub fn solve(
         if floor == 1 && min_denom > 1 && best.is_some() {
             break; // 1 msat notes only when nothing larger balances
         }
-        match solve_with(notes, price, free_slots, fee, floor) {
+        match solve_with(notes, price, free_slots, fee, floor, surplus, min_overpay) {
             Ok(mut p) => {
                 p.dust = floor < min_denom;
                 let key = |p: &Plan| {
@@ -327,6 +355,8 @@ fn solve_with(
     free_slots: usize,
     fee: FeeFn,
     min_denom: u64,
+    surplus: u64,
+    min_overpay: u64,
 ) -> Result<Plan, PlanError> {
     if price == 0 {
         return Err(PlanError::NoExactPlan { price, free_slots });
@@ -336,7 +366,7 @@ fn solve_with(
         return Err(PlanError::TooManyNotes(n));
     }
     let have: u64 = notes.iter().sum();
-    let min_need = price + fee_sum(&binary(price), fee);
+    let min_need = price + fee_sum(&binary(price), fee) + surplus;
     if have < min_need {
         return Err(PlanError::Insufficient { have, need: min_need });
     }
@@ -344,7 +374,7 @@ fn solve_with(
     let min_till_any = (price..=price + MAX_TILL_OVERPAY).map(|t| t + fee_sum(&binary(t), fee)).min().unwrap_or(u64::MAX);
     let mut nets: Vec<u64> = notes.iter().map(|&a| a.saturating_sub(fee(a))).collect();
     nets.sort_unstable_by(|a, b| b.cmp(a));
-    if nets.iter().take(MAX_INPUTS).sum::<u64>() < min_till_any {
+    if nets.iter().take(MAX_INPUTS).sum::<u64>() < min_till_any.saturating_add(surplus) {
         return Err(PlanError::TooManyInputs { price, max_inputs: MAX_INPUTS });
     }
 
@@ -353,6 +383,7 @@ fn solve_with(
     let till_cost: Vec<(u64, u64)> = (0..)
         .map(|i| first + i * min_denom)
         .take_while(|t| *t <= price + MAX_TILL_OVERPAY)
+        .filter(|t| t - price >= min_overpay)
         .map(|t| (t - price, t + fee_sum(&binary(t), fee)))
         .collect();
     let Some(min_till) = till_cost.iter().map(|c| c.1).min() else {
@@ -412,7 +443,8 @@ fn solve_with(
         idx.sort_unstable();
         let gross: u64 = idx.iter().map(|&i| notes[i]).sum();
         let in_fees: u64 = idx.iter().map(|&i| fee(notes[i])).sum();
-        let Some(avail) = gross.checked_sub(in_fees) else { continue };
+        // The surplus is paid like a fee: what is left after it goes to the till and the change.
+        let Some(avail) = gross.checked_sub(in_fees).and_then(|a| a.checked_sub(surplus)) else { continue };
         if avail >= min_till && seen.insert((size, avail)) {
             sets.push((size, avail, idx));
         }
@@ -482,7 +514,7 @@ fn solve_with(
     };
     let till = binary(price + overpay);
     change.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(Plan { inputs: idx, till, change, overpay, dust: false })
+    Ok(Plan { inputs: idx, till, change, overpay, surplus, dust: false })
 }
 
 /// Every multiset of exactly `items` notes of exponents `floor..=e` whose creation cost
@@ -555,8 +587,99 @@ impl Plan {
     pub fn balances(&self, notes: &[u64], fee: FeeFn) -> bool {
         let ins: Vec<u64> = self.inputs.iter().map(|&i| notes[i]).collect();
         let outs: Vec<u64> = self.till.iter().chain(&self.change).copied().collect();
-        ins.iter().sum::<u64>() == outs.iter().sum::<u64>() + fee_sum(&ins, fee) + fee_sum(&outs, fee)
+        ins.iter().sum::<u64>() == outs.iter().sum::<u64>() + fee_sum(&ins, fee) + fee_sum(&outs, fee) + self.surplus
     }
+
+    /// The amounts of the plan's inputs and outputs (till, then change).
+    fn items(&self, notes: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        (self.inputs.iter().map(|&i| notes[i]).collect(), self.till.iter().chain(&self.change).copied().collect())
+    }
+}
+
+/// A fee schedule an offline charge keeps room for: `base_msat + amount * ppm / 1_000_000` per
+/// input and per output, as fedimint's mint v1 `FeeConsensus::fee`
+/// (`modules/fedimint-mint-common/src/config.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeHeadroom {
+    pub base_msat: u64,
+    pub ppm: u64,
+}
+
+impl FeeHeadroom {
+    /// Fedimint's default mint fees: what `fedimint-mint-server` configures unless base fees are
+    /// disabled, `FeeConsensus::new(0)` (`modules/fedimint-mint-server/src/lib.rs`), a 100 msat
+    /// base fee and no relative fee.
+    pub const DEFAULT: FeeHeadroom = FeeHeadroom { base_msat: 100, ppm: 0 };
+    /// No margin.
+    pub const OFF: FeeHeadroom = FeeHeadroom { base_msat: 0, ppm: 0 };
+
+    pub fn fee(&self, amount: u64) -> u64 {
+        amount.saturating_mul(self.ppm) / 1_000_000 + self.base_msat
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.base_msat == 0 && self.ppm == 0
+    }
+}
+
+/// The fee margin a transaction with these inputs and outputs needs: its fees under `headroom`
+/// less its fees under the current schedule `fee`, or 0 when the current fees are the higher.
+pub fn fee_margin(inputs: &[u64], outputs: &[u64], fee: FeeFn, headroom: FeeHeadroom) -> u64 {
+    let items = || inputs.iter().chain(outputs);
+    let at_headroom: u64 = items().map(|a| headroom.fee(*a)).sum();
+    let now: u64 = items().map(|a| fee(*a)).sum();
+    at_headroom.saturating_sub(now)
+}
+
+/// Rounds [`solve_with_margin`] re-plans for a margin that a plan's own shape changed.
+const MARGIN_ROUNDS: usize = 4;
+
+/// [`solve`] with a fee margin: the plan's inputs also pay a surplus of at least
+/// [`fee_margin`] of its own inputs and outputs under `headroom`, so the transaction still
+/// balances if the federation's fees rise to `headroom` before it is sent.
+///
+/// The margin comes out of what the card gets back: its change, the till getting at least what
+/// the exact plan gives it; or, when the exact plan has no change, the till's overpay, the till
+/// still getting at least `price`. A margin plan is
+/// taken only when it is no worse than the exact plan on room left, change notes and inputs (card
+/// slots and signatures are what a tap is short of); otherwise, or when the notes cannot pay it,
+/// the exact plan is returned with `surplus == 0`. Only for a federation at core consensus 2.1 or
+/// later: older ones refuse any surplus.
+pub fn solve_with_margin(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    headroom: FeeHeadroom,
+) -> Result<Plan, PlanError> {
+    let exact = solve(notes, price, free_slots, fee, min_denom)?;
+    if headroom.is_off() {
+        return Ok(exact);
+    }
+    let rank = |p: &Plan| (room_short(free_slots, p.inputs.len(), p.change.len()), p.change.len());
+    let need = |p: &Plan| {
+        let (ins, outs) = p.items(notes);
+        fee_margin(&ins, &outs, fee, headroom)
+    };
+    // With change to give, the till's side stays as it was or grows: the change pays.
+    let min_overpay = if exact.change.is_empty() { 0 } else { exact.overpay };
+    let mut margin = need(&exact);
+    for _ in 0..MARGIN_ROUNDS {
+        if margin == 0 {
+            break;
+        }
+        let Ok(p) = solve_surplus(notes, price, free_slots, fee, min_denom, margin, min_overpay) else { break };
+        if rank(&p) > rank(&exact) || p.inputs.len() > exact.inputs.len() {
+            break;
+        }
+        let more = need(&p);
+        if more <= margin {
+            return Ok(p);
+        }
+        margin = more; // the margin plan has more items than the exact one: plan for them too
+    }
+    Ok(exact)
 }
 
 /// The card amount nearest `msat` (docs/TOPUP.md): at most `max_notes` notes, each a power of two
@@ -874,7 +997,7 @@ mod tests {
         // The descending floors stop at 4 msat here: 100 msat fees balance on multiples of 4.
         assert!(p.till.iter().chain(&p.change).all(|a| *a >= 4), "{p:?}");
         // And the strict search alone finds nothing.
-        assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512), Err(PlanError::NoExactPlan { .. })));
+        assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512, 0, 0), Err(PlanError::NoExactPlan { .. })));
     }
 
     #[test]
@@ -981,5 +1104,132 @@ mod tests {
         }
         // Overflow at the top is not a candidate.
         assert_eq!(nearest_card_amount(u64::MAX, 3, 1, any), Some(u64::MAX - (u64::MAX >> 3)));
+    }
+
+    // ------------------------------------------------------------------ fee margin
+
+    /// Fees of a plan's inputs and outputs under `headroom`.
+    fn headroom_fees(p: &Plan, notes: &[u64], h: FeeHeadroom) -> u64 {
+        let (ins, outs) = p.items(notes);
+        ins.iter().chain(&outs).map(|a| h.fee(*a)).sum()
+    }
+
+    #[test]
+    fn the_margin_is_headroom_fees_less_current_fees() {
+        let (ins, outs) = ([65_536u64, 16_384], [32_768u64, 16_384, 1_024]);
+        // Five items at 100 msat each, against no fees now.
+        assert_eq!(fee_margin(&ins, &outs, &zero, FeeHeadroom::DEFAULT), 500);
+        // Already at the default: nothing to keep.
+        assert_eq!(fee_margin(&ins, &outs, &base100, FeeHeadroom::DEFAULT), 0);
+        // Current fees above the headroom: floored at 0.
+        assert_eq!(fee_margin(&ins, &outs, &ppm1000, FeeHeadroom::DEFAULT), 0);
+        // The relative part of a ppm headroom: 0.1 % of 131,072 msat in, of 50,176 out.
+        let h = FeeHeadroom { base_msat: 100, ppm: 1_000 };
+        assert_eq!(fee_margin(&ins, &outs, &base100, h), 65 + 16 + 32 + 16 + 1);
+        assert_eq!(fee_margin(&ins, &outs, &zero, FeeHeadroom::OFF), 0);
+    }
+
+    /// Zero fees, change to give: the change pays the margin, the till gets what it would have,
+    /// and the transaction still balances once fees rise to the headroom.
+    #[test]
+    fn the_margin_comes_out_of_the_change() {
+        let notes = [65_536u64, 16_384];
+        let exact = check(&notes, 50_000, 6, &zero);
+        assert!(!exact.change.is_empty());
+        let p = solve_with_margin(&notes, 50_000, 6, &zero, 1, FeeHeadroom::DEFAULT).unwrap();
+        let (ins, outs) = p.items(&notes);
+        assert!(p.surplus > 0 && p.surplus >= fee_margin(&ins, &outs, &zero, FeeHeadroom::DEFAULT), "{p:?}");
+        assert!(p.balances(&notes, &zero), "{p:?}");
+        assert_eq!(p.till.iter().sum::<u64>(), 50_000 + p.overpay);
+        assert!(p.overpay >= exact.overpay, "the till gets at least what it would have: {p:?} {exact:?}");
+        let in_sum: u64 = ins.iter().sum();
+        assert_eq!(p.change.iter().sum::<u64>(), in_sum - 50_000 - p.overpay - p.surplus, "the change pays it");
+        assert_eq!(in_sum, exact.inputs.iter().map(|&i| notes[i]).sum::<u64>());
+        // Under the default fees the inputs still cover outputs and fees.
+        assert!(in_sum >= outs.iter().sum::<u64>() + headroom_fees(&p, &notes, FeeHeadroom::DEFAULT), "{p:?}");
+        assert!(p.change.len() <= exact.change.len() && p.inputs.len() <= exact.inputs.len());
+    }
+
+    /// No change to give: the margin may come out of the till's overpay (the price is still paid).
+    #[test]
+    fn with_no_change_the_margin_comes_out_of_the_overpay() {
+        let notes = [65_536u64];
+        let exact = check(&notes, 65_536 - 2_000, 0, &zero);
+        assert_eq!((exact.change.len(), exact.overpay), (0, 2_000));
+        let p = solve_with_margin(&notes, 65_536 - 2_000, 0, &zero, 1, FeeHeadroom::DEFAULT).unwrap();
+        assert!(p.change.is_empty() && p.surplus > 0, "{p:?}");
+        assert!(p.balances(&notes, &zero));
+        assert!(p.till.iter().sum::<u64>() >= 65_536 - 2_000);
+        assert!(65_536 >= p.till.iter().sum::<u64>() + headroom_fees(&p, &notes, FeeHeadroom::DEFAULT), "{p:?}");
+    }
+
+    /// Neither change nor overpay covers a margin: the exact plan, with no margin.
+    #[test]
+    fn without_room_for_a_margin_the_charge_is_exact() {
+        let notes = [65_536u64];
+        let price = 65_536 - 100;
+        let exact = check(&notes, price, 0, &zero);
+        let p = solve_with_margin(&notes, price, 0, &zero, 1, FeeHeadroom::DEFAULT).unwrap();
+        assert_eq!((p.surplus, &p), (0, &exact));
+        // A margin that would need a second change note, with one slot free: not taken either.
+        let notes = [65_536u64];
+        let exact = check(&notes, 32_768, 1, &zero);
+        assert_eq!(exact.change, vec![32_768]);
+        assert_eq!(solve_with_margin(&notes, 32_768, 1, &zero, 1, FeeHeadroom::DEFAULT).unwrap(), exact);
+    }
+
+    /// The margin off, or fees already at the headroom: exactly [`solve`].
+    #[test]
+    fn no_margin_is_the_exact_plan() {
+        let notes = [65_536u64, 32_768, 16_384, 8_192, 2_048];
+        for price in [5_000u64, 50_000, 100_000] {
+            let exact = solve(&notes, price, 6, &zero, 1).unwrap();
+            assert_eq!(solve_with_margin(&notes, price, 6, &zero, 1, FeeHeadroom::OFF).unwrap(), exact);
+            let m = min_econ(&base100);
+            let exact = solve(&notes, price, 6, &base100, m).unwrap();
+            assert_eq!(solve_with_margin(&notes, price, 6, &base100, m, FeeHeadroom::DEFAULT).unwrap(), exact);
+        }
+    }
+
+    #[test]
+    fn randomised_margin_plans_balance_and_cover_the_headroom() {
+        let mut s = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let wide = FeeHeadroom { base_msat: 100, ppm: 1_000 };
+        let mut with_margin = 0;
+        for (fee, h) in [(&zero as FeeFn, FeeHeadroom::DEFAULT), (&zero, wide), (&base100, wide)] {
+            for _ in 0..40 {
+                let n = 1 + (next() % 6) as usize;
+                let notes: Vec<u64> = (0..n).map(|_| 1u64 << (10 + next() % 12)).collect();
+                let total: u64 = notes.iter().sum();
+                let price = 1 + next() % (total / 2);
+                let free = (next() % 8) as usize;
+                let m = min_econ(fee);
+                let Ok(exact) = solve(&notes, price, free, fee, m) else {
+                    assert!(solve_with_margin(&notes, price, free, fee, m, h).is_err());
+                    continue;
+                };
+                let p = solve_with_margin(&notes, price, free, fee, m, h).unwrap();
+                assert!(p.balances(&notes, fee), "{notes:?} {price} {p:?}");
+                assert!(p.till.iter().sum::<u64>() >= price && p.change.len() <= free);
+                assert!(p.change.len() <= exact.change.len() && p.inputs.len() <= exact.inputs.len(), "{p:?} {exact:?}");
+                if p.surplus > 0 {
+                    with_margin += 1;
+                    if !exact.change.is_empty() {
+                        assert!(p.overpay >= exact.overpay, "{notes:?} {price} {p:?} {exact:?}");
+                    }
+                    let (ins, outs) = p.items(&notes);
+                    assert!(ins.iter().sum::<u64>() >= outs.iter().sum::<u64>() + headroom_fees(&p, &notes, h), "{notes:?} {price} {p:?}");
+                } else {
+                    assert_eq!(p, exact);
+                }
+            }
+        }
+        assert!(with_margin > 20, "{with_margin}");
     }
 }

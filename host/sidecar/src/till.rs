@@ -1045,7 +1045,9 @@ async fn offline_charge(
         Ok(saved) => rec = saved,
         Err(e) => rec.warnings.push(format!("sale not recorded in sales.json: {e:#}")),
     }
-    Reply::ok(charge_body(&rec, &rec.warnings, rec.duration_ms))
+    let mut body = charge_body(&rec, &rec.warnings, rec.duration_ms);
+    body["fee_margin_msat"] = json!(taken.fee_margin_msat);
+    Reply::ok(body)
 }
 
 /// Bring the sales of offline charges in line with what the sender found.
@@ -1505,7 +1507,7 @@ async fn status(State(h): State<TillHandle>) -> Reply {
     body["registry_reachable"] = json!(reg);
     body["federation_reachable"] = json!(fed);
     body["offline"] = match &off {
-        Some(o) => o.status_json(),
+        Some(o) => o.status_json(h.wallet.surplus_allowed()),
         None => Value::Null,
     };
     Reply::ok(body)
@@ -2028,6 +2030,17 @@ pub async fn serve_opts(
     cw.spares = opts.spares;
     let wallet = cw.wallet.clone();
     let offline = crate::offline::Offline::open(&dir, opts.offline)?;
+    {
+        let h = opts.offline.fee_headroom;
+        let v = wallet.consensus_version;
+        if !wallet.surplus_allowed() {
+            eprintln!("federation core consensus {v}: no surplus allowed, offline charges balance exactly (no fee margin)");
+        } else if h.is_off() {
+            eprintln!("federation core consensus {v}: fee margin on offline charges turned off");
+        } else {
+            eprintln!("federation core consensus {v}: offline charges keep a fee margin for {} msat + {} ppm per input and output", h.base_msat, h.ppm);
+        }
+    }
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;
     let handle = handle.with_offline(offline.clone());
     // The sender: while on ops, every so often, send what was taken offline (one job, never

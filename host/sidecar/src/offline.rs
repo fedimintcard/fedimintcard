@@ -37,6 +37,7 @@ use tbs::BlindingKey;
 
 use crate::glue::{CardWallet, nonce_for, on_card};
 use crate::ops::{OfflineAnswer, Ops, OpsError, short_id_of};
+use crate::plan::FeeHeadroom;
 use crate::shares::blind;
 use crate::state::{HostKind, HostPending, LoadNote, NoteRec, NoteStatus, PendingTx, StateStore, write_private_json};
 
@@ -96,11 +97,14 @@ impl std::error::Error for OfflineError {}
 pub struct OfflineConfig {
     pub cap_msat: u64,
     pub cap_count: usize,
+    /// The fee schedule an offline charge keeps a margin for (OFFLINE-PLAN.md § 10, "Fee
+    /// margin"), on a federation that takes a surplus; [`FeeHeadroom::OFF`] for none.
+    pub fee_headroom: FeeHeadroom,
 }
 
 impl Default for OfflineConfig {
     fn default() -> Self {
-        Self { cap_msat: DEFAULT_CAP_MSAT, cap_count: DEFAULT_CAP_COUNT }
+        Self { cap_msat: DEFAULT_CAP_MSAT, cap_count: DEFAULT_CAP_COUNT, fee_headroom: FeeHeadroom::DEFAULT }
     }
 }
 
@@ -116,7 +120,7 @@ pub enum ChargeState {
     /// The registry found an input already spent by another charge: a loss, kept for the operator.
     DoubleSpent,
     /// The registry took it and the federation refused it: an input spent where the registry did
-    /// not see it (a copied card), or a fee the transaction no longer covers. A loss, kept for
+    /// not see it (a copied card), or a fee rise its fee margin (if any) does not cover. A loss, kept for
     /// the operator; the federation's answer is not more specific than that here.
     Rejected,
     /// The registry refused the report for another reason (`detail`); kept for the operator.
@@ -155,6 +159,10 @@ pub struct OfflineCharge {
     pub till_msat: u64,
     pub overpay_msat: u64,
     pub fees_msat: u64,
+    /// The fee margin the inputs pay beyond the outputs and `fees_msat` (burned by the
+    /// federation; OFFLINE-PLAN.md § 10). 0: an exact balance.
+    #[serde(default)]
+    pub fee_margin_msat: u64,
     pub ts_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -316,10 +324,16 @@ impl Offline {
         self.queue.lock().unwrap().stats()
     }
 
-    /// `/v1/status`'s `offline` object.
-    pub fn status_json(&self) -> Value {
+    /// `/v1/status`'s `offline` object. `surplus_allowed`: the federation takes a surplus
+    /// (`Wallet::surplus_allowed`), so offline charges carry a fee margin.
+    pub fn status_json(&self, surplus_allowed: bool) -> Value {
         let s = self.stats();
+        let last_margin = self.queue.lock().unwrap().file.charges.last().map(|c| c.fee_margin_msat);
         json!({
+            "fee_margin": surplus_allowed && !self.cfg.fee_headroom.is_off(),
+            "fee_headroom_base_msat": self.cfg.fee_headroom.base_msat,
+            "fee_headroom_ppm": self.cfg.fee_headroom.ppm,
+            "last_fee_margin_msat": last_margin,
             "queued": s.queued,
             "queued_msat": s.queued_msat,
             "double_spent": s.double_spent,
@@ -450,12 +464,19 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
     let local = StateStore::open(ops.card_path(&short_id))?;
     keyed.retain(|s| local.state.notes_on_current_key(*s).next().is_none());
 
-    // 5. Plan from the card's own notes; change into KEYED slots.
+    // 5. Plan from the card's own notes; change into KEYED slots. On a federation that takes a
+    //    surplus, with a fee margin (OFFLINE-PLAN.md § 10): the charge is sent days later, perhaps
+    //    under higher fees. Older federations refuse any surplus: an exact balance.
     let fee_cfg = cw.wallet.mint_cfg.fee_consensus.clone();
     let fee = move |a: u64| fee_cfg.fee(Amount::from_msats(a)).msats;
     let amounts: Vec<u64> = notes.iter().map(|n| n.amount_msat).collect();
     let min_denom = cw.wallet.min_denom();
-    let plan = match crate::plan::solve(&amounts, price, keyed.len(), &fee, min_denom) {
+    let planned = if cw.wallet.surplus_allowed() {
+        crate::plan::solve_with_margin(&amounts, price, keyed.len(), &fee, min_denom, off.cfg.fee_headroom)
+    } else {
+        crate::plan::solve(&amounts, price, keyed.len(), &fee, min_denom)
+    };
+    let plan = match planned {
         Ok(p) => p,
         // Change is what the card has no room for offline (a fresh keyed slot per change note,
         // and no till can key one without the registry): say so, with prices it can pay.
@@ -533,6 +554,11 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
     let txid = tx.tx_hash();
     let n_till = plan.till.len();
     let fees_msat = inputs.iter().map(|n| fee(n.amount_msat)).sum::<u64>() + crate::plan::fee_sum(&plan.till, &fee) + crate::plan::fee_sum(&plan.change, &fee);
+    // What the card signs pays the outputs, their fees and the margin, to the msat.
+    ensure!(
+        input_amounts.iter().sum::<u64>() == till_msat + plan.change.iter().sum::<u64>() + fees_msat + plan.surplus,
+        "the offline plan does not balance"
+    );
     let entry = OfflineCharge {
         txid: txid.to_string(),
         short_id: short_id.clone(),
@@ -572,6 +598,7 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
         till_msat,
         overpay_msat: plan.overpay,
         fees_msat,
+        fee_margin_msat: plan.surplus,
         ts_unix_ms: now_ms(),
         detail: None,
     };
@@ -923,6 +950,7 @@ mod tests {
             till_msat: till,
             overpay_msat: 0,
             fees_msat: 0,
+            fee_margin_msat: 0,
             ts_unix_ms: 0,
             detail: None,
         }

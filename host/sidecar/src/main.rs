@@ -92,6 +92,16 @@ enum TillCmd {
         /// Most offline charges this till holds not yet settled.
         #[arg(long, env = "TILL_OFFLINE_CAP_COUNT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_COUNT)]
         offline_cap_count: usize,
+        /// The fee margin of offline charges: they keep room for a fee schedule of this base fee
+        /// (msat per input and per output) plus --offline-fee-headroom-ppm, against a fee rise
+        /// before they are sent. Only on a federation at core consensus 2.1 or later; 0 and 0
+        /// turn the margin off. Default: fedimint's default mint fees (100 msat, 0 ppm).
+        #[arg(long, env = "TILL_OFFLINE_FEE_BASE_MSAT", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.base_msat)]
+        offline_fee_base_msat: u64,
+        /// The relative part of that fee schedule, parts per million of each note (fedimint
+        /// allows at most 1,000).
+        #[arg(long, env = "TILL_OFFLINE_FEE_HEADROOM_PPM", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.ppm)]
+        offline_fee_headroom_ppm: u64,
         /// Fresh keyed slots an online tap keeps an applet 3.0 card at, so it can take change
         /// offline (0 turns the reserve off).
         #[arg(long, env = "TILL_SPARE_TARGET", default_value_t = fedimint_card_sidecar::ops::SPARE_TARGET)]
@@ -346,13 +356,17 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count, spare_target, spare_keys_per_tap }) => {
+        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count, offline_fee_base_msat, offline_fee_headroom_ppm, spare_target, spare_keys_per_tap }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
             let opts = fedimint_card_sidecar::till::ServeOptions {
                 esplora_url: Some(esplora_url.clone()).filter(|u| !u.trim().is_empty()),
-                offline: fedimint_card_sidecar::offline::OfflineConfig { cap_msat: *offline_cap_msat, cap_count: *offline_cap_count },
+                offline: fedimint_card_sidecar::offline::OfflineConfig {
+                    cap_msat: *offline_cap_msat,
+                    cap_count: *offline_cap_count,
+                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom { base_msat: *offline_fee_base_msat, ppm: *offline_fee_headroom_ppm },
+                },
                 spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
             };
             fedimint_card_sidecar::till::serve_opts(

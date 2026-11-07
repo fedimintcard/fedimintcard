@@ -55,13 +55,29 @@ transaction is saved in `<data_dir>/offline_queue.json` (0600, fsync) before the
 with `"offline": true` and `collection_pending: true`. The sale is in `sales.json` with
 `offline: true`.
 
+**Fee margin.** An offline charge is signed at the federation's fees of that moment and sent
+later. On a federation at core consensus 2.1 or later (read from its client config; logged at
+startup), which takes a transaction that pays more than its outputs and fees and burns the
+surplus, the till plans an offline charge with a fee margin: its inputs also pay the fees this
+transaction would owe under a headroom fee schedule, less its fees now (floored at 0). The
+headroom is `--offline-fee-base-msat` (`TILL_OFFLINE_FEE_BASE_MSAT`, default 100 msat per input
+and per output) plus `--offline-fee-headroom-ppm` (`TILL_OFFLINE_FEE_HEADROOM_PPM`, default 0),
+fedimint's default mint fees; 0 and 0 turn it off. A federation already charging the default fees
+gives a margin of 0. The holder pays the margin out of the change, the till getting at least what
+an exact charge gives it; with no change it may come out of the till's overpay (the till still
+gets the price). A margin that would need another change note, slot or input is not taken: the
+charge is then exact, never refused for it. The margin is `fee_margin_msat` in the answer and in
+the queue entry. Online charges always balance exactly. On an older federation (no surplus
+allowed) offline charges balance exactly, and a fee change before the charge is sent gets it
+rejected (`rejected: true`, its notes released, below).
+
 A sender (every 30 s while on ops, one job at a time) reports each queued charge
 (`POST /cards/:id/offline-charges`), writes it into the card's file as an open, signed charge, and
 lets the ordinary recovery send it to the federation, collect the change and the till's notes, and
 post `/outcome`; the sale then has `collection_pending: false`. A `409 double_spend` marks the
 sale `double_spent: true`; a federation rejection after the registry took it marks it
-`rejected: true` (an input spent where the registry did not see it, or a fee the transaction no
-longer covers). Both are losses, kept and counted. The registry signs a release for what such a
+`rejected: true` (an input spent where the registry did not see it, or a fee rise beyond the
+charge's fee margin). Both are losses, kept and counted. The registry signs a release for what such a
 charge left on the card (docs/OFFLINE-PROTOCOL.md § 6): for a double spend its change slots, for a
 rejection its notes and change slots. The card's next online tap at any till sends the releases
 that still fit (`RELEASE`) before the charge is planned, so a rejected charge's notes pay again
@@ -136,7 +152,7 @@ relay (`CARD_BRIDGE_URL`) as before. Frames, timeouts and the pairing flow are i
 `200 {"ok":true}`
 
 ## GET /v1/status
-`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null,"registry_reachable":bool|null,"federation_reachable":bool,"offline":{"queued":N,"queued_msat":N,"double_spent":N,"refused":N,"rejected":N,"cap_msat":N,"cap_count":N}|null}`
+`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null,"registry_reachable":bool|null,"federation_reachable":bool,"offline":{"queued":N,"queued_msat":N,"double_spent":N,"refused":N,"rejected":N,"cap_msat":N,"cap_count":N,"fee_margin":bool,"fee_headroom_base_msat":N,"fee_headroom_ppm":N,"last_fee_margin_msat":N|null}|null}`
 
 `registry_reachable` and `federation_reachable` are the probe of the offline section above (2 s
 each, kept 10 s); `registry_reachable` is null without a registry. `offline` is null when the
@@ -144,7 +160,10 @@ till takes no offline charges (not `serve`). `queued` counts charges taken offli
 settled, `queued_msat` what the till is owed for them (its outputs: the price plus any overpay),
 `double_spent` the ones the registry found spent elsewhere, `rejected` the ones the federation
 refused after the registry took them, `refused` reports the registry refused for another reason
-(all kept for the operator).
+(all kept for the operator). `fee_margin` is true when offline charges carry a fee margin (the
+federation is at core consensus 2.1 or later and the headroom is not 0); `fee_headroom_base_msat`
+and `fee_headroom_ppm` are the headroom; `last_fee_margin_msat` is the margin of the newest charge
+in the queue (null when there is none).
 
 `ops_state` is `connected`, `waiting_for_approval` (a claim is live: `claim_code` and its expiry),
 `claim_expired`, `not_connected` (no token and no claim) or `local` (no registry configured).
@@ -163,7 +182,8 @@ normally 5–20 s, worst case about 120 s: use a read timeout of at least 120 s.
 
 `200 {"ok":true,"sale_id":N,"txid":"<hex>","price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"inputs":[{"slot":0,"msat":N}],"change":[{"slot":1,"msat":N}],"collection_pending":bool,"warnings":[],"duration_ms":N}`
 
-An offline charge (above) adds `"offline": true`; its `received_msat` is 0 and
+An offline charge (above) adds `"offline": true` and `"fee_margin_msat":N` (the fee margin its
+inputs pay, burned when it is sent; 0 for an exact charge); its `received_msat` is 0 and
 `collection_pending` true until the sender settles it. Show "Paid offline".
 
 `received_msat` is what the wallet has collected so far; when `collection_pending` is true the
