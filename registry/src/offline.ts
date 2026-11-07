@@ -114,7 +114,7 @@ export async function recordAttestation(
     // The install tap asks before the app registers the card: certify the key the card
     // names, held until the card is stored with that slot 0 (`adoptPendingAttestation`).
     if (named === null) throw new NotFound(`no card ${shortId}`);
-    return recordPendingAttestation(storage, secret, operatorId, shortId, named, attest, attestHex, Date.now());
+    return await recordPendingAttestation(storage, secret, operatorId, shortId, named, attest, attestHex, Date.now());
   }
   if (cardOwner(sql, shortId) !== operatorId) {
     throw new NotFound(`no card ${shortId}`);
@@ -219,7 +219,7 @@ export interface Conflicts {
 
 export type OfflineResult =
   | {recorded: true; version: number; replayed: boolean}
-  | {recorded: false; conflicts: Conflicts[]};
+  | {recorded: false; conflicts: Conflicts[]; release: {txid: string; slots: number[]} | null};
 
 /**
  * An offline charge reported after the fact. Unlike `recordIntent` it takes no
@@ -267,7 +267,8 @@ export function recordOfflineCharge(
       .exec("SELECT detail FROM offline_reports WHERE txid = ? AND short_id = ? AND result = 'double_spend' LIMIT 1", intent.txid, shortId)
       .toArray()[0];
     if (reported) {
-      return {recorded: false, conflicts: (JSON.parse(String(reported.detail)) as {conflicts: Conflicts[]}).conflicts};
+      const stored = (JSON.parse(String(reported.detail)) as {conflicts: Conflicts[]}).conflicts;
+      return {recorded: false, conflicts: stored, release: null};
     }
     const conflicts: Conflicts[] = [];
     for (const nonce of intent.body.inputs) {
@@ -286,7 +287,10 @@ export function recordOfflineCharge(
       );
     if (conflicts.length > 0) {
       report('double_spend', {client_ref: intent.client_ref, signed_at: r.signed_at, inputs: intent.body.inputs, conflicts});
-      return {recorded: false, conflicts};
+      // The card's change slots wait for change that will never come; its inputs were spent
+      // elsewhere and stay spent (docs/OFFLINE-PROTOCOL.md § 6).
+      const slots = intent.body.change.map(c => c.slot).sort((a, b) => a - b);
+      return {recorded: false, conflicts, release: slots.length > 0 ? {txid: intent.txid, slots} : null};
     }
     for (const c of intent.body.change) {
       const used = sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, c.nonce).toArray();
@@ -313,6 +317,123 @@ export function recordOfflineCharge(
     return {recorded: true, version: bump(sql, shortId), replayed: false};
   });
 }
+
+/* ------------------------------------------------------------------------- */
+/* Releases (§ 6)                                                            */
+/* ------------------------------------------------------------------------- */
+
+/** Domain separator of a release, 17 ASCII bytes. */
+const RELEASE_DOMAIN = new TextEncoder().encode('fedimintcard/rel1');
+
+/** One INTEGER of a DER signature: minimal, positive (a leading 00 only before a high bit). */
+function derInteger(bytes: Uint8Array): Uint8Array {
+  let i = 0;
+  while (i < bytes.length - 1 && bytes[i] === 0) i += 1;
+  const v = bytes.subarray(i);
+  const body = v[0]! & 0x80 ? new Uint8Array([0, ...v]) : v;
+  return new Uint8Array([0x02, body.length, ...body]);
+}
+
+/** WebCrypto's ECDSA P-256 signature, raw r ‖ s (64 bytes), as DER, which the card verifies. */
+export function rawToDer(raw: Uint8Array): Uint8Array {
+  if (raw.length !== 64) throw new Error('a P-256 signature is 64 bytes, r ‖ s');
+  const r = derInteger(raw.subarray(0, 32));
+  const s = derInteger(raw.subarray(32));
+  return new Uint8Array([0x30, r.length + s.length, ...r, ...s]);
+}
+
+/** A DER ECDSA P-256 signature as raw r ‖ s (64 bytes); throws on anything else. */
+export function derToRaw(der: Uint8Array): Uint8Array {
+  const fail = () => {
+    throw new Error('not a DER P-256 signature');
+  };
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) fail();
+  const out = new Uint8Array(64);
+  let at = 2;
+  for (const half of [0, 32]) {
+    if (der[at] !== 0x02) fail();
+    const len = der[at + 1]!;
+    const v = der.subarray(at + 2, at + 2 + len);
+    if (len < 1 || v.length !== len || v[0]! & 0x80) fail();
+    if (len > 1 && v[0] === 0 && !(v[1]! & 0x80)) fail();
+    const trimmed = v[0] === 0 && len > 1 ? v.subarray(1) : v;
+    if (trimmed.length > 32) fail();
+    out.set(trimmed, half + 32 - trimmed.length);
+    at += 2 + len;
+  }
+  if (at !== der.length) fail();
+  return out;
+}
+
+/** What a release signs: the label, slot 0's x-only key, the slot, the txid. */
+export function releaseMessage(slot0: string, slot: number, txid: string): Uint8Array {
+  return new Uint8Array([...RELEASE_DOMAIN, ...fromHex(slot0), slot, ...fromHex(txid)]);
+}
+
+/**
+ * Sign and keep a release for each of `slots` of card `shortId` for `txid`, a transaction the
+ * registry has just recorded as never to be accepted. Signing awaits, so it happens outside the
+ * transaction that recorded the refusal; the rows are written after, in a transaction that checks
+ * `still` (the refusal is on record) and that slot 0 is the key that was signed over.
+ *
+ * Never throws: with no `CERT_SIGNING_KEY` (or any other failure) it logs and records nothing,
+ * and the outcome or report it follows stands.
+ */
+export async function recordReleases(
+  storage: DurableObjectStorage,
+  secret: string | undefined,
+  shortId: string,
+  txid: string,
+  slots: readonly number[],
+  still: (sql: SqlStorage) => boolean,
+  now: number,
+): Promise<number> {
+  if (slots.length === 0) return 0;
+  const sql = storage.sql;
+  try {
+    if (!secret) {
+      console.warn(`releases: CERT_SIGNING_KEY is not set; none signed for ${txid} on card ${shortId} (slots ${slots.join(', ')})`);
+      return 0;
+    }
+    const slot0Of = () => sql.exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot = 0', shortId).toArray()[0]?.pubkey;
+    const slot0 = slot0Of();
+    if (typeof slot0 !== 'string') {
+      console.warn(`releases: card ${shortId} has no slot 0 key on record; none signed for ${txid}`);
+      return 0;
+    }
+    const key = await certKey(secret);
+    const signed: {slot: number; sig: string}[] = [];
+    for (const slot of slots) {
+      const raw = new Uint8Array(
+        await crypto.subtle.sign({name: 'ECDSA', hash: 'SHA-256'}, key, releaseMessage(slot0, slot, txid)),
+      );
+      signed.push({slot, sig: toHex(rawToDer(raw))});
+    }
+    return storage.transactionSync(() => {
+      if (!still(sql) || slot0Of() !== slot0) return 0;
+      for (const {slot, sig} of signed) {
+        sql.exec(
+          'INSERT OR IGNORE INTO releases (short_id, slot, txid, sig, created_at) VALUES (?, ?, ?, ?, ?)',
+          shortId, slot, txid, sig, now,
+        );
+      }
+      return signed.length;
+    });
+  } catch (e) {
+    console.warn(`releases: none recorded for ${txid} on card ${shortId}: ${e instanceof Error ? e.message : String(e)}`);
+    return 0;
+  }
+}
+
+/** Still true when the releases for a rejected charge are written. */
+export const chargeRejected = (txid: string) => (sql: SqlStorage) =>
+  sql.exec("SELECT 1 FROM card_txs WHERE txid = ? AND status = 'rejected'", txid).toArray().length > 0;
+
+/** Still true when the releases for an offline report refused as a double spend are written. */
+export const reportRefused = (txid: string, shortId: string) => (sql: SqlStorage) =>
+  sql
+    .exec("SELECT 1 FROM offline_reports WHERE txid = ? AND short_id = ? AND result = 'double_spend'", txid, shortId)
+    .toArray().length > 0;
 
 /* ------------------------------------------------------------------------- */
 /* Reports                                                                   */

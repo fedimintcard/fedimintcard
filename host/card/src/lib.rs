@@ -299,6 +299,30 @@ pub trait Card {
     fn attest(&mut self, challenge: &[u8; 32]) -> Result<Vec<u8>> {
         self.apdu(&v3_apdu(v3::INS_ATTEST, 0, challenge))
     }
+
+    /// `SET_REGISTRY_KEY`: the registry's certificate key, 65 bytes uncompressed, before
+    /// `SET_PIN` (docs/OFFLINE-PROTOCOL.md § 6).
+    fn set_registry_key(&mut self, key: &[u8; 65]) -> Result<()> {
+        self.apdu(&v3_apdu(v3::INS_SET_REGISTRY_KEY, 0, key)).map(|_| ())
+    }
+
+    /// `RELEASE`: the registry's signature (DER) that `txid` will never be accepted. A SPENT slot
+    /// whose spent hash is `txid` becomes NOTE, a CHANGE slot owed by `txid` becomes KEYED; the
+    /// answer is the new state. `6982` for a bad signature, `6985` for a slot it does not fit or a
+    /// card with no registry key. No PIN.
+    fn release(&mut self, slot: u8, txid: &[u8; 32], der: &[u8]) -> Result<SlotState> {
+        ensure!(
+            (v3::RELEASE_SIG_MIN..=v3::RELEASE_SIG_MAX).contains(&der.len()),
+            "a release signature is {} to {} bytes of DER",
+            v3::RELEASE_SIG_MIN,
+            v3::RELEASE_SIG_MAX
+        );
+        let mut d = txid.to_vec();
+        d.extend_from_slice(der);
+        let out = self.apdu(&v3_apdu(v3::INS_RELEASE, slot, &d))?;
+        ensure!(out.len() == 1, "RELEASE answered {} bytes, not 1", out.len());
+        SlotState::from_byte(out[0])
+    }
 }
 
 /// A 3.0 command: the applet's CLA, `ins`, P1 = `p1`, P2 = 0, the data with its Lc when there is
@@ -466,6 +490,8 @@ pub struct SoftCard {
     clock: Clock,
     cert: Vec<u8>,
     attest: Option<p256::ecdsa::SigningKey>,
+    /// The registry's certificate key (SET_REGISTRY_KEY), which signs releases.
+    registry_key: Option<p256::ecdsa::VerifyingKey>,
 }
 
 impl Default for AppletVersion {
@@ -596,6 +622,7 @@ impl SoftCard {
             clock: Clock { spent: 0, ..self.clock },
             cert: self.cert.clone(),
             attest: Some(p256::ecdsa::SigningKey::random(&mut rand::thread_rng())),
+            registry_key: self.registry_key,
         }
     }
 
@@ -721,6 +748,7 @@ impl SoftCard {
                 out.extend_from_slice(&self.clock.spent.to_be_bytes());
                 out.push(self.cert.len() as u8);
                 out.push(u8::from(self.attest.is_some()));
+                out.push(u8::from(self.registry_key.is_some()));
                 Ok(out)
             }
             v3::INS_SET_CHANGE => {
@@ -792,6 +820,50 @@ impl SoftCard {
                 let msg = v3::attest_message(&challenge, &kp.x_only_public_key().0.serialize());
                 let sig: p256::ecdsa::Signature = key.sign(&msg);
                 Ok(sig.to_der().as_bytes().to_vec())
+            }
+            v3::INS_SET_REGISTRY_KEY => {
+                len_is(65)?;
+                if !self.pin_not_set() {
+                    return Err(refuse());
+                }
+                if body[0] != 0x04 {
+                    return Err(StatusWord(v3::SW_WRONG_DATA).into());
+                }
+                let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(body).map_err(|_| StatusWord(v3::SW_WRONG_DATA))?;
+                self.registry_key = Some(key);
+                Ok(vec![])
+            }
+            v3::INS_RELEASE => {
+                let s = slot()?;
+                if body.len() < 32 + v3::RELEASE_SIG_MIN || body.len() > 32 + v3::RELEASE_SIG_MAX {
+                    return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+                }
+                let (Some(key), Some(Some(kp))) = (&self.registry_key, self.slots.first()) else {
+                    return Err(refuse());
+                };
+                if self.v3[0].state == SlotState::Empty {
+                    return Err(refuse());
+                }
+                let txid: [u8; 32] = body[..32].try_into().expect("32");
+                let slot0 = kp.x_only_public_key().0.serialize();
+                if !v3::verify_release(key, &slot0, s as u8, &txid, &body[32..]) {
+                    return Err(StatusWord(v3::SW_SECURITY_STATUS_NOT_SATISFIED).into());
+                }
+                let v = &mut self.v3[s];
+                match v.state {
+                    SlotState::Spent if v.spent == txid => {
+                        v.state = SlotState::Note;
+                        v.spent = [0; 32];
+                        v.sig = [0; 64];
+                    }
+                    SlotState::Change if v.opening[..32] == txid => {
+                        v.state = SlotState::Keyed;
+                        v.opening = [0; v3::OPEN_LEN];
+                        v.note = [0; v3::NOTE_LEN];
+                    }
+                    _ => return Err(refuse()),
+                }
+                Ok(vec![v.state.byte()])
             }
             _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }

@@ -506,6 +506,12 @@ export function cardState(sql: Sql, shortId: string) {
       created_at: Number(r.created_at),
       ...(JSON.parse(String(r.body)) as {tx_hex: string | null; inputs: string[]; change: ChangeOut[]}),
     }));
+  // Releases (docs/OFFLINE-PROTOCOL.md § 6): a till sends each to the card at its next online
+  // tap, where the slot still holds what the refused transaction left (SPENT or CHANGE).
+  const releases = sql
+    .exec('SELECT slot, txid, sig FROM releases WHERE short_id = ? ORDER BY slot, txid', shortId)
+    .toArray()
+    .map(r => ({slot: Number(r.slot), txid: String(r.txid), sig: String(r.sig)}));
   const count = slotCount(sql, shortId);
   return {
     short_id: shortId,
@@ -515,6 +521,7 @@ export function cardState(sql: Sql, shortId: string) {
     unkeyed_slots: unkeyedSlots(count, slots.map(s => s.slot)),
     notes,
     open_txs: open,
+    releases,
   };
 }
 
@@ -702,16 +709,23 @@ export function recordIntent(
 /**
  * What the federation decided. Accepted: the inputs are spent and each change
  * note becomes live with its unblinded signature. Rejected: the change notes
- * are dead and the inputs stay live. Any till of the operator may record it,
- * so a charge whose till died is finished by the next one to see the card.
- * A repeat of the recorded outcome answers 200; a different one is a 409.
+ * are dead and the inputs are live (an online charge never moved them; an
+ * offline one held them pending under its txid, and they are live again).
+ * Any till of the operator may record it, so a charge whose till died is
+ * finished by the next one to see the card. A repeat of the recorded outcome
+ * answers 200; a different one is a 409.
+ *
+ * `release` names, for a charge newly recorded rejected, every slot the card
+ * may have left SPENT (its inputs') or CHANGE (its change's) for it: the
+ * caller signs a release for each (`recordReleases`). A load (no inputs) never
+ * touched the card's slot states and has none.
  */
 export function recordOutcome(
   storage: DurableObjectStorage,
   shortId: string,
   r: Record<string, unknown>,
   now: number,
-): {version: number; replayed: boolean} {
+): {version: number; replayed: boolean; release: {txid: string; slots: number[]} | null} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -742,11 +756,12 @@ export function recordOutcome(
     }
     if (tx.status !== 'open') {
       if (tx.outcome === outcome) {
-        return {version: versionOf(sql, shortId), replayed: true};
+        return {version: versionOf(sql, shortId), replayed: true, release: null};
       }
       throw new Conflict(`charge ${String(r.txid)} is already resolved differently`);
     }
     const body = JSON.parse(tx.body) as {inputs: string[]; change: ChangeOut[]};
+    let release: {txid: string; slots: number[]} | null = null;
     if (r.accepted) {
       if (
         signatures.size !== body.change.length ||
@@ -784,6 +799,25 @@ export function recordOutcome(
           c.nonce,
         );
       }
+      // An offline charge's inputs were pending under it (`recordOfflineCharge`).
+      for (const nonce of body.inputs) {
+        sql.exec(
+          "UPDATE notes SET status = 'live' WHERE short_id = ? AND nonce = ? AND status = 'pending' AND txid = ?",
+          shortId,
+          nonce,
+          r.txid,
+        );
+      }
+      if (body.inputs.length > 0) {
+        const inputSlots = body.inputs.flatMap(n =>
+          sql
+            .exec('SELECT slot FROM notes WHERE short_id = ? AND nonce = ?', shortId, n)
+            .toArray()
+            .map(row => Number(row.slot)),
+        );
+        const slots = [...new Set([...inputSlots, ...body.change.map(c => c.slot)])].sort((a, b) => a - b);
+        release = {txid: String(r.txid), slots};
+      }
     }
     sql.exec(
       'UPDATE card_txs SET status = ?, outcome = ?, resolved_at = ? WHERE txid = ?',
@@ -792,7 +826,7 @@ export function recordOutcome(
       now,
       r.txid,
     );
-    return {version: bump(sql, shortId), replayed: false};
+    return {version: bump(sql, shortId), replayed: false, release};
   });
 }
 
@@ -948,6 +982,8 @@ export function renewSlot(
       shortId,
       slot,
     );
+    // A new key: whatever the slot held for an old transaction is gone with the old one.
+    sql.exec('DELETE FROM releases WHERE short_id = ? AND slot = ?', shortId, slot);
     return {version: bump(sql, shortId)};
   });
 }
@@ -1046,6 +1082,7 @@ export function addSlotKeys(
     }
     for (const k of added) {
       sql.exec('INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)', shortId, k.slot, k.pubkey);
+      sql.exec('DELETE FROM releases WHERE short_id = ? AND slot = ?', shortId, k.slot);
     }
     const version = added.length > 0 ? bump(sql, shortId) : versionOf(sql, shortId);
     const keyed = sql

@@ -255,6 +255,20 @@ export const MIGRATIONS: readonly string[] = [
     created_at  INTEGER NOT NULL
   );
   `,
+  // v12 (docs/OFFLINE-PROTOCOL.md § 6): releases, the registry's signature that
+  // a transaction will never be accepted, one per card slot it left SPENT or
+  // CHANGE. Listed in the card's state until the slot is keyed anew or the
+  // card reset. In the backup: card state, and re-signing needs the key.
+  `
+  CREATE TABLE releases (
+    short_id   TEXT    NOT NULL,
+    slot       INTEGER NOT NULL,
+    txid       TEXT    NOT NULL,
+    sig        TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (short_id, slot, txid)
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

@@ -19,6 +19,8 @@ pub const INS_ATTEST_INIT: u8 = 0x30;
 pub const INS_SET_CERT: u8 = 0x31;
 pub const INS_GET_CERT: u8 = 0x32;
 pub const INS_ATTEST: u8 = 0x33;
+pub const INS_SET_REGISTRY_KEY: u8 = 0x34;
+pub const INS_RELEASE: u8 = 0x35;
 
 /// SIGN past the day's limit (3.0). Nothing was spent.
 pub const SW_OVER_LIMIT: u16 = 0x6A95;
@@ -30,19 +32,29 @@ pub const SW_WRONG_DATA: u16 = 0x6A80;
 /// GET_CERT on a card with no certificate.
 pub const SW_RECORD_NOT_FOUND: u16 = 0x6A83;
 pub const SW_WRONG_LENGTH: u16 = 0x6700;
+/// RELEASE with a signature the registry key does not verify.
+pub const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6982;
 
 /// A note on the card: amount (8, big-endian msat) then the federation's signature (48).
 pub const NOTE_LEN: usize = 56;
 /// Change owed to a slot: txid (32), output index (2, big-endian), blinding key (32).
 pub const OPEN_LEN: usize = 66;
 pub const GET_SLOT_LEN: usize = 187;
-pub const GET_STATE_LEN: usize = 58;
+/// GET_STATE since releases (§ 6): byte 58 says whether the registry key is set.
+pub const GET_STATE_LEN: usize = 59;
+/// GET_STATE of a 3.0 card from before releases: no registry key byte.
+pub const GET_STATE_LEN_PRE_RELEASE: usize = 58;
 pub const CERT_MAX: usize = 160;
 pub const HEADER_LEN: usize = 80;
 /// ATTEST's label, 16 ASCII bytes.
 pub const ATTEST_LABEL: &[u8; 16] = b"fedimintcard/at1";
 /// The certificate's label, 18 ASCII bytes.
 pub const CERT_LABEL: &[u8; 18] = b"fedimintcard/cert1";
+/// RELEASE's label, 17 ASCII bytes.
+pub const RELEASE_LABEL: &[u8; 17] = b"fedimintcard/rel1";
+/// The shortest and longest DER signature RELEASE takes (the applet's bounds).
+pub const RELEASE_SIG_MIN: usize = 8;
+pub const RELEASE_SIG_MAX: usize = 72;
 /// The least work a header must show, as `bits` little-endian (0x17087BC0, cashucard's floor).
 pub const FLOOR_BITS: [u8; 4] = [0xC0, 0x7B, 0x08, 0x17];
 pub const DAY_SECONDS: u32 = 86_400;
@@ -197,11 +209,18 @@ pub struct CardStatus {
     pub spent_msat: u64,
     pub cert_len: u8,
     pub attest_key: bool,
+    /// The registry's certificate key is set (SET_REGISTRY_KEY), so the card takes releases.
+    /// False on a 3.0 card from before releases (58 bytes).
+    pub registry_key: bool,
 }
 
 impl CardStatus {
     pub fn parse(b: &[u8]) -> Result<Self> {
-        ensure!(b.len() == GET_STATE_LEN, "GET_STATE answered {} bytes, not {GET_STATE_LEN}", b.len());
+        ensure!(
+            b.len() == GET_STATE_LEN || b.len() == GET_STATE_LEN_PRE_RELEASE,
+            "GET_STATE answered {} bytes, not {GET_STATE_LEN}",
+            b.len()
+        );
         Ok(Self {
             states: b[..32].iter().map(|s| SlotState::from_byte(*s)).collect::<Result<_>>()?,
             now: u32::from_be_bytes(b[32..36].try_into().expect("4")),
@@ -210,6 +229,7 @@ impl CardStatus {
             spent_msat: u64::from_be_bytes(b[48..56].try_into().expect("8")),
             cert_len: b[56],
             attest_key: b[57] != 0,
+            registry_key: b.get(58).is_some_and(|k| *k != 0),
         })
     }
 
@@ -378,6 +398,29 @@ pub fn attest_message(challenge: &[u8; 32], slot0: &[u8; 32]) -> Vec<u8> {
     m
 }
 
+// ------------------------------------------------------------------ releases (§ 6)
+
+/// What the registry signs for a release: the label, slot 0's x-only key, the slot, the txid.
+pub fn release_message(slot0: &[u8; 32], slot: u8, txid: &[u8; 32]) -> Vec<u8> {
+    let mut m = RELEASE_LABEL.to_vec();
+    m.extend_from_slice(slot0);
+    m.push(slot);
+    m.extend_from_slice(txid);
+    m
+}
+
+/// Check a release (DER) with the registry's certificate key: the applet's verify, on the host.
+pub fn verify_release(registry_key: &p256::ecdsa::VerifyingKey, slot0: &[u8; 32], slot: u8, txid: &[u8; 32], der: &[u8]) -> bool {
+    p256::ecdsa::Signature::from_der(der).is_ok_and(|sig| registry_key.verify(&release_message(slot0, slot, txid), &sig).is_ok())
+}
+
+/// Sign a release as the registry does, DER (tests and tools).
+pub fn sign_release(key: &p256::ecdsa::SigningKey, slot0: &[u8; 32], slot: u8, txid: &[u8; 32]) -> Vec<u8> {
+    use p256::ecdsa::signature::Signer as _;
+    let sig: p256::ecdsa::Signature = key.sign(&release_message(slot0, slot, txid));
+    sig.to_der().as_bytes().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,7 +441,7 @@ mod tests {
 
     #[test]
     fn limit_is_the_applets_day_after() {
-        let s = |now, window, limit, spent| CardStatus { states: vec![], now, window, limit_msat: limit, spent_msat: spent, cert_len: 0, attest_key: false };
+        let s = |now, window, limit, spent| CardStatus { states: vec![], now, window, limit_msat: limit, spent_msat: spent, cert_len: 0, attest_key: false, registry_key: false };
         assert!(s(0, 0, 0, 0).limit_allows(&[u64::MAX]));
         assert!(s(0, 0, 2000, 0).limit_allows(&[1000, 1000]));
         assert!(!s(0, 0, 2000, 0).limit_allows(&[1000, 1000, 1]));
@@ -406,5 +449,22 @@ mod tests {
         // a day later the window starts again
         assert!(s(100_000, 10_000, 2000, 2000).limit_allows(&[2000]));
         assert!(!s(10_000 + 86_399, 10_000, 2000, 2000).limit_allows(&[1]));
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn get_state_takes_59_bytes_and_58_from_a_card_before_releases() {
+        let mut b = vec![0u8; GET_STATE_LEN];
+        b[58] = 1;
+        assert!(CardStatus::parse(&b).unwrap().registry_key);
+        b[58] = 0;
+        assert!(!CardStatus::parse(&b).unwrap().registry_key);
+        assert!(!CardStatus::parse(&b[..58]).unwrap().registry_key, "a pre-release 3.0 card has no registry key");
+        assert!(CardStatus::parse(&b[..57]).is_err());
+        assert!(CardStatus::parse(&[0u8; 60]).is_err());
     }
 }

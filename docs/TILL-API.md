@@ -61,8 +61,12 @@ lets the ordinary recovery send it to the federation, collect the change and the
 post `/outcome`; the sale then has `collection_pending: false`. A `409 double_spend` marks the
 sale `double_spent: true`; a federation rejection after the registry took it marks it
 `rejected: true` (an input spent where the registry did not see it, or a fee the transaction no
-longer covers). Both are losses, kept and counted. The next tap
-of the card writes its change (`SET_NOTE`). A queue survives restarts; an entry cut off between
+longer covers). Both are losses, kept and counted. The registry signs a release for what such a
+charge left on the card (docs/OFFLINE-PROTOCOL.md § 6): for a double spend its change slots, for a
+rejection its notes and change slots. The card's next online tap at any till sends the releases
+that still fit (`RELEASE`) before the charge is planned, so a rejected charge's notes pay again
+and its change slots take notes again; a card provisioned without the registry key keeps them as
+they are. The next tap of the card writes its change (`SET_NOTE`). A queue survives restarts; an entry cut off between
 the card signing and the save is finished at the card's next offline tap from the card's stored
 signatures.
 

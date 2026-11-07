@@ -3,8 +3,11 @@ import {beforeEach, describe, expect, it} from 'vitest';
 
 import {bls12_381} from '@noble/curves/bls12-381.js';
 
+import {p256} from '@noble/curves/nist.js';
+
 import {decrypt} from '../src/backup';
 import {fromHex, toHex} from '../src/http';
+import {derToRaw, rawToDer, releaseMessage} from '../src/offline';
 import {messageOf} from '../src/tbs';
 
 /**
@@ -459,5 +462,195 @@ describe('backup', () => {
     const snap = await decrypt(await (await env.BACKUPS!.get(objectKey))!.text(), BACKUP_IDENTITY);
     expect(snap.tables.offline_reports).toEqual([expect.objectContaining({txid: txid(7), short_id: shortId, result: 'recorded'})]);
     expect(snap.tables.cards![0]).toEqual(expect.objectContaining({attest_pub: attest, attest_cert: expect.stringMatching(/^[0-9a-f]{260}$/)}));
+  });
+});
+
+describe('releases (docs/OFFLINE-PROTOCOL.md § 6)', () => {
+  type Release = {slot: number; txid: string; sig: string};
+  const releasesOf = async (tok: string, shortId: string) =>
+    ((await (await get(`/cards/${shortId}/state`, tok)).json()) as {releases: Release[]}).releases;
+
+  /** Each release verifies under the cert key over label ‖ slot 0 ‖ slot ‖ txid, with WebCrypto and noble. */
+  async function expectSigned(shortId: string, rels: Release[]) {
+    const certKey = ((await (await get('/registry/cert-key', null)).json()) as {key: string}).key;
+    const pub = await crypto.subtle.importKey('raw', fromHex(certKey), {name: 'ECDSA', namedCurve: 'P-256'}, false, ['verify']);
+    for (const r of rels) {
+      const msg = releaseMessage(slots(shortId)[0]!, r.slot, r.txid);
+      expect(msg.length).toBe(82);
+      const der = fromHex(r.sig);
+      expect(toHex(rawToDer(derToRaw(der)))).toBe(r.sig);
+      expect(await crypto.subtle.verify({name: 'ECDSA', hash: 'SHA-256'}, pub, derToRaw(der), msg)).toBe(true);
+      expect(p256.verify(der, msg, fromHex(certKey), {format: 'der', lowS: false})).toBe(true);
+      // Not transferable to another slot.
+      expect(await crypto.subtle.verify({name: 'ECDSA', hash: 'SHA-256'}, pub, derToRaw(der), releaseMessage(slots(shortId)[0]!, r.slot + 1, r.txid))).toBe(false);
+    }
+  }
+
+  const online = (over: Record<string, unknown> = {}) => ({
+    version: 0, txid: txid(9), client_ref: 'online-1', tx_hex: 'ab'.repeat(50), inputs: [nonce(1)],
+    change: [{slot: 3, amount_msat: 24_000, nonce: nonce(6), blinding_key: 'e'.repeat(64), out_idx: 1}],
+    ...over,
+  });
+
+  describe('DER', () => {
+    const raw = (r: number[], s: number[]) => {
+      const out = new Uint8Array(64);
+      out.set(r, 32 - r.length);
+      out.set(s, 64 - s.length);
+      return out;
+    };
+    it('is minimal and positive: leading zeros stripped, 00 before a high bit', () => {
+      // r = 1 (31 leading zero bytes), s = 0x80 (high bit after stripping)
+      expect(toHex(rawToDer(raw([1], [0x80])))).toBe('3007020101020200' + '80');
+      // r has its own high bit: 33 bytes; s = 0x7f..: 32 bytes, no pad
+      const hi = new Uint8Array(32).fill(0xff);
+      const lo = new Uint8Array(32).fill(0x7f);
+      const der = rawToDer(raw([...hi], [...lo]));
+      expect(toHex(der.subarray(0, 5))).toBe('3045022100');
+      expect(der.length).toBe(71);
+      // leading 00 followed by a high-bit byte: stripped to 31 bytes, then padded to 32
+      const z = [0x00, 0x80, ...new Array(30).fill(1)];
+      const d2 = rawToDer(raw(z, z));
+      expect(toHex(d2.subarray(0, 4))).toBe('30440220');
+      expect(d2[4]).toBe(0);
+      expect(d2[5]).toBe(0x80);
+      // r = 0 is one zero byte
+      expect(toHex(rawToDer(raw([], [1])))).toBe('3006020100020101');
+      for (const x of [raw([1], [0x80]), raw([...hi], [...lo]), raw(z, z), raw([], [1])]) {
+        expect(toHex(derToRaw(rawToDer(x)))).toBe(toHex(x));
+      }
+    });
+
+    it('refuses non-minimal, negative and malformed DER', () => {
+      for (const bad of ['3008020200010202000180', '3006020180020101', '3006020101020101ff', '3106020101020101', '300602010102']) {
+        expect(() => derToRaw(fromHex(bad))).toThrow();
+      }
+      expect(() => rawToDer(new Uint8Array(63))).toThrow();
+      // and the minimal form of the same values parses
+      expect(toHex(derToRaw(fromHex('3006020101020101')))).toBe('00'.repeat(31) + '01' + '00'.repeat(31) + '01');
+    });
+
+    it('carries a WebCrypto signature that verifies after the round trip, and in noble', async () => {
+      const pair = (await crypto.subtle.generateKey({name: 'ECDSA', namedCurve: 'P-256'}, true, ['sign', 'verify'])) as CryptoKeyPair;
+      const pub = new Uint8Array((await crypto.subtle.exportKey('raw', pair.publicKey)) as ArrayBuffer);
+      for (let i = 0; i < 20; i += 1) {
+        const msg = new Uint8Array([i, 1, 2, 3]);
+        const sig = new Uint8Array(await crypto.subtle.sign({name: 'ECDSA', hash: 'SHA-256'}, pair.privateKey, msg));
+        const der = rawToDer(sig);
+        expect(await crypto.subtle.verify({name: 'ECDSA', hash: 'SHA-256'}, pair.publicKey, derToRaw(der), msg)).toBe(true);
+        expect(p256.verify(der, msg, pub, {format: 'der', lowS: false})).toBe(true);
+      }
+    });
+  });
+
+  it('a rejected online charge: a release for its input slot and its change slot, listed in the state', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/intent`, till.token, online())).status).toBe(200);
+    const res = await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: false});
+    expect(res.status).toBe(200);
+    expect(Object.keys((await res.json()) as object).sort()).toEqual(['ok', 'replayed', 'version']);
+    const rels = await releasesOf(till.token, shortId);
+    expect(rels.map(r => [r.slot, r.txid])).toEqual([[0, txid(9)], [3, txid(9)]]);
+    await expectSigned(shortId, rels);
+    // The input stays live; a replay of the outcome adds nothing.
+    expect((await state(till.token, shortId)).notes.find(n => n.nonce === nonce(1))?.status).toBe('live');
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: false})).status).toBe(200);
+    expect(await releasesOf(till.token, shortId)).toEqual(rels);
+  });
+
+  it('an accepted charge, and a load, leave no release', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/intent`, till.token, online())).status).toBe(200);
+    const sig = sign(nonce(6), 24_000);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: true, change: [{nonce: nonce(6), signature: sig}]})).status).toBe(200);
+    const load = online({version: 2, txid: txid(10), inputs: [], tx_hex: undefined,
+      change: [{slot: 4, amount_msat: 24_000, nonce: nonce(8), blinding_key: 'e'.repeat(64), out_idx: 0}]});
+    expect((await post(`/cards/${shortId}/intent`, till.token, load)).status).toBe(200);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(10), accepted: false})).status).toBe(200);
+    expect(await releasesOf(till.token, shortId)).toEqual([]);
+  });
+
+  it('a rejected offline charge: its inputs are live again, with releases for input and change', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, charge())).status).toBe(200);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: false})).status).toBe(200);
+    const notes = (await state(till.token, shortId)).notes;
+    expect(notes.find(n => n.nonce === nonce(1))?.status).toBe('live');
+    expect(notes.find(n => n.nonce === nonce(2))).toBeUndefined(); // dead, and not on a slot's key
+    const rels = await releasesOf(till.token, shortId);
+    expect(rels.map(r => [r.slot, r.txid])).toEqual([[0, txid(7)], [1, txid(7)]]);
+    await expectSigned(shortId, rels);
+    // The note is live: a new charge may spend it.
+    expect((await post(`/cards/${shortId}/intent`, till.token, online({version: 2}))).status).toBe(200);
+  });
+
+  it('an offline double spend: releases for the change slots it named only, once', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, charge())).status).toBe(200);
+    const twice = charge({
+      txid: txid(8), client_ref: 'offline-2',
+      change: [
+        {slot: 4, amount_msat: 24_000, nonce: nonce(12), blinding_key: 'e'.repeat(64), out_idx: 1},
+        {slot: 5, amount_msat: 24_000, nonce: nonce(13), blinding_key: 'e'.repeat(64), out_idx: 2},
+      ],
+    });
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, twice)).status).toBe(409);
+    const rels = await releasesOf(till.token, shortId);
+    expect(rels.map(r => [r.slot, r.txid])).toEqual([[4, txid(8)], [5, txid(8)]]);
+    await expectSigned(shortId, rels);
+    // The replay answers the stored conflicts and signs nothing new.
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, twice)).status).toBe(409);
+    expect(await releasesOf(till.token, shortId)).toEqual(rels);
+    // The first charge's input stays pending: it was spent, by txid(7).
+    expect((await state(till.token, shortId)).notes.find(n => n.nonce === nonce(1))?.status).toBe('pending');
+  });
+
+  it('goes when the slot is keyed anew, and all of them when the card is reset', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    expect((await post(`/cards/${shortId}/intent`, till.token, online())).status).toBe(200);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: false})).status).toBe(200);
+    expect((await releasesOf(till.token, shortId)).map(r => r.slot)).toEqual([0, 3]);
+    const renew = {version: 2, old_pubkey: slots(shortId)[3], pubkey: key(0x33)};
+    expect((await call('PUT', `/cards/${shortId}/slots/3`, till.token, renew)).status).toBe(200);
+    expect((await releasesOf(till.token, shortId)).map(r => r.slot)).toEqual([0]);
+    const reset = {short_id: shortId, chip: 'cplc-v1:' + '4'.repeat(24), gp_key_version: 1, manager_keys: 'factory', package: 'absent', verified_at: 1_770_000_000_000};
+    expect((await post(`/registry/cards/${shortId}/reset`, token, reset)).status).toBe(200);
+    expect(await releasesOf(token, shortId)).toEqual([]);
+  });
+
+  it('without CERT_SIGNING_KEY the outcome and the refusal stand, with no release', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    await hook('/test/cert-key', {off: true});
+    expect((await post(`/cards/${shortId}/intent`, till.token, online())).status).toBe(200);
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: false})).status).toBe(200);
+    expect((await state(till.token, shortId)).open_txs).toEqual([]);
+    await hook('/test/note', {short_id: shortId, nonce: nonce(20), slot: 6, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, charge({txid: txid(11), inputs: [nonce(20)]}))).status).toBe(200);
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, charge({txid: txid(12), client_ref: 'x', inputs: [nonce(20)]}))).status).toBe(409);
+    expect(await releasesOf(till.token, shortId)).toEqual([]);
+  });
+
+  it('is in the backup', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, till.token, online());
+    await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(9), accepted: false});
+    const res = await stub().fetch('https://registry.internal/internal/backup', {method: 'POST'});
+    const {key: objectKey} = (await res.json()) as {key: string};
+    const snap = await decrypt(await (await env.BACKUPS!.get(objectKey))!.text(), BACKUP_IDENTITY);
+    expect(snap.tables.releases!.map(r => [r.short_id, r.slot, r.txid])).toEqual([[shortId, 0, txid(9)], [shortId, 3, txid(9)]]);
   });
 });
