@@ -42,7 +42,7 @@ export const SLOT_COUNTS = [8, 32] as const;
  */
 export const MIN_REGISTERED_KEYS = 8;
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
-const MAX_TX_HEX = 64 * 1024;
+export const MAX_TX_HEX = 64 * 1024;
 
 export {BadRequest, Conflict, NotFound};
 
@@ -516,7 +516,7 @@ export function cardState(sql: Sql, shortId: string) {
   };
 }
 
-interface ChangeOut {
+export interface ChangeOut {
   readonly slot: number;
   readonly amount_msat: number;
   readonly nonce: string;
@@ -524,7 +524,7 @@ interface ChangeOut {
   readonly out_idx: number;
 }
 
-function parseIntent(r: Record<string, unknown>, slots: number) {
+export function parseIntent(r: Record<string, unknown>, slots: number) {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }

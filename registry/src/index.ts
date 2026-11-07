@@ -14,6 +14,7 @@
  * Routes, by who may call them:
  *
  *   anyone     GET  /health
+ *              GET  /registry/cert-key           the certificate key's public point (65 bytes hex)
  *              POST /auth/operator/session       {name, password} -> {operator_id, token}
  *              POST /till-claims                 {name} -> {claim_id, code, poll_secret, expires_at}
  *                                                (docs/TILL-CLAIM.md; per-IP and global limits, 429)
@@ -35,6 +36,8 @@
  *              POST /till-claims/:code/approve   ties it to this operator; its till is made at the poll
  *              GET  /registry/federations        names tills reported
  *              GET  /registry/backup-status      last backup; 503 if none or stale
+ *              POST /registry/cards/:id/attestation  {attest_pub} -> {cert}: the card's certificate
+ *              GET  /registry/offline-reports?short_id=  offline charges reported, newest first
  *   operator   GET  /cards/:short_id/state
  *   or till    POST /cards/:short_id/slots/:n/key   {pubkey}: the first key of a never-keyed slot
  *              POST /cards/:short_id/slot-keys      {keys: [{slot, pubkey}]}: the same, several at once
@@ -43,6 +46,9 @@
  *                                                 with no inputs, a load from the till's wallet
  *              POST /cards/:short_id/submitted   the signed bytes, before the till sends them
  *              POST /cards/:short_id/outcome     the federation's answer
+ *              POST /cards/:short_id/offline-charges  a charge the card signed offline, reported after the
+ *                                                fact: {intent fields, signed_hex, signed_at}; 409 double_spend
+ *                                                with conflicts (offline.ts, docs/OFFLINE-PROTOCOL.md § 3)
  *              POST /federations                 {federation_id, name, tbs_pks} from the federation's config
  *              PUT  /cards/:short_id/slots/:n    a renewed slot key
  *
@@ -96,6 +102,7 @@ import {
   Unprocessable,
 } from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
+import {certPublicKey, listOfflineReports, recordAttestation, recordOfflineCharge} from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
 import {completeReset, resetCheck, resetOwner} from './reset';
 import {closedReason, closeSuperseded, parseSupersedes, pinIsSet, resumeCheck} from './resume';
@@ -118,6 +125,11 @@ export interface Env {
    * it, `/registry/manager-keys` answers 503 and nothing else changes.
    */
   readonly CARD_MANAGER_MASTER?: string;
+  /**
+   * The certificate key (`offline.ts`): a P-256 private key, PKCS#8 DER, base64. A secret:
+   * `wrangler secret put CERT_SIGNING_KEY`. Without it the certificate routes answer 503.
+   */
+  readonly CERT_SIGNING_KEY?: string;
 }
 
 type Caller = {kind: 'operator'; operatorId: number} | {kind: 'till'; till: Till};
@@ -237,6 +249,11 @@ export class Registry {
       return this.holderRoute(request, holder[1]!, holder[2]!, now);
     }
 
+    if (path === '/registry/cert-key') {
+      if (method !== 'GET') return fail(405, 'use GET');
+      return json(200, {ok: true, key: await certPublicKey(this.env.CERT_SIGNING_KEY)});
+    }
+
     const caller = await this.caller(request);
     if (!caller) {
       // The app signs out on a 401 rather than retrying.
@@ -323,6 +340,19 @@ export class Registry {
         return json(200, {ok: true, ...resetCheck(sql, op, shortId, isChip(chip) ? chip : null)});
       }
       return json(200, {ok: true, ...completeReset(storage, op, shortId, body!, now)});
+    }
+    const attest = /^\/registry\/cards\/([^/]+)\/attestation$/.exec(path);
+    if (attest) {
+      if (method !== 'POST') return fail(405, 'use POST');
+      if (!isShortId(attest[1])) return fail(400, 'short_id must be 8 lower-case hex characters');
+      const body = await objectBody(request);
+      if (!body) return fail(400, 'expected {attest_pub}');
+      return json(200, {ok: true, ...(await recordAttestation(storage, this.env.CERT_SIGNING_KEY, op, attest[1], body))});
+    }
+    if (path === '/registry/offline-reports' && method === 'GET') {
+      const id = url.searchParams.get('short_id');
+      if (id !== null && !isShortId(id)) return fail(400, 'short_id must be 8 lower-case hex characters');
+      return json(200, {ok: true, reports: listOfflineReports(sql, op, id)});
     }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.
@@ -421,6 +451,11 @@ export class Registry {
     if (rest === '/outcome' && method === 'POST') {
       return json(200, {ok: true, ...recordOutcome(storage, shortId, body, now)});
     }
+    if (rest === '/offline-charges' && method === 'POST') {
+      const done = recordOfflineCharge(storage, shortId, caller.till.till_id, body, now);
+      if (!done.recorded) return json(409, {ok: false, reason: 'double_spend', conflicts: done.conflicts});
+      return json(200, {ok: true, version: done.version});
+    }
     const slot = /^\/slots\/(\d{1,2})$/.exec(rest);
     if (slot && method === 'PUT') {
       return json(200, {ok: true, ...renewSlot(storage, shortId, Number(slot[1]), body)});
@@ -478,10 +513,14 @@ export class Registry {
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
         'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys', 'card_resets',
-        'till_claims', 'till_claim_budget',
+        'till_claims', 'till_claim_budget', 'offline_reports',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }
+      return json(200, {ok: true});
+    }
+    if (path === '/test/reset-notes') {
+      sql.exec('DELETE FROM notes');
       return json(200, {ok: true});
     }
     if (path === '/test/count') {
