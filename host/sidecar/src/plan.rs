@@ -600,9 +600,79 @@ pub fn nearest_card_amount(msat: u64, max_notes: u32, min_denom: u64, is_denom: 
     }
 }
 
+/// Most prices [`exact_prices_near`] checks with [`solve`] on each side of the asked one.
+const NEAR_TRIES: usize = 8;
+
+/// For a price `notes` cannot pay within `free_slots` change notes: the nearest prices, in
+/// multiples of `step` msat (1,000 for whole sats), that they can, as `(below, above)`. Kept cheap
+/// for a refusal at the counter: every set of at most [`MAX_INPUTS`] notes gives the price it would
+/// pay with no change (its value after the input fees, less the till's output fees, rounded down
+/// to `step`), and the nearest of those on each side are checked with [`solve`], at most
+/// [`NEAR_TRIES`] per side. `None` on a side where none checks.
+pub fn exact_prices_near(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64, step: u64) -> (Option<u64>, Option<u64>) {
+    let step = step.max(1);
+    let n = notes.len().min(MAX_CARD_NOTES);
+    let net = |a: u64| a.saturating_sub(fee(a));
+    let mut cands: Vec<u64> = vec![];
+    let mut add = |avail: u64| {
+        // The till's notes cost their own fees: t + fee_sum(binary(t)) == avail, near enough.
+        let mut t = avail;
+        for _ in 0..4 {
+            t = avail.saturating_sub(fee_sum(&binary(t), fee));
+        }
+        let p = t / step * step;
+        // The overpay slack lets a slightly lower price pay too; the step below is the next one.
+        for c in [p, p.saturating_sub(step)] {
+            if c > 0 && c != price {
+                cands.push(c);
+            }
+        }
+    };
+    for i in 0..n {
+        add(net(notes[i]));
+        for j in i + 1..n {
+            add(net(notes[i]) + net(notes[j]));
+            for k in j + 1..n {
+                add(net(notes[i]) + net(notes[j]) + net(notes[k]));
+            }
+        }
+    }
+    cands.sort_unstable();
+    cands.dedup();
+    let pays = |p: u64| solve(notes, p, free_slots, fee, min_denom).is_ok();
+    let below = cands.iter().rev().filter(|c| **c < price).take(NEAR_TRIES).copied().find(|c| pays(*c));
+    let above = cands.iter().filter(|c| **c > price).take(NEAR_TRIES).copied().find(|c| pays(*c));
+    (below, above)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drill's card (F6): ten notes, no slot for change. A price that needs change gets the
+    /// nearest prices the card pays exactly, in whole sats, and each of them does pay.
+    #[test]
+    fn prices_near_a_refused_one_pay_with_no_change() {
+        let notes = binary(30_000_000);
+        for fee in [&zero as FeeFn, &base100, &ppm1000] {
+            let m = min_econ(fee);
+            for price in [10_000u64, 777_000, 5_000_000] {
+                if solve(&notes, price, 0, fee, m).is_ok() {
+                    continue;
+                }
+                let (below, above) = exact_prices_near(&notes, price, 0, fee, m, 1_000);
+                assert!(below.is_some() || above.is_some(), "price {price}: no suggestion");
+                for p in below.into_iter().chain(above) {
+                    assert_eq!(p % 1_000, 0);
+                    let plan = solve(&notes, p, 0, fee, m).expect("a suggestion pays");
+                    assert!(plan.change.is_empty(), "{plan:?}");
+                }
+                assert!(below.is_none_or(|b| b < price) && above.is_none_or(|a| a > price));
+            }
+        }
+        // Nothing to suggest from a card with no notes.
+        assert_eq!(exact_prices_near(&[], 10_000, 0, &base100, 512, 1_000), (None, None));
+    }
 
     fn zero(_: u64) -> u64 {
         0

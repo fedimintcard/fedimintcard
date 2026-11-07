@@ -74,6 +74,7 @@ class PosFlowTest {
             declined(ChargeErrorCode.NO_CARD) to ErrorKind.NO_CARD,
             declined(ChargeErrorCode.INSUFFICIENT) to ErrorKind.INSUFFICIENT,
             declined(ChargeErrorCode.NO_EXACT_PLAN) to ErrorKind.NO_EXACT_PLAN,
+            declined(ChargeErrorCode.OFFLINE_NO_CHANGE_ROOM) to ErrorKind.OFFLINE_NO_CHANGE_ROOM,
             declined(ChargeErrorCode.UNDECIDED) to ErrorKind.UNDECIDED,
             declined(ChargeErrorCode.UNKNOWN) to ErrorKind.UNKNOWN,
             declined(ChargeErrorCode.RECOVERING) to ErrorKind.RECOVERING,
@@ -87,6 +88,14 @@ class PosFlowTest {
             assertEquals(k, (f.state as PosState.Error).kind)
         }
         for (c in ChargeErrorCode.values()) ErrorKind.from(c)
+    }
+    @Test fun noRoomForChangeOfflineKeepsTheSuggestionAndMovedNothing() {
+        val f = flow(); f.dispatch(PosEvent.CardPresent); f.charge()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), ChargeResult.Declined(ChargeErrorCode.OFFLINE_NO_CHANGE_ROOM, "d", 409, 12_000)))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.OFFLINE_NO_CHANGE_ROOM, e.kind)
+        assertEquals(12_000L, e.suggestedMsat)
+        assertNull(e.unresolvedRef)
     }
     @Test fun retryReusesClientRefAndGoesStraightToSigningWithCard() {
         val f = flow(); f.dispatch(PosEvent.CardPresent)

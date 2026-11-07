@@ -41,7 +41,8 @@ enum TillResult<T: Equatable>: Equatable {
 
 enum ChargeResult: Equatable {
     case success(ChargeReceipt)
-    case declined(code: ChargeErrorCode, detail: String, httpStatus: Int)
+    /// `suggestedMsat`: `suggested_msat`, a price the card can pay instead (`offline_no_change_room`).
+    case declined(code: ChargeErrorCode, detail: String, httpStatus: Int, suggestedMsat: Int64? = nil)
     case failed(TillError)
 }
 
@@ -275,7 +276,9 @@ enum TillParse {
             let o = try obj(body)
             guard let okv = o["ok"] as? NSNumber else { throw Bad(msg: "missing ok") }
             if !okv.boolValue {
-                return .declined(code: .fromWire(optStr(o, "error")), detail: optStr(o, "detail") ?? "", httpStatus: status)
+                let suggested = (o["suggested_msat"] as? NSNumber)?.int64Value
+                return .declined(code: .fromWire(optStr(o, "error")), detail: optStr(o, "detail") ?? "", httpStatus: status,
+                                 suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil })
             }
             return .success(ChargeReceipt(
                 saleId: optLong(o, "sale_id"),

@@ -301,7 +301,7 @@ class PosUi(
     }
 
     private fun renderError(e: PosState.Error) {
-        val (title, detail) = errorCopy(e.kind, e.detail)
+        val (title, detail) = errorCopy(e.kind, e.detail, e.suggestedMsat)
         errTitle.text = title
         errDetail.text = detail
         val unresolved = e.unresolvedRef != null
@@ -473,11 +473,18 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
     BalanceProblem.OTHER -> "Couldn't read the card" to "Hold the card to the phone and try again."
 }
 
-/** Title and detail copy for a charge error. */
-fun errorCopy(kind: ErrorKind, detail: String): Pair<String, String> = when (kind) {
+/**
+ * Title and detail copy for a charge error. [suggestedMsat] is the price the till says the card
+ * can pay instead, for `offline_no_change_room`.
+ */
+fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null): Pair<String, String> = when (kind) {
     ErrorKind.NO_CARD -> "Card not detected" to "Hold card flat on the phone's NFC antenna"
     ErrorKind.INSUFFICIENT -> "Card balance too low" to ""
     ErrorKind.NO_EXACT_PLAN -> "Card needs a top up" to ""
+    // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.
+    ErrorKind.OFFLINE_NO_CHANGE_ROOM -> "No room for change offline" to
+        ("This card can't take change while offline. " +
+            (suggestedMsat?.let { "Try ${formatSats(it)} sats" } ?: "Try another amount"))
     ErrorKind.DECLINED -> "Card declined" to detail
     ErrorKind.RELAY_UNREACHABLE -> "Phone relay unreachable" to "Check adb forward tcp:9876 tcp:9876"
     ErrorKind.BUSY -> "Till is busy" to "Try again in a moment"

@@ -40,7 +40,8 @@ sealed class TillResult<out T> {
 
 sealed class ChargeResult {
     data class Success(val receipt: ChargeReceipt) : ChargeResult()
-    data class Declined(val code: ChargeErrorCode, val detail: String, val httpStatus: Int) : ChargeResult()
+    /** [suggestedMsat]: `suggested_msat`, a price the card can pay instead (`offline_no_change_room`). */
+    data class Declined(val code: ChargeErrorCode, val detail: String, val httpStatus: Int, val suggestedMsat: Long? = null) : ChargeResult()
     data class Failed(val error: TillError) : ChargeResult()
 }
 
@@ -236,6 +237,7 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
             ChargeErrorCode.fromWire(o.optString("error", "")),
             if (o.isNull("detail")) "" else o.optString("detail", ""),
             httpStatus,
+            if (o.isNull("suggested_msat")) null else o.optLong("suggested_msat", 0L).takeIf { it > 0 },
         )
     } else {
         val w = o.optJSONArray("warnings")

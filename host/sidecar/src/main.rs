@@ -92,6 +92,13 @@ enum TillCmd {
         /// Most offline charges this till holds not yet settled.
         #[arg(long, env = "TILL_OFFLINE_CAP_COUNT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_COUNT)]
         offline_cap_count: usize,
+        /// Fresh keyed slots an online tap keeps an applet 3.0 card at, so it can take change
+        /// offline (0 turns the reserve off).
+        #[arg(long, env = "TILL_SPARE_TARGET", default_value_t = fedimint_card_sidecar::ops::SPARE_TARGET)]
+        spare_target: usize,
+        /// Most slots one tap keys for that reserve (a key takes about 320 ms on the card).
+        #[arg(long, env = "TILL_SPARE_KEYS_PER_TAP", default_value_t = fedimint_card_sidecar::ops::MAX_KEY_PER_TAP)]
+        spare_keys_per_tap: usize,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -339,13 +346,14 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count }) => {
+        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count, spare_target, spare_keys_per_tap }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
             let opts = fedimint_card_sidecar::till::ServeOptions {
                 esplora_url: Some(esplora_url.clone()).filter(|u| !u.trim().is_empty()),
                 offline: fedimint_card_sidecar::offline::OfflineConfig { cap_msat: *offline_cap_msat, cap_count: *offline_cap_count },
+                spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
             };
             fedimint_card_sidecar::till::serve_opts(
                 cw,

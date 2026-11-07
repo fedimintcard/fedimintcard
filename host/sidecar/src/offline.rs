@@ -64,12 +64,29 @@ pub enum OfflineError {
     NotGenuine(String),
     /// The till's unsettled offline total or count would pass its cap.
     Cap(String),
+    /// The price needs change and the card has no fresh KEYED slot (or too few) to take it
+    /// offline; an exact plan would exist with room. The nearest prices the card pays with the
+    /// slots it has, in whole sats (msat), below and above the asked one, when there are any.
+    NoChangeRoom { detail: String, below_msat: Option<u64>, above_msat: Option<u64> },
+}
+
+impl OfflineError {
+    /// The suggestion of [`OfflineError::NoChangeRoom`]: the nearer of its two prices, the
+    /// higher one on a tie.
+    pub fn suggested_msat(&self, price: u64) -> Option<u64> {
+        let OfflineError::NoChangeRoom { below_msat, above_msat, .. } = self else { return None };
+        match (below_msat, above_msat) {
+            (Some(b), Some(a)) => Some(if price - b < a - price { *b } else { *a }),
+            (b, a) => b.or(*a),
+        }
+    }
 }
 
 impl std::fmt::Display for OfflineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OfflineError::Unsupported(m) | OfflineError::NotReady(m) | OfflineError::NotGenuine(m) | OfflineError::Cap(m) => f.write_str(m),
+            OfflineError::NoChangeRoom { detail, .. } => f.write_str(detail),
         }
     }
 }
@@ -437,7 +454,32 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
     let fee_cfg = cw.wallet.mint_cfg.fee_consensus.clone();
     let fee = move |a: u64| fee_cfg.fee(Amount::from_msats(a)).msats;
     let amounts: Vec<u64> = notes.iter().map(|n| n.amount_msat).collect();
-    let plan = crate::plan::solve(&amounts, price, keyed.len(), &fee, cw.wallet.min_denom())?;
+    let min_denom = cw.wallet.min_denom();
+    let plan = match crate::plan::solve(&amounts, price, keyed.len(), &fee, min_denom) {
+        Ok(p) => p,
+        // Change is what the card has no room for offline (a fresh keyed slot per change note,
+        // and no till can key one without the registry): say so, with prices it can pay.
+        Err(crate::plan::PlanError::NoExactPlan { .. })
+            if crate::plan::solve(&amounts, price, crate::plan::MAX_CARD_NOTES, &fee, min_denom).is_ok() =>
+        {
+            let (below, above) = crate::plan::exact_prices_near(&amounts, price, keyed.len(), &fee, min_denom, 1_000);
+            let sats = |m: u64| if m % 1_000 == 0 { format!("{} sats", m / 1_000) } else { format!("{:.3} sats", m as f64 / 1_000.0) };
+            let tip = match (below, above) {
+                (None, None) => "try another amount".to_owned(),
+                (b, a) => format!("it can pay {} exactly", [b, a].into_iter().flatten().map(sats).collect::<Vec<_>>().join(" or ")),
+            };
+            bail!(OfflineError::NoChangeRoom {
+                detail: format!(
+                    "{} needs change the card has no room for while the till is offline ({} free slot(s) for change); {tip}",
+                    sats(price),
+                    keyed.len()
+                ),
+                below_msat: below,
+                above_msat: above,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
     let inputs: Vec<CardNote> = plan.inputs.iter().map(|&i| notes[i].clone()).collect();
     let till_msat: u64 = plan.till.iter().sum();
 

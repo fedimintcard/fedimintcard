@@ -5,7 +5,7 @@ import java.util.UUID
 enum class ErrorKind {
     BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NO_EXACT_PLAN,
     DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_BLOCKED, CARD_CHANGED,
-    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN;
+    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN;
 
     /** Outcome may already have happened: starts an unresolved sale. */
     val needsSalesCheck: Boolean get() = this == UNDECIDED || this == TIMEOUT_UNKNOWN
@@ -15,7 +15,7 @@ enum class ErrorKind {
      * the till has settled any earlier attempt with the same ref, so it proves nothing is pending.
      * `pin_required` and the ops codes are answered before that check, so they prove nothing.
      */
-    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NO_EXACT_PLAN, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_BLOCKED)
+    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NO_EXACT_PLAN, OFFLINE_NO_CHANGE_ROOM, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_BLOCKED)
 
     /** Whether trying the same sale again can help. */
     val retryable: Boolean get() = this != PIN_BLOCKED
@@ -45,7 +45,15 @@ sealed class PosState {
     data class WaitingForCard(val priceMsat: Long, val mustRemoveFirst: Boolean) : PosState()
     data class Signing(val priceMsat: Long, val chargeId: Int, val clientRef: String, val unresolvedRef: String? = null) : PosState()
     data class Receipt(val receipt: ChargeReceipt) : PosState()
-    data class Error(val priceMsat: Long, val kind: ErrorKind, val detail: String, val clientRef: String, val unresolvedRef: String? = null) : PosState()
+    /** [suggestedMsat]: a price the card can pay instead (`offline_no_change_room`), when the till said one. */
+    data class Error(
+        val priceMsat: Long,
+        val kind: ErrorKind,
+        val detail: String,
+        val clientRef: String,
+        val unresolvedRef: String? = null,
+        val suggestedMsat: Long? = null,
+    ) : PosState()
     /** [returnTo] is the unresolved Error to go back to, or null to go back to Entering. */
     data class Sales(val returnTo: Error? = null) : PosState()
 
@@ -330,13 +338,13 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
     }
 
     /** Unresolved is sticky: only success, a found sale or a nothing-moved code clears it. */
-    private fun error(s: PosState.Signing, kind: ErrorKind, detail: String): PosState.Error {
+    private fun error(s: PosState.Signing, kind: ErrorKind, detail: String, suggestedMsat: Long? = null): PosState.Error {
         val unresolved = when {
             kind.needsSalesCheck -> s.clientRef
             kind.definitive -> null
             else -> s.unresolvedRef
         }
-        return PosState.Error(s.priceMsat, kind, detail, s.clientRef, unresolved)
+        return PosState.Error(s.priceMsat, kind, detail, s.clientRef, unresolved, suggestedMsat)
     }
 
     fun dispatch(e: PosEvent): List<PosEffect> {
@@ -411,7 +419,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                         val left = parseTriesLeft(r.detail)
                         if (left == 0) state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, null)
                         else askPin(s.priceMsat, s.clientRef, wrongPin = true, triesLeft = left)
-                    } else state = error(s, ErrorKind.from(r.code), r.detail)
+                    } else state = error(s, ErrorKind.from(r.code), r.detail, r.suggestedMsat)
                     is ChargeResult.Failed -> state = error(
                         s,
                         when (r.error) {

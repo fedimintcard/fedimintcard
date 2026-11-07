@@ -399,7 +399,7 @@ struct ErrorScreen: View {
     @State private var confirmAbandon = false
 
     var body: some View {
-        let (title, detail) = errorCopy(info.kind, info.detail)
+        let (title, detail) = errorCopy(info.kind, info.detail, suggestedMsat: info.suggestedMsat)
         let unresolved = info.unresolvedRef != nil
         VStack(spacing: 10) {
             Spacer()

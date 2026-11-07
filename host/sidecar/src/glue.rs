@@ -279,11 +279,25 @@ pub struct CardWallet {
     /// Transactions `resolve_pending` abandoned (rejected, or never sent) during this wallet's
     /// life, oldest first. The offline sender reads it to tell a rejected offline charge.
     pub abandoned: Vec<String>,
+    /// The spare reserve an online tap keeps a 3.0 card at ([`CardWallet::card_spares`]).
+    pub spares: crate::ops::SpareConfig,
 }
 
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
-        Self { wallet, store, card, recovered_cashouts: vec![], crash_point: None, on_promote: None, ops: None, pin: None, headers: None, abandoned: vec![] }
+        Self {
+            wallet,
+            store,
+            card,
+            recovered_cashouts: vec![],
+            crash_point: None,
+            on_promote: None,
+            ops: None,
+            pin: None,
+            headers: None,
+            abandoned: vec![],
+            spares: crate::ops::SpareConfig::default(),
+        }
     }
 
     /// Open the card's PIN session for this selection.
@@ -481,14 +495,7 @@ impl CardWallet {
         let mut done = vec![];
         let slots: Vec<u8> = self.store.state.overwritable_slots().into_iter().filter(|s| self.may_renew(*s)).collect();
         for slot in slots {
-            let notes: Vec<NoteRec> = self.store.state.notes_on_current_key(slot).cloned().collect();
-            let mut safe = true;
-            for n in &notes {
-                if n.status == NoteStatus::Spent && !self.is_spent(nonce_from_hex(&n.nonce)?).await? {
-                    safe = false;
-                }
-            }
-            if !safe {
+            if !self.renewable(slot).await? {
                 continue;
             }
             match self.overwrite_slot(slot) {
@@ -497,6 +504,18 @@ impl CardWallet {
             }
         }
         Ok(done)
+    }
+
+    /// Whether every spent note on `slot`'s current key is spent on the federation too, so the
+    /// key holds nothing and may be overwritten.
+    pub(crate) async fn renewable(&self, slot: u8) -> Result<bool> {
+        let notes: Vec<NoteRec> = self.store.state.notes_on_current_key(slot).cloned().collect();
+        for n in &notes {
+            if n.status == NoteStatus::Spent && !self.is_spent(nonce_from_hex(&n.nonce)?).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     // ---------------------------------------------------------------- federation helpers
@@ -1724,10 +1743,11 @@ impl CardWallet {
         }
     }
 
-    /// What a tap does first on a 3.0 card: its clock, then the notes it lacks.
-    pub fn card_tick(&mut self) {
+    /// What a tap does first on a 3.0 card: its clock, then the notes it lacks. Answers how many
+    /// notes it wrote.
+    pub fn card_tick(&mut self) -> usize {
         self.sync_card_clock();
-        self.sync_card_notes();
+        self.sync_card_notes()
     }
 }
 
