@@ -1,5 +1,6 @@
 import {fromHex, toHex} from './cardkit';
 import {limitApdu, DEFAULT_DAILY_LIMIT_SAT, type OfflineSetup} from './cardSetup';
+import {LOOP, registryHeldWhat} from './strings';
 import {holdsPlace, installTap, type TapOptions} from './installTap';
 import {shortIdOf} from './store';
 import {FakeGpCard, J3R180_CHIP} from './testing/fakeGpCard';
@@ -24,6 +25,7 @@ const GET_STATE = 0x16;
 const SET_LIMIT = 0x18;
 const ATTEST_INIT = 0x30;
 const SET_CERT = 0x31;
+const SET_REGISTRY_KEY = 0x34;
 const SET_PIN = 0x41;
 const GEN_KEY = 0x10;
 
@@ -36,11 +38,14 @@ const certFor = (attestPub: readonly number[], slot0: readonly number[]) => [
   ...new Array(64).fill(0xab),
 ];
 
+/** The registry's certificate key: 04 and a 64-byte body. */
+const REGISTRY_KEY = [0x04, ...Array.from({length: 64}, (_, i) => (i * 5 + 3) & 0xff)];
+
 function setup(over: Partial<OfflineSetup> = {}) {
   const certify = jest.fn(async (attestPub: readonly number[], slot0: readonly number[]) =>
     certFor(attestPub, slot0),
   );
-  const offline: OfflineSetup = {limitMsat: DEFAULT_DAILY_LIMIT_SAT * 1000, certify, ...over};
+  const offline: OfflineSetup = {limitMsat: DEFAULT_DAILY_LIMIT_SAT * 1000, certify, registryKey: REGISTRY_KEY, ...over};
   return {certify, offline};
 }
 
@@ -91,7 +96,9 @@ test('a blank card: keys, then limit, attestation, certificate, and only then th
   expect(ins.lastIndexOf(GEN_KEY)).toBeLessThan(at(SET_LIMIT));
   expect(at(SET_LIMIT)).toBeLessThan(at(ATTEST_INIT));
   expect(at(ATTEST_INIT)).toBeLessThan(at(SET_CERT));
-  expect(at(SET_CERT)).toBeLessThan(at(SET_PIN));
+  expect(at(SET_CERT)).toBeLessThan(at(SET_REGISTRY_KEY));
+  expect(at(SET_REGISTRY_KEY)).toBeLessThan(at(SET_PIN));
+  expect(a.registryKey).toEqual(REGISTRY_KEY);
 });
 
 test('no limit is 0 msat', async () => {
@@ -230,4 +237,98 @@ test('a certificate for another key is not taken for this card’s', async () =>
   expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'attest'}));
   expect(r.setup && !r.setup.ok && r.setup.reason).toMatch(/another key/);
   expect(other.applet!.pin).toBeNull();
+});
+
+describe('SET_REGISTRY_KEY', () => {
+  test('is sent once, as CLA B0 INS 34 with the 65-byte key, after SET_CERT and before SET_PIN', async () => {
+    const card = new FakeGpCard();
+    await installTap(card.transceive, tapOptions(setup().offline));
+    expect(card.log.filter(a => a[0] === 0xb0 && a[1] === SET_REGISTRY_KEY)).toEqual([
+      [0xb0, 0x34, 0, 0, 65, ...REGISTRY_KEY],
+    ]);
+  });
+
+  test.each([['before'], ['after']] as const)('a lift %s it is finished by the next tap', async when => {
+    const card = new FakeGpCard();
+    card.pull(a => a[0] === 0xb0 && a[1] === SET_REGISTRY_KEY, when);
+    await expect(installTap(card.transceive, tapOptions(setup().offline))).rejects.toThrow('Tag was lost');
+    expect(card.applet!.pin).toBeNull();
+    const keyed = card.applet!.registryKey ?? null;
+    expect(keyed === null).toBe(when === 'before');
+    const idAfterLift = slot0Id(card);
+
+    card.reset();
+    const second = setup();
+    const r = await installTap(card.transceive, tapOptions(second.offline));
+    expect(r.setup?.ok).toBe(true);
+    expect(card.applet!.registryKey).toEqual(REGISTRY_KEY);
+    expect(card.applet!.pin).toBe(PIN);
+    // the certificate was already taken: not asked for again, and slot 0 is kept
+    expect(second.certify).not.toHaveBeenCalled();
+    expect(slot0Id(card)).toBe(idAfterLift);
+    // the lifted APDU is in the log too; a key the card already holds is not sent again
+    expect(b0(card).filter(i => i === SET_REGISTRY_KEY)).toHaveLength(when === 'before' ? 2 : 1);
+  });
+
+  test('a card that already holds the key is not sent it again', async () => {
+    const card = new FakeGpCard();
+    card.pull(a => a[0] === 0xb0 && a[1] === SET_PIN, 'before');
+    await expect(installTap(card.transceive, tapOptions(setup().offline))).rejects.toThrow('Tag was lost');
+    expect(card.applet!.registryKey).toEqual(REGISTRY_KEY);
+    card.reset();
+    const before = b0(card).filter(i => i === SET_REGISTRY_KEY).length;
+    const r = await installTap(card.transceive, tapOptions(setup().offline));
+    expect(r.setup?.ok).toBe(true);
+    expect(b0(card).filter(i => i === SET_REGISTRY_KEY)).toHaveLength(before);
+  });
+
+  test('an older 3.0 card (58-byte GET_STATE) skips it and is finished', async () => {
+    const card = new FakeGpCard();
+    card.stateLength = 58;
+    const r = await installTap(card.transceive, tapOptions(setup().offline));
+    expect(r.setup?.ok).toBe(true);
+    expect(b0(card)).not.toContain(SET_REGISTRY_KEY);
+    expect(card.applet!.cert).not.toBeNull();
+    expect(card.applet!.pin).toBe(PIN);
+  });
+
+  test('a key that is not 04 and 64 bytes is never sent to the card', async () => {
+    const card = new FakeGpCard();
+    const bad = setup({registryKey: [0x02, ...new Array(64).fill(1)]});
+    const r = await installTap(card.transceive, tapOptions(bad.offline));
+    expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'attest', registry: true}));
+    expect(b0(card)).not.toContain(SET_REGISTRY_KEY);
+    expect(card.applet!.pin).toBeNull();
+    expect(holdsPlace({lost: false, result: r})).toBe(true);
+  });
+});
+
+describe('a registry failure is not reported as a lifted card', () => {
+  test('a refusal of the certificate carries the registry flag and its own reason', async () => {
+    const card = new FakeGpCard();
+    const refusing = setup({
+      certify: async () => {
+        throw new Error('the card has live notes under another key');
+      },
+    });
+    const r = await installTap(card.transceive, tapOptions(refusing.offline));
+    expect(r.setup).toEqual(
+      expect.objectContaining({
+        ok: false,
+        step: 'attest',
+        registry: true,
+        reason: 'the card has live notes under another key',
+      }),
+    );
+    const held = r.setup && !r.setup.ok ? {reason: r.setup.reason, registry: r.setup.registry === true} : {};
+    expect(registryHeldWhat(held)).toBe(
+      "The registry refused the card's certificate: the card has live notes under another key",
+    );
+  });
+
+  test('a card-side failure (and a really lifted tap) keeps the lifted-card text', () => {
+    expect(registryHeldWhat({})).toBeNull();
+    expect(registryHeldWhat({reason: 'SET_LIMIT answered 6985'})).toBeNull();
+    expect(LOOP.heldWhat).toMatch(/left the phone/);
+  });
 });

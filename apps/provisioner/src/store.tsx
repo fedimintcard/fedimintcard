@@ -810,6 +810,8 @@ export function StoreProvider({
         apiRef.current?.resetCheck?.(shortId, chip) ?? missing('the reset check'),
       attestCard: (shortId, attestPub, slot0) =>
         apiRef.current?.attestCard?.(shortId, attestPub, slot0) ?? missing('the card certificate'),
+      registryCertKey: () =>
+        apiRef.current?.registryCertKey?.() ?? missing('the registry key'),
       completeReset: completion =>
         apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };

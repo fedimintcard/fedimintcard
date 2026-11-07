@@ -43,7 +43,7 @@ import {fromHex, toHex} from '../cardkit';
 import {holdsPlace, installTap} from '../installTap';
 import {generatePin, useAttemptedPin, useBatchPin, usePinReveal} from '../pin';
 import {phaseMessage, setCardMessage, withCard} from '../session';
-import {CALM, LOOP, STATE} from '../strings';
+import {CALM, LOOP, STATE, registryHeldWhat} from '../strings';
 import {
   useLoop,
   type CardPhase,
@@ -139,9 +139,12 @@ export function LoopScreen({
   const [line, setLine] = useState<string | null>(null);
   const [stopShown, setStopShown] = useState<CardStop | null>(null);
   // A tap that kept the batch's place for the same card: what to say about it.
-  const [held, setHeld] = useState<{kind?: CardStop; reason?: string} | null>(null);
+  const [held, setHeld] = useState<{kind?: CardStop; reason?: string; registry?: boolean} | null>(null);
   const attempted = useAttemptedPin();
   const cancelled = useRef(false);
+  // The registry's certificate key (SET_REGISTRY_KEY), fetched once before a
+  // tap and kept for the batch: the NFC session makes no network call for it.
+  const registryKey = useRef<number[] | null>(null);
   // Ends the wait for a card: `withCard` cancels the NFC request on abort.
   const abort = useRef<AbortController | null>(null);
   // The last finished card's generated PIN, read from the reveal slot. Bumped
@@ -168,6 +171,20 @@ export function LoopScreen({
       return;
     }
     cancelled.current = false;
+    if (registryKey.current === null) {
+      setBusy(true);
+      setLine(LOOP.fetchingKey);
+      try {
+        registryKey.current = fromHex(await ops.registryCertKey());
+      } catch (e) {
+        // Before any card is touched: nothing is recorded, nothing is lost.
+        setLine(LOOP.registryKeyFailed(e instanceof Error ? e.message : String(e)));
+        setBusy(false);
+        return;
+      }
+      setBusy(false);
+    }
+    const certKey = registryKey.current;
     // The previous card's PIN leaves the screen as this card's tap starts.
     reveal.wipe();
     setShownPin(null);
@@ -223,6 +240,7 @@ export function LoopScreen({
             resumeCheck: (chip, shortId) => ops.resumeCheck(chip, shortId),
             offline: {
               limitMsat: dailyLimitOf(config) * 1000,
+              registryKey: certKey,
               certify: async (attestPub, slot0) =>
                 fromHex(await ops.attestCard(shortIdOf(slot0), toHex([...attestPub]), toHex([...slot0]))),
             },
@@ -284,7 +302,9 @@ export function LoopScreen({
         keepAttempt();
         setHeld(
           installed.ok
-            ? {reason: setup && !setup.ok ? setup.reason : undefined}
+            ? setup && !setup.ok
+              ? {reason: setup.reason, registry: setup.registry === true}
+              : {}
             : {kind: installed.kind, reason: installed.reason},
         );
         setLine(LOOP.sameCard);
@@ -555,7 +575,7 @@ export function LoopScreen({
             what={
               held.kind === 'noManagerKeys'
                 ? stopWhat(held.kind, held.reason)
-                : LOOP.heldWhat
+                : registryHeldWhat(held) ?? LOOP.heldWhat
             }
             now={LOOP.heldNow}
             testID="loop-held"

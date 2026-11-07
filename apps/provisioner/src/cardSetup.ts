@@ -50,6 +50,8 @@ export const INS_SET_LIMIT = 0x18;
 export const INS_ATTEST_INIT = 0x30;
 export const INS_SET_CERT = 0x31;
 export const INS_GET_CERT = 0x32;
+/** SET_REGISTRY_KEY: the registry's certificate key, 65 bytes; only before SET_PIN. */
+export const INS_SET_REGISTRY_KEY = 0x34;
 
 /** The most a certificate can be (FedimintCardApplet.CERT_MAX). */
 export const CERT_MAX = 160;
@@ -114,6 +116,12 @@ export type SetupResult =
       readonly step: SetupStep;
       readonly sw: number | null;
       readonly reason: string;
+      /**
+       * Set when the registry, not the card, is why the step stopped (it refused,
+       * was unreachable, or answered something unusable): `reason` is then the
+       * registry's own words and the card is only waiting.
+       */
+      readonly registry?: true;
     };
 
 export function selectApdu(): number[] {
@@ -275,6 +283,14 @@ export interface OfflineSetup {
     attestPub: readonly number[],
     slot0: readonly number[],
   ) => Promise<readonly number[]>;
+  /**
+   * The registry's certificate key (`GET /registry/cert-key`): 65 bytes,
+   * uncompressed, starting 04. Fetched before the tap, so no network call
+   * is made while the card is on the phone for it. A card that answers
+   * GET_STATE with 58 bytes (an older 3.0 build) has no SET_REGISTRY_KEY
+   * and is never sent it.
+   */
+  readonly registryKey: readonly number[];
 }
 
 /**
@@ -408,19 +424,22 @@ export async function finishCard(
   return {ok: true, keys, generated, slotCount: counted.count};
 }
 
-const attestFailed = (sw: number | null, reason: string): SetupResult => ({
+const attestFailed = (sw: number | null, reason: string, registry?: true): SetupResult => ({
   ok: false,
   step: 'attest',
   sw,
   reason,
+  ...(registry ? {registry} : {}),
 });
 
 /**
- * SET_LIMIT, then the certificate. Every step is safe to run again on a card
+ * SET_LIMIT, then the certificate, then the registry's key. Every step is safe to run again on a card
  * a lifted tap left part-way, so the next tap's resume sends them all again:
  * SET_LIMIT may be repeated before the PIN; ATTEST_INIT may be repeated until
  * SET_CERT, and is skipped once the card holds a certificate (GET_STATE byte
  * 56), which is then only checked to be over this card's slot 0 key.
+ * SET_REGISTRY_KEY may be repeated before the PIN; GET_STATE byte 58 says it
+ * is done, and a 58-byte GET_STATE (an older 3.0 build) skips it.
  * Returns the failure, or null when the card is ready for its PIN.
  */
 async function offlineSteps(
@@ -436,7 +455,33 @@ async function offlineSteps(
   if (state.sw !== SW_OK || state.body.length < 58) {
     return attestFailed(state.sw, `GET_STATE answered ${hex(state.sw)}`);
   }
-  if (state.body[56] !== 0) {
+  const certified = await certificateStep(tx, offline, slot0, state.body[56] !== 0);
+  if (certified) {
+    return certified;
+  }
+  // GET_STATE of a build before SET_REGISTRY_KEY is 58 bytes: nothing to set.
+  // Byte 58 is 1 once the key is set; the step is then done and not repeated.
+  if (state.body.length >= 59 && state.body[58] !== 1) {
+    const key = offline.registryKey;
+    if (key.length !== 65 || key[0] !== 0x04) {
+      return attestFailed(null, `the registry's certificate key is ${key.length} bytes, not 65 starting 04`, true);
+    }
+    const set = await exchange(tx, [CLA, INS_SET_REGISTRY_KEY, 0x00, 0x00, 65, ...key]);
+    if (set.sw !== SW_OK) {
+      return attestFailed(set.sw, `SET_REGISTRY_KEY answered ${hex(set.sw)}`);
+    }
+  }
+  return null;
+}
+
+/** The certificate: checked when the card holds one, otherwise ATTEST_INIT, the registry, SET_CERT. */
+async function certificateStep(
+  tx: Transceiver,
+  offline: OfflineSetup,
+  slot0: readonly number[],
+  hasCert: boolean,
+): Promise<SetupResult | null> {
+  if (hasCert) {
     const cert = await exchange(tx, [CLA, INS_GET_CERT, 0x00, 0x00, 0x00]);
     const same =
       cert.sw === SW_OK &&
@@ -464,10 +509,10 @@ async function offlineSteps(
   try {
     cert = await offline.certify(init.body, slot0);
   } catch (e) {
-    return attestFailed(null, `the registry gave no certificate: ${e instanceof Error ? e.message : String(e)}`);
+    return attestFailed(null, e instanceof Error ? e.message : String(e), true);
   }
   if (cert.length < 1 || cert.length > CERT_MAX) {
-    return attestFailed(null, `the registry's certificate is ${cert.length} bytes, not 1 to ${CERT_MAX}`);
+    return attestFailed(null, `the registry's certificate is ${cert.length} bytes, not 1 to ${CERT_MAX}`, true);
   }
   const set = await exchange(tx, [CLA, INS_SET_CERT, 0x00, 0x00, cert.length, ...cert]);
   if (set.sw !== SW_OK) {

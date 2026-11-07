@@ -67,6 +67,8 @@ export interface AppletState {
   attest?: number[] | null;
   /** The certificate, once SET_CERT took it. */
   cert?: number[] | null;
+  /** The registry's certificate key (65 bytes) once SET_REGISTRY_KEY took it. */
+  registryKey?: number[] | null;
 }
 
 interface Instance {
@@ -584,6 +586,12 @@ export class FakeGpCard {
 
   private attestations = 0;
 
+  /**
+   * GET_STATE's length: 59 from the applet that has SET_REGISTRY_KEY, 58 before
+   * it (an older 3.0 build, which answers INS 34 with `6D 00`).
+   */
+  stateLength: 58 | 59 = 59;
+
   /** Applet 3.0's GET_STATE, SET_LIMIT, ATTEST_INIT, SET_CERT and GET_CERT (FedimintCardApplet). */
   private offlineApplet(a: AppletState, ins: number, data: number[]): number[] {
     const beforePinAndCert = a.pin === null && !a.cert;
@@ -592,6 +600,9 @@ export class FakeGpCard {
         const out: number[] = a.slots.map(s => (s ? 1 : 0));
         out.push(0, 0, 0, 0, 0, 0, 0, 0, ...(a.limit ?? new Array(8).fill(0)));
         out.push(...new Array(8).fill(0), a.cert ? a.cert.length : 0, a.attest ? 1 : 0);
+        if (this.stateLength === 59) {
+          out.push(a.registryKey ? 1 : 0);
+        }
         return ok(out);
       }
       case 0x18:
@@ -624,6 +635,18 @@ export class FakeGpCard {
         return ok();
       case 0x32:
         return a.cert ? ok(a.cert) : sw(0x6a83);
+      case 0x34:
+        if (this.stateLength !== 59) {
+          return sw(0x6d00);
+        }
+        if (data.length !== 65 || data[0] !== 0x04) {
+          return sw(0x6700);
+        }
+        if (a.pin !== null) {
+          return sw(0x6985);
+        }
+        a.registryKey = [...data];
+        return ok();
       default:
         return sw(0x6d00);
     }

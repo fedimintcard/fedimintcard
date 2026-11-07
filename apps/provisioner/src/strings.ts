@@ -99,10 +99,14 @@ export const LOOP = {
   tryNext: 'Set that card aside. Press Install when the next one is ready.',
   /** A tap lifted while the card's keys or PIN were written: the same card finishes it. */
   sameCard: 'Hold the same card to the phone and press Finish to complete it.',
+  fetchingKey: 'Asking the registry for its certificate key…',
   finishCard: (n: number) => `Finish card ${n}`,
   heldTitle: 'Card not finished',
   heldName: 'Tap the same card again',
   heldWhat: 'The card left the phone while its keys or its PIN were being written.',
+  /** The registry, not the card, stopped the finish: its own reason, verbatim. */
+  registryRefused: (reason: string) => `The registry refused the card's certificate: ${reason}`,
+  registryKeyFailed: (reason: string) => `The registry's certificate key could not be fetched: ${reason}`,
   heldNow: 'Nothing is lost and it did not use up a place in this batch. Hold the same card to the phone again to finish it.',
   allDone: 'Every card in this batch has been tried. Open the summary.',
   stopping: 'Stopping after this step…',
@@ -128,6 +132,15 @@ export const LOOP = {
   end: 'End batch',
   summary: 'Batch summary',
 };
+
+/**
+ * What a held tap says when the registry, not a lifted card, stopped it
+ * (`SetupResult.registry`): its own reason. Null for a tap that really was
+ * lifted, which keeps `LOOP.heldWhat`.
+ */
+export function registryHeldWhat(held: {reason?: string; registry?: boolean}): string | null {
+  return held.registry && held.reason ? LOOP.registryRefused(held.reason) : null;
+}
 
 export const CALM = {
   pulled: 'The card left the phone before it finished.',

@@ -20,12 +20,17 @@ The install tap, after the card manager is locked to the card's own keys: GEN_KE
 slots 0-7, then `SET_LIMIT` (the batch's offline limit per day, set in BatchSetup,
 default 10,000 sat, 0 for none), `ATTEST_INIT` (the card makes a P-256 key),
 `POST /registry/cards/:short_id/attestation` with the operator session (the registry
-answers the certificate), `SET_CERT`, then `SET_PIN` and `VERIFY_PIN`. A tap lifted
+answers the certificate), `SET_CERT`, `SET_REGISTRY_KEY` (the registry's certificate
+key from the public `GET /registry/cert-key`, fetched once per batch before the first
+tap so the NFC session makes no network call for it; skipped when `GET_STATE` byte 58
+is already 1, and on a card whose `GET_STATE` is 58 bytes), then `SET_PIN` and `VERIFY_PIN`. A tap lifted
 anywhere in it is finished by the next tap of the same card: the offline steps are
 idempotent before the PIN (`SET_LIMIT` again, `ATTEST_INIT` again until `SET_CERT`
-took), and a card that already holds its certificate keeps its keys, because the
+took, `SET_REGISTRY_KEY` until byte 58 says it is set), and a card that already holds its certificate keeps its keys, because the
 certificate is over slot 0's key and cannot be replaced. A card that answers SELECT
-below 3.0 is finished the old way, without them.
+below 3.0 is finished the old way, without them. When the registry (not the card)
+stops the finish, the screen shows the registry's own reason ("The registry refused the
+card's certificate: …"), not the lifted-card text.
 
 That is the whole surface, plus Settings → Reset a card (docs/OPS-PLAN.md O5).
 There is no card browser and no load-test bench: those live in `host/sidecar`

@@ -118,8 +118,8 @@ describe('the runs themselves', () => {
     expect(run.result?.ok).toBe(false);
     expect(run.result?.kind).toBe('pulled');
     expect(run.result?.phase).toBe('load');
-    // 38 blocks (applet 3.0, tools/cardkit/make-assets.py): the lift is before the end
-    expect(run.result?.blocks).toEqual({at: 12, of: 38});
+    // 41 blocks (applet 3.0, tools/cardkit/make-assets.py): the lift is before the end
+    expect(run.result?.blocks).toEqual({at: 12, of: 41});
     expect(stopFor(run)).toBe('pulled');
   });
 
@@ -202,7 +202,7 @@ describe('the fake card is a card, not a shortcut', () => {
     expect(events).toContain('phase:load');
     expect(events).toContain('block');
     // a phase event per phase, and one block event per LOAD that was confirmed
-    expect(events.filter(e => e === 'block')).toHaveLength(38);
+    expect(events.filter(e => e === 'block')).toHaveLength(41);
     expect(run.result?.timings.every(t => t.apdus >= 0)).toBe(true);
     expect(run.result?.apdus.length).toBeGreaterThan(0);
   });

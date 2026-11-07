@@ -253,3 +253,22 @@ test('the attestation call posts the card’s key with the operator session and 
   // a refusal (409: the card has live notes under another key) is an error, not a certificate
   await expect(api.attestCard('0a0b0c0e', attestPub, SLOT0)).rejects.toThrow();
 });
+
+test('the registry certificate key is fetched with no session and checked: 130 lower-case hex starting 04', async () => {
+  const origin = 'https://registry.test';
+  const seen: {path: string; auth?: string}[] = [];
+  let key: unknown = '04' + 'ab'.repeat(64);
+  const fetcher = async (url: string, init?: RequestInit) => {
+    const path = String(url).replace(origin, '');
+    seen.push({path, auth: (init?.headers as any)?.Authorization ?? (init?.headers as any)?.authorization});
+    if (path === '/registry/cert-key') return post({ok: true, key});
+    throw new Error('unexpected ' + path);
+  };
+  const api = new RegistryStoreApi(new RegistryClient({baseUrl: origin, fetcher}), origin);
+  expect(await api.registryCertKey()).toBe('04' + 'ab'.repeat(64));
+  expect(seen).toEqual([{path: '/registry/cert-key', auth: undefined}]);
+  for (const bad of ['04' + 'AB'.repeat(64), '02' + 'ab'.repeat(64), '04' + 'ab'.repeat(63), '04' + 'ab'.repeat(65), 'zz', 7, undefined]) {
+    key = bad;
+    await expect(api.registryCertKey()).rejects.toThrow(/malformed/);
+  }
+});

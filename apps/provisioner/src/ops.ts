@@ -96,6 +96,11 @@ export interface CardOps {
    * (hex, 130 bytes) over a card's attestation key (65 bytes hex, uncompressed).
    */
   attestCard(shortId: string, attestPub: string, slot0: string): Promise<string>;
+  /**
+   * `GET /registry/cert-key`: the registry's certificate key, 130 lower-case
+   * hex chars (uncompressed P-256, starting 04). Public.
+   */
+  registryCertKey(): Promise<string>;
 }
 
 /** `GET /tills`: one of the operator's tills. Epoch ms; `revoked_at` null while it may charge. */

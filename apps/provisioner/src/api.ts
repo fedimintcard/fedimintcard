@@ -50,6 +50,7 @@ export type ServiceOperation =
   | 'sign-out'
   | 'create-batch'
   | 'attestation'
+  | 'cert-key'
   | 'post-card'
   | 'list-cards'
   | 'list-federations'
@@ -551,6 +552,21 @@ export class RegistryClient extends HttpTransport {
   }
 
   /**
+   * GET /registry/cert-key — the key the registry's certificates verify under
+   * (public, no token): `{ok, key}`, 130 lower-case hex chars, an uncompressed
+   * P-256 point. The card is given it (SET_REGISTRY_KEY) so it can check a
+   * release. A reply that is not exactly that is never passed on.
+   */
+  async registryCertKey(): Promise<string> {
+    const json = await this.get('/registry/cert-key', {operation: 'cert-key'});
+    const key = json.key;
+    if (typeof key !== 'string' || !/^04[0-9a-f]{128}$/.test(key)) {
+      throw new ApiServiceError("the registry's certificate key is malformed", 200, undefined, 'cert-key');
+    }
+    return key;
+  }
+
+  /**
    * GET /registry/cards/:id/reset-check?chip= — what ops holds for the card.
    * The chip lets ops find a card it knows only by its chip (a `needsReset`
    * install), and say whether the holder's PIN is needed at all.
@@ -893,6 +909,10 @@ export class RegistryStoreApi implements CardOps, TillOps {
 
   attestCard(shortId: string, attestPub: string, slot0: string): Promise<string> {
     return this.client.attestCard(this.token(), shortId, attestPub, slot0);
+  }
+
+  registryCertKey(): Promise<string> {
+    return this.client.registryCertKey();
   }
 
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {

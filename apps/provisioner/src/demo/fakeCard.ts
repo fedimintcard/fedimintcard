@@ -210,6 +210,7 @@ export function fakeCard(
   let limit: number[] = new Array(8).fill(0);
   let attest: number[] | null = null;
   let cert: number[] | null = null;
+  let registryKey = false;
   function offline(ins: number, data: number[]): number[] {
     switch (ins) {
       case 0x16:
@@ -220,6 +221,7 @@ export function fakeCard(
           ...new Array(8).fill(0), // spent in the window
           cert ? cert.length : 0,
           attest ? 1 : 0,
+          registryKey ? 1 : 0,
         ]);
       case 0x18:
         if (data.length !== 8) {
@@ -241,6 +243,12 @@ export function fakeCard(
           return sw(0x6700);
         }
         cert = [...data];
+        return ok();
+      case 0x34:
+        if (data.length !== 65 || data[0] !== 0x04) {
+          return sw(0x6700);
+        }
+        registryKey = true;
         return ok();
       default:
         return cert ? ok(cert) : sw(0x6a83);
@@ -289,7 +297,8 @@ export function fakeCard(
       case 0x18:
       case 0x30:
       case 0x31:
-      case 0x32: {
+      case 0x32:
+      case 0x34: {
         // applet 3.0's offline commands (CLA B0), over a fresh applet: no key is
         // made, no PIN set, so the limit, the attestation key and the certificate
         // are the only state. Mirrors FedimintCardApplet's rules.
