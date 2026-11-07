@@ -212,6 +212,66 @@ describe('POST /registry/cards/:id/attestation', () => {
     }
   });
 
+  describe('before the card is registered (the install tap asks first)', () => {
+    async function batchOf(token: string) {
+      const res = await post('/registry/batches', token, {federation_id: FED, count: 5, pin_policy: 'batch', load_sha256: SHA});
+      return ((await res.json()) as {batch: {batch_id: number}}).batch.batch_id;
+    }
+    const register = (token: string, batchId: number, shortId: string, slotKeys = slots(shortId)) =>
+      post('/registry/cards', token, {
+        short_id: shortId, batch_id: batchId, installed_at: 1_760_000_000_000, load_sha256: SHA,
+        pin_set: true, pin_policy: 'batch', notes_issued: 0, slot_pubkeys: slotKeys,
+      });
+
+    it('certifies the slot 0 key the card names, and the card keeps that certificate once registered', async () => {
+      const token = await signIn();
+      const shortId = '1e1b01ef';
+      const slot0 = slots(shortId)[0]!;
+      const attest = await attestKey();
+      const res = await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: attest, slot0});
+      expect(res.status).toBe(200);
+      const {cert} = (await res.json()) as {cert: string};
+      expect(cert.slice(2, 66)).toBe(slot0);
+      // the same request again before registering: the same bytes
+      const again = (await (await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: attest, slot0})).json()) as {cert: string};
+      expect(again.cert).toBe(cert);
+      expect((await register(token, await batchOf(token), shortId)).status).toBe(200);
+      // registered: the card's own row answers the same certificate, so it was adopted
+      const stored = (await (await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: attest})).json()) as {cert: string};
+      expect(stored.cert).toBe(cert);
+    });
+
+    it('is not adopted by a card registered with another slot 0', async () => {
+      const token = await signIn();
+      const shortId = '2e2b02ef';
+      const attest = await attestKey();
+      const {cert} = (await (await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: attest, slot0: slots(shortId)[0]})).json()) as {cert: string};
+      const other = slots(shortId);
+      other[0] = key(9, shortId);
+      expect((await register(token, await batchOf(token), shortId, other)).status).toBe(200);
+      const fresh = (await (await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: attest})).json()) as {cert: string};
+      expect(fresh.cert).not.toBe(cert);
+      expect(fresh.cert.slice(2, 66)).toBe(other[0]);
+    });
+
+    it('refuses a slot 0 that is not the short id’s, a missing one, and another operator’s set-up', async () => {
+      const token = await signIn();
+      const attest = await attestKey();
+      expect((await post('/registry/cards/3e3b03ef/attestation', token, {attest_pub: attest, slot0: slots('ffffffff')[0]})).status).toBe(400);
+      expect((await post('/registry/cards/3e3b03ef/attestation', token, {attest_pub: attest})).status).toBe(404);
+      expect((await post('/registry/cards/3e3b03ef/attestation', token, {attest_pub: attest, slot0: slots('3e3b03ef')[0]})).status).toBe(200);
+      await hook('/test/operator', {name: 'other', password: PASSWORD});
+      const other = await signIn('other');
+      expect((await post('/registry/cards/3e3b03ef/attestation', other, {attest_pub: attest, slot0: slots('3e3b03ef')[0]})).status).toBe(409);
+    });
+
+    it('refuses a registered card’s slot 0 that is not the key named', async () => {
+      const token = await signIn();
+      const shortId = await cardWithNote(token, '4e4b04ef');
+      expect((await post(`/registry/cards/${shortId}/attestation`, token, {attest_pub: await attestKey(), slot0: key(9, shortId)})).status).toBe(409);
+    });
+  });
+
   it('is 401 with no session, 403 for a till, 404 for another operator’s card', async () => {
     const token = await signIn();
     const till = await newTill(token);

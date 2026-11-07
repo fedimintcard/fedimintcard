@@ -27,6 +27,7 @@ import {
   NotFound,
 } from './http';
 import {isChip, linkChip} from './managerKeys';
+import {adoptPendingAttestation} from './offline';
 import {checkNotes, putMintKeys} from './mint';
 
 /**
@@ -376,6 +377,7 @@ export function insertCard(sql: Sql, operatorId: number, card: CardBody, now: nu
   if (card.chip !== null) {
     linkChip(sql, card.chip, card.short_id, operatorId);
   }
+  adoptPendingAttestation(sql, operatorId, card.short_id, card.slot_pubkeys[0]);
   return {...card, received_at: now, reset_at: null, replaced_by: null};
 }
 

@@ -103,14 +103,28 @@ export async function recordAttestation(
   r: Record<string, unknown>,
 ): Promise<{cert: string}> {
   const sql = storage.sql;
+  const attest = await parseAttestKey(r.attest_pub);
+  const attestHex = toHex(attest);
+  const named = r.slot0 === undefined ? null : r.slot0;
+  if (named !== null && (!isHex(named, 32) || named !== named.toLowerCase())) {
+    throw new BadRequest('slot0 must be slot 0\u2019s x-only key, 32 bytes lower-case hex');
+  }
+  const exists = sql.exec('SELECT 1 FROM cards WHERE short_id = ?', shortId).toArray().length > 0;
+  if (!exists) {
+    // The install tap asks before the app registers the card: certify the key the card
+    // names, held until the card is stored with that slot 0 (`adoptPendingAttestation`).
+    if (named === null) throw new NotFound(`no card ${shortId}`);
+    return recordPendingAttestation(storage, secret, operatorId, shortId, named, attest, attestHex, Date.now());
+  }
   if (cardOwner(sql, shortId) !== operatorId) {
     throw new NotFound(`no card ${shortId}`);
   }
-  const attest = await parseAttestKey(r.attest_pub);
-  const attestHex = toHex(attest);
   const read = () => {
     const slot0 = sql.exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot = 0', shortId).toArray()[0];
     if (!slot0) throw new Conflict(`card ${shortId} has no slot 0 key on record`);
+    if (named !== null && String(slot0.pubkey) !== named) {
+      throw new Conflict(`card ${shortId}'s slot 0 on record is not the key named`);
+    }
     const row = sql.exec('SELECT attest_pub, attest_cert FROM cards WHERE short_id = ?', shortId).one();
     return {slot0: String(slot0.pubkey), pub: row.attest_pub as string | null, cert: row.attest_cert as string | null};
   };
@@ -138,6 +152,59 @@ export async function recordAttestation(
     sql.exec('UPDATE cards SET attest_pub = ?, attest_cert = ? WHERE short_id = ?', attestHex, cert, shortId);
     return {cert};
   });
+}
+
+/** Pending certificates older than this are dropped: an install tap that never registered its card. */
+const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function recordPendingAttestation(
+  storage: DurableObjectStorage,
+  secret: string | undefined,
+  operatorId: number,
+  shortId: string,
+  slot0: string,
+  attest: Uint8Array,
+  attestHex: string,
+  now: number,
+): Promise<{cert: string}> {
+  const sql = storage.sql;
+  if (slot0.slice(-8) !== shortId) {
+    throw new BadRequest(`slot0 is not card ${shortId}'s key (a short id is its last 8 hex digits)`);
+  }
+  const held = () => {
+    sql.exec('DELETE FROM pending_attestations WHERE created_at < ?', now - PENDING_TTL_MS);
+    const row = sql.exec('SELECT * FROM pending_attestations WHERE short_id = ?', shortId).toArray()[0];
+    if (!row) return null;
+    if (Number(row.operator_id) !== operatorId) throw new Conflict(`card ${shortId} is being set up by another operator`);
+    return row.slot0 === slot0 && row.attest_pub === attestHex ? String(row.attest_cert) : null;
+  };
+  const first = held();
+  if (first) return {cert: first};
+  const cert = await buildCert(secret, slot0, attest);
+  return storage.transactionSync(() => {
+    const again = held();
+    if (again) return {cert: again};
+    sql.exec(
+      `INSERT OR REPLACE INTO pending_attestations (short_id, operator_id, slot0, attest_pub, attest_cert, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      shortId, operatorId, slot0, attestHex, cert, now,
+    );
+    return {cert};
+  });
+}
+
+/**
+ * Inside `insertCard`'s transaction: a certificate the install tap asked for moves onto the new
+ * card row when it was this operator's and its slot 0 is the card's. Any other pending row for
+ * the short id is dropped: it certified a key the stored card does not have.
+ */
+export function adoptPendingAttestation(sql: SqlStorage, operatorId: number, shortId: string, slot0: string | undefined): void {
+  const row = sql.exec('SELECT * FROM pending_attestations WHERE short_id = ?', shortId).toArray()[0];
+  if (!row) return;
+  sql.exec('DELETE FROM pending_attestations WHERE short_id = ?', shortId);
+  if (Number(row.operator_id) === operatorId && slot0 !== undefined && row.slot0 === slot0) {
+    sql.exec('UPDATE cards SET attest_pub = ?, attest_cert = ? WHERE short_id = ?', row.attest_pub, row.attest_cert, shortId);
+  }
 }
 
 /* ------------------------------------------------------------------------- */

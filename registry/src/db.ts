@@ -240,6 +240,21 @@ export const MIGRATIONS: readonly string[] = [
   );
   CREATE INDEX offline_reports_card ON offline_reports (short_id, created_at);
   `,
+  // v11: a certificate asked for in the install tap, before the Setup app has
+  // registered the card (it registers after the tap). Held by short id until
+  // POST /registry/cards stores a card whose slot 0 is the same key, then moved
+  // onto the card row. Not in the backup: like a claim, it is useless after a
+  // restore, and the app asks again.
+  `
+  CREATE TABLE pending_attestations (
+    short_id    TEXT    PRIMARY KEY,
+    operator_id INTEGER NOT NULL,
+    slot0       TEXT    NOT NULL,
+    attest_pub  TEXT    NOT NULL,
+    attest_cert TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

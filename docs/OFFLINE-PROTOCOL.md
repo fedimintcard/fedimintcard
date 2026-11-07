@@ -39,8 +39,12 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
 - `GET /registry/cert-key` — public: `{ok, key}`, the certificate key's public point, 65 bytes
   uncompressed hex. A till fetches it when it connects and keeps it in `till-ops.json`
   (`cert_key`); offline it uses the kept copy.
-- `POST /registry/cards/:short_id/attestation` — operator session: `{attest_pub}` (65 bytes hex,
-  uncompressed) → `{ok, cert}` (130 bytes hex, § 2). The card must have its slot 0 key on record.
+- `POST /registry/cards/:short_id/attestation` — operator session: `{attest_pub, slot0}` (65 bytes
+  hex, uncompressed; slot 0's x-only key, 32 bytes hex) → `{ok, cert}` (130 bytes hex, § 2). The
+  install tap asks before the Setup app has registered the card, so for an unregistered short id
+  the registry certifies the `slot0` named (whose last 8 hex digits must be the short id) and holds
+  the certificate until `POST /registry/cards` stores a card with that slot 0, then moves it onto
+  the card. For a registered card `slot0`, if sent, must match the one on record.
   Stores `attest_pub` on the card; the same key again answers the same certificate; a different
   key is 409 while the card has live or pending notes.
 - `POST /cards/:short_id/offline-charges` — till token: an offline charge reported after the
