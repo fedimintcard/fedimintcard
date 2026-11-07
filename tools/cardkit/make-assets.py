@@ -40,8 +40,8 @@ ASSET = os.path.join(HERE, 'gp/load-file.ts')
 # The pins. None means "not pinned yet": the first run fills them in from the
 # CAP and refuses --check. They are never a guess -- run the script on a real
 # CAP and copy what it prints.
-LOAD_FILE_SIZE = 6039
-LOAD_FILE_SHA256 = 'c687b3ed8b0b8afa24188798093ccf07147b88277d7eb8fce6143bc49589200d'
+LOAD_FILE_SIZE = 9293
+LOAD_FILE_SHA256 = '51f6518b67f5ece7811e332fd0c1c9fc658a9956331d1de26923c9af1cfb245a'
 
 # ant-javacard's CAPFile.componentNames, in the order getCode writes them.
 # Descriptor and Debug are skipped, as getCode(false) skips them.

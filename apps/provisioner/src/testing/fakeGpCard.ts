@@ -61,6 +61,12 @@ export interface AppletState {
   tries: number;
   blocked: boolean;
   verified: boolean;
+  /** Applet 3.0 (32 slots): the day's limit in msat, 8 bytes BE; absent until SET_LIMIT. */
+  limit?: number[];
+  /** The attestation public point (65 bytes) once ATTEST_INIT made it. */
+  attest?: number[] | null;
+  /** The certificate, once SET_CERT took it. */
+  cert?: number[] | null;
 }
 
 interface Instance {
@@ -266,9 +272,9 @@ export class FakeGpCard {
     if (aid !== CARD) {
       return ok();
     }
-    // The applet's version: 2.1 has 32 slots, 2.0 had 8.
+    // The applet's version: 3.0 has 32 slots, 2.0 had 8.
     const slots = this.instances.get(aid)?.applet?.slots.length ?? 8;
-    return ok([0x02, slots === 32 ? 0x01 : 0x00]);
+    return ok(slots === 32 ? [0x03, 0x00] : [0x02, 0x00]);
   }
 
   private derive(seq: number[]) {
@@ -468,7 +474,7 @@ export class FakeGpCard {
       ...(module === CARD
         ? {
             applet: {
-              // What INSTALL puts on the card is the load file the app carries: applet 2.1.
+              // What INSTALL puts on the card is the load file the app carries: applet 3.0.
               slots: new Array(32).fill(null),
               pin: null,
               tries: 3,
@@ -571,6 +577,53 @@ export class FakeGpCard {
         }
         return sw(0x63c0 | a.tries);
       }
+      default:
+        return a.slots.length === 32 ? this.offlineApplet(a, ins, data) : sw(0x6d00);
+    }
+  }
+
+  private attestations = 0;
+
+  /** Applet 3.0's GET_STATE, SET_LIMIT, ATTEST_INIT, SET_CERT and GET_CERT (FedimintCardApplet). */
+  private offlineApplet(a: AppletState, ins: number, data: number[]): number[] {
+    const beforePinAndCert = a.pin === null && !a.cert;
+    switch (ins) {
+      case 0x16: {
+        const out: number[] = a.slots.map(s => (s ? 1 : 0));
+        out.push(0, 0, 0, 0, 0, 0, 0, 0, ...(a.limit ?? new Array(8).fill(0)));
+        out.push(...new Array(8).fill(0), a.cert ? a.cert.length : 0, a.attest ? 1 : 0);
+        return ok(out);
+      }
+      case 0x18:
+        if (data.length !== 8) {
+          return sw(0x6700);
+        }
+        if (a.pin !== null) {
+          return sw(0x6985);
+        }
+        a.limit = [...data];
+        return ok();
+      case 0x30:
+        if (data.length !== 0) {
+          return sw(0x6700);
+        }
+        if (!beforePinAndCert) {
+          return sw(0x6985);
+        }
+        this.attestations++;
+        a.attest = [0x04, ...new Array(64).fill(0).map((_, i) => (this.attestations * 7 + i) & 0xff)];
+        return ok(a.attest);
+      case 0x31:
+        if (data.length < 1 || data.length > 160) {
+          return sw(0x6700);
+        }
+        if (!beforePinAndCert || !a.attest) {
+          return sw(0x6985);
+        }
+        a.cert = [...data];
+        return ok();
+      case 0x32:
+        return a.cert ? ok(a.cert) : sw(0x6a83);
       default:
         return sw(0x6d00);
     }

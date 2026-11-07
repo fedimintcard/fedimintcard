@@ -152,7 +152,7 @@ final class PosController: ObservableObject {
                 guard let self else { pin?.wipe(); return }
                 let r = await self.client.charge(priceMsat: price, clientRef: ref, pin: pin, cardLink: linkId) // wipes pin
                 switch r {
-                case .success(let rc): self.endCardJob(message: "Paid \(formatSats(rc.priceMsat)) sats", ok: true)
+                case .success(let rc): self.endCardJob(message: receiptHeadline(rc), ok: true)
                 case .declined(let code, _, _) where code == .wrongPin: self.endCardJob(message: "Wrong PIN", ok: false)
                 default: self.endCardJob(message: "Payment didn't go through", ok: false)
                 }

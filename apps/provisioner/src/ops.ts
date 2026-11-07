@@ -91,6 +91,11 @@ export interface CardOps {
   /** `chip`, the CPLC id the tap read, lets ops find a card it has no row for. */
   resetCheck(shortId: string, chip?: string): Promise<ResetCheck>;
   completeReset(completion: ResetCompletion): Promise<ResetRecorded>;
+  /**
+   * `POST /registry/cards/:short_id/attestation`: the registry's certificate
+   * (hex, 130 bytes) over a card's attestation key (65 bytes hex, uncompressed).
+   */
+  attestCard(shortId: string, attestPub: string): Promise<string>;
 }
 
 /** `GET /tills`: one of the operator's tills. Epoch ms; `revoked_at` null while it may charge. */

@@ -59,6 +59,11 @@ export const SETUP = {
     'The card refuses to sign without its PIN.\n\nOne PIN for the batch: you type it once here and every card gets it. It is never stored or sent anywhere but the card.\n\nA PIN per card: each card gets a fresh PIN, shown with the finished card until you start the next one. Write it down, or hand it over with the card, before you go on. It is not shown again.',
   pinPlaceholder: (max: number) => `4 to ${max} digits`,
   perCardSub: 'Shown with each finished card. Write it down before the next.',
+  limit: 'Offline limit',
+  limitHelp:
+    'What a card may spend in a day when the till cannot reach the internet, in sat. The card enforces it itself and cannot be talked past it. 0 means no limit.\n\nEvery card in this batch gets it, once, as it is set up; it cannot be changed afterwards.',
+  limitLabel: 'Sat per day',
+  limitValue: (sat: number) => (sat === 0 ? 'No limit' : `${sat.toLocaleString('en-US')} sat a day`),
   pinBatchShort: 'One for the batch',
   pinPerCardShort: 'One per card',
   review: 'Review batch',
@@ -74,6 +79,7 @@ export const SETUP = {
   needFederation: 'Add the federation to continue.',
   needCount: (max: number) => `Enter 1 to ${max} cards.`,
   needPin: 'Enter a batch PIN, or choose a PIN per card.',
+  needLimit: 'Enter the offline limit in sat, or 0 for none.',
   buildLine: (load: string) => `Card software ${load}`,
 };
 
@@ -150,6 +156,7 @@ export const STATE = {
 
 export const SUMMARY = {
   title: 'Summary',
+  limit: 'Offline limit',
   headline: (programmed: number, of: number) =>
     `${programmed} of ${of} ${of === 1 ? 'card' : 'cards'} programmed`,
   programmed: 'Programmed',

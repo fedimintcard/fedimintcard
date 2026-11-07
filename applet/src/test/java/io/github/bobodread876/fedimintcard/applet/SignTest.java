@@ -85,15 +85,19 @@ class SignTest {
         assertTrue(odd >= 2 && even >= 2, "both parities covered: odd=" + odd + " even=" + even);
     }
 
+    /**
+     * 3.0: a key signs once; the same message again is the stored signature, not a new one, so no
+     * key ever computes two signatures. That each computed signature takes a fresh nonce is
+     * SchnorrHWSignTest#signUsesAFreshNonce.
+     */
     @Test
-    void freshNonceSameMessageSignaturesDifferAndVerify() {
+    void theSameMessageAgainIsTheStoredSignature() {
         CardTestSupport c = new CardTestSupport();
         byte[] pub = c.genKey(0);
         byte[] msg = CardTestSupport.fill(32, 1);
         byte[] a = c.signPin(CardTestSupport.DEFAULT_PIN, 0, msg), b = c.signPin(CardTestSupport.DEFAULT_PIN, 0, msg);
-        assertFalse(Arrays.equals(a, b));
+        assertArrayEquals(a, b);
         assertTrue(Bip340.verify(pub, msg, a));
-        assertTrue(Bip340.verify(pub, msg, b));
     }
 
     /** Anti-vacuity: the verifier rejects a corrupted card signature. */

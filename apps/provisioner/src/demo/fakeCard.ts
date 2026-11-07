@@ -12,9 +12,11 @@
  *   host authentication is proven the same way on a phone as in this fake. A
  *   wrong key set therefore fails where a real card fails it.
  * - **The framing is this card's.** The Fedimint applet (applet/…/FedimintCardApplet.java)
- *   selects with `02 00` (VERSION_MAJOR/MINOR) and answers CLA `B0`; an unkeyed
- *   slot answers `69 85` and anything else `6D 00`. Cashu's `B0 01` GET_INFO
- *   does not exist here, and neither does a `02 01` version. The provisioning
+ *   selects with `03 00` (VERSION_MAJOR/MINOR) and answers CLA `B0`; an unkeyed
+ *   slot answers `69 85`, the offline commands (GET_STATE, SET_LIMIT,
+ *   ATTEST_INIT, SET_CERT, GET_CERT) answer as applet 3.0 does, and anything
+ *   else `6D 00`. Cashu's `B0 01` GET_INFO does not exist here, and neither
+ *   does a `02 01` version. The provisioning
  *   writes (ISD, INSTALL, LOAD) are the JavaCard's generic ones.
  *
  * Timings are the iPhone column of the 2026-10-18 hardware report, so the demo
@@ -119,10 +121,10 @@ function containsAid(payload: number[], aid: readonly number[]): boolean {
 }
 
 /**
- * The applet's own answer to a selected card, at its version: `02 01` (applet 2.1) from
+ * The applet's own answer to a selected card, at its version: `03 00` (applet 3.0) from
  * VERSION_MAJOR/VERSION_MINOR, which cardkit's fedimint plan checks on SELECT.
  */
-const APLET_VERSION = [0x02, 0x01];
+const APLET_VERSION = [0x03, 0x00];
 
 /**
  * A `Transceiver` wired to a fake card in `profile`. `speed` scales every delay
@@ -204,6 +206,47 @@ export function fakeCard(
     return tlv[0] === 0x4f && tlv.length >= 3 ? tlv.slice(2, 2 + tlv[1]) : tlv;
   };
 
+  // Applet 3.0's offline state, as a fresh applet holds it.
+  let limit: number[] = new Array(8).fill(0);
+  let attest: number[] | null = null;
+  let cert: number[] | null = null;
+  function offline(ins: number, data: number[]): number[] {
+    switch (ins) {
+      case 0x16:
+        return ok([
+          ...new Array(32).fill(0), // no slot has a key
+          ...new Array(8).fill(0), // now, window
+          ...limit,
+          ...new Array(8).fill(0), // spent in the window
+          cert ? cert.length : 0,
+          attest ? 1 : 0,
+        ]);
+      case 0x18:
+        if (data.length !== 8) {
+          return sw(0x6700);
+        }
+        limit = [...data];
+        return ok();
+      case 0x30:
+        if (cert) {
+          return sw(0x6985);
+        }
+        attest = [0x04, ...new Array(64).fill(0x5a)];
+        return ok(attest);
+      case 0x31:
+        if (cert || !attest) {
+          return sw(0x6985);
+        }
+        if (data.length < 1 || data.length > 160) {
+          return sw(0x6700);
+        }
+        cert = [...data];
+        return ok();
+      default:
+        return cert ? ok(cert) : sw(0x6a83);
+    }
+  }
+
   async function tx(apdu: number[]): Promise<number[]> {
     const ins = apdu[1];
     const wrapped = apdu[0] === 0x84;
@@ -234,12 +277,27 @@ export function fakeCard(
 
       case 0x11: {
         // the applet's GET_PUB (CLA B0): `69 85` until the slot is keyed, `6B 00`
-        // past applet 2.1's 32 slots
+        // past applet 3.0's 32 slots
         await at(DELAYS.plainApdu);
         if (apdu[0] !== 0xb0 || installed === 'none') {
           return sw(0x6d00);
         }
         return sw(apdu[2] >= 32 ? 0x6b00 : 0x6985);
+      }
+
+      case 0x16:
+      case 0x18:
+      case 0x30:
+      case 0x31:
+      case 0x32: {
+        // applet 3.0's offline commands (CLA B0), over a fresh applet: no key is
+        // made, no PIN set, so the limit, the attestation key and the certificate
+        // are the only state. Mirrors FedimintCardApplet's rules.
+        await at(DELAYS.plainApdu);
+        if (apdu[0] !== 0xb0 || installed === 'none') {
+          return sw(0x6d00);
+        }
+        return offline(ins, data);
       }
 
       case 0x50: {

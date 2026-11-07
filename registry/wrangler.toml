@@ -26,6 +26,12 @@ preview_urls = false
 # Without it /registry/manager-keys answers 503 and the phone installs nothing.
 # Keep a copy offline: the escrow in the backup covers every card already
 # issued, the master is what re-derives a set if the escrow is ever lost.
+#
+# Offline payment certificates (src/offline.ts, docs/OFFLINE-PROTOCOL.md § 2) are signed with
+# CERT_SIGNING_KEY: a P-256 private key, PKCS#8 DER, base64. Tills pin its public point
+# (GET /registry/cert-key), so rotating it invalidates every issued certificate; keep a
+# copy offline. Without it the certificate routes answer 503.
+#   openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 | tr -d '\n' | npx wrangler secret put CERT_SIGNING_KEY
 
 [[durable_objects.bindings]]
 name = "REGISTRY"

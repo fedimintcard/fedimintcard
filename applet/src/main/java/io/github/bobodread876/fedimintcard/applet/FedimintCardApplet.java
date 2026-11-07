@@ -37,7 +37,8 @@ import javacard.security.Signature;
  *                                        PIN is set); a slot holding a note or owed change is never re-keyed (6985)
  * 11 GET_PUB     P1=slot Lc=0         -> 32 bytes x-only pubkey
  * 12 SIGN        P1=slot Lc=32 (hash) -> 64 bytes R.x || s (after VERIFY_PIN). A NOTE slot: counted against the day's limit,
- *                                        then spent. A SPENT slot: the same hash only. Else 6985; over the limit 6A95
+ *                                        then spent. A SPENT slot: the same hash only, answered with the signature it
+ *                                        gave. Else 6985; over the limit 6A95
  * 13 STATE_KEY   P1=P2=0              -> 32 bytes (after VERIFY_PIN)
  * 14 SET_NOTE    P1=slot Lc=56        amount (8, msat, big-endian) || federation signature (48). A KEYED slot, or a CHANGE
  *                                        slot finished (same amount); the slot becomes NOTE
@@ -219,6 +220,8 @@ public final class FedimintCardApplet extends Applet {
     private final byte[] state = new byte[SLOTS];
     private final byte[] notes = new byte[(short) (SLOTS * NOTE_LEN)];
     private final byte[] spentHash = new byte[(short) (SLOTS * 32)];
+    /** The one signature a spent slot gave: a repeat of its transaction is answered from here, not signed again. */
+    private final byte[] spentSig = new byte[(short) (SLOTS * 64)];
     private final byte[] openings = new byte[(short) (SLOTS * OPEN_LEN)];
     private final byte[] clock = new byte[CK_LEN];
     /** The certificate: its length (1), then up to {@link #CERT_MAX} bytes. */
@@ -685,6 +688,7 @@ public final class FedimintCardApplet extends Applet {
             // again, nor a spent hash that a new key would inherit.
             state[s] = ST_EMPTY;
             Util.arrayFillNonAtomic(spentHash, (short) (s * 32), (short) 32, (byte) 0);
+            Util.arrayFillNonAtomic(spentSig, (short) (s * 64), (short) 64, (byte) 0);
             Util.arrayFillNonAtomic(notes, (short) (s * NOTE_LEN), NOTE_LEN, (byte) 0);
             Util.arrayFillNonAtomic(openings, (short) (s * OPEN_LEN), OPEN_LEN, (byte) 0);
             privs[s].clearKey();
@@ -750,7 +754,9 @@ public final class FedimintCardApplet extends Applet {
             if (Util.arrayCompare(buf, ISO7816.OFFSET_CDATA, spentHash, (short) (s * 32), (short) 32) != 0) {
                 ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
             }
-            schnorr.sign(privs[s], pubs[s], buf, ISO7816.OFFSET_CDATA, buf, (short) 0);
+            // Answered from storage, as cashucard's SPEND_ALL_AGAIN: the key computes one
+            // signature in its life, which leaves a power analysis nothing to compare.
+            Util.arrayCopyNonAtomic(spentSig, (short) (s * 64), buf, (short) 0, (short) 64);
             apdu.setOutgoingAndSend((short) 0, (short) 64);
             return;
         }
@@ -763,6 +769,7 @@ public final class FedimintCardApplet extends Applet {
         schnorr.sign(privs[s], pubs[s], buf, ISO7816.OFFSET_CDATA, buf, (short) 0);
         JCSystem.beginTransaction();
         Util.arrayCopy(x, X_HASH, spentHash, (short) (s * 32), (short) 32);
+        Util.arrayCopy(buf, (short) 0, spentSig, (short) (s * 64), (short) 64);
         state[s] = ST_SPENT;
         Util.arrayCopy(x, X_WINDOW, clock, CK_WINDOW, (short) 4);
         Util.arrayCopy(x, X_SPENT, clock, CK_SPENT, (short) 8);
@@ -836,9 +843,30 @@ public final class FedimintCardApplet extends Applet {
 
     /** Receives exactly {@code len} bytes of data, or 6700. */
     private static void receiveExactly(APDU apdu, short len) {
-        if (apdu.setIncomingAndReceive() != len || apdu.getIncomingLength() != len) {
+        if (receiveAll(apdu) != len) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
+    }
+
+    /**
+     * The whole data field, however the transport delivers it: over contactless the J3R180 gave
+     * a 130-byte SET_CERT in pieces, and one setIncomingAndReceive took only the first (F0).
+     * Answers the length received, which is the Lc when all of it came.
+     */
+    private static short receiveAll(APDU apdu) {
+        // setIncomingAndReceive first: getIncomingLength is not defined before it (JC 3.0.5, jCardSim)
+        short got = apdu.setIncomingAndReceive();
+        short want = apdu.getIncomingLength();
+        short off = (short) (ISO7816.OFFSET_CDATA + got);
+        while (got < want) {
+            short n = apdu.receiveBytes(off);
+            if (n <= 0) {
+                break;
+            }
+            got += n;
+            off += n;
+        }
+        return got;
     }
 
     /**
@@ -1057,7 +1085,7 @@ public final class FedimintCardApplet extends Applet {
 
     /** SET_CERT: the registry's certificate over this card's keys, once, before the PIN. */
     private void setCert(APDU apdu, byte[] buf) {
-        short len = apdu.setIncomingAndReceive();
+        short len = receiveAll(apdu);
         if (len < 1 || len > CERT_MAX || apdu.getIncomingLength() != len) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }

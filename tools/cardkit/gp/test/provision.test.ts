@@ -581,7 +581,7 @@ describe('provision: the Fedimint card', () => {
     );
   });
 
-  it('fails verify when SELECT lands on the opener: 9000 with no data is not 02 01', async () => {
+  it('fails verify when SELECT lands on the opener: 9000 with no data is not 03 00', async () => {
     const card = new FakeCard();
     const tx: Transceiver = async apdu => {
       // a card whose card applet was not instantiated: the whole-AID SELECT
@@ -594,7 +594,7 @@ describe('provision: the Fedimint card', () => {
     const r = await provision(tx, PLAN, options());
     assert.equal(r.ok, false);
     assert.equal(r.phase, 'verify');
-    assert.match(r.reason ?? '', /answered .*not 0201/);
+    assert.match(r.reason ?? '', /answered .*not 0300/);
   });
 });
 
@@ -630,7 +630,7 @@ describe('provision: the fake card', () => {
     // and the card applet, whose AID also begins with the package's, still answers as itself
     assert.deepEqual(
       await card.transceive(selectAid(CARD_AID)),
-      [0x02, 0x01, 0x90, 0x00],
+      [0x03, 0x00, 0x90, 0x00],
     );
   });
 

@@ -23,6 +23,9 @@ export default defineConfig({
           BACKUP_RECIPIENT: 'age1thskleqxjwaf5peh9adq5wz5jxmenhrhgwhl0c5j4xgyhwf9tf2q6zh9mt',
           // A test-only card-manager master (32 bytes); a deployment's is a secret.
           CARD_MANAGER_MASTER: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+          // A test-only certificate key (P-256, PKCS#8 DER, base64); a deployment's is a secret.
+          CERT_SIGNING_KEY:
+            'MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/DE99yTWjzuL0myUB+lNYpsjgqGgJmcYbFbMXdvmlAyhRANCAAQIbYkb8A3XqINlBNh01WAPEmU18pSBqxEKSzweT7w+cMYmjleQPK0dg4r0O5Y1lzupnaZLOs2ZE30sjuEqzDT1',
         },
         r2Buckets: ['BACKUPS'],
       },

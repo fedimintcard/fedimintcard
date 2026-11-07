@@ -7,10 +7,11 @@
  *   probe → CPLC → keys from ops → install (factory or own keys) → rotate →
  *   GET_PUB past the last slot (the card's count, 8 or 32) → GEN_KEY on slots
  *   0-7 (every slot of an 8-slot card; a till keys a 32-slot card's 8-31
- *   later, split keying) → SET_PIN, VERIFY_PIN
+ *   later, split keying) → SET_LIMIT, ATTEST_INIT, the registry's certificate,
+ *   SET_CERT (applet 3.0) → SET_PIN, VERIFY_PIN
  *
  * A card the probe finds keyed is never installed over. If it is ours with
- * no PIN (a tap lifted during GEN_KEY, SET_PIN or VERIFY_PIN), it is resumed:
+ * no PIN (a tap lifted during GEN_KEY, the offline steps, SET_PIN or VERIFY_PIN), it is resumed:
  *
  *   probe (slot 0, PIN state) → CPLC → keys from ops → ops' resume check →
  *   one INITIALIZE UPDATE proving the card's own keys → GEN_KEY P2=01 on 0-7,
@@ -83,6 +84,7 @@ import {
   finishVerified,
   probeCard,
   type CardProbe,
+  type OfflineSetup,
   type SetupResult,
   type SetupStep,
 } from './cardSetup';
@@ -158,7 +160,11 @@ export function holdsPlace(seen: SeenTap): boolean {
   if (!installed.ok) {
     return seen.result.resumable === true;
   }
-  return setup !== null && !setup.ok && (setup.step === 'select' || setup.step === 'keys');
+  return (
+    setup !== null &&
+    !setup.ok &&
+    (setup.step === 'select' || setup.step === 'keys' || setup.step === 'attest')
+  );
 }
 
 export interface TapOptions {
@@ -173,6 +179,11 @@ export interface TapOptions {
   /** This tap's own steps: `managerKeys` before the install, `rotate` after it. */
   readonly onPhase?: (phase: 'managerKeys' | 'rotate') => void;
   readonly onSetupStep?: (step: SetupStep) => void;
+  /**
+   * Applet 3.0's offline steps (limit, certificate), sent after the keys and
+   * before the PIN; a card that answers SELECT below 3.0 gets none.
+   */
+  readonly offline?: OfflineSetup;
   /** The chip, as soon as it is read: the loop keys the PIN it sends by it. */
   readonly onChip?: (chip: string) => void;
   /**
@@ -453,6 +464,7 @@ async function resumeTap(
     if (sentPin === null) {
       const setup = await finishCard(tx, options.pin, options.onSetupStep, {
         rekey: true,
+        offline: options.offline,
       });
       return {
         installed: {ok: true},
@@ -526,7 +538,9 @@ async function installRotateFinish(
     }
     rotated = rotation.rotated === true;
   }
-  const setup = await finishCard(tx, options.pin, options.onSetupStep);
+  const setup = await finishCard(tx, options.pin, options.onSetupStep, {
+    offline: options.offline,
+  });
   return {installed: {ok: true}, setup, rotated};
 }
 

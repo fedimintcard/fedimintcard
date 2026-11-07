@@ -44,6 +44,17 @@ export const INS_GEN_KEY = 0x10;
 export const INS_GET_PUB = 0x11;
 export const INS_VERIFY_PIN = 0x40;
 const INS_SET_PIN = 0x41;
+/** Applet 3.0 (docs/OFFLINE-PROTOCOL.md § 1). */
+export const INS_GET_STATE = 0x16;
+export const INS_SET_LIMIT = 0x18;
+export const INS_ATTEST_INIT = 0x30;
+export const INS_SET_CERT = 0x31;
+export const INS_GET_CERT = 0x32;
+
+/** The most a certificate can be (FedimintCardApplet.CERT_MAX). */
+export const CERT_MAX = 160;
+/** The default offline limit for a day, in sat; 0 is none (SET_LIMIT). */
+export const DEFAULT_DAILY_LIMIT_SAT = 10_000;
 
 export const SW_OK = 0x9000;
 /** GET_PUB: the slot is empty. SET_PIN: a PIN is already set. */
@@ -82,7 +93,7 @@ export function pinStatusOf(sw: number | null): PinStatus | null {
 }
 
 /** Where a failed setup stopped, for the batch row. */
-export type SetupStep = 'select' | 'keys' | 'setPin' | 'verifyPin';
+export type SetupStep = 'select' | 'keys' | 'attest' | 'setPin' | 'verifyPin';
 
 export type SetupResult =
   | {
@@ -111,6 +122,20 @@ export function selectApdu(): number[] {
 
 export function keyApdu(ins: number, slot: number): number[] {
   return [CLA, ins, slot, 0x00, 0x00];
+}
+
+/** SET_LIMIT: the day's limit in msat as 8 bytes, big-endian. Arithmetic, not BigInt. */
+export function limitApdu(msat: number): number[] {
+  if (!Number.isSafeInteger(msat) || msat < 0) {
+    throw new Error('limitApdu: the limit must be a non-negative integer of msat');
+  }
+  const bytes: number[] = new Array(8).fill(0);
+  let rest = msat;
+  for (let i = 7; i >= 0 && rest > 0; i--) {
+    bytes[i] = rest % 256;
+    rest = Math.floor(rest / 256);
+  }
+  return [CLA, INS_SET_LIMIT, 0x00, 0x00, 8, ...bytes];
 }
 
 export function pinApdu(ins: number, pin: string): number[] {
@@ -238,8 +263,22 @@ export async function probeSlotCount(
   return {ok: false, sw: SW_OK, reason: `slot count: the card has a slot ${most}, more than this app knows`};
 }
 
+export interface OfflineSetup {
+  /** The offline limit for a day, in msat; 0 for none. */
+  readonly limitMsat: number;
+  /**
+   * Asks the registry for the certificate over the card's attestation key
+   * (`POST /registry/cards/:short_id/attestation`): the 65-byte point and
+   * slot 0's x-only key in, the certificate out.
+   */
+  readonly certify: (
+    attestPub: readonly number[],
+    slot0: readonly number[],
+  ) => Promise<readonly number[]>;
+}
+
 /**
- * Keys, then the PIN. Each step is reported through `onStep` before its first
+ * Keys, then (applet 3.0) the offline limit and certificate, then the PIN. Each step is reported through `onStep` before its first
  * APDU, so the loop can name where the card is.
  */
 export async function finishCard(
@@ -256,6 +295,12 @@ export async function finishCard(
     readonly rekey?: boolean;
     /** Slots to key from 0, capped at the card's count; `INSTALL_TAP_KEY_SLOTS` when absent. */
     readonly keySlots?: number;
+    /**
+     * The offline steps of an applet 3.0 card, between the keys and SET_PIN:
+     * SET_LIMIT, ATTEST_INIT, the registry's certificate, SET_CERT. Absent,
+     * or on a card that answers SELECT below 3.0, none is sent.
+     */
+    readonly offline?: OfflineSetup;
   } = {},
 ): Promise<SetupResult> {
   if (!/^[0-9]{4,8}$/.test(pin)) {
@@ -281,14 +326,26 @@ export async function finishCard(
   if (!counted.ok) {
     return {ok: false, step: 'keys', sw: counted.sw, reason: counted.reason};
   }
+  // SELECT answers the applet's version; 3.0 and later have the offline steps.
+  const offline = selected.body.length >= 2 && selected.body[0] >= 3 ? options.offline : undefined;
+  // A certificate already on the card is over slot 0's key and cannot be
+  // replaced, so a card that has one keeps the keys it has: re-keying would
+  // orphan the certificate.
+  let rekey = options.rekey === true;
+  if (rekey && offline) {
+    const state = await exchange(tx, [CLA, INS_GET_STATE, 0x00, 0x00, 0x00]);
+    if (state.sw === SW_OK && state.body.length >= 58 && state.body[56] !== 0) {
+      rekey = false;
+    }
+  }
   const keySlots = Math.min(counted.count, options.keySlots ?? INSTALL_TAP_KEY_SLOTS);
   const keys: number[][] = [];
   const generated: number[] = [];
   for (let slot = 0; slot < keySlots; slot++) {
-    let reply = options.rekey
+    let reply = rekey
       ? await exchange(tx, [CLA, INS_GEN_KEY, slot, 0x01, 0x00])
       : await exchange(tx, keyApdu(INS_GET_PUB, slot));
-    if (options.rekey) {
+    if (rekey) {
       if (reply.sw === SW_OK) {
         generated.push(slot);
       }
@@ -311,6 +368,14 @@ export async function finishCard(
       };
     }
     keys.push(reply.body);
+  }
+
+  if (offline) {
+    onStep('attest');
+    const failed = await offlineSteps(tx, offline, keys[0]);
+    if (failed) {
+      return failed;
+    }
   }
 
   onStep('setPin');
@@ -341,6 +406,74 @@ export async function finishCard(
   }
 
   return {ok: true, keys, generated, slotCount: counted.count};
+}
+
+const attestFailed = (sw: number | null, reason: string): SetupResult => ({
+  ok: false,
+  step: 'attest',
+  sw,
+  reason,
+});
+
+/**
+ * SET_LIMIT, then the certificate. Every step is safe to run again on a card
+ * a lifted tap left part-way, so the next tap's resume sends them all again:
+ * SET_LIMIT may be repeated before the PIN; ATTEST_INIT may be repeated until
+ * SET_CERT, and is skipped once the card holds a certificate (GET_STATE byte
+ * 56), which is then only checked to be over this card's slot 0 key.
+ * Returns the failure, or null when the card is ready for its PIN.
+ */
+async function offlineSteps(
+  tx: Transceiver,
+  offline: OfflineSetup,
+  slot0: readonly number[],
+): Promise<SetupResult | null> {
+  const limit = await exchange(tx, limitApdu(offline.limitMsat));
+  if (limit.sw !== SW_OK) {
+    return attestFailed(limit.sw, `SET_LIMIT answered ${hex(limit.sw)}`);
+  }
+  const state = await exchange(tx, [CLA, INS_GET_STATE, 0x00, 0x00, 0x00]);
+  if (state.sw !== SW_OK || state.body.length < 58) {
+    return attestFailed(state.sw, `GET_STATE answered ${hex(state.sw)}`);
+  }
+  if (state.body[56] !== 0) {
+    const cert = await exchange(tx, [CLA, INS_GET_CERT, 0x00, 0x00, 0x00]);
+    const same =
+      cert.sw === SW_OK &&
+      cert.body.length >= 33 &&
+      cert.body.slice(1, 33).every((b, i) => b === slot0[i]);
+    return same
+      ? null
+      : attestFailed(
+          cert.sw,
+          cert.sw === SW_OK
+            ? 'the card holds a certificate for another key; Settings → Reset a card takes it back to blank'
+            : `GET_CERT answered ${hex(cert.sw)}`,
+        );
+  }
+  const init = await exchange(tx, [CLA, INS_ATTEST_INIT, 0x00, 0x00, 0x00]);
+  if (init.sw !== SW_OK || init.body.length !== 65 || init.body[0] !== 0x04) {
+    return attestFailed(
+      init.sw,
+      init.sw === SW_OK
+        ? `ATTEST_INIT answered a ${init.body.length}-byte key, not 65`
+        : `ATTEST_INIT answered ${hex(init.sw)}`,
+    );
+  }
+  let cert: readonly number[];
+  try {
+    cert = await offline.certify(init.body, slot0);
+  } catch (e) {
+    return attestFailed(null, `the registry gave no certificate: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (cert.length < 1 || cert.length > CERT_MAX) {
+    return attestFailed(null, `the registry's certificate is ${cert.length} bytes, not 1 to ${CERT_MAX}`);
+  }
+  const set = await exchange(tx, [CLA, INS_SET_CERT, 0x00, 0x00, cert.length, ...cert]);
+  if (set.sw !== SW_OK) {
+    return attestFailed(set.sw, `SET_CERT answered ${hex(set.sw)}`);
+  }
+  return null;
 }
 
 /**

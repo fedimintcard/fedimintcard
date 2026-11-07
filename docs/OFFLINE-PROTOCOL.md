@@ -39,8 +39,12 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
 - `GET /registry/cert-key` — public: `{ok, key}`, the certificate key's public point, 65 bytes
   uncompressed hex. A till fetches it when it connects and keeps it in `till-ops.json`
   (`cert_key`); offline it uses the kept copy.
-- `POST /registry/cards/:short_id/attestation` — operator session: `{attest_pub}` (65 bytes hex,
-  uncompressed) → `{ok, cert}` (130 bytes hex, § 2). The card must have its slot 0 key on record.
+- `POST /registry/cards/:short_id/attestation` — operator session: `{attest_pub, slot0}` (65 bytes
+  hex, uncompressed; slot 0's x-only key, 32 bytes hex) → `{ok, cert}` (130 bytes hex, § 2). The
+  install tap asks before the Setup app has registered the card, so for an unregistered short id
+  the registry certifies the `slot0` named (whose last 8 hex digits must be the short id) and holds
+  the certificate until `POST /registry/cards` stores a card with that slot 0, then moves it onto
+  the card. For a registered card `slot0`, if sent, must match the one on record.
   Stores `attest_pub` on the card; the same key again answers the same certificate; a different
   key is 409 while the card has live or pending notes.
 - `POST /cards/:short_id/offline-charges` — till token: an offline charge reported after the
@@ -55,6 +59,15 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
 - `GET /registry/offline-reports?short_id=` — operator: every report, with its result.
 - Secret `CERT_SIGNING_KEY`: the P-256 private key, PKCS#8 DER base64. Migration: `cards.attest_pub`,
   table `offline_reports (txid, short_id, till_id, result, detail, created_at)`.
+- As built (registry/src/offline.ts, migration v10): `cards.attest_cert` also stores the issued
+  certificate, since ECDSA signatures are randomized and the same key must answer the same bytes;
+  `offline_reports` is keyed `(txid, till_id)`, and `detail` is JSON (`client_ref`, `signed_at`,
+  `inputs`, and `conflicts` for a double spend). Both are in the nightly backup. Without
+  `CERT_SIGNING_KEY`, `/registry/cert-key` and the attestation route answer 503. An offline charge
+  does not repeat `/intent`'s change-slot checks (the card chose its slots offline); it refuses only
+  a change nonce that already carried a note (409). A replay of a double spend answers the stored
+  conflicts. `GET /registry/offline-reports` lists at most 200, newest first, only for the
+  operator's own cards.
 
 ## 4. Till (F3)
 
