@@ -79,6 +79,8 @@ enum ChargeErrorCode: String, CaseIterable {
     case unknownCard = "unknown_card"
     case opsUnreachable = "ops_unreachable"
     case opsRefused = "ops_refused"
+    /// Offline, the price needs change and the card has no slot for it; `suggested_msat` may say what it can pay.
+    case offlineNoChangeRoom = "offline_no_change_room"
     case cardLinkGone = "card_link_gone"
     case unauthorized
     case `internal`

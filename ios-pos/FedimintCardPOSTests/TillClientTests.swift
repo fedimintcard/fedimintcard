@@ -132,6 +132,14 @@ final class ErrorMappingTests: XCTestCase {
         XCTAssertEqual(ChargeErrorCode.fromWire(nil), .unknown)
     }
 
+    func testNoRoomForChangeOfflineCarriesTheSuggestion() {
+        let body = #"{"ok":false,"error":"offline_no_change_room","detail":"d","suggested_msat":12000,"suggest_below_msat":12000,"suggest_above_msat":null}"#
+        XCTAssertEqual(TillParse.charge(status: 409, body: Data(body.utf8)),
+                       .declined(code: .offlineNoChangeRoom, detail: "d", httpStatus: 409, suggestedMsat: 12_000))
+        let none = #"{"ok":false,"error":"offline_no_change_room","detail":"d","suggested_msat":null}"#
+        XCTAssertEqual(TillParse.charge(status: 409, body: Data(none.utf8)), .declined(code: .offlineNoChangeRoom, detail: "d", httpStatus: 409))
+    }
+
     func testUnreadableBodies() {
         XCTAssertEqual(TillParse.charge(status: 202, body: Data("x".utf8)), .declined(code: .undecided, detail: "", httpStatus: 202))
         XCTAssertEqual(TillParse.charge(status: 200, body: Data("x".utf8)), .failed(.interrupted))
@@ -174,7 +182,7 @@ final class ErrorMappingTests: XCTestCase {
         let kinds: [ErrorKind] = [.badRequest, .busy, .noCard, .relayUnreachable, .cardError, .insufficient, .noExactPlan, .declined,
                                   .undecided, .recovering, .conflict, .pinRequired, .wrongPin, .pinBlocked, .cardChanged, .unknownCard,
                                   .opsUnreachable, .opsRefused, .cardLinkGone, .unauthorized, .internal, .unknown, .tillUnreachable,
-                                  .timeoutUnknown, .notPaired]
+                                  .timeoutUnknown, .notPaired, .offlineNoChangeRoom]
         for k in kinds {
             let (t, d) = errorCopy(k, "")
             XCTAssertFalse(t.isEmpty)
@@ -182,6 +190,11 @@ final class ErrorMappingTests: XCTestCase {
         }
         XCTAssertEqual(errorCopy(.pinBlocked, "").0, "PIN blocked")
         XCTAssertEqual(errorCopy(.insufficient, "").0, "Card balance too low")
+        // Offline with no slot for change is not a full card (OFFLINE-PLAN.md § 10).
+        XCTAssertEqual(errorCopy(.noExactPlan, "").0, "Card needs a top up")
+        XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d", suggestedMsat: 12_000).0, "No room for change offline")
+        XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d", suggestedMsat: 12_000).1, "This card can't take change while offline. Try 12 sats")
+        XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d").1, "This card can't take change while offline. Try another amount")
         for p: BalanceProblem in [.cardMoved, .notOurCard, .tillUnreachable, .relayUnreachable, .busy, .cardService, .timeout, .notPaired, .other] {
             XCTAssertFalse(balanceErrorCopy(p).0.isEmpty)
         }

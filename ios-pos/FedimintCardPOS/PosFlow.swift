@@ -4,6 +4,8 @@ enum ErrorKind: Equatable {
     case badRequest, busy, noCard, relayUnreachable, cardError, insufficient, noExactPlan
     case declined, undecided, recovering, conflict, pinRequired, wrongPin, pinBlocked, cardChanged
     case unknownCard, opsUnreachable, opsRefused, cardLinkGone, unauthorized, `internal`, unknown
+    /// Offline, the price needs change and the card has no slot for it (not a full card).
+    case offlineNoChangeRoom
     /// The phone could not reach the till (nothing was sent).
     case tillUnreachable
     /// The till did not answer in time: the outcome may already have happened.
@@ -31,6 +33,7 @@ enum ErrorKind: Equatable {
         case .unknownCard: return .unknownCard
         case .opsUnreachable: return .opsUnreachable
         case .opsRefused: return .opsRefused
+        case .offlineNoChangeRoom: return .offlineNoChangeRoom
         case .cardLinkGone: return .cardLinkGone
         case .unauthorized: return .unauthorized
         case .internal: return .internal
@@ -55,7 +58,7 @@ enum ErrorKind: Equatable {
     /// till has settled any earlier attempt with the same ref. `pin_required`, the ops codes, and the
     /// link/auth refusals are answered before that, so they prove nothing about an earlier attempt.
     var definitive: Bool {
-        [.insufficient, .noExactPlan, .declined, .badRequest, .noCard, .cardError, .wrongPin, .pinBlocked].contains(self)
+        [.insufficient, .noExactPlan, .offlineNoChangeRoom, .declined, .badRequest, .noCard, .cardError, .wrongPin, .pinBlocked].contains(self)
     }
 
     /// Whether trying the same sale again can help.
@@ -68,6 +71,8 @@ struct PosErrorInfo: Equatable {
     let detail: String
     let clientRef: String
     let unresolvedRef: String?
+    /// A price the card can pay instead (`offline_no_change_room`), when the till said one.
+    var suggestedMsat: Int64? = nil
 }
 
 /// Why a balance read failed, in the terms the holder's screen needs.
@@ -255,10 +260,10 @@ final class PosFlow {
 
     private func back(to r: PosErrorInfo?) -> PosState { r.map { .error($0) } ?? .entering }
 
-    private func errorFrom(price: Int64, ref: String, prevUnresolved: String?, kind: ErrorKind, detail: String) -> PosState {
+    private func errorFrom(price: Int64, ref: String, prevUnresolved: String?, kind: ErrorKind, detail: String, suggestedMsat: Int64? = nil) -> PosState {
         let unresolved: String?
         if kind.needsSalesCheck { unresolved = ref } else if kind.definitive { unresolved = nil } else { unresolved = prevUnresolved }
-        return .error(PosErrorInfo(priceMsat: price, kind: kind, detail: detail, clientRef: ref, unresolvedRef: unresolved))
+        return .error(PosErrorInfo(priceMsat: price, kind: kind, detail: detail, clientRef: ref, unresolvedRef: unresolved, suggestedMsat: suggestedMsat))
     }
 
     private func createTopUp(_ msat: Int64, _ ref: String) -> [PosEffect] {
@@ -437,7 +442,7 @@ final class PosFlow {
             switch r {
             case .success(let receipt):
                 state = .receipt(receipt)
-            case .declined(let code, let detail, _) where code == .wrongPin:
+            case .declined(let code, let detail, _, _) where code == .wrongPin:
                 // Nothing moved; the same ref is a fresh attempt (TILL-API, wrong_pin).
                 let left = parseTriesLeft(detail)
                 if left == 0 {
@@ -445,8 +450,8 @@ final class PosFlow {
                 } else {
                     askPin(price, ref, wrongPin: true, triesLeft: left)
                 }
-            case .declined(let code, let detail, _):
-                state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: .from(code), detail: detail)
+            case .declined(let code, let detail, _, let suggested):
+                state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: .from(code), detail: detail, suggestedMsat: suggested)
             case .failed(let te):
                 var detail = ""
                 if case .badResponse(let d) = te { detail = d }

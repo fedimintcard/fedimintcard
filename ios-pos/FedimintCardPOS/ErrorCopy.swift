@@ -15,12 +15,17 @@ func balanceErrorCopy(_ p: BalanceProblem) -> (String, String) {
     }
 }
 
-/// Title and detail copy for a charge error.
-func errorCopy(_ kind: ErrorKind, _ detail: String) -> (String, String) {
+/// Title and detail copy for a charge error. `suggestedMsat` is the price the till says the card
+/// can pay instead, for `offline_no_change_room`.
+func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil) -> (String, String) {
     switch kind {
     case .noCard: return ("Card not detected", "Hold the card to the top of the phone and keep it there")
     case .insufficient: return ("Card balance too low", "")
     case .noExactPlan: return ("Card needs a top up", "")
+    // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.
+    case .offlineNoChangeRoom:
+        let tip = suggestedMsat.map { "Try \(formatSats($0)) sats" } ?? "Try another amount"
+        return ("No room for change offline", "This card can't take change while offline. " + tip)
     case .declined: return ("Card declined", detail)
     case .relayUnreachable: return ("The till lost the card", "Hold the card to the phone and try again")
     case .cardLinkGone: return ("The card moved away", "Hold the card to the phone and try again")

@@ -131,6 +131,17 @@ final class PosFlowTests: XCTestCase {
         XCTAssertEqual(signingId(f), id)
     }
 
+    func testNoRoomForChangeOfflineKeepsTheSuggestionAndMovedNothing() {
+        let f = flow()
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .offlineNoChangeRoom, detail: "d", httpStatus: 409, suggestedMsat: 12_000)))
+        guard case .error(let e) = f.state else { return XCTFail("\(f.state)") }
+        XCTAssertEqual(e.kind, .offlineNoChangeRoom)
+        XCTAssertEqual(e.suggestedMsat, 12_000)
+        XCTAssertEqual(e.clientRef, ref)
+        XCTAssertNil(e.unresolvedRef)
+    }
+
     func testRetryableErrorKeepsRef() {
         let f = flow()
         let (id, ref, _) = chargeToSigning(f)
