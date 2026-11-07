@@ -1,6 +1,11 @@
 applet/src/main/java/io/github/bobodread876/fedimintcard/applet/SchnorrHW.java is copied
 from cashucard/javacard and trimmed. Its licence follows verbatim.
 
+In FedimintCardApplet.java, applet 3.0's block-header clock (SET_HEADER, targetOf,
+timesFour, the floor), its burn-then-answer order for SIGN and its attestation follow
+cashucard/cashucard's applet (CashuApplet.java, protocol 2.2); the clock code is ported
+from it. Same licence.
+
 tools/cardkit is ported from cashucard's tools/cardkit. Its own NOTICE, in
 that directory, names what was copied and carries the same licence.
 

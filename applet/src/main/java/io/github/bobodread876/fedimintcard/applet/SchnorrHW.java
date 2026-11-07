@@ -55,8 +55,17 @@ import javacard.security.*;
  *
  *   No `new` may appear anywhere outside the constructor and init().
  *
- *   Transient footprint: `sc` (256 B scratchpad) + `work` (288 B arithmetic
+ *   Transient footprint: `sc` (320 B scratchpad) + `work` (320 B arithmetic
  *   scratch, see WORK_LEN).
+ *
+ * --- Side channels (F1, docs/OFFLINE-PLAN.md) ---
+ *
+ *   No branch or loop length depends on a secret: reductions subtract and
+ *   keep the result by mask, the parity negations of d and k are masked, and
+ *   the carry fold runs four rounds always. e·d is computed as e·d1 + e·d2
+ *   with d1 fresh randomness per signature, so the key never meets the
+ *   public, varying e whole. getS still copies d into RAM for the nonce and
+ *   the split; it is wiped before the multiplications.
  *
  * ENG-182 — cashucard/javacard
  */
@@ -120,6 +129,10 @@ final class SchnorrHW {
     private static final short SC_TMP  = (short) 96;
     private static final short SC_E    = (short)192;
     private static final short SC_ED   = (short)224;
+    // The key's two shares for e·d (F1, docs/OFFLINE-PLAN.md): d = d1 + d2 mod n, d1 fresh per signature.
+    private static final short SC_D1   = (short)256;
+    private static final short SC_D2   = (short)288;
+    private static final short SC_LEN  = (short)320;
 
     // ── Transient arithmetic scratch (CLEAR_ON_DESELECT, WORK_LEN bytes) ──
     // Threaded into mulModN as (work, workOff) so that nothing on the signing
@@ -129,8 +142,9 @@ final class SchnorrHW {
     //   [128..191]  t2         — 512-bit t_hi*DELTA            (reduce512toModN)
     //   [192..223]  hiContrib  — 256-bit t2_hi*DELTA           (reduce512toModN)
     //   [224..287]  full       — 512-bit scratch               (mulSmallByDelta)
+    //   [288..319]  ct         — 256-bit scratch for the constant-time subtract-and-select
     /** Bytes of scratch mulModN needs; callers must supply at least this much. */
-    static final short WORK_LEN      = (short)288;
+    static final short WORK_LEN      = (short)320;
     /** Offsets inside the work buffer handed to reduce512toModN. */
     private static final short W_PROD = (short)  0;
     private static final short W_RED  = (short) 64;   // reduce512toModN's region
@@ -138,6 +152,8 @@ final class SchnorrHW {
     private static final short W_T2   = (short) 64;
     private static final short W_HI   = (short)128;
     private static final short W_SUB  = (short)160;   // mulSmallByDelta's region
+    private static final short W_CT   = (short)288;   // condSubN's region (absolute)
+    private static final short W_CT_IN_RED = (short)224; // the same 32 bytes, relative to W_RED
     private final byte[] work;
 
     // ── Crypto objects (allocated once) ───────────────────────────────────
@@ -175,7 +191,7 @@ final class SchnorrHW {
         tagHashNonce     = new byte[32];
         tagHashChallenge = new byte[32];
 
-        sc     = JCSystem.makeTransientByteArray((short)256, JCSystem.CLEAR_ON_DESELECT);
+        sc     = JCSystem.makeTransientByteArray(SC_LEN, JCSystem.CLEAR_ON_DESELECT);
         work   = JCSystem.makeTransientByteArray(WORK_LEN,   JCSystem.CLEAR_ON_DESELECT);
         sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
 
@@ -363,7 +379,7 @@ final class SchnorrHW {
 
         // Get public key point W (uncompressed 65 bytes or compressed 33 bytes)
         short wLen = pubKey.getW(sc, SC_TMP);  // W at sc[96..]
-        boolean pyOdd;
+        byte pyBit;
         if (wLen == (short)65) {
             // Uncompressed: 04 || Px(32) || Py(32)
             // A 65-byte W whose lead byte is not 0x04 is not a point encoding we
@@ -374,21 +390,20 @@ final class SchnorrHW {
                 ISOException.throwIt(SW_CRYPTO_ERROR);
             }
             // P.y is sc[TMP+33..TMP+64]; parity = LSB of last byte
-            pyOdd = (sc[(short)(SC_TMP + 64)] & 1) == 1;
+            pyBit = (byte)(sc[(short)(SC_TMP + 64)] & 1);
             Util.arrayCopy(sc, (short)(SC_TMP + 1), sc, SC_PX, (short)32);
         } else if (wLen == (short)33
                    && (sc[SC_TMP] == (byte)0x02 || sc[SC_TMP] == (byte)0x03)) {
             // Compressed: prefix 02 (even) or 03 (odd)
-            pyOdd = (sc[SC_TMP] & 1) == 1;
+            pyBit = (byte)(sc[SC_TMP] & 1);
             Util.arrayCopy(sc, (short)(SC_TMP + 1), sc, SC_PX, (short)32);
         } else {
             ISOException.throwIt(SW_CRYPTO_ERROR);
-            return (short)0;   // unreachable; keeps pyOdd definitely assigned
+            return (short)0;   // unreachable; keeps pyBit definitely assigned
         }
 
-        if (pyOdd) {
-            subtractFromN(sc, SC_D, sc, SC_D);   // d = n − d
-        }
+        // d = n − d when P.y is odd: always computed, kept by mask (F1).
+        condNegateModN(sc, SC_D, (byte)(-pyBit), work, W_CT);
 
         // ── Step 2: t = d_eff XOR taggedHash("BIP0340/aux", a) ───────
         // BIP-340 default signing. `a` is fresh secure randomness per signature;
@@ -407,7 +422,7 @@ final class SchnorrHW {
         Util.arrayCopy(sc,  SC_PX,              sc, (short)(SC_TMP+32),(short)32); // Px
         Util.arrayCopy(msg, msgOff,             sc, (short)(SC_TMP+64),(short)32); // msg
         taggedHash(tagHashNonce, sc, SC_TMP, (short)96, sc, SC_K);
-        reduceModN(sc, SC_K);         // k = k mod n (in place)
+        reduceModN(sc, SC_K, work, W_CT);   // k = k mod n (in place)
 
         // ── Step 4: R = k·G via ECDH coprocessor ─────────────────────
         // Load k into temp private key, compute [k]G
@@ -434,10 +449,8 @@ final class SchnorrHW {
         }
 
         // ── Step 5: if R.y is odd, k = n − k ─────────────────────────
-        boolean ryOdd = (sc[(short)(SC_TMP + 64)] & 1) == 1;
-        if (ryOdd) {
-            subtractFromN(sc, SC_K, sc, SC_K);
-        }
+        // k = n − k when R.y is odd, by mask as for d (F1).
+        condNegateModN(sc, SC_K, (byte)(-(sc[(short)(SC_TMP + 64)] & 1)), work, W_CT);
         // Rx is at sc[TMP+1..TMP+32]
 
         // ── Step 6: e = taggedHash("BIP0340/challenge", Rx ‖ Px ‖ msg) mod n
@@ -447,16 +460,29 @@ final class SchnorrHW {
         Util.arrayCopy(sc, SC_PX,             sc, (short)(SC_TMP+32),(short)32); // Px
         Util.arrayCopy(msg, msgOff,           sc, (short)(SC_TMP+64),(short)32); // msg
         taggedHash(tagHashChallenge, sc, SC_TMP, (short)96, sc, SC_E);
-        reduceModN(sc, SC_E);         // e = e mod n
+        reduceModN(sc, SC_E, work, W_CT);   // e = e mod n
 
-        // ── Step 7: s = (k + e·d) mod n ──────────────────────────────
-        mulModN(sc, SC_E, sc, SC_D, sc, SC_ED, work, (short)0);  // ed = e * d mod n
-        addModN(sc, SC_ED, sc, SC_K, out, (short)(outOff + 32)); // s = ed + k mod n
-
-        // ── Step 8: output = Rx ‖ s ──────────────────────────────────
+        // ── Step 8 first: output Rx ‖ (s below) ──────────────────────
         // Rx sits at sc[SC_TMP..SC_TMP+31] — step 6 shifted it there before
-        // hashing; the challenge hash wrote to SC_E, not SC_TMP.
+        // hashing. It goes out now, which frees SC_TMP; msg may share `out`
+        // and is not read again.
         Util.arrayCopy(sc, SC_TMP, out, outOff, (short)32);  // Rx
+
+        // ── Step 7: s = (k + e·d) mod n, with d in two shares (F1) ───
+        // e is public and changes with every message: e·d is the textbook
+        // target of a power analysis that learns d one multiplication at a
+        // time. So d never meets e whole: d1 is fresh randomness each time,
+        // d2 = d − d1, and e·d = e·d1 + e·d2. Each product is with a value
+        // that is new for this signature, and d itself is wiped first.
+        rng.generateData(sc, SC_D1, (short)32);
+        reduceModN(sc, SC_D1, work, W_CT);                        // d1 < n
+        subtractFromN(sc, SC_D1, sc, SC_D2);                      // n − d1 (== n when d1 is 0)
+        addModN(sc, SC_D, sc, SC_D2, sc, SC_D2, work, W_CT);      // d2 = d + n − d1 mod n
+        Util.arrayFillNonAtomic(sc, SC_D, (short)32, (byte)0);    // d, whole, is gone
+        mulModN(sc, SC_E, sc, SC_D1, sc, SC_ED, work, (short)0);  // e·d1
+        mulModN(sc, SC_E, sc, SC_D2, sc, SC_TMP, work, (short)0); // e·d2
+        addModN(sc, SC_ED, sc, SC_TMP, sc, SC_ED, work, W_CT);    // e·d mod n
+        addModN(sc, SC_ED, sc, SC_K, out, (short)(outOff + 32), work, W_CT); // s = ed + k mod n
 
         return (short)64;
     }
@@ -527,10 +553,8 @@ final class SchnorrHW {
      * If a ≥ n, subtracts n (at most once, since callers guarantee a < 2n
      * after the tagged-hash reduction step).
      */
-    static void reduceModN(byte[] a, short aOff) {
-        if (cmp32(a, aOff, N, (short)0) >= 0) {
-            sub32(a, aOff, N, (short)0, a, aOff);
-        }
+    static void reduceModN(byte[] a, short aOff, byte[] work, short ctOff) {
+        condSubN(a, aOff, work, ctOff);
     }
 
     /**
@@ -538,7 +562,7 @@ final class SchnorrHW {
      * All buffers are big-endian.
      */
     static void addModN(byte[] a, short aOff, byte[] b, short bOff,
-                        byte[] out, short outOff) {
+                        byte[] out, short outOff, byte[] work, short ctOff) {
         short carry = 0;
         for (short i = 31; i >= 0; i--) {
             short sum = (short)((a[(short)(aOff+i)] & 0xFF)
@@ -547,10 +571,11 @@ final class SchnorrHW {
             out[(short)(outOff+i)] = (byte)sum;
             carry = (short)((sum >>> 8) & 1);
         }
-        // carry > 0 means sum ≥ 2^256 > n, so subtract n
-        if (carry != 0 || cmp32(out, outOff, N, (short)0) >= 0) {
-            sub32(out, outOff, N, (short)0, out, outOff);
-        }
+        // a, b < n, so the sum is < 2n: subtract n once when it overflowed 2^256 or is >= n.
+        // Both are computed and one is kept by mask, so the time does not say which (F1).
+        short borrow = sub32ct(out, outOff, N, (short)0, work, ctOff);
+        short take = (short)(carry | (short)(borrow ^ 1));
+        select32(out, outOff, work, ctOff, (byte)(-take));
     }
 
     /**
@@ -569,7 +594,7 @@ final class SchnorrHW {
      *
      * So two iterations bring us to < 2n; final subtractIfGe finishes.
      *
-     * Allocates nothing: all 288 bytes of temporary storage come from the
+     * Allocates nothing: the 288 bytes it uses come from the
      * caller-supplied `work` buffer (see WORK_LEN and the layout map at the
      * top of the class). `work` must not overlap `out`, `a` or `b`.
      *
@@ -698,18 +723,20 @@ final class SchnorrHW {
         // 2^256, and 2^256 ≡ DELTA (mod n), so fold it back rather than losing
         // it. Adding DELTA can itself overflow, hence the loop; carry shrinks
         // rapidly (DELTA < 2^129) so this terminates after a couple of rounds.
-        while (carry != 0) {
-            short pending = carry;
-            carry = 0;
-            for (short i = 0; i < pending; i++) {
-                carry = (short)(carry
-                        + add32(out, outOff, DELTA, (short)0, out, outOff));
-            }
+        // Four rounds whatever the carry (F1): each adds DELTA under a mask that is all ones while
+        // carry is left. A carry of at most 3 needs at most 4 (an add that wraps leaves a value under
+        // DELTA, which the next adds cannot wrap again).
+        short pending = carry;
+        for (short r = 0; r < 4; r++) {
+            short nz = (short)((((short)(pending | (short)(-pending))) >> 15) & 1);
+            pending = (short)(pending - nz + add32masked(out, outOff, DELTA, (short)0, (byte)(-nz)));
         }
-        // Final reduction: at most 2–3 conditional subtracts
-        while (cmp32(out, outOff, N, (short)0) >= 0) {
-            sub32(out, outOff, N, (short)0, out, outOff);
+        if (pending != 0) {
+            ISOException.throwIt(SW_CRYPTO_ERROR);   // unreachable: the arithmetic above is wrong
         }
+        // The sum is now < 2^256 < 2n: one subtract of n at most, done twice for margin, by mask.
+        condSubN(out, outOff, work, (short)(workOff + W_CT_IN_RED));
+        condSubN(out, outOff, work, (short)(workOff + W_CT_IN_RED));
     }
 
     /**
@@ -740,10 +767,13 @@ final class SchnorrHW {
                                         byte[] out, short outOff,
                                         byte[] work, short workOff) {
         mulByDelta(a, aOff, work, workOff);
+        // One test of all 32 bytes together, not 32 branches on a secret intermediate (F1).
+        byte acc = 0;
         for (short i = 0; i < 32; i++) {
-            if (work[(short)(workOff + i)] != (byte)0) {
-                ISOException.throwIt(SW_CRYPTO_ERROR);
-            }
+            acc |= work[(short)(workOff + i)];
+        }
+        if (acc != (byte)0) {
+            ISOException.throwIt(SW_CRYPTO_ERROR);
         }
         Util.arrayCopy(work, (short)(workOff + 32), out, outOff, (short)32);
     }
@@ -804,37 +834,59 @@ final class SchnorrHW {
      * out = n − a  (modular negation in Z_n), 32 bytes each, big-endian.
      */
     static void subtractFromN(byte[] a, short aOff, byte[] out, short outOff) {
-        sub32(N, (short)0, a, aOff, out, outOff);
+        sub32ct(N, (short)0, a, aOff, out, outOff);
     }
 
     /**
-     * 256-bit subtraction: out = a − b.  Assumes a ≥ b (no underflow check).
+     * out = a − b mod 2^256 with no branch on the data; answers the borrow out of the top byte
+     * (0 or 1). A byte's difference is in −256..255, and its sign bit is the borrow (F1).
      */
-    private static void sub32(byte[] a, short aOff,
-                               byte[] b, short bOff,
-                               byte[] out, short outOff) {
+    static short sub32ct(byte[] a, short aOff, byte[] b, short bOff, byte[] out, short outOff) {
         short borrow = 0;
         for (short i = 31; i >= 0; i--) {
             short diff = (short)((a[(short)(aOff+i)] & 0xFF)
                                - (b[(short)(bOff+i)] & 0xFF)
                                - borrow);
-            if (diff < 0) { diff += 256; borrow = 1; } else { borrow = 0; }
             out[(short)(outOff+i)] = (byte)diff;
+            borrow = (short)((diff >> 8) & 1);
+        }
+        return borrow;
+    }
+
+    /** a = b where mask is 0xFF, a kept where it is 0x00: byte by byte, the same work either way. */
+    static void select32(byte[] a, short aOff, byte[] b, short bOff, byte mask) {
+        byte keep = (byte)~mask;
+        for (short i = 0; i < 32; i++) {
+            a[(short)(aOff+i)] = (byte)((a[(short)(aOff+i)] & keep) | (b[(short)(bOff+i)] & mask));
         }
     }
 
-    /**
-     * Compare two 32-byte big-endian values.
-     * @return negative / 0 / positive as a < b / a == b / a > b.
-     */
-    private static short cmp32(byte[] a, short aOff, byte[] b, short bOff) {
-        for (short i = 0; i < 32; i++) {
-            short ai = (short)(a[(short)(aOff+i)] & 0xFF);
-            short bi = (short)(b[(short)(bOff+i)] & 0xFF);
-            if (ai != bi) return (short)(ai - bi);
-        }
-        return (short)0;
+    /** a = a − n when a ≥ n, for a < 2n: the subtraction is always done and kept by mask. */
+    static void condSubN(byte[] a, short aOff, byte[] work, short ctOff) {
+        short borrow = sub32ct(a, aOff, N, (short)0, work, ctOff);
+        select32(a, aOff, work, ctOff, (byte)(borrow - 1));
     }
+
+    /** a = n − a where mask is 0xFF, a kept where it is 0x00 (BIP-340's parity negations, F1). */
+    static void condNegateModN(byte[] a, short aOff, byte mask, byte[] work, short ctOff) {
+        sub32ct(N, (short)0, a, aOff, work, ctOff);
+        select32(a, aOff, work, ctOff, mask);
+    }
+
+    /** out = out + (b AND mask) mod 2^256; answers the carry (0 or 1). */
+    private static short add32masked(byte[] out, short outOff, byte[] b, short bOff, byte mask) {
+        short carry = 0;
+        for (short i = 31; i >= 0; i--) {
+            short s = (short)((short)(out[(short)(outOff+i)] & 0xFF)
+                            + (short)(b[(short)(bOff+i)] & mask & 0xFF)
+                            + carry);
+            out[(short)(outOff+i)] = (byte)(s & 0xFF);
+            carry = (short)((s >> 8) & 0xFF);
+        }
+        return carry;
+    }
+
+
 
     /**
      * Set secp256k1 EC curve parameters on a private and/or public key.

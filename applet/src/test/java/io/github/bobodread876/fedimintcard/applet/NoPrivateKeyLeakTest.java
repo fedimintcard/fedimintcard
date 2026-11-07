@@ -132,6 +132,8 @@ class NoPrivateKeyLeakTest {
     void sweepOnKeyedPinCardLeaksNothing() throws Exception {
         CardTestSupport c = new CardTestSupport();
         c.installKeyAndPin(0, SWEEP_KEY, CardTestSupport.DEFAULT_PIN);
+        // 3.0 signs only a slot that holds a note
+        CardTestSupport.assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         List<byte[]> secrets = new ArrayList<>();
         addKeySecrets(secrets, SWEEP_KEY);
         int signed = 0, refused = 0;
@@ -164,9 +166,9 @@ class NoPrivateKeyLeakTest {
         assertFalse(leaks(stateKey, secrets));
     }
 
-    /** The only INS values the applet answers (with CLA B0) are 0x10-0x13 and 0x40-0x42. */
+    /** The only INS values the applet answers (with CLA B0): 0x10-0x19, 0x30-0x33 and 0x40-0x42 (3.0). */
     @Test
-    void onlyTheSevenCommandsExist() {
+    void onlyTheseCommandsExist() {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.setPin(CardTestSupport.DEFAULT_PIN);
@@ -174,7 +176,8 @@ class NoPrivateKeyLeakTest {
         for (int ins = 0; ins < 256; ins++) {
             if (c.tx(0xB0, ins, 0, 0, null).getSW() != 0x6D00) known.add(ins);
         }
-        assertEquals(List.of(0x10, 0x11, 0x12, 0x13, 0x40, 0x41, 0x42), known);
+        assertEquals(List.of(0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+            0x30, 0x31, 0x32, 0x33, 0x40, 0x41, 0x42), known);
     }
 
     /** Anti-vacuity: the scan flags a planted scalar, a planted fragment, and its negation. */

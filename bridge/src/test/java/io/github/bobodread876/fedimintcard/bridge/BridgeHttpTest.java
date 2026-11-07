@@ -54,10 +54,12 @@ class BridgeHttpTest {
 
     @Test
     void selectGenKeySetPinVerifySignVerifiesOverHttp() throws Exception {
-        assertEquals("02009000", apdu("00a4040008f0464d4341524401"));
+        assertEquals("03009000", apdu("00a4040008f0464d4341524401")); // applet 3.0
         String gen = apdu("b0100000");
         assertEquals(68, gen.length());
         assertTrue(gen.endsWith("9000"));
+        // 3.0 signs only a slot holding a note: 1000 msat, then 48 bytes standing for its signature
+        assertEquals("9000", apdu("b0140000" + "38" + "00000000000003e8" + "aa".repeat(48)));
         byte[] pub = Bip340.hex(gen.substring(0, 64));
         byte[] msg = new byte[32];
         for (int i = 0; i < 32; i++) msg[i] = (byte) (i * 5);

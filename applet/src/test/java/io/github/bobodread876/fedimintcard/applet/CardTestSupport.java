@@ -19,6 +19,26 @@ final class CardTestSupport {
     static final int CLA = 0xB0;
     static final int GEN_KEY = 0x10, GET_PUB = 0x11, SIGN = 0x12, STATE_KEY = 0x13;
     static final int VERIFY_PIN = 0x40, SET_PIN = 0x41, CHANGE_PIN = 0x42;
+    static final int SET_NOTE = 0x14, GET_SLOT = 0x15, GET_STATE = 0x16, SET_CHANGE = 0x17, SET_LIMIT = 0x18,
+        SET_HEADER = 0x19, ATTEST_INIT = 0x30, SET_CERT = 0x31, GET_CERT = 0x32, ATTEST = 0x33;
+    static final int ST_EMPTY = 0, ST_KEYED = 1, ST_NOTE = 2, ST_CHANGE = 3, ST_SPENT = 4;
+
+    /** A note's data for SET_NOTE: the amount in msat (8, big-endian), then 48 bytes standing for the signature. */
+    static byte[] noteData(long msat) {
+        byte[] d = new byte[56];
+        for (int i = 0; i < 8; i++) d[7 - i] = (byte) (msat >>> (8 * i));
+        for (int i = 8; i < 56; i++) d[i] = (byte) (0xA0 + i);
+        return d;
+    }
+
+    /** The slot's state byte (test-only reflection). */
+    int slotState(int slot) {
+        try {
+            return ((byte[]) field("state"))[slot];
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
 
     /** A PIN every helper uses unless a test says otherwise: inside the 4..8 byte bounds. */
     static final byte[] DEFAULT_PIN = { '1', '2', '3', '4' };
@@ -124,7 +144,24 @@ final class CardTestSupport {
         return r.getData();
     }
 
+    /**
+     * SIGN as the crypto tests use it: a KEYED slot gets a note first (SET_NOTE, 1000 msat), and a
+     * slot already spent on another message gets a fresh note on the same key by reflection. That
+     * second step is test-only: 3.0 signs one transaction per note (OfflineTest covers the rule),
+     * and these tests are about the signatures, not the burn.
+     */
     byte[] sign(int slot, byte[] msg) {
+        if (slotState(slot) == ST_KEYED) assertSw(0x9000, tx(SET_NOTE, slot, noteData(1000)));
+        if (slotState(slot) == ST_SPENT) {
+            try {
+                byte[] spent = (byte[]) field("spentHash");
+                if (!Arrays.equals(Arrays.copyOfRange(spent, slot * 32, slot * 32 + 32), msg)) {
+                    ((byte[]) field("state"))[slot] = (byte) ST_NOTE;
+                }
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException(e);
+            }
+        }
         ResponseAPDU r = tx(SIGN, slot, msg);
         assertSw(0x9000, r);
         return r.getData();
@@ -168,7 +205,7 @@ final class CardTestSupport {
         keysFor.invoke(applet(), (short) slot);
         ((ECPrivateKey[]) field("privs"))[slot].setS(s, (short) 0, (short) 32);
         ((ECPublicKey[]) field("pubs"))[slot].setW(w, (short) 0, (short) 65);
-        ((boolean[]) field("used"))[slot] = true;
+        ((byte[]) field("state"))[slot] = (byte) ST_KEYED;
     }
 
     /** installKey plus the selected-PIN session, so a test can go straight to SIGN. */

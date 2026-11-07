@@ -319,6 +319,7 @@ class PinTest {
         assertEquals(javacard.framework.JCSystem.CLEAR_ON_DESELECT, c.transientClass("tmp"),
             "the session's buffer is CLEAR_ON_DESELECT, so a deselect drops it");
         c.genKey(0);
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
@@ -548,7 +549,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         ResponseAPDU r = c.select();
         assertSw(0x9000, r);
-        assertArrayEquals(new byte[] { 0x02, 0x01 }, r.getData());
+        assertArrayEquals(new byte[] { 0x03, 0x00 }, r.getData());
     }
 
     /** A verified PIN ends with the selection: another applet selected, then this one, asks again. */
@@ -558,6 +559,7 @@ class PinTest {
         javacard.framework.AID other = com.licel.jcardsim.utils.AIDUtil.create("F0464D4341524402");
         c.sim.installApplet(other, FedimintCardApplet.class);
         c.genKey(0);
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
@@ -573,6 +575,7 @@ class PinTest {
     void sessionEndsOnReselect() {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
