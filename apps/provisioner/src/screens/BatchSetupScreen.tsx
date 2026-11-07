@@ -11,10 +11,9 @@
  * lives in this component's state and in nothing else; the store receives the
  * *policy*, never the value.
  */
-import React, {useState} from 'react';
+import React, {useRef, useState} from 'react';
 import {
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -80,6 +79,7 @@ export function BatchSetupScreen({
   const [count, setCount] = useState('1');
   const [policy, setPolicy] = useState<PinPolicy>('batch');
   const [limit, setLimit] = useState(String(DEFAULT_DAILY_LIMIT_SAT));
+  const scroll = useRef<ScrollView>(null);
   const [reviewing, setReviewing] = useState(false);
   const draft = usePinDraft();
   // The batch PIN crosses to the loop through `pin.ts`'s provider slot, never
@@ -202,14 +202,17 @@ export function BatchSetupScreen({
 
   return (
     <KeyboardAvoidingView
+      // On Android too: drawn edge to edge (Android 15+), the window no longer
+      // shrinks for the keyboard (adjustResize), and the limit field, last on
+      // the screen, sat under it.
       style={local.grow}
-      enabled={Platform.OS === 'ios'}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      behavior="padding">
       <Screen
         title={SETUP.title}
         onStop={onStop}
         headerRight={<GearButton onPress={onSettings} />}>
         <ScrollView
+          ref={scroll}
           contentContainerStyle={local.scroll}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
@@ -304,6 +307,8 @@ export function BatchSetupScreen({
                   keyboardType="number-pad"
                   autoComplete="off"
                   maxLength={9}
+                  // the last field: once the keyboard is up, show it above it
+                  onFocus={() => setTimeout(() => scroll.current?.scrollToEnd({animated: true}), 250)}
                   style={[s.input, local.pinInput]}
                   testID="limit-input"
                 />
