@@ -40,6 +40,7 @@ docs/           plans, protocols and results (below)
 | [TILL-API.md](docs/TILL-API.md), [TILL-CLAIM.md](docs/TILL-CLAIM.md), [POS-LINK.md](docs/POS-LINK.md) | the till's HTTP API, connecting a till to the registry, pairing a POS |
 | [TOPUP.md](docs/TOPUP.md) | Lightning top-up at the POS |
 | [OFFLINE-PAYMENTS.md](docs/OFFLINE-PAYMENTS.md) | research: card payments with no internet for days |
+| [OFFLINE-PLAN.md](docs/OFFLINE-PLAN.md) | plan: offline card payments (draft) |
 | [DEMO.md](docs/DEMO.md) | the first demo script (2026-10-27, laptop till) |
 
 ## Build
