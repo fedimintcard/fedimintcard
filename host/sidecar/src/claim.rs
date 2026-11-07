@@ -69,10 +69,16 @@ impl Claim {
 }
 
 /// The token file `serve` reads when no `--ops-token` is given.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct OpsFile {
+    #[serde(default)]
     url: String,
+    #[serde(default)]
     token: String,
+    /// The registry's certificate key (docs/OFFLINE-PROTOCOL.md § 3), 65 bytes uncompressed, hex:
+    /// fetched from `GET /registry/cert-key` while online, used to check cards offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cert_key: Option<String>,
 }
 
 /// `https://registry.example.org` from any URL on it; only http and https.
@@ -145,11 +151,31 @@ pub fn read_claim(data_dir: &Path) -> Result<Option<Claim>> {
 
 /// The till token `serve` keeps (`till-ops.json`), if there is one.
 pub fn read_ops(data_dir: &Path) -> Result<Option<OpsConfig>> {
-    Ok(read_json::<OpsFile>(&ops_path(data_dir))?.map(|f| OpsConfig { url: f.url, token: f.token }))
+    // A file holding only the certificate key (a till given its token by flag) has no token.
+    Ok(read_json::<OpsFile>(&ops_path(data_dir))?
+        .filter(|f| !f.token.is_empty())
+        .map(|f| OpsConfig { url: f.url, token: f.token }))
 }
 
 pub fn write_ops(data_dir: &Path, cfg: &OpsConfig) -> Result<()> {
-    let f = OpsFile { url: cfg.url.clone(), token: cfg.token.clone() };
+    let old = read_json::<OpsFile>(&ops_path(data_dir)).ok().flatten().unwrap_or_default();
+    let f = OpsFile { url: cfg.url.clone(), token: cfg.token.clone(), cert_key: old.cert_key };
+    write_private(&ops_path(data_dir), &serde_json::to_vec_pretty(&f)?)
+}
+
+/// The registry's certificate key this till keeps (`cert_key` in `till-ops.json`), hex.
+pub fn read_cert_key(data_dir: &Path) -> Result<Option<String>> {
+    Ok(read_json::<OpsFile>(&ops_path(data_dir))?.and_then(|f| f.cert_key))
+}
+
+/// Keep the registry's certificate key in `till-ops.json`, beside the token (a file is made
+/// for it when the token came by flag).
+pub fn write_cert_key(data_dir: &Path, key_hex: &str) -> Result<()> {
+    let mut f = read_json::<OpsFile>(&ops_path(data_dir))?.unwrap_or_default();
+    if f.cert_key.as_deref() == Some(key_hex) {
+        return Ok(());
+    }
+    f.cert_key = Some(key_hex.to_owned());
     write_private(&ops_path(data_dir), &serde_json::to_vec_pretty(&f)?)
 }
 
@@ -240,6 +266,19 @@ mod tests {
         };
         assert_eq!(c.qr_text().unwrap(), "fedimintcard-till-claim:https://registry.fedimintcard.org?c=K7QM-3XRP");
         assert!(!format!("{c:?}").contains(&"b".repeat(64)));
+    }
+
+    #[test]
+    fn the_cert_key_lives_beside_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cert_key(dir.path(), "04ab").unwrap();
+        assert!(read_ops(dir.path()).unwrap().is_none(), "a key alone is no token");
+        assert_eq!(read_cert_key(dir.path()).unwrap().as_deref(), Some("04ab"));
+        write_ops(dir.path(), &OpsConfig { url: "http://x".into(), token: "till_t".into() }).unwrap();
+        assert_eq!(read_cert_key(dir.path()).unwrap().as_deref(), Some("04ab"), "kept across a new token");
+        write_cert_key(dir.path(), "04cd").unwrap();
+        assert_eq!(read_ops(dir.path()).unwrap().unwrap().token, "till_t");
+        assert_eq!(read_cert_key(dir.path()).unwrap().as_deref(), Some("04cd"));
     }
 
     #[test]

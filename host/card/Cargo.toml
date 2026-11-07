@@ -14,8 +14,10 @@ pcsc = ["dep:pcsc"]
 [dependencies]
 anyhow = { workspace = true }
 hex = "0.4"
+p256 = { version = "0.13", features = ["ecdsa"] }
 pcsc = { version = "2", optional = true }
 rand = "0.8"
 secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
 serde_json = "1"
+sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["json"] }

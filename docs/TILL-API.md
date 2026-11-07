@@ -26,6 +26,44 @@ till's own outputs, `sales.json` and `cashouts.log` stay local. Slot 0 is never 
 its key is the card's short id. At startup the till reports the federation's name to ops. The
 token is never logged.
 
+### Applet 3.0 cards and offline charges
+
+A card with applet 3.0 (`SELECT` answers `03 00`; `docs/OFFLINE-PROTOCOL.md` § 1) signs each slot
+once, ever, and only a slot that holds its note. The till keeps it so, online: before the card
+signs, every input slot gets its note if it lacks one (`SET_NOTE` from the registry's amount and
+signature), and the card's daily limit is checked (`card_limit` otherwise, before anything is
+recorded); notes issued in a tap (change, a load, a top-up load) are written to the card in that
+tap; and every attach writes any live note the card still lacks (a change finished elsewhere). The
+till also keeps the newest Bitcoin block header (`--esplora-url`, default
+`https://mempool.space/api`, `TILL_ESPLORA_URL`; every 10 minutes, kept in
+`<data_dir>/block-header.json`; an empty value turns it off) and shows it to the card
+(`SET_HEADER`) when the card's clock is older; this never blocks or fails a job. 2.x cards get
+none of this.
+
+**Offline.** On ops, a charge first probes the registry (`GET /registry/cert-key`) and the
+federation, 2 s each, the answer kept 10 s. While both answer, charges taken offline are reported
+first and the charge runs online as above. When either does not answer (or the registry goes quiet
+at the attach), a 3.0 card is charged offline: its certificate is checked against the registry's
+certificate key the till keeps (`cert_key` in `till-ops.json`, refreshed by every probe while
+online), the card attests to a fresh challenge, each note's federation signature is checked
+against the federation's keys from the client config, notes this till already took offline are
+skipped, and the till's caps are checked (`--offline-cap-msat`, default 100,000,000 msat, and
+`--offline-cap-count`, default 200, of charges taken offline and not yet settled; env
+`TILL_OFFLINE_CAP_MSAT`, `TILL_OFFLINE_CAP_COUNT`). The PIN is verified, change goes to the
+card's KEYED slots (`SET_CHANGE`, the opening kept on the card), the card signs, and the signed
+transaction is saved in `<data_dir>/offline_queue.json` (0600, fsync) before the answer: `200`
+with `"offline": true` and `collection_pending: true`. The sale is in `sales.json` with
+`offline: true`.
+
+A sender (every 30 s while on ops, one job at a time) reports each queued charge
+(`POST /cards/:id/offline-charges`), writes it into the card's file as an open, signed charge, and
+lets the ordinary recovery send it to the federation, collect the change and the till's notes, and
+post `/outcome`; the sale then has `collection_pending: false`. A `409 double_spend`, or a
+federation rejection, marks the sale `double_spent: true` (a loss, kept and counted). The next tap
+of the card writes its change (`SET_NOTE`). A queue survives restarts; an entry cut off between
+the card signing and the save is finished at the card's next offline tap from the card's stored
+signatures.
+
 ### Connecting by claim
 
 A till can ask for its own token instead (`docs/TILL-CLAIM.md`). `card-sidecar till claim
@@ -70,7 +108,14 @@ relay (`CARD_BRIDGE_URL`) as before. Frames, timeouts and the pairing flow are i
 `200 {"ok":true}`
 
 ## GET /v1/status
-`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null}`
+`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null,"registry_reachable":bool|null,"federation_reachable":bool,"offline":{"queued":N,"queued_msat":N,"double_spent":N,"refused":N,"cap_msat":N,"cap_count":N}|null}`
+
+`registry_reachable` and `federation_reachable` are the probe of the offline section above (2 s
+each, kept 10 s); `registry_reachable` is null without a registry. `offline` is null when the
+till takes no offline charges (not `serve`). `queued` counts charges taken offline and not yet
+settled, `queued_msat` what the till is owed for them (its outputs: the price plus any overpay),
+`double_spent` the ones found spent elsewhere, `refused` reports the registry refused for another
+reason (kept for the operator).
 
 `ops_state` is `connected`, `waiting_for_approval` (a claim is live: `claim_code` and its expiry),
 `claim_expired`, `not_connected` (no token and no claim) or `local` (no registry configured).
@@ -88,6 +133,9 @@ Send it only once the card is present on the phone. Blocks until the federation 
 normally 5–20 s, worst case about 120 s: use a read timeout of at least 120 s.
 
 `200 {"ok":true,"sale_id":N,"txid":"<hex>","price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"inputs":[{"slot":0,"msat":N}],"change":[{"slot":1,"msat":N}],"collection_pending":bool,"warnings":[],"duration_ms":N}`
+
+An offline charge (above) adds `"offline": true`; its `received_msat` is 0 and
+`collection_pending` true until the sender settles it. Show "Paid offline".
 
 `received_msat` is what the wallet has collected so far; when `collection_pending` is true the
 federation has accepted the payment but the wallet has not yet swept it. Show "paid" either way.
@@ -136,10 +184,15 @@ earlier attempt.
 | `ops_unreachable` | 502 | on ops: the registry could not be reached; nothing was sent | retry; check the network |
 | `ops_refused` | 502 | on ops: the registry refused the till (bad or revoked token) | check the till token |
 | `ops_not_connected` | 503 | the till belongs on ops but has no token yet (no claim, a claim waiting for approval, or an expired one); nothing ran | connect the till (Connect to registry), approve it in the provisioner app |
+| `card_limit` | 402 | a 3.0 card's daily limit (`6A95`) does not take this charge; checked before anything is signed or recorded | decline; the card pays again once a later block header starts its next day |
+| `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is applet 2.x, which this till takes only online; nothing moved | decline, or retry once the till is online |
+| `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online) | retry once the till is online |
+| `card_not_genuine` | 403 | offline: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
+| `offline_cap_reached` | 503 | offline: this till's unsettled offline total or count would pass its cap; nothing moved | decline, or retry once the till is online and has sent its queue |
 | `internal` | 500 | anything else | show detail |
 
 ## GET /v1/sales
-`200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>"}]}`
+`200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>","offline":bool,"double_spent":bool,"collection_pending":bool}]}`
 
 Oldest first. The sales file (`sales.json` in the data dir, mode 0600) is a convenience ledger;
 the money truth is the federation and `card_state.json`.

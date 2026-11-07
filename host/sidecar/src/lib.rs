@@ -1,8 +1,10 @@
 pub mod cards;
 pub mod claim;
+pub mod clock;
 pub mod glue;
 pub mod holder;
 pub mod link;
+pub mod offline;
 pub mod ops;
 pub mod plan;
 pub mod pos;

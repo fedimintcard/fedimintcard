@@ -48,6 +48,13 @@ pub struct SaleRec {
     pub duration_ms: u64,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Taken with no registry or federation reachable (docs/OFFLINE-PROTOCOL.md § 4.4): paid by
+    /// a signed transaction the till sends once it is online.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline: bool,
+    /// An offline sale whose notes turned out spent elsewhere: a loss, kept for the operator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub double_spent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +151,15 @@ impl SalesStore {
             bail!("client_ref {:?} is already recorded for transaction {}", r.client_ref, r.txid);
         }
         self.commit(rec)
+    }
+
+    /// Change the sale of `txid` (an offline sale settling, or found double spent) and save.
+    pub fn update(&mut self, txid: &str, f: impl FnOnce(&mut SaleRec)) -> Result<Option<SaleRec>> {
+        let Some(r) = self.file.sales.iter_mut().find(|s| s.txid == txid) else { return Ok(None) };
+        f(r);
+        let r = r.clone();
+        self.save()?;
+        Ok(Some(r))
     }
 
     fn commit(&mut self, mut rec: SaleRec) -> Result<SaleRec> {
