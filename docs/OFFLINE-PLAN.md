@@ -154,6 +154,23 @@ tests.
   stranded. Proposed: the registry signs a release (card, slot, txid) with its certificate key;
   the card checks it (native P-256, about 75 ms) and returns the slot to NOTE or KEYED.
 - **Fee margin** on offline charges, so a fee change before the sync does not reject them.
+  *Built:* on a federation at core consensus 2.1 or later (the till reads it from the client
+  config, logs it at startup and shows it as `offline.fee_margin` in `/v1/status`), an offline
+  charge's inputs also pay a surplus the federation burns: the fees the transaction would owe
+  under a headroom schedule (default fedimint's default mint fees, 100 msat per input and output,
+  0 ppm; `--offline-fee-base-msat`, `--offline-fee-headroom-ppm`) less its fees now, floored at 0
+  (`host/sidecar/src/plan.rs`, `solve_with_margin`). The holder's change pays it; with no change
+  the till's overpay may; the till always gets at least what the exact charge gives it (at least
+  the price with no change). It covers a rise of the federation's fees up to the headroom, e.g.
+  a zero-fee federation turning on the default base fee. It does not cover a rise beyond the
+  headroom; a charge where neither the change nor the overpay can pay the margin without another
+  change note, slot or input (it goes exact rather than being refused, `fee_margin_msat: 0`); or
+  a federation older than 2.1, which refuses any surplus: there a fee change before the sync
+  still rejects the charge and the card's notes are released (`OFFLINE-PROTOCOL.md` § 6). Online
+  charges stay exact. In fedimint v0.13 a mint's fees are fixed in the federation's consensus
+  config, so the in-process test federation cannot change them mid-test: the tests show a charge
+  with a margin accepted on a zero-fee federation and the margin covering the default fees, not
+  a live fee change.
 - **Spare slots offline.** A fresh card ran out of keyed spare slots after two charges with change.
   Online tills should key more ahead; an offline till may re-key the slots its own queued charges
   spent. *Built (online half):* every online tap keeps a 3.0 card at 6 fresh keyed slots, at most 2

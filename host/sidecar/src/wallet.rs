@@ -15,6 +15,7 @@ use fedimint_core::config::FederationId;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::module::CoreConsensusVersion;
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_core::Amount;
 use fedimint_mint_client::{
@@ -50,7 +51,13 @@ pub struct Wallet {
     pub mint_cfg: MintClientConfig,
     /// Invite code saved by `join`, offered to the recipients of exported ecash.
     pub invite: Option<InviteCode>,
+    /// The federation's core consensus version, from its client config.
+    pub consensus_version: CoreConsensusVersion,
 }
+
+/// The first core consensus version whose guardians take a transaction that pays more than its
+/// outputs and fees (`fedimint-server/src/consensus/transaction.rs`, `OVERPAY_MIN_VERSION`).
+pub const SURPLUS_MIN_VERSION: CoreConsensusVersion = CoreConsensusVersion::new(2, 1);
 
 /// Result of reissuing external notes into the wallet.
 #[derive(Debug, Clone, Copy)]
@@ -69,7 +76,7 @@ impl Wallet {
         let (mint_id, mint_cfg) = cfg
             .get_first_module_by_kind::<MintClientConfig>(fedimint_mint_common::KIND)
             .context("federation has no mint (v1) module")?;
-        Ok(Self { client, mint_id, mint_cfg: mint_cfg.clone(), invite: None })
+        Ok(Self { client, mint_id, mint_cfg: mint_cfg.clone(), invite: None, consensus_version: cfg.global.consensus_version })
     }
 
     /// Join the federation behind `invite` (first run). Creates the mnemonic file if missing.
@@ -147,6 +154,12 @@ impl Wallet {
     }
 
     /// The federation's smallest economical note: below this a note's fees eat a quarter of it.
+    /// Whether the federation takes a surplus (core consensus 2.1 or later): what lets an offline
+    /// charge carry a fee margin (`plan::solve_with_margin`).
+    pub fn surplus_allowed(&self) -> bool {
+        self.consensus_version >= SURPLUS_MIN_VERSION
+    }
+
     pub fn min_denom(&self) -> u64 {
         self.mint_cfg.fee_consensus.min_economical_denomination().msats
     }

@@ -417,8 +417,16 @@ async fn fund(client: &ClientHandleArc, amount: Amount) -> anyhow::Result<()> {
 }
 
 async fn federation() -> anyhow::Result<FederationTest> {
+    federation_fees(true).await
+}
+
+/// The in-process federation with fedimint's default mint fees (100 msat per input and output),
+/// or with none.
+async fn federation_fees(fees: bool) -> anyhow::Result<FederationTest> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
-    Ok(tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).build()).await?)
+    let builder = fixtures.new_fed_builder(0);
+    let builder = if fees { builder } else { builder.disable_mint_fees() };
+    Ok(tokio::time::timeout(Duration::from_secs(60), builder.build()).await?)
 }
 
 struct Till {
@@ -433,7 +441,11 @@ struct Till {
 
 impl Till {
     async fn new(cfg: OfflineConfig) -> anyhow::Result<Self> {
-        let fed = federation().await?;
+        Self::new_fees(cfg, true).await
+    }
+
+    async fn new_fees(cfg: OfflineConfig, fees: bool) -> anyhow::Result<Self> {
+        let fed = federation_fees(fees).await?;
         let client = fed.new_client().await;
         fund(&client, Amount::from_sats(10_000)).await?;
         let wallet = Wallet::from_client(client).await?;
@@ -648,7 +660,7 @@ async fn a_clone_with_an_uncertified_attestation_key_is_refused() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_tills_caps_and_a_2_1_card_are_refused() -> anyhow::Result<()> {
-    let mut t = Till::new(OfflineConfig { cap_msat: 60_000, cap_count: 1 }).await?;
+    let mut t = Till::new(OfflineConfig { cap_msat: 60_000, cap_count: 1, ..OfflineConfig::default() }).await?;
     let card = v3_card();
     provision(&t.reg, &card);
     t.load(&card, &[1 << 16, 1 << 15]).await?;
@@ -705,7 +717,7 @@ async fn a_queued_charge_survives_a_restart_and_is_sent() -> anyhow::Result<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_reports_reachability_and_the_offline_queue() -> anyhow::Result<()> {
-    let t = Till::new(OfflineConfig { cap_msat: 5_000_000, cap_count: 7 }).await?;
+    let t = Till::new(OfflineConfig { cap_msat: 5_000_000, cap_count: 7, ..OfflineConfig::default() }).await?;
     t.set_down(true);
     let conn = Conn::new(OpsState::Connected { url: t.ops.client.url().to_owned() }, Some(t.ops.clone()));
     let sales = SalesStore::open(t.dir.path().join("sales2.json"))?;
@@ -717,7 +729,15 @@ async fn status_reports_reachability_and_the_offline_queue() -> anyhow::Result<(
     let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await?)?;
     assert_eq!(v["registry_reachable"], false, "{v}");
     assert_eq!(v["federation_reachable"], true, "{v}");
-    assert_eq!(v["offline"], json!({"queued": 0, "queued_msat": 0, "double_spent": 0, "refused": 0, "rejected": 0, "cap_msat": 5_000_000, "cap_count": 7}));
+    // The test federation runs core consensus 2.1: a surplus is allowed, so offline charges keep
+    // a fee margin (none charged yet).
+    assert_eq!(
+        v["offline"],
+        json!({
+            "queued": 0, "queued_msat": 0, "double_spent": 0, "refused": 0, "rejected": 0, "cap_msat": 5_000_000, "cap_count": 7,
+            "fee_margin": true, "fee_headroom_base_msat": 100, "fee_headroom_ppm": 0, "last_fee_margin_msat": null,
+        })
+    );
     Ok(())
 }
 
@@ -1074,5 +1094,84 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
     if renewed.len() < spent.len() {
         assert_eq!(unkeyed_of(&t.reg.cards.lock().unwrap()[&id]), unkeyed_before, "no new slot while a SPENT one could be renewed");
     }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ the fee margin
+
+/// A federation with no fees, at core consensus 2.1: an offline charge keeps a margin for
+/// fedimint's default fees (100 msat per input and output), burned when it is sent. The
+/// federation takes the surplus; the till gets what an exact charge would have given it, and the
+/// card's change is short by the margin.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offline_charge_with_a_fee_margin_is_sent_and_accepted() -> anyhow::Result<()> {
+    use fedimint_card_sidecar::plan;
+    let mut t = Till::new_fees(OfflineConfig::default(), false).await?;
+    assert!(t.cw.wallet.surplus_allowed(), "the test federation runs core consensus {}", t.cw.wallet.consensus_version);
+    assert_eq!(t.cw.wallet.fee(1 << 16), 0);
+    let card = v3_card();
+    provision(&t.reg, &card);
+    let loaded = [1u64 << 16, 1 << 14];
+    t.load(&card, &loaded).await?;
+    let bal0 = t.cw.wallet.balance_msat().await?;
+
+    let n_keyed = (0..card.borrow().slot_len()).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Keyed)).count();
+    t.set_down(true);
+    let price = 50_000;
+    let (status, body) = t.charge(&card, price, "m").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["offline"], true, "{body}");
+    let margin = body["fee_margin_msat"].as_u64().unwrap();
+    let q: Value = serde_json::from_slice(&std::fs::read(t.dir.path().join("offline_queue.json"))?)?;
+    let c = &q["charges"][0];
+    assert_eq!(c["fee_margin_msat"].as_u64(), Some(margin));
+    let sum = |v: &Value| v.as_array().unwrap().iter().map(|n| n["amount_msat"].as_u64().unwrap()).sum::<u64>();
+    let (ins, n_in) = (sum(&c["inputs"]), c["inputs"].as_array().unwrap().len() as u64);
+    let (change, n_change) = (sum(&c["change"]), c["change"].as_array().unwrap().len() as u64);
+    let till_msat = c["till_msat"].as_u64().unwrap();
+    let n_till = c["host"].as_array().unwrap().len() as u64;
+    // The signed transaction pays more than its outputs (no fees here): the surplus is the
+    // margin, the default fees of every input and output.
+    assert_eq!(c["fees_msat"], 0);
+    assert_eq!(ins, till_msat + change + margin, "{c}");
+    assert!(margin >= 100 * (n_in + n_till + n_change), "{margin} for {n_in} in, {n_till} + {n_change} out");
+    // The same charge planned exactly: the till gets at least as much; the change carries the
+    // margin (and any rise of the till's overpay).
+    let exact = plan::solve(&loaded, price, n_keyed, &|_| 0, 1)?;
+    let exact_till = exact.till.iter().sum::<u64>();
+    assert!(!exact.change.is_empty() && exact.surplus == 0);
+    assert!(till_msat >= exact_till, "the margin is not the till's: {till_msat} < {exact_till}");
+    assert_eq!(change + margin + (till_msat - exact_till), exact.change.iter().sum::<u64>(), "the card's change pays the margin");
+
+    t.set_down(false);
+    let sent = t.send().await;
+    assert_eq!(sent["settled"].as_array().unwrap().len(), 1, "{sent}");
+    let st = t.off.stats();
+    assert_eq!((st.queued, st.rejected, st.double_spent), (0, 0, 0), "the federation took the surplus: {sent}");
+    let sale = t.sale("m");
+    assert!(sale.offline && !sale.collection_pending && !sale.double_spent && !sale.rejected, "{sale:?}");
+    assert_eq!(t.cw.wallet.balance_msat().await? - bal0, till_msat, "the till's notes, whole");
+    let txid = body["txid"].as_str().unwrap();
+    assert!(t.reg.outcomes.lock().unwrap().iter().any(|o| o["txid"] == txid && o["accepted"] == true));
+    // The change, short by the margin, lands on the card at its next tap.
+    t.tap(&card);
+    let r = card_balance_job(&mut t.cw, Some(&t.ops), &t.sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["live_msat"].as_u64(), Some(loaded.iter().sum::<u64>() - ins + change), "{}", r.body);
+    Ok(())
+}
+
+/// Fedimint's default fees on the federation: the margin for the default schedule is 0, and an
+/// offline charge balances exactly, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_the_default_fees_an_offline_charge_has_no_margin() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 50_000, "z").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["fee_margin_msat"], 0, "{body}");
     Ok(())
 }
