@@ -30,13 +30,15 @@ stored in plain text anywhere but the till.
 - `claim_id`: 16 random bytes, hex. `poll_secret`: 32 random bytes, hex; the registry stores only
   its SHA-256. `code`: 8 characters from an unambiguous alphabet (no 0/O/1/I/L), shown as
   `XXXX-XXXX`, unique among live claims; case-insensitive on input.
-- A claim lives 10 minutes. Expired claims answer 404 (`no claim`) and are swept.
+- A pending claim lives 10 minutes. Approval extends it to 7 days from the approval, so a till
+  that was off or restarting when the operator approved still gets its token at its next poll.
+  Expired claims answer 404 (`no claim`) and are swept.
 - The token is created at the approved poll, not at approval, so the registry never holds a till
   token in plain text. It is created exactly as `POST /tills` does, under the approving operator.
 - An approve for a code that is unknown, expired or already approved answers 404 or 409.
   A wrong `poll_secret` answers 404 (as if there were no claim).
-- `POST /till-claims` is rate limited per client IP (e.g. 10 an hour) and globally capped in live
-  claims (e.g. 200), refusing with 429.
+- `POST /till-claims` is rate limited per client IP (e.g. 10 an hour) and globally capped in
+  pending claims (e.g. 200; approved claims do not count), refusing with 429.
 
 ## QR text
 
@@ -49,10 +51,13 @@ whose registry origin is not the one it is signed in to, and says which registry
 - `card-sidecar till claim --ops-url URL --name NAME` starts a claim, prints the QR (or, with
   `--text`, the QR text and the code), writes the claim (`claim_id`, `poll_secret`, expiry, ops URL)
   to `<data_dir>/till-claim.json` (0600), and exits.
-- `till serve` with no till token but a live `till-claim.json` polls it every few seconds; on
-  `approved` it writes the token where it keeps its till token (0600), deletes the claim file, and
-  carries on as a till on ops. Without a token or a claim it serves `/v1/status` saying it is not
-  connected, and refuses charges with `ops_not_connected`.
+- `till serve` with no till token watches `till-claim.json` every few seconds, including one
+  written after it started, and polls the registry about it; on `approved` it writes the token
+  where it keeps its till token (0600), deletes the claim file, and carries on as a till on ops.
+  The registry, not the file's `expires_at`, decides whether a claim is still live: a claim past
+  its file's expiry is still asked about once, and only a 404 ends it. Without a token or a claim
+  it serves `/v1/status` saying it is not connected and refuses charges with `ops_not_connected`;
+  a till started with no registry URL at all stays `local` until a claim file appears.
 - StartOS: **Connect to registry** (input: till name, registry URL default
   `https://registry.fedimintcard.org`) runs `till claim` and shows the QR and the code as its
   result. Health reports "Waiting for approval in the provisioner app" while a claim is live.

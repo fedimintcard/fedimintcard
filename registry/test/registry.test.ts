@@ -491,6 +491,25 @@ describe('till claims (docs/TILL-CLAIM.md)', () => {
     });
   });
 
+  it('keeps an approved claim for a till that polls after the pending window, then lets it go', async () => {
+    const token = await signIn();
+    const late = await started('Asleep at approval');
+    const never = await started('Never comes back');
+    for (const c of [late, never]) expect((await post(`/till-claims/${c.code}/approve`, token, {})).status).toBe(200);
+    const sevenDays = 7 * 24 * 60 * 60 * 1000;
+    await runInDurableObject(stub(), async (_i, state) => {
+      const row = state.storage.sql.exec('SELECT expires_at, approved_at FROM till_claims WHERE claim_id = ?', late.claim_id).one();
+      expect(Number(row.expires_at) - Number(row.approved_at)).toBe(sevenDays);
+      // Past both claims' first 10 minutes, and past the second one's approved window.
+      state.storage.sql.exec('UPDATE till_claims SET created_at = created_at - ?', 60 * 60 * 1000);
+      state.storage.sql.exec('UPDATE till_claims SET expires_at = ? WHERE claim_id = ?', Date.now() - 1, never.claim_id);
+    });
+    const res = await pollOf(late);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as {status: string}).status).toBe('approved');
+    expect((await pollOf(never)).status).toBe(404);
+  });
+
   it('answers a second approve 409; another operator neither sees nor approves an approved claim', async () => {
     const token = await signIn();
     const c = await started();
@@ -534,7 +553,7 @@ describe('till claims (docs/TILL-CLAIM.md)', () => {
     expect((await start('t', '203.0.113.10')).status).toBe(200);
   });
 
-  it('caps live claims across the registry (429), and expired ones stop counting', async () => {
+  it('caps pending claims across the registry (429); approved and expired ones stop counting', async () => {
     await runInDurableObject(stub(), async (_i, state) => {
       const sql = state.storage.sql;
       for (let i = 0; i < 200; i += 1) {
@@ -544,6 +563,12 @@ describe('till claims (docs/TILL-CLAIM.md)', () => {
         );
       }
     });
+    expect((await start()).status).toBe(429);
+    // An approved claim waits for its till for days; it does not hold a pending place.
+    await runInDurableObject(stub(), async (_i, state) => {
+      state.storage.sql.exec('UPDATE till_claims SET approved_by = 1, approved_at = ? WHERE claim_id = ?', Date.now(), '0'.repeat(32));
+    });
+    expect((await start()).status).toBe(200);
     expect((await start()).status).toBe(429);
     await runInDurableObject(stub(), async (_i, state) => {
       state.storage.sql.exec('UPDATE till_claims SET expires_at = ? WHERE claim_id < ?', Date.now() - 1, '0'.repeat(30) + '10');

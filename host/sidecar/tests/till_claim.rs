@@ -163,16 +163,35 @@ async fn the_poller_waits_then_keeps_the_token_and_goes_on_ops() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn an_expired_claim_says_so_without_asking_and_a_forgotten_one_is_asked_once() -> anyhow::Result<()> {
+async fn a_claim_approved_while_the_till_was_off_is_collected_after_its_file_expires() -> anyhow::Result<()> {
+    // The operator approved within the claim's 10 minutes; the till only polls after them. The
+    // registry keeps an approved claim for days, so the file's expires_at must not stop the poll.
     let (url, fake) = fake_registry(-1).await;
     let dir = tempfile::tempdir()?;
     let c = claim::start(dir.path(), &url, "t", false).await?;
     assert_eq!(OpsState::of_claim(Some(&c), None, claim::now_ms()), OpsState::ClaimExpired { url: url.clone(), code: c.code.clone() });
+    fake.lock().unwrap().approved = true;
+    let conn = Conn::new(OpsState::of_claim(Some(&c), None, claim::now_ms()), None);
+    let r = report();
+    claim_tick(&conn, dir.path(), Some(&r), &mut Default::default()).await;
+    assert_eq!(conn.lock().unwrap().state, OpsState::Connected { url: url.clone() });
+    assert_eq!(claim::read_ops(dir.path())?.unwrap().token, TOKEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_expired_claim_the_registry_forgot_is_asked_once() -> anyhow::Result<()> {
+    let (url, fake) = fake_registry(-1).await;
+    let dir = tempfile::tempdir()?;
+    claim::start(dir.path(), &url, "t", false).await?;
+    fake.lock().unwrap().taken = true;
     let conn = Conn::new(OpsState::NotConnected { url: None }, None);
     let mut dead = Default::default();
-    claim_tick(&conn, dir.path(), None, &mut dead).await;
+    for _ in 0..3 {
+        claim_tick(&conn, dir.path(), None, &mut dead).await;
+    }
     assert!(matches!(conn.lock().unwrap().state, OpsState::ClaimExpired { .. }));
-    assert_eq!(fake.lock().unwrap().polls, 0, "an expired claim is not polled");
+    assert_eq!(fake.lock().unwrap().polls, 1);
 
     // Live by its file, but the registry no longer knows it (404): expired, and asked only once.
     let (url, fake) = fake_registry(600_000).await;
@@ -186,6 +205,20 @@ async fn an_expired_claim_says_so_without_asking_and_a_forgotten_one_is_asked_on
     }
     assert!(matches!(conn.lock().unwrap().state, OpsState::ClaimExpired { .. }));
     assert_eq!(fake.lock().unwrap().polls, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_local_till_stays_local_until_a_claim_file_appears() -> anyhow::Result<()> {
+    let (url, _fake) = fake_registry(600_000).await;
+    let dir = tempfile::tempdir()?;
+    let conn = Conn::new(OpsState::Local, None);
+    let mut dead = Default::default();
+    claim_tick(&conn, dir.path(), None, &mut dead).await;
+    assert_eq!(conn.lock().unwrap().state, OpsState::Local);
+    claim::start(dir.path(), &url, "t", false).await?;
+    claim_tick(&conn, dir.path(), None, &mut dead).await;
+    assert!(matches!(conn.lock().unwrap().state, OpsState::Waiting { .. }));
     Ok(())
 }
 
@@ -328,6 +361,49 @@ async fn serve_polls_the_claim_and_picks_up_the_token() -> anyhow::Result<()> {
             assert_eq!(seen["ops_state"], "connected", "{seen}");
             assert!(claim::read_ops(&dir).unwrap().is_some());
             assert!(claim::read_claim(&dir).unwrap().is_none());
+            server.abort();
+            drop(f._fed);
+        })
+        .await;
+    Ok(())
+}
+
+/// A till serving with no registry and no claim picks up a claim made afterwards (`till claim`
+/// while it runs) and is on ops after approval, with no restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_picks_up_a_claim_made_after_it_started() -> anyhow::Result<()> {
+    let (url, fake) = fake_registry(600_000).await;
+    let f = fx().await?;
+    let dir = f.dir.path().to_owned();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let listen: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let status_url = format!("http://127.0.0.1:{port}/v1/status");
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(till::serve_with(f.cw, listen, "http://127.0.0.1:1".into(), None, None, false));
+            let client = reqwest::Client::new();
+            let status = || async {
+                for _ in 0..200 {
+                    if let Ok(r) = client.get(&status_url).send().await {
+                        return r.json::<Value>().await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("the till never answered");
+            };
+            assert_eq!(status().await["ops_state"], "local");
+            claim::start(&dir, &url, "late claim", false).await.unwrap();
+            fake.lock().unwrap().approved = true;
+            let mut seen = Value::Null;
+            for _ in 0..40 {
+                seen = status().await;
+                if seen["connected"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            assert_eq!(seen["ops_state"], "connected", "{seen}");
             server.abort();
             drop(f._fed);
         })

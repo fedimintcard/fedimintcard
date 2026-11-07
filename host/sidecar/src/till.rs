@@ -258,9 +258,13 @@ impl Conn {
     }
 }
 
-/// One look at the claim file, and at the registry while the claim is live. On approval: keep the
-/// token (`till-ops.json`), report the federation, and put the till on ops. `dead` remembers
-/// claims the registry answered 404, so they are not asked about again.
+/// One look at the claim file, and at the registry about it. On approval: keep the token
+/// (`till-ops.json`), report the federation, and put the till on ops. `dead` remembers claims the
+/// registry answered 404, so they are not asked about again.
+///
+/// The registry decides whether a claim is still live, not the claim file's `expires_at`: an
+/// approved claim waits for its till for days (registry `APPROVED_CLAIM_TTL_MS`), so a till that
+/// was not running when the operator approved still collects its token on its first poll.
 pub async fn claim_tick(conn: &SharedConn, dir: &Path, report: Option<&FederationReport>, dead: &mut HashSet<String>) {
     let claim = match crate::claim::read_claim(dir) {
         Ok(c) => c,
@@ -280,11 +284,14 @@ pub async fn claim_tick(conn: &SharedConn, dir: &Path, report: Option<&Federatio
     };
     let default_url = conn.lock().unwrap().default_url.clone();
     let Some(c) = claim else {
-        set(OpsState::NotConnected { url: default_url }, None);
+        // A till serving without a registry stays that way until a claim file appears.
+        if !matches!(conn.lock().unwrap().state, OpsState::Local) {
+            set(OpsState::NotConnected { url: default_url }, None);
+        }
         return;
     };
     let expired = OpsState::ClaimExpired { url: c.ops_url.clone(), code: c.code.clone() };
-    if c.expired(now) || dead.contains(&c.claim_id) {
+    if dead.contains(&c.claim_id) {
         set(expired, None);
         return;
     }
@@ -1733,7 +1740,9 @@ pub async fn serve_with(
                 }
                 (Some(cfg), true)
             }
-            None => (None, ops_url.is_some() || claim.is_some()),
+            // No registry yet: watch for a claim anyway, so `till claim` works against a till
+            // that is already serving.
+            None => (None, true),
         },
     };
     let report = if cfg.is_some() || poll { Some(crate::ops::FederationReport::of(&cw.wallet).await) } else { None };
@@ -1744,7 +1753,7 @@ pub async fn serve_with(
             eprintln!("card state from ops at {}", cfg.url);
             Conn::new(OpsState::Connected { url: cfg.url.clone() }, Some(o))
         }
-        None if poll => {
+        None if ops_url.is_some() || claim.is_some() => {
             let state = OpsState::of_claim(claim.as_ref(), ops_url.clone(), crate::claim::now_ms());
             eprintln!("not connected to a registry yet ({}): card jobs are refused until a claim is approved", state.name());
             let c = Conn::new(state, None);

@@ -9,17 +9,22 @@
  *   does and deletes the claim in the same transaction, so the token is answered once and the
  *   registry never holds it in plain text.
  *
- * Claims live 10 minutes and are swept on every claim route. They are not in the backup
- * (`backup.ts` lists the tables it copies): a claim is useless after a restore.
+ * A pending claim lives 10 minutes. Approval extends it to 7 days from the approval, so a till
+ * that is off when the operator approves (a StartOS box restarting, a laptop asleep) still gets
+ * its token when it next polls. The token itself is minted only at that poll, so the registry
+ * holds nothing usable meanwhile. Claims are swept on every claim route. They are not in the
+ * backup (`backup.ts` lists the tables it copies): a claim is useless after a restore.
  */
 import {insertTill, newTillToken, RateLimited} from './auth';
 import {BadRequest, Conflict, constantTimeEqual, fromHex, isHex, NotFound, randomHex, sha256Hex} from './http';
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000;
+/** How long an approved claim waits for its till's poll, from the approval. */
+export const APPROVED_CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Claims one client IP may start per window. */
 export const CLAIMS_PER_IP = 10;
 export const CLAIM_IP_WINDOW_MS = 60 * 60 * 1000;
-/** Live claims across the registry; past it every start answers 429. */
+/** Pending claims across the registry; past it every start answers 429. */
 export const MAX_LIVE_CLAIMS = 200;
 
 /** No 0/O/1/I/L: a code is read off a screen and may be typed. */
@@ -103,7 +108,7 @@ export async function startClaim(
       fresh ? now : Number(row.window_start),
       fresh ? 1 : Number(row.claims) + 1,
     );
-    const live = sql.exec('SELECT COUNT(*) AS n FROM till_claims').one() as {n: number};
+    const live = sql.exec('SELECT COUNT(*) AS n FROM till_claims WHERE approved_by IS NULL').one() as {n: number};
     if (Number(live.n) >= MAX_LIVE_CLAIMS) {
       throw new RateLimited('too many till claims are waiting; try again in a few minutes');
     }
@@ -154,7 +159,10 @@ export function readClaim(sql: Sql, operatorId: number, rawCode: string, now: nu
   };
 }
 
-/** `POST /till-claims/:code/approve`: ties a pending claim to this operator. */
+/**
+ * `POST /till-claims/:code/approve`: ties a pending claim to this operator and keeps it for
+ * [`APPROVED_CLAIM_TTL_MS`] from now, for a till that is not running to poll later.
+ */
 export function approveClaim(storage: DurableObjectStorage, operatorId: number, rawCode: string, now: number): void {
   storage.transactionSync(() => {
     const c = byCode(storage.sql, rawCode, now);
@@ -164,8 +172,8 @@ export function approveClaim(storage: DurableObjectStorage, operatorId: number, 
       throw new Conflict('this claim is already approved');
     }
     storage.sql.exec(
-      'UPDATE till_claims SET approved_by = ?, approved_at = ? WHERE claim_id = ?',
-      operatorId, now, c.claim_id,
+      'UPDATE till_claims SET approved_by = ?, approved_at = ?, expires_at = ? WHERE claim_id = ?',
+      operatorId, now, now + APPROVED_CLAIM_TTL_MS, c.claim_id,
     );
   });
 }
