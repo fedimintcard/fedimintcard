@@ -6,6 +6,11 @@ data class TillStatus(
     val walletBalanceMsat: Long,
     val cardRelayOk: Boolean,
     val busy: Boolean,
+    /** Offline charges queued on the till and not yet sent (`offline.queued`); 0 on a till without the field. */
+    val offlineQueued: Long = 0,
+    val offlineQueuedMsat: Long = 0,
+    /** Offline charges the registry refused as double spends (`offline.double_spent`). */
+    val offlineDoubleSpent: Long = 0,
 )
 
 data class Note(val slot: Int, val msat: Long)
@@ -35,6 +40,8 @@ data class ChargeReceipt(
     val collectionPending: Boolean,
     val warnings: List<String>,
     val durationMs: Long,
+    /** The till took this charge with no registry or federation reachable (`"offline": true`). */
+    val offline: Boolean = false,
 )
 
 data class Sale(
