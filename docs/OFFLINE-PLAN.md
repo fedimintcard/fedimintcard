@@ -124,3 +124,44 @@ are reset and set up again.
   the federation.
 - Co-signed notes (option 2). Reconsider if card extraction becomes a real threat.
 - Tills gossiping spent notes over a local network; a later improvement.
+
+## 10. As built and drilled (2026-11-07)
+
+F0–F5 are on `main` (applet 3.0 `332a45f`, registry `3cee827`/`f65e7c0`, till `00c7bf4`/`ede3c2c`,
+apps `bb62673`ff.). F6 ran on staging with a real J3R180 (`908901dc`), the Pixel and a laptop till:
+
+1. Setup app on the Test registry: applet 3.0, keys 0–7, a 20,000 sat daily limit, attestation
+   key, a 130-byte certificate from the registry, then the PIN. (First found: the app sent the
+   keys in upper-case hex and the registry refused them; fixed in `4ec5b25`.)
+2. `card load 30000000` from the staging till: 10 notes, each written to the card (SET_NOTE).
+3. Online charge 50 sat: paid; change to three spare slots.
+4. Till restarted with the registry unreachable: 30 sat → "Paid offline" (change to a CHANGE
+   slot); 10 sat refused (no spare slot for change, no exact plan); 16 sat → "Paid offline"
+   (one note, no change).
+5. Till back online: the sender reported both charges, the federation took them, the queue went
+   to 0 with no double spend or rejection, the till's wallet rose by the 47.488 sat it was owed.
+6. A balance tap online finished the change: the CHANGE slot became a NOTE with its signature.
+   The card's clock had moved to the tip header; its day's count read 121.2 sat (gross inputs).
+
+A double spend cannot be staged with a genuine card: it refuses a second transaction per note.
+Double spends from a copied card are covered by `host/sidecar/tests/offline.rs` and the registry
+tests.
+
+### Follow-ups found
+
+- **Release for rejected charges.** A charge the federation rejects (e.g. a fee change) leaves
+  its inputs SPENT on the card and its change slots CHANGE for good: the inputs' value is
+  stranded. Proposed: the registry signs a release (card, slot, txid) with its certificate key;
+  the card checks it (native P-256, about 75 ms) and returns the slot to NOTE or KEYED.
+- **Fee margin** on offline charges, so a fee change before the sync does not reject them.
+- **Spare slots offline.** A fresh card ran out of keyed spare slots after two charges with change.
+  Online tills should key more ahead; an offline till may re-key the slots its own queued charges
+  spent.
+- **Messages.** The POS says "card needs a top up" for "no slot for change"; the Setup app says
+  "the card left the phone" for a registry refusal.
+- **The daily limit counts online charges too, by gross input** (as cashucard's): with notes up
+  to 16,777 sat, one charge can use most of a 20,000 sat day. Owner decision pending.
+- **A note pending under another till's unresolved online charge** makes an offline report a
+  `double_spend` even if that charge later fails.
+- **Production**: registry v11 needs its own `CERT_SIGNING_KEY` (set by the owner), then the
+  registry, the zion till package and the apps.
