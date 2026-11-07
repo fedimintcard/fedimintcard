@@ -25,6 +25,9 @@ export function json(status: number, body: unknown): Response {
 
 /** A failure the app can show. */
 export function fail(status: number, reason: string): Response {
+  // Logged so `wrangler tail` shows why a request was refused: the reason is
+  // what the caller sent wrong, never a secret or a request body.
+  console.warn(`refused ${status}: ${reason}`);
   return json(status, {ok: false, reason});
 }
 

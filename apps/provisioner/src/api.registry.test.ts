@@ -240,6 +240,9 @@ test('the attestation call posts the card’s key with the operator session and 
     body: {attest_pub: attestPub, slot0: SLOT0},
     auth: 'Bearer op_tok',
   });
+  // cardkit's toHex is upper case: the registry gets lower case, or it answers 400
+  await api.attestCard('0a0b0c0d', attestPub.toUpperCase(), SLOT0.toUpperCase());
+  expect(seen.at(-1)?.body).toEqual({attest_pub: attestPub.toLowerCase(), slot0: SLOT0.toLowerCase()});
   // a certificate that is not hex, or longer than the card can hold, is no certificate
   cert = 'zz';
   await expect(api.attestCard('0a0b0c0d', attestPub, SLOT0)).rejects.toThrow(/malformed/);

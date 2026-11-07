@@ -536,7 +536,8 @@ export class RegistryClient extends HttpTransport {
   async attestCard(token: string, shortId: string, attestPub: string, slot0: string): Promise<string> {
     const json = await this.post(`/registry/cards/${encodeURIComponent(shortId)}/attestation`, {
       token,
-      body: {attest_pub: attestPub, slot0},
+      // The registry takes lower-case hex only; cardkit's toHex writes upper case.
+      body: {attest_pub: attestPub.toLowerCase(), slot0: slot0.toLowerCase()},
       operation: 'attestation',
     });
     const cert = json.cert;
