@@ -18,8 +18,8 @@
 import React from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
-import {SUMMARY} from '../strings';
-import {type RecordRow, useBatch} from '../store';
+import {SUMMARY, SETUP} from '../strings';
+import {type RecordRow, dailyLimitOf, useBatch} from '../store';
 import {
   Card,
   Divider,
@@ -29,6 +29,7 @@ import {
   SectionHeader,
   SecondaryButton,
   useTheme,
+  ValueRow,
 } from '../ui';
 
 function timeOf(at: number): string {
@@ -63,6 +64,16 @@ export function BatchSummaryScreen({
           <Stat value={summary.spendable} label={SUMMARY.programmed} tone="accent" />
           <Stat value={stopped} label={SUMMARY.stopped} tone={stopped > 0 ? 'danger' : 'ink'} />
           <Stat value={summary.pending} label={SUMMARY.pending} tone="ink" />
+        </View>
+        <View style={local.section}>
+          <Card>
+            <ValueRow
+              label={SUMMARY.limit}
+              value={SETUP.limitValue(dailyLimitOf(config))}
+              valueTone="ink"
+              testID="summary-limit"
+            />
+          </Card>
         </View>
         <View style={local.section}>
           <SectionHeader help={SUMMARY.recordHelp} testID="summary-record-help">

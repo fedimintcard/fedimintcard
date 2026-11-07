@@ -49,6 +49,7 @@ export type ServiceOperation =
   | 'sign-in'
   | 'sign-out'
   | 'create-batch'
+  | 'attestation'
   | 'post-card'
   | 'list-cards'
   | 'list-federations'
@@ -525,6 +526,28 @@ export class RegistryClient extends HttpTransport {
   }
 
   /**
+   * POST /registry/cards/:short_id/attestation — the certificate over a
+   * card's attestation key (docs/OFFLINE-PROTOCOL.md § 3). The same key again
+   * answers the same certificate, so a lifted tap's retry is safe. The reply
+   * is checked here: a certificate the card would refuse never reaches it.
+   */
+  async attestCard(token: string, shortId: string, attestPub: string): Promise<string> {
+    const json = await this.post(`/registry/cards/${encodeURIComponent(shortId)}/attestation`, {
+      token,
+      body: {attest_pub: attestPub},
+      operation: 'attestation',
+    });
+    const cert = json.cert;
+    if (
+      typeof cert !== 'string' ||
+      !/^([0-9a-f]{2}){1,160}$/.test(cert)
+    ) {
+      throw new ApiServiceError('the certificate is malformed', 200, undefined, 'attestation');
+    }
+    return cert;
+  }
+
+  /**
    * GET /registry/cards/:id/reset-check?chip= — what ops holds for the card.
    * The chip lets ops find a card it knows only by its chip (a `needsReset`
    * install), and say whether the holder's PIN is needed at all.
@@ -863,6 +886,10 @@ export class RegistryStoreApi implements CardOps, TillOps {
 
   resumeCheck(chip: string, shortId: string): Promise<ResumeCheck> {
     return this.client.resumeCheck(this.token(), chip, shortId);
+  }
+
+  attestCard(shortId: string, attestPub: string): Promise<string> {
+    return this.client.attestCard(this.token(), shortId, attestPub);
   }
 
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {

@@ -39,6 +39,7 @@ import {ScrollView, StyleSheet, Text, View} from 'react-native';
 
 import {CardFigure} from '../CardFigure';
 
+import {fromHex, toHex} from '../cardkit';
 import {holdsPlace, installTap} from '../installTap';
 import {generatePin, useAttemptedPin, useBatchPin, usePinReveal} from '../pin';
 import {phaseMessage, setCardMessage, withCard} from '../session';
@@ -48,6 +49,7 @@ import {
   type CardPhase,
   type CardStop,
   type RecordRow,
+  dailyLimitOf,
   shortIdOf,
   useBatch,
   useStore,
@@ -219,6 +221,11 @@ export function LoopScreen({
             pin,
             managerKeys: chip => ops.managerKeys(chip),
             resumeCheck: (chip, shortId) => ops.resumeCheck(chip, shortId),
+            offline: {
+              limitMsat: dailyLimitOf(config) * 1000,
+              certify: async (attestPub, slot0) =>
+                fromHex(await ops.attestCard(shortIdOf(slot0), toHex([...attestPub]))),
+            },
             attemptedPin: chip => attempted.forChip(chip),
             onChip: chip => {
               chipSeen = chip;
@@ -257,7 +264,7 @@ export function LoopScreen({
               if (step === 'setPin') {
                 pinSent = true;
               }
-              if (step === 'keys') {
+              if (step === 'keys' || step === 'attest') {
                 enter('keySetup', LOOP.phaseKeys);
               } else if (step === 'setPin') {
                 enter('setPin', LOOP.phasePin);
@@ -302,7 +309,9 @@ export function LoopScreen({
       if (!setup || !setup.ok) {
         // Installed, but its PIN refused: the card cannot be handed out.
         dropAttempt();
-        const keysDone = setup !== null && setup.step !== 'select' && setup.step !== 'keys';
+        const keysDone = setup !== null && setup.step !== 'select' &&
+          setup.step !== 'keys' &&
+          setup.step !== 'attest';
         actions.recordCard({
           ok: false,
           phase: keysDone ? 'setPin' : 'keySetup',

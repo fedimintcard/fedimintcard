@@ -36,6 +36,7 @@ import React, {
 import {AppState} from 'react-native';
 
 import type {StopKind} from './cardkit';
+import {DEFAULT_DAILY_LIMIT_SAT} from './cardSetup';
 import type {CardOps, TillOps} from './ops';
 import {
   useOptionalBatchPin,
@@ -179,6 +180,16 @@ export interface BatchConfig {
   count: number;
   /** One PIN for the batch, or one generated per card: a policy, never a value. */
   pinPolicy: PinPolicy;
+  /**
+   * What an applet 3.0 card may spend offline in a day, in sat (SET_LIMIT);
+   * 0 for none. Absent is `DEFAULT_DAILY_LIMIT_SAT`.
+   */
+  dailyLimitSat?: number;
+}
+
+/** The batch's offline limit, in sat. */
+export function dailyLimitOf(config: BatchConfig): number {
+  return config.dailyLimitSat ?? DEFAULT_DAILY_LIMIT_SAT;
 }
 
 /** The outcome of one card's run, as the engine reports it. */
@@ -665,6 +676,12 @@ export function StoreProvider({
         if (!Number.isSafeInteger(config.count) || config.count < 1) {
           throw new Error('a batch is at least one card');
         }
+        if (
+          config.dailyLimitSat !== undefined &&
+          (!Number.isSafeInteger(config.dailyLimitSat) || config.dailyLimitSat < 0)
+        ) {
+          throw new Error('the daily limit is a whole number of sat, 0 or more');
+        }
         // A new batch starts empty and takes its PIN policy from the config.
         // Any PIN left from a previous batch goes first.
         pinSlot.wipe();
@@ -791,6 +808,8 @@ export function StoreProvider({
         apiRef.current?.resumeCheck?.(chip, shortId) ?? missing('the resume check'),
       resetCheck: (shortId, chip) =>
         apiRef.current?.resetCheck?.(shortId, chip) ?? missing('the reset check'),
+      attestCard: (shortId, attestPub) =>
+        apiRef.current?.attestCard?.(shortId, attestPub) ?? missing('the card certificate'),
       completeReset: completion =>
         apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };
