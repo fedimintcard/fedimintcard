@@ -20,7 +20,8 @@ final class CardTestSupport {
     static final int GEN_KEY = 0x10, GET_PUB = 0x11, SIGN = 0x12, STATE_KEY = 0x13;
     static final int VERIFY_PIN = 0x40, SET_PIN = 0x41, CHANGE_PIN = 0x42;
     static final int SET_NOTE = 0x14, GET_SLOT = 0x15, GET_STATE = 0x16, SET_CHANGE = 0x17, SET_LIMIT = 0x18,
-        SET_HEADER = 0x19, ATTEST_INIT = 0x30, SET_CERT = 0x31, GET_CERT = 0x32, ATTEST = 0x33;
+        SET_HEADER = 0x19, ATTEST_INIT = 0x30, SET_CERT = 0x31, GET_CERT = 0x32, ATTEST = 0x33,
+        SET_REGISTRY_KEY = 0x34, RELEASE = 0x35;
     static final int ST_EMPTY = 0, ST_KEYED = 1, ST_NOTE = 2, ST_CHANGE = 3, ST_SPENT = 4;
 
     /** A note's data for SET_NOTE: the amount in msat (8, big-endian), then 48 bytes standing for the signature. */

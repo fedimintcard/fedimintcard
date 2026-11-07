@@ -178,7 +178,7 @@ class OfflineTest {
         c.verifyPin(DEFAULT_PIN);
         assertSw(0x6985, c.tx(SET_LIMIT, 0, longBytes(1L << 40)));
         byte[] st = c.tx(GET_STATE, 0, null).getData();
-        assertEquals(58, st.length);
+        assertEquals(59, st.length);
         assertEquals(5000, u64(st, 40));
     }
 

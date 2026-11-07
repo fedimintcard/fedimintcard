@@ -107,3 +107,32 @@ Online, a 3.0 card's `SIGN` counts against its daily limit too, so the till chec
   SET_LIMIT (a batch setting, default 10,000 sat), ATTEST_INIT, `POST …/attestation`, SET_CERT.
 - **POS**: a charge answered with `offline: true` shows "Paid offline"; the till's status shows
   what is waiting to sync.
+
+## 6. Releases (follow-up 1 of `OFFLINE-PLAN.md` § 10)
+
+A charge the federation refuses, or an offline report the registry refuses as a double spend,
+leaves the card holding state for a transaction that will never be accepted: its inputs SPENT
+(the card signs one transaction per note, so their value is stranded) and its change slots
+CHANGE. The registry, which learns of the refusal, signs a release per slot; the card checks it
+and undoes exactly that.
+
+- **Card.** `SET_REGISTRY_KEY` (INS 34, 65 bytes, the registry's certificate key from
+  `GET /registry/cert-key`, uncompressed; only before SET_PIN). `RELEASE` (INS 35, P1 = slot,
+  data = txid (32) ‖ DER ECDSA-SHA256 signature): a SPENT slot whose spent hash is txid → NOTE;
+  a CHANGE slot whose opening names txid → KEYED; answers the new state (1). 6982 for a bad
+  signature, 6985 for a slot the release does not fit or a card with no registry key.
+  GET_STATE is 59 bytes: byte 58 is 1 once the registry key is set.
+- **Signed message.** ECDSA P-256, SHA-256, by `CERT_SIGNING_KEY`, over `"fedimintcard/rel1"`
+  (17 ASCII) ‖ slot 0's x-only key (32) ‖ slot (1) ‖ txid (32). The card wants DER; WebCrypto
+  gives r ‖ s, so the registry converts.
+- **Registry.** When a charge's outcome is `rejected` (online or offline), a release for every
+  input's slot and every change slot of that transaction; when an offline report is refused as a
+  double spend, a release for every change slot it named (its inputs were spent elsewhere and
+  stay spent). Kept in a `releases` table and listed in the card's state (`GET /cards/:id/state`,
+  `releases: [{slot, txid, sig}]`, sig as DER hex) until the slot is keyed anew or the card reset.
+- **Till.** At an online attach of a 3.0 card, each listed release whose slot still fits
+  (GET_SLOT: SPENT with that spent hash, or CHANGE with that txid) is sent as RELEASE. A
+  released input is a live note again (the registry restored it when it recorded the
+  rejection); a released change slot is a free keyed slot.
+- **Setup app.** SET_REGISTRY_KEY in the install tap before SET_PIN, with the key fetched from
+  `GET /registry/cert-key`; GET_STATE byte 58 tells a resumed tap whether it is done.

@@ -45,7 +45,7 @@ import javacard.security.Signature;
  * 15 GET_SLOT    P1=slot              -> state (1) || x-only pubkey (32) || amount and signature (56) || spent hash (32)
  *                                        || opening (66)
  * 16 GET_STATE                        -> slot states (32) || now (4) || window (4) || limit (8) || spent today (8)
- *                                        || certificate length (1) || attestation key present (1)
+ *                                        || certificate length (1) || attestation key present (1) || registry key set (1)
  * 17 SET_CHANGE  P1=slot Lc=74        amount (8) || txid (32) || output index (2) || blinding key (32). A KEYED slot becomes CHANGE
  * 18 SET_LIMIT   Lc=8                 the day's limit in msat (0: none). Only before SET_PIN
  * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work (6A93)
@@ -53,6 +53,12 @@ import javacard.security.Signature;
  * 31 SET_CERT    Lc=1..160            the registry's certificate over this card; once, before SET_PIN
  * 32 GET_CERT                         -> the certificate
  * 33 ATTEST      Lc=32 (challenge)    -> ECDSA-SHA256 (DER) over "fedimintcard/at1" || challenge || slot 0's x-only pubkey
+ * 34 SET_REGISTRY_KEY Lc=65           the registry's P-256 certificate key (uncompressed); only before SET_PIN
+ * 35 RELEASE     P1=slot Lc=32+DER    txid (32) || the registry's ECDSA-SHA256 (DER) over "fedimintcard/rel1" || slot 0's
+ *                                        x-only key || slot (1) || txid. A SPENT slot whose one transaction is txid goes
+ *                                        back to NOTE; a CHANGE slot owed by txid goes back to KEYED. -> the new state (1).
+ *                                        The registry signs one only for a transaction the federation refused, or whose
+ *                                        report it refused as a double spend (docs/OFFLINE-PROTOCOL.md § 6)
  * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN
  * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card; does not open a session
  * 42 CHANGE_PIN  P1=P2=0 Lc=8..16     -> after VERIFY_PIN; closes the session
@@ -118,6 +124,8 @@ public final class FedimintCardApplet extends Applet {
     static final byte INS_SET_CERT = (byte) 0x31;
     static final byte INS_GET_CERT = (byte) 0x32;
     static final byte INS_ATTEST = (byte) 0x33;
+    static final byte INS_SET_REGISTRY_KEY = (byte) 0x34;
+    static final byte INS_RELEASE = (byte) 0x35;
 
     static final byte ST_EMPTY = 0;
     static final byte ST_KEYED = 1;
@@ -147,6 +155,9 @@ public final class FedimintCardApplet extends Applet {
     private static final byte[] FLOOR_BITS = { (byte) 0xC0, (byte) 0x7B, (byte) 0x08, (byte) 0x17 };
     /** 86 400 seconds, big-endian. */
     private static final byte[] DAY_SECONDS = { (byte) 0x00, (byte) 0x01, (byte) 0x51, (byte) 0x80 };
+    /** RELEASE's label: ASCII "fedimintcard/rel1", 17 bytes. */
+    private static final byte[] RELEASE_LABEL = {
+        'f','e','d','i','m','i','n','t','c','a','r','d','/','r','e','l','1' };
     /** ATTEST's label: ASCII "fedimintcard/at1", 16 bytes. */
     private static final byte[] ATTEST_LABEL = {
         'f','e','d','i','m','i','n','t','c','a','r','d','/','a','t','1' };
@@ -231,6 +242,9 @@ public final class FedimintCardApplet extends Applet {
     /** Whether ATTEST_INIT has made the attestation key. */
     private boolean attestMade;
     private final Signature ecdsa;
+    /** The registry's certificate key (P-256), which signs releases; set at provisioning. */
+    private final ECPublicKey registryKey;
+    private boolean registryKeySet;
     private final MessageDigest sha;
     /** Working room for SIGN's limit, the header checks and ATTEST (CLEAR_ON_DESELECT). */
     private final byte[] x;
@@ -279,6 +293,8 @@ public final class FedimintCardApplet extends Applet {
         p256((javacard.security.ECKey) attest.getPrivate());
         p256((javacard.security.ECKey) attest.getPublic());
         ecdsa = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
+        registryKey = (ECPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+        p256(registryKey);
         sha = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         x = JCSystem.makeTransientByteArray(X_LEN, JCSystem.CLEAR_ON_DESELECT);
         secret = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_256, false);
@@ -396,6 +412,12 @@ public final class FedimintCardApplet extends Applet {
                 break;
             case INS_ATTEST:
                 attestSign(apdu, buf);
+                break;
+            case INS_SET_REGISTRY_KEY:
+                setRegistryKey(apdu, buf);
+                break;
+            case INS_RELEASE:
+                release(apdu, buf);
                 break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -955,7 +977,8 @@ public final class FedimintCardApplet extends Applet {
         Util.arrayCopyNonAtomic(clock, CK_SPENT, buf, (short) 48, (short) 8);
         buf[56] = cert[0];
         buf[57] = attestMade ? (byte) 1 : (byte) 0;
-        apdu.setOutgoingAndSend((short) 0, (short) 58);
+        buf[58] = registryKeySet ? (byte) 1 : (byte) 0;
+        apdu.setOutgoingAndSend((short) 0, (short) 59);
     }
 
     /** SET_LIMIT: the day's limit in msat, set at provisioning, before the PIN; 0 for none. */
@@ -1133,5 +1156,84 @@ public final class FedimintCardApplet extends Applet {
         ecdsa.init(attest.getPrivate(), Signature.MODE_SIGN);
         short sl = ecdsa.sign(buf, m, (short) 80, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sl);
+    }
+
+    /** SET_REGISTRY_KEY: the registry's P-256 certificate key, at provisioning, before the PIN. */
+    private void setRegistryKey(APDU apdu, byte[] buf) {
+        receiveExactly(apdu, (short) 65);
+        if (pinState != PIN_STATE_NOT_SET) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+        if (buf[ISO7816.OFFSET_CDATA] != 0x04) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        try {
+            registryKey.setW(buf, ISO7816.OFFSET_CDATA, (short) 65);
+        } catch (javacard.security.CryptoException e) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        registryKeySet = true;
+    }
+
+    /**
+     * RELEASE: the registry says a transaction will never be accepted (the federation refused it,
+     * or the registry refused its report as a double spend), so the card may undo what it did for
+     * it. A SPENT slot whose one transaction is txid goes back to NOTE, so its note can be spent
+     * again: it never was. A CHANGE slot owed by txid goes back to KEYED: that change will never
+     * be issued. Nothing else changes, and a release names one card (slot 0's key), one slot and
+     * one transaction, so it cannot be replayed onto a later spend of the same slot. No PIN: it
+     * moves no value. The day's count is left as it was.
+     */
+    private void release(APDU apdu, byte[] buf) {
+        short s = slot(buf, false);
+        short len = receiveAll(apdu);
+        short sigLen = (short) (len - 32);
+        if (len != apdu.getIncomingLength() || sigLen < 8 || sigLen > 72) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (!registryKeySet || state[0] == ST_EMPTY) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+        short txid = ISO7816.OFFSET_CDATA;
+        // label (17) || slot 0's x (32) || slot (1) || txid (32), built from byte 128 of the buffer
+        short m = (short) 128;
+        Util.arrayCopyNonAtomic(RELEASE_LABEL, (short) 0, buf, m, (short) 17);
+        short n = pubs[0].getW(tmp, (short) 0);
+        if (!((n == 65 && tmp[0] == 0x04) || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03)))) {
+            ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+        }
+        Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) (m + 17), (short) 32);
+        buf[(short) (m + 49)] = (byte) s;
+        Util.arrayCopyNonAtomic(buf, txid, buf, (short) (m + 50), (short) 32);
+        ecdsa.init(registryKey, Signature.MODE_VERIFY);
+        boolean ok;
+        try {
+            ok = ecdsa.verify(buf, m, (short) 82, buf, (short) (txid + 32), sigLen);
+        } catch (javacard.security.CryptoException e) {
+            ok = false;
+        }
+        if (!ok) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+        byte st = state[s];
+        if (st == ST_SPENT
+            && Util.arrayCompare(buf, txid, spentHash, (short) (s * 32), (short) 32) == 0) {
+            JCSystem.beginTransaction();
+            state[s] = ST_NOTE;
+            Util.arrayFillNonAtomic(spentHash, (short) (s * 32), (short) 32, (byte) 0);
+            JCSystem.commitTransaction();
+            Util.arrayFillNonAtomic(spentSig, (short) (s * 64), (short) 64, (byte) 0);
+        } else if (st == ST_CHANGE
+            && Util.arrayCompare(buf, txid, openings, (short) (s * OPEN_LEN), (short) 32) == 0) {
+            JCSystem.beginTransaction();
+            state[s] = ST_KEYED;
+            JCSystem.commitTransaction();
+            Util.arrayFillNonAtomic(openings, (short) (s * OPEN_LEN), OPEN_LEN, (byte) 0);
+            Util.arrayFillNonAtomic(notes, (short) (s * NOTE_LEN), NOTE_LEN, (byte) 0);
+        } else {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+        buf[0] = state[s];
+        apdu.setOutgoingAndSend((short) 0, (short) 1);
     }
 }
