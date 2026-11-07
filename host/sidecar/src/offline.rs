@@ -96,8 +96,12 @@ pub enum ChargeState {
     Queued,
     /// The registry took it; written into the card's file, waiting for the federation.
     Reported,
-    /// The registry or the federation found an input already spent: a loss, kept for the operator.
+    /// The registry found an input already spent by another charge: a loss, kept for the operator.
     DoubleSpent,
+    /// The registry took it and the federation refused it: an input spent where the registry did
+    /// not see it (a copied card), or a fee the transaction no longer covers. A loss, kept for
+    /// the operator; the federation's answer is not more specific than that here.
+    Rejected,
     /// The registry refused the report for another reason (`detail`); kept for the operator.
     Refused,
 }
@@ -204,6 +208,7 @@ impl Queue {
             queued_msat: open.map(|c| c.till_msat).sum(),
             double_spent: self.file.charges.iter().filter(|c| c.state == ChargeState::DoubleSpent).count(),
             refused: self.file.charges.iter().filter(|c| c.state == ChargeState::Refused).count(),
+            rejected: self.file.charges.iter().filter(|c| c.state == ChargeState::Rejected).count(),
         }
     }
 
@@ -223,6 +228,7 @@ pub struct Stats {
     pub queued_msat: u64,
     pub double_spent: usize,
     pub refused: usize,
+    pub rejected: usize,
 }
 
 /// Whether the registry and the federation answer, probed with [`PROBE_TIMEOUT`] and kept for
@@ -301,6 +307,7 @@ impl Offline {
             "queued_msat": s.queued_msat,
             "double_spent": s.double_spent,
             "refused": s.refused,
+            "rejected": s.rejected,
             "cap_msat": self.cfg.cap_msat,
             "cap_count": self.cfg.cap_count,
         })
@@ -673,6 +680,8 @@ pub struct Sent {
     pub settled: Vec<String>,
     pub double_spent: Vec<String>,
     pub refused: Vec<String>,
+    /// Reported, then refused by the federation (`ChargeState::Rejected`).
+    pub rejected: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -827,10 +836,10 @@ pub async fn settle(cw: &mut CardWallet, off: &Offline, ops: &Ops, sent: &mut Se
                 continue;
             }
             let r = if abandoned.contains(&c.txid) {
-                sent.double_spent.push(c.txid.clone());
+                sent.rejected.push(c.txid.clone());
                 off.queue.lock().unwrap().set(&c.txid, |x| {
-                    x.state = ChargeState::DoubleSpent;
-                    x.detail = Some("the federation rejected it: an input was spent elsewhere".into());
+                    x.state = ChargeState::Rejected;
+                    x.detail = Some("the federation rejected it: an input spent elsewhere, or a fee it no longer covers".into());
                 })
             } else {
                 sent.settled.push(c.txid.clone());
@@ -886,7 +895,7 @@ mod tests {
             assert_eq!(std::fs::metadata(q.path()).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let q = Queue::open(dir.path()).unwrap();
-        assert_eq!(q.stats(), Stats { queued: 3, queued_msat: 11_000, double_spent: 1, refused: 0 });
+        assert_eq!(q.stats(), Stats { queued: 3, queued_msat: 11_000, double_spent: 1, refused: 0, rejected: 0 });
         assert_eq!(q.file.spent, vec!["02aa".to_string()]);
     }
 

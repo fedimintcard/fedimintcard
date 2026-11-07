@@ -1029,6 +1029,7 @@ async fn offline_charge(
         warnings: vec![],
         offline: true,
         double_spent: false,
+        rejected: false,
     };
     match sales.lock().unwrap().append(rec.clone()) {
         Ok(saved) => rec = saved,
@@ -1043,6 +1044,11 @@ fn mark_offline_sales(off: &crate::offline::Offline, sales: &Mutex<SalesStore>, 
     for t in &sent.double_spent {
         if let Err(e) = s.update(t, |r| r.double_spent = true) {
             tracing::warn!("marking sale {t} double spent: {e:#}");
+        }
+    }
+    for t in &sent.rejected {
+        if let Err(e) = s.update(t, |r| r.rejected = true) {
+            tracing::warn!("marking sale {t} rejected: {e:#}");
         }
     }
     for t in &sent.settled {
@@ -1163,6 +1169,9 @@ fn charge_body(s: &SaleRec, warnings: &[String], duration_ms: u64) -> Value {
     if s.double_spent {
         b["double_spent"] = json!(true);
     }
+    if s.rejected {
+        b["rejected"] = json!(true);
+    }
     b
 }
 
@@ -1235,6 +1244,7 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
         warnings: vec![],
         offline: false,
         double_spent: false,
+        rejected: false,
     }
 }
 
@@ -1399,6 +1409,7 @@ pub async fn charge_with(
         warnings: r.warnings.clone(),
         offline: false,
         double_spent: false,
+        rejected: false,
     };
     // The money has moved: a ledger failure must not turn a paid sale into an error. The store
     // keeps the sale in memory, so a repeat still replays it.

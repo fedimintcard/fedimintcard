@@ -55,6 +55,9 @@ pub struct SaleRec {
     /// An offline sale whose notes turned out spent elsewhere: a loss, kept for the operator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub double_spent: bool,
+    /// An offline sale the federation refused after the registry took it (`ChargeState::Rejected`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

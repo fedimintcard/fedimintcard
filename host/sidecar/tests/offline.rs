@@ -620,7 +620,7 @@ async fn status_reports_reachability_and_the_offline_queue() -> anyhow::Result<(
     let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await?)?;
     assert_eq!(v["registry_reachable"], false, "{v}");
     assert_eq!(v["federation_reachable"], true, "{v}");
-    assert_eq!(v["offline"], json!({"queued": 0, "queued_msat": 0, "double_spent": 0, "refused": 0, "cap_msat": 5_000_000, "cap_count": 7}));
+    assert_eq!(v["offline"], json!({"queued": 0, "queued_msat": 0, "double_spent": 0, "refused": 0, "rejected": 0, "cap_msat": 5_000_000, "cap_count": 7}));
     Ok(())
 }
 

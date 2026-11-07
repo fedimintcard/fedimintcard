@@ -58,8 +58,10 @@ with `"offline": true` and `collection_pending: true`. The sale is in `sales.jso
 A sender (every 30 s while on ops, one job at a time) reports each queued charge
 (`POST /cards/:id/offline-charges`), writes it into the card's file as an open, signed charge, and
 lets the ordinary recovery send it to the federation, collect the change and the till's notes, and
-post `/outcome`; the sale then has `collection_pending: false`. A `409 double_spend`, or a
-federation rejection, marks the sale `double_spent: true` (a loss, kept and counted). The next tap
+post `/outcome`; the sale then has `collection_pending: false`. A `409 double_spend` marks the
+sale `double_spent: true`; a federation rejection after the registry took it marks it
+`rejected: true` (an input spent where the registry did not see it, or a fee the transaction no
+longer covers). Both are losses, kept and counted. The next tap
 of the card writes its change (`SET_NOTE`). A queue survives restarts; an entry cut off between
 the card signing and the save is finished at the card's next offline tap from the card's stored
 signatures.
@@ -108,14 +110,15 @@ relay (`CARD_BRIDGE_URL`) as before. Frames, timeouts and the pairing flow are i
 `200 {"ok":true}`
 
 ## GET /v1/status
-`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null,"registry_reachable":bool|null,"federation_reachable":bool,"offline":{"queued":N,"queued_msat":N,"double_spent":N,"refused":N,"cap_msat":N,"cap_count":N}|null}`
+`200 {"federation_id":"<hex>","federation_name":"<string|null>","wallet_balance_msat":N,"card_relay_ok":bool,"busy":bool,"connected":bool,"ops_state":"<state>","ops_url":"<url|null>","claim_code":"<XXXX-XXXX|null>","claim_expires_at_ms":N|null,"registry_reachable":bool|null,"federation_reachable":bool,"offline":{"queued":N,"queued_msat":N,"double_spent":N,"refused":N,"rejected":N,"cap_msat":N,"cap_count":N}|null}`
 
 `registry_reachable` and `federation_reachable` are the probe of the offline section above (2 s
 each, kept 10 s); `registry_reachable` is null without a registry. `offline` is null when the
 till takes no offline charges (not `serve`). `queued` counts charges taken offline and not yet
 settled, `queued_msat` what the till is owed for them (its outputs: the price plus any overpay),
-`double_spent` the ones found spent elsewhere, `refused` reports the registry refused for another
-reason (kept for the operator).
+`double_spent` the ones the registry found spent elsewhere, `rejected` the ones the federation
+refused after the registry took them, `refused` reports the registry refused for another reason
+(all kept for the operator).
 
 `ops_state` is `connected`, `waiting_for_approval` (a claim is live: `claim_code` and its expiry),
 `claim_expired`, `not_connected` (no token and no claim) or `local` (no registry configured).
@@ -192,7 +195,7 @@ earlier attempt.
 | `internal` | 500 | anything else | show detail |
 
 ## GET /v1/sales
-`200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>","offline":bool,"double_spent":bool,"collection_pending":bool}]}`
+`200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>","offline":bool,"double_spent":bool,"rejected":bool,"collection_pending":bool}]}`
 
 Oldest first. The sales file (`sales.json` in the data dir, mode 0600) is a convenience ledger;
 the money truth is the federation and `card_state.json`.
