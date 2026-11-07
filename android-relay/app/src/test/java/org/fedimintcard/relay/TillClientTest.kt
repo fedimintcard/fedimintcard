@@ -30,6 +30,26 @@ class TillClientTest {
         val r = client(Fake(raw(200, """{"federation_id":"ab"}"""))).status()
         assertTrue((r as TillResult.Err).error is TillError.BadResponse)
     }
+    @Test fun statusReadsTheOfflineQueue() {
+        val r = parseStatus("""{"federation_id":"ab","federation_name":null,"wallet_balance_msat":1,"card_relay_ok":true,"busy":false,
+            "offline":{"queued":3,"queued_msat":4500000,"double_spent":1,"cap_msat":100000000,"cap_count":20}}""") as TillResult.Ok
+        assertEquals(3L, r.value.offlineQueued); assertEquals(4_500_000L, r.value.offlineQueuedMsat); assertEquals(1L, r.value.offlineDoubleSpent)
+    }
+    @Test fun statusWithoutOrWithOddOfflineFieldsIsZero() {
+        val base = """"federation_id":"ab","wallet_balance_msat":1,"card_relay_ok":true,"busy":false"""
+        for (extra in listOf("", ""","offline":null""", ""","offline":true""", ""","offline":{}""", ""","offline":{"queued":"many"}""")) {
+            val r = parseStatus("{$base$extra}") as TillResult.Ok
+            assertEquals(extra, 0L, r.value.offlineQueued); assertEquals(0L, r.value.offlineDoubleSpent)
+        }
+    }
+    @Test fun chargeAnsweredOfflineIsMarked() {
+        val s = parseCharge(200, """{"ok":true,"offline":true,"txid":"t","price_msat":5000,"received_msat":5000}""") as ChargeResult.Success
+        assertTrue(s.receipt.offline); assertEquals(5000L, s.receipt.priceMsat)
+    }
+    @Test fun chargeOnlineOrWithoutTheFieldIsNotOffline() {
+        assertFalse((parseCharge(200, okCharge) as ChargeResult.Success).receipt.offline)
+        assertFalse((parseCharge(200, """{"ok":true,"offline":false,"price_msat":1}""") as ChargeResult.Success).receipt.offline)
+    }
     @Test fun chargeSuccess() {
         val s = client(Fake(raw(200, okCharge))).charge(5_000_000, "r") as ChargeResult.Success
         assertEquals(3L, s.receipt.saleId); assertEquals(2, s.receipt.inputs.size); assertEquals(1, s.receipt.change.size)

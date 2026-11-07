@@ -219,6 +219,9 @@ internal fun parseStatus(body: String): TillResult<TillStatus> = try {
             o.reqLong("wallet_balance_msat"),
             o.reqBool("card_relay_ok"),
             o.reqBool("busy"),
+            offlineQueued = o.optJSONObject("offline")?.optLong("queued", 0) ?: 0,
+            offlineQueuedMsat = o.optJSONObject("offline")?.optLong("queued_msat", 0) ?: 0,
+            offlineDoubleSpent = o.optJSONObject("offline")?.optLong("double_spent", 0) ?: 0,
         )
     )
 } catch (e: JSONException) {
@@ -249,6 +252,7 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
                 collectionPending = o.optBoolean("collection_pending", false),
                 warnings = if (w == null) emptyList() else (0 until w.length()).map { w.optString(it) },
                 durationMs = o.optL("duration_ms"),
+                offline = o.optBoolean("offline", false),
             )
         )
     }

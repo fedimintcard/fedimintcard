@@ -262,7 +262,7 @@ export class FakeCard {
     const inst = this.instances.get(target)!;
     if (inst.module === CARD_MODULE) {
       // FedimintCardApplet: selectingApplet() sends VERSION_MAJOR, VERSION_MINOR and nothing else
-      return sw(0x9000, [0x02, 0x01]);
+      return sw(0x9000, [0x03, 0x00]);
     }
     // the opener: an Applet with no process(), so the toolkit answers 9000 with no data
     return sw(0x9000);

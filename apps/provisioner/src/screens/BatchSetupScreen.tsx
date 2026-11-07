@@ -40,6 +40,7 @@ import {
   settingsAreReady,
   useSettings,
 } from '../settings';
+import {DEFAULT_DAILY_LIMIT_SAT} from '../cardSetup';
 import {SETUP} from '../strings';
 import {useStore} from '../store';
 import {
@@ -78,6 +79,7 @@ export function BatchSetupScreen({
   );
   const [count, setCount] = useState('1');
   const [policy, setPolicy] = useState<PinPolicy>('batch');
+  const [limit, setLimit] = useState(String(DEFAULT_DAILY_LIMIT_SAT));
   const [reviewing, setReviewing] = useState(false);
   const draft = usePinDraft();
   // The batch PIN crosses to the loop through `pin.ts`'s provider slot, never
@@ -93,10 +95,14 @@ export function BatchSetupScreen({
     countNumber >= 1 &&
     countNumber <= MAX_COUNT;
 
+  const limitNumber = Number(limit);
+  const validLimit = /^\d{1,9}$/.test(limit);
+
   const pinReady = policy === 'perCard' || draft.valid;
   const inviteReady = isInviteCode(federation);
   const ready =
     validCount &&
+    validLimit &&
     pinReady &&
     settingsAreReady({...settings, federation: federation.trim()});
 
@@ -107,7 +113,9 @@ export function BatchSetupScreen({
       ? SETUP.needCount(MAX_COUNT)
       : !pinReady
         ? SETUP.needPin
-        : null;
+        : !validLimit
+          ? SETUP.needLimit
+          : null;
 
   // A scanned or pasted invite is the batch's federation and the saved one:
   // choosing it is the operator's decision, as tapping a preset was.
@@ -131,6 +139,7 @@ export function BatchSetupScreen({
         federation: federation.trim(),
         count: countNumber,
         pinPolicy: policy,
+        dailyLimitSat: limitNumber,
       });
       onStart();
     } catch (e) {
@@ -160,6 +169,13 @@ export function BatchSetupScreen({
                 label={SETUP.pin}
                 value={policy === 'batch' ? SETUP.pinBatchShort : SETUP.pinPerCardShort}
                 valueTone="ink"
+              />
+              <Divider />
+              <ValueRow
+                label={SETUP.limit}
+                value={SETUP.limitValue(limitNumber)}
+                valueTone="ink"
+                testID="review-limit"
               />
             </Card>
             <Text style={[local.small, {color: t.dim}]}>
@@ -272,6 +288,26 @@ export function BatchSetupScreen({
                 onPress={() => setPolicy('perCard')}
                 testID="pin-perCard"
               />
+            </Card>
+          </View>
+
+          <View style={local.section}>
+            <SectionHeader help={SETUP.limitHelp} testID="limit-help">
+              {SETUP.limit}
+            </SectionHeader>
+            <Card>
+              <View style={local.fieldRow}>
+                <Text style={[local.fieldLabel, {color: t.ink}]}>{SETUP.limitLabel}</Text>
+                <TextInput
+                  value={limit}
+                  onChangeText={v => setLimit(digitsOnly(v).slice(0, 9))}
+                  keyboardType="number-pad"
+                  autoComplete="off"
+                  maxLength={9}
+                  style={[s.input, local.pinInput]}
+                  testID="limit-input"
+                />
+              </View>
             </Card>
           </View>
 

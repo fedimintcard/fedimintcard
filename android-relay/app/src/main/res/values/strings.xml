@@ -16,6 +16,11 @@
     <string name="card_balance_label">Card balance</string>
     <string name="on_this_card">on this card</string>
     <string name="done">Done</string>
+    <string name="paid_offline">Paid offline</string>
+    <plurals name="payments_waiting_to_sync">
+        <item quantity="one">%d payment waiting to sync</item>
+        <item quantity="other">%d payments waiting to sync</item>
+    </plurals>
     <string name="settings">Settings</string>
     <string name="hold_card">Hold the card to the phone</string>
     <string name="reading_card">Reading… keep the card on the phone</string>

@@ -142,7 +142,13 @@ class PosUi(
 
     fun setStatus(s: TillStatus?) {
         fedName.text = s?.federationName ?: act.getString(R.string.app_name)
-        balance.text = if (s == null) "" else "Till balance: ${formatSats(s.walletBalanceMsat)} sats"
+        balance.text = if (s == null) "" else {
+            val line = "Till balance: ${formatSats(s.walletBalanceMsat)} sats"
+            if (s.offlineQueued > 0) {
+                val n = s.offlineQueued.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                line + "\n" + act.resources.getQuantityString(R.plurals.payments_waiting_to_sync, n, n)
+            } else line
+        }
     }
 
     /** The amount keypad types a sale, or a top-up on [PosState.TopUpEntering] and while its invoice is made. */
@@ -288,7 +294,9 @@ class PosUi(
     private fun renderReceipt(r: ChargeReceipt) {
         // The price only. Change and the sub-sat rounding the planner adds to save card slots
         // (plan.rs) stay in the till's sales record; at the counter they read like an error.
-        v<TextView>(R.id.receipt_amount).text = "Paid ${formatSats(r.priceMsat)} sats"
+        val amount = "${formatSats(r.priceMsat)} sats"
+        v<TextView>(R.id.receipt_amount).text =
+            if (r.offline) act.getString(R.string.paid_offline) + "\n" + amount else "Paid $amount"
         v<TextView>(R.id.receipt_txid).text = shortTxid(r.txid)
     }
 

@@ -6,6 +6,11 @@ struct TillStatus: Equatable {
     let walletBalanceMsat: Int64
     let cardRelayOk: Bool
     let busy: Bool
+    /// Offline charges queued on the till and not yet sent (`offline.queued`); 0 on a till without the field.
+    var offlineQueued: Int64 = 0
+    var offlineQueuedMsat: Int64 = 0
+    /// Offline charges the registry refused as double spends (`offline.double_spent`).
+    var offlineDoubleSpent: Int64 = 0
 }
 
 struct Note: Equatable { let slot: Int; let msat: Int64 }
@@ -32,6 +37,8 @@ struct ChargeReceipt: Equatable {
     let collectionPending: Bool
     let warnings: [String]
     let durationMs: Int64
+    /// The till took this charge with no registry or federation reachable (`"offline": true`).
+    var offline: Bool = false
 }
 
 struct Sale: Equatable, Identifiable {

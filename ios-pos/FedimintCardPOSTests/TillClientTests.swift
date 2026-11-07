@@ -86,6 +86,34 @@ final class TillClientTests: XCTestCase {
         XCTAssertEqual(s3, .declined(code: .unauthorized, detail: "", httpStatus: 401))
     }
 
+    func testStatusReadsTheOfflineQueue() {
+        let r = TillParse.status(body(#"{"federation_id":"ab","federation_name":null,"wallet_balance_msat":1,"card_relay_ok":true,"busy":false,"offline":{"queued":3,"queued_msat":4500000,"double_spent":1,"cap_msat":100000000,"cap_count":20}}"#))
+        guard case .ok(let s) = r else { return XCTFail() }
+        XCTAssertEqual(s.offlineQueued, 3); XCTAssertEqual(s.offlineQueuedMsat, 4_500_000); XCTAssertEqual(s.offlineDoubleSpent, 1)
+        XCTAssertEqual(waitingToSyncText(s.offlineQueued), "3 payments waiting to sync")
+        XCTAssertEqual(waitingToSyncText(1), "1 payment waiting to sync")
+        XCTAssertNil(waitingToSyncText(0))
+    }
+
+    func testStatusWithoutOrWithOddOfflineFieldsIsNothingQueued() {
+        let base = #""federation_id":"ab","wallet_balance_msat":1,"card_relay_ok":true,"busy":false"#
+        for extra in ["", #","offline":null"#, #","offline":true"#, #","offline":{}"#, #","offline":{"queued":"many"}"#] {
+            guard case .ok(let s) = TillParse.status(body("{" + base + extra + "}")) else { return XCTFail(extra) }
+            XCTAssertEqual(s.offlineQueued, 0, extra); XCTAssertEqual(s.offlineDoubleSpent, 0, extra)
+        }
+    }
+
+    func testChargeAnsweredOfflineIsMarkedAndSaysPaidOffline() {
+        guard case .success(let rc) = TillParse.charge(status: 200, body: body(#"{"ok":true,"offline":true,"txid":"t","price_msat":5000,"received_msat":5000}"#)) else { return XCTFail() }
+        XCTAssertTrue(rc.offline)
+        XCTAssertEqual(receiptHeadline(rc), "Paid offline · 5 sats")
+        guard case .success(let on) = TillParse.charge(status: 200, body: body(#"{"ok":true,"txid":"t","price_msat":5000}"#)) else { return XCTFail() }
+        XCTAssertFalse(on.offline)
+        XCTAssertEqual(receiptHeadline(on), "Paid 5 sats")
+        guard case .success(let no) = TillParse.charge(status: 200, body: body(#"{"ok":true,"offline":false,"price_msat":5000}"#)) else { return XCTFail() }
+        XCTAssertFalse(no.offline)
+    }
+
     func testSalesParse() {
         let r = TillParse.sales(body(#"{"count":1,"total_price_msat":5000,"total_received_msat":5000,"sales":[{"id":1,"ts_unix_ms":1700000000000,"price_msat":5000,"received_msat":5000,"overpaid_msat":0,"fees_msat":0,"txid":"t","inputs":[],"change":[],"client_ref":null}]}"#))
         guard case .ok(let l) = r else { return XCTFail() }

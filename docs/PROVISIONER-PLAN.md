@@ -318,6 +318,7 @@ Phases, in the operator's words:
 | installOpener / installCard | `Installing the card` | opener first, then the applet |
 | verify | `Checking the install` | SELECT applet, `GET_PUB 0` → `6985` (empty slot, as it should be) |
 | keySetup | `Setting up keys` | the applet is written but has no keys until the **card** generates them, and only a host can ask. Over the same relay, after the install session closes |
+| attest | `Setting up keys` | applet 3.0 only (SELECT `03 00`), after the keys and before the PIN, in the same tap (docs/OFFLINE-PROTOCOL.md § 5): `SET_LIMIT` (the batch's `dailyLimitSat`, default 10,000 sat, as 8-byte msat; 0 = none), `GET_STATE`, `ATTEST_INIT` → 65-byte P-256 key, `POST /registry/cards/:short_id/attestation {attest_pub}` with the operator session → certificate, `SET_CERT`. Resumable: a lifted tap leaves a keyed card with no PIN and the next tap sends the steps again (`ATTEST_INIT` may repeat until `SET_CERT` took); once the card holds a certificate (`GET_STATE` byte 56) its keys are kept, since the certificate is over slot 0 |
 | setPin | `Setting the PIN` | `SET_PIN` with the batch's PIN (one for the batch, or a generated per-card one), then `VERIFY_PIN` to prove the card took it; a card whose PIN does not verify is stopped, not retried |
 | issue | `Loading n of m notes` | local sidecar issues the batch's amounts to the card's keys |
 | done | `Done · …9c2f` | short id = last 4 bytes of slot-0 x-only key, as Cashu's; a generated PIN shows here once |

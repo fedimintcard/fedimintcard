@@ -3,7 +3,9 @@
 The phone-side operator app for programming blank J3R180 JavaCards into Fedimint
 cards, one tap at a time, in batches. It installs the Fedimint card applet over
 NFC, locks its card manager to the card's own keys from ops, lets the card
-generate its keys and sets the card's PIN. Value comes from the holder's wallet
+generate its keys, sets its offline limit, gets the registry's certificate over the
+card's attestation key written onto it, and sets the card's PIN (applet 3.0, all in
+the one install tap; docs/OFFLINE-PROTOCOL.md § 5). Value comes from the holder's wallet
 (docs/OPS-PLAN.md § 6).
 
 Read `docs/PROVISIONER-PLAN.md` § 5 for what the app is and § 8.6 for the
@@ -13,6 +15,17 @@ package; `src/cardkit.ts` is the only module that imports it.
 ```text
 SignIn → BatchSetup → Loop (one card per tap, with stops) → BatchSummary → Settings
 ```
+
+The install tap, after the card manager is locked to the card's own keys: GEN_KEY on
+slots 0-7, then `SET_LIMIT` (the batch's offline limit per day, set in BatchSetup,
+default 10,000 sat, 0 for none), `ATTEST_INIT` (the card makes a P-256 key),
+`POST /registry/cards/:short_id/attestation` with the operator session (the registry
+answers the certificate), `SET_CERT`, then `SET_PIN` and `VERIFY_PIN`. A tap lifted
+anywhere in it is finished by the next tap of the same card: the offline steps are
+idempotent before the PIN (`SET_LIMIT` again, `ATTEST_INIT` again until `SET_CERT`
+took), and a card that already holds its certificate keeps its keys, because the
+certificate is over slot 0's key and cannot be replaced. A card that answers SELECT
+below 3.0 is finished the old way, without them.
 
 That is the whole surface, plus Settings → Reset a card (docs/OPS-PLAN.md O5).
 There is no card browser and no load-test bench: those live in `host/sidecar`
@@ -103,8 +116,8 @@ the engine in the bundle.
 ## Status
 
 Experimental. The app programs a card and loads value onto it; the card refuses
-to sign without the PIN set here, and it has no spending limits, no owner key
-and no note list. The app makes no claim to custody.
+to sign without the PIN set here and enforces the offline limit set here; it has no
+owner key. The app makes no claim to custody.
 
 Ported from the Cashu provisioner (`cashucard/cashucard`, MIT), with the trimmed
 screen surface and this card's install plan.
