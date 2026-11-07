@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The F0 probe (docs/OFFLINE-PLAN.md). Reuses the applet's pinned ant-javacard: build the applet once first.
+     ant -f tools/j3r180-probe/build.xml  ->  tools/j3r180-probe/target/probe.cap
+     Package F0 46 4D 50 52 4F 42 ("FMPROB"), applet + 01. Install on a blank test card only. -->
+<project name="j3r180-probe" default="cap" basedir=".">
+    <property name="jc.sdk" value="${user.home}/.javacard/sdks/jc305u4_kit"/>
+    <property name="ant.javacard.jar" value="../../applet/target/ant-javacard-v26.05.15.jar"/>
+    <target name="cap">
+        <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="${ant.javacard.jar}"/>
+        <mkdir dir="target"/>
+        <javacard>
+            <cap jckit="${jc.sdk}" targetsdk="${jc.sdk}" sources="src"
+                 package="io.github.bobodread876.fedimintcard.probe" version="0.1"
+                 aid="F0:46:4D:50:52:4F:42" output="target/probe.cap">
+                <applet class="io.github.bobodread876.fedimintcard.probe.Probe" aid="F0:46:4D:50:52:4F:42:01"/>
+            </cap>
+        </javacard>
+    </target>
+</project>
