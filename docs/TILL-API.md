@@ -70,6 +70,28 @@ they are. The next tap of the card writes its change (`SET_NOTE`). A queue survi
 the card signing and the save is finished at the card's next offline tap from the card's stored
 signatures.
 
+**Spare slots for offline change.** Offline, change goes only to a KEYED slot whose key never
+carried a note, and no till can key one without the registry; a freshly loaded card has only a
+few (the F6 drill's card ran out after two charges with change). So every online tap of a 3.0
+card on ops (a charge, a balance, a load), after the releases and the notes it writes and before
+anything is planned, tops up a spare reserve: when the card has fewer than `--spare-target`
+(`TILL_SPARE_TARGET`, default 6; 0 turns it off) fresh keyed slots, the till keys more, at most
+`--spare-keys-per-tap` (`TILL_SPARE_KEYS_PER_TAP`, default 2) in one tap, since a key takes about
+320 ms on the card. A tap that already sent releases or wrote notes keys fewer (about 100 ms per
+release and 40 ms per note come out of that budget). SPENT slots whose notes are settled (spent
+or dead in the registry, confirmed spent by the federation, no charge open on them) are renewed
+first, queued to the registry as every renewal is (`PUT /cards/:id/slots/:n`); renewing takes the
+holder's PIN, so only a charge renews. Then never-keyed slots (`unkeyed_slots`) are keyed and
+recorded with `POST /cards/:id/slot-keys`. A failure is logged and the tap goes on; only a PIN the
+card refuses ends it (`wrong_pin`, as the charge would when it signs, so the holder spends one try,
+not two). 2.x cards are left as they are.
+
+An offline charge whose price needs change the card has no room for is refused with
+`offline_no_change_room` (409), and the answer adds the prices the card can pay with the slots it
+has, in whole sats: `"suggested_msat":N|null` (the nearer of the two), `"suggest_below_msat"`
+and `"suggest_above_msat"` (each `N` or null). The POS shows "This card can't take change while
+offline. Try N sats" (or "Try another amount"), not "card needs a top up".
+
 ### Connecting by claim
 
 A till can ask for its own token instead (`docs/TILL-CLAIM.md`). `card-sidecar till claim
@@ -195,6 +217,7 @@ earlier attempt.
 | `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is applet 2.x, which this till takes only online; nothing moved | decline, or retry once the till is online |
 | `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online) | retry once the till is online |
 | `card_not_genuine` | 403 | offline: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
+| `offline_no_change_room` | 409 | offline: the price needs change and the card has no fresh keyed slot (or too few) for it; an online till keys more. The body adds `suggested_msat`, `suggest_below_msat` and `suggest_above_msat`, prices in whole sats the card pays exactly now (each may be null); nothing moved | show "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_cap_reached` | 503 | offline: this till's unsettled offline total or count would pass its cap; nothing moved | decline, or retry once the till is online and has sent its queue |
 | `internal` | 500 | anything else | show detail |
 

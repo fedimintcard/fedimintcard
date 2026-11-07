@@ -101,6 +101,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 E::NotReady(_) => c(503, "offline_not_ready"),
                 E::NotGenuine(_) => c(403, "card_not_genuine"),
                 E::Cap(_) => c(503, "offline_cap_reached"),
+                E::NoChangeRoom { .. } => c(409, "offline_no_change_room"),
             };
         }
         if let Some(o) = cause.downcast_ref::<OpsError>() {
@@ -1010,7 +1011,16 @@ async fn offline_charge(
         Ok(t) => t.charge,
         Err(e) => {
             tracing::warn!("offline charge of {price} msat refused: {e:#}");
-            return error_reply(&e);
+            let mut r = error_reply(&e);
+            // No room for change offline: the prices the card can pay instead.
+            if let Some(o @ crate::offline::OfflineError::NoChangeRoom { below_msat, above_msat, .. }) =
+                e.chain().find_map(|c| c.downcast_ref::<crate::offline::OfflineError>())
+            {
+                r.body["suggested_msat"] = json!(o.suggested_msat(price));
+                r.body["suggest_below_msat"] = json!(below_msat);
+                r.body["suggest_above_msat"] = json!(above_msat);
+            }
+            return r;
         }
     };
     let mut rec = SaleRec {
@@ -1938,6 +1948,8 @@ pub struct ServeOptions {
     pub esplora_url: Option<String>,
     /// The till's caps on unsettled offline charges.
     pub offline: crate::offline::OfflineConfig,
+    /// The spare reserve an online tap keeps a 3.0 card at.
+    pub spares: crate::ops::SpareConfig,
 }
 
 /// [`serve_with`], with the offline options.
@@ -2013,6 +2025,7 @@ pub async fn serve_opts(
     let headers = crate::clock::Headers::new(opts.esplora_url.clone(), &dir);
     let header_task = headers.spawn(crate::clock::REFRESH_EVERY);
     cw.headers = Some(headers);
+    cw.spares = opts.spares;
     let wallet = cw.wallet.clone();
     let offline = crate::offline::Offline::open(&dir, opts.offline)?;
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;

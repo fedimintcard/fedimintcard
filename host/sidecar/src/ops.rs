@@ -50,6 +50,57 @@ pub const CARDS_DIR: &str = "cards";
 /// so the margin adds at most about 1 s to the tap that keys.
 pub const KEY_AHEAD: usize = 3;
 
+/// Fresh keyed slots (keyed, never carried a note, KEYED on the card) an online tap keeps a 3.0
+/// card at, so it can take change offline (docs/OFFLINE-PLAN.md § 10 "Spare slots offline"):
+/// offline, change goes only to such slots, and no till can key one without the registry.
+pub const SPARE_TARGET: usize = 6;
+/// Most slots one tap keys for that reserve. A `GEN_KEY` takes about 320 ms on a J3R180.
+pub const MAX_KEY_PER_TAP: usize = 2;
+/// What the reserve's budget counts, per card command (J3R180 estimates: a `GEN_KEY` measured
+/// at about 320 ms, a `RELEASE` checks a P-256 signature in about 75 ms, a `SET_NOTE` writes
+/// 56 bytes).
+const GEN_KEY_MS: u64 = 320;
+const RELEASE_MS: u64 = 100;
+const SET_NOTE_MS: u64 = 40;
+
+/// The spare reserve's settings (`till serve --spare-target`, `--spare-keys-per-tap`). A target
+/// or a per-tap cap of 0 turns it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpareConfig {
+    pub target: usize,
+    pub max_per_tap: usize,
+}
+
+impl Default for SpareConfig {
+    fn default() -> Self {
+        Self { target: SPARE_TARGET, max_per_tap: MAX_KEY_PER_TAP }
+    }
+}
+
+/// How many slots a tap keys for the spare reserve: none when the card has `fresh >= target`,
+/// else the shortfall, but never more than the per-tap budget (`max_per_tap` keys' worth of card
+/// time) leaves after the `released` releases and `written` notes the tap already sent.
+pub fn spares_to_key(fresh: usize, cfg: SpareConfig, released: usize, written: usize) -> usize {
+    if fresh >= cfg.target {
+        return 0;
+    }
+    let budget = cfg.max_per_tap as u64 * GEN_KEY_MS;
+    let busy = released as u64 * RELEASE_MS + written as u64 * SET_NOTE_MS;
+    let n = (budget.saturating_sub(busy) / GEN_KEY_MS) as usize;
+    n.min(cfg.target - fresh)
+}
+
+/// What [`CardWallet::card_spares`] did at a tap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpareReport {
+    /// Fresh keyed slots the card had before.
+    pub fresh: usize,
+    /// SPENT slots re-keyed (queued to ops as renewals, as every renewal is).
+    pub renewed: Vec<u8>,
+    /// Never-keyed slots keyed and recorded in ops (`POST /slot-keys`).
+    pub keyed: Vec<u8>,
+}
+
 /// `--ops-url` and `--ops-token`. The token is a till token (`till_…`) and is never printed.
 #[derive(Clone)]
 pub struct OpsConfig {
@@ -445,9 +496,23 @@ impl Ops {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
         let base = self.attach_id(cw, &short_id_of(&pk)).await?;
         // A 3.0 card: what the registry released (before planning, so this tap can use it), its
-        // clock, and any live note it lacks (a load or change finished elsewhere).
-        cw.card_releases();
-        cw.card_tick();
+        // clock, any live note it lacks (a load or change finished elsewhere), then its spare
+        // reserve.
+        let released = cw.card_releases();
+        let written = cw.card_tick();
+        match cw.card_spares(released, written).await {
+            Ok(r) if !r.renewed.is_empty() || !r.keyed.is_empty() => {
+                tracing::info!("card {}: spare reserve from {} fresh slot(s): renewed {:?}, keyed {:?}", short_id_of(&pk), r.fresh, r.renewed, r.keyed);
+            }
+            Ok(_) => {}
+            // The holder's PIN was refused: the charge would be refused the same way when it
+            // signs, and verifying again there would spend a second try.
+            Err(e) if pin_refused(&e) => {
+                Self::finish(cw, base).await;
+                return Err(e);
+            }
+            Err(e) => tracing::warn!("card {}: spare reserve not topped up this tap: {e:#}", short_id_of(&pk)),
+        }
         Ok(base)
     }
 
@@ -774,6 +839,91 @@ impl CardWallet {
         self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: true, change });
     }
 
+    /// Keep a 3.0 card's spare reserve (docs/OFFLINE-PLAN.md § 10): when it has fewer than
+    /// `self.spares.target` fresh keyed slots, key at most [`spares_to_key`] more in this tap.
+    /// SPENT slots whose notes are settled (spent or dead in ops, confirmed spent by the
+    /// federation, no charge open on them) are renewed first ([`overwrite_slot`], queued to ops
+    /// like every renewal); they need the holder's PIN, so only a job that carries it renews.
+    /// Then never-keyed slots, recorded in ops as split keying does ([`key_slots`]). Off ops, on a
+    /// 2.x card, or with the reserve full it does nothing. The caller logs any error and goes on,
+    /// except a refused PIN.
+    ///
+    /// [`overwrite_slot`]: CardWallet::overwrite_slot
+    pub async fn card_spares(&mut self, released: usize, written: usize) -> Result<SpareReport> {
+        let mut rep = SpareReport::default();
+        let Some(link) = self.ops.clone() else { return Ok(rep) };
+        if self.spares.target == 0 || self.spares.max_per_tap == 0 || !self.card_sign_once() {
+            return Ok(rep);
+        }
+        let st = on_card(|| self.card.get_state()).context("GET_STATE")?;
+        let on_card_is = |slot: u8, want: &[SlotState]| st.states.get(slot as usize).is_some_and(|s| want.contains(s));
+        rep.fresh = self.store.state.free_slots().into_iter().filter(|s| on_card_is(*s, &[SlotState::Keyed])).count();
+        let n = spares_to_key(rep.fresh, self.spares, released, written);
+        if n == 0 {
+            return Ok(rep);
+        }
+
+        // 1. Settled SPENT slots: their keys are burned, so renewing one costs the card nothing.
+        if self.pin.is_some() {
+            let open: Vec<&String> = self.store.state.pending_txs.iter().flat_map(|p| &p.inputs).collect();
+            let spent: Vec<u8> = self
+                .store
+                .state
+                .overwritable_slots()
+                .into_iter()
+                .filter(|s| self.may_renew(*s) && on_card_is(*s, &[SlotState::Spent, SlotState::Keyed]))
+                .filter(|s| self.store.state.notes_on_current_key(*s).all(|n| !open.contains(&&n.nonce)))
+                .collect();
+            if !spent.is_empty() {
+                self.verify_pin_session()?;
+                for slot in spent {
+                    if rep.renewed.len() >= n {
+                        break;
+                    }
+                    match self.renewable(slot).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            tracing::warn!("spare reserve: slot {slot}: {e:#}");
+                            continue;
+                        }
+                    }
+                    match self.overwrite_slot(slot) {
+                        Ok(_) => rep.renewed.push(slot),
+                        Err(e) => tracing::warn!("spare reserve: could not renew slot {slot}: {e:#}"),
+                    }
+                }
+            }
+        }
+
+        // 2. Never-keyed slots.
+        let more = n - rep.renewed.len();
+        if more > 0 && !link.unkeyed.is_empty() {
+            let want: Vec<u8> = link.unkeyed.iter().take(more).copied().collect();
+            self.ops_key_unkeyed(&want).await?;
+            rep.keyed = want;
+        }
+        Ok(rep)
+    }
+
+    /// Key `want` (never keyed in ops) on the card and record them in ops ([`key_slots`]), then
+    /// take the keys into the link and the card's file.
+    async fn ops_key_unkeyed(&mut self, want: &[u8]) -> Result<()> {
+        let link = self.ops.clone().context("no ops link")?;
+        let keyed = key_slots(self.card.as_mut(), &link.client, &link.short_id, want).await?;
+        let l = self.ops.as_mut().expect("set");
+        l.version = keyed.answer.version;
+        l.unkeyed = keyed.answer.unkeyed_slots.clone();
+        for (slot, pk) in &keyed.keys {
+            l.remote_slots.retain(|(s, _)| s != slot);
+            l.remote_slots.push((*slot, pk.clone()));
+            self.store.state.set_slot_pubkey(*slot, pk.clone());
+        }
+        self.store.save()?;
+        tracing::info!("ops: keyed slots {want:?} of card {} (version {})", link.short_id, keyed.answer.version);
+        Ok(())
+    }
+
     /// Unkeyed slots this tap may key: those ops reported, none off ops.
     pub(crate) fn keyable_slots(&self) -> usize {
         self.ops.as_ref().map_or(0, |l| l.unkeyed.len())
@@ -791,19 +941,9 @@ impl CardWallet {
         if n == 0 || free + n < need {
             return Ok(vec![]);
         }
-        let want = &link.unkeyed[..n];
-        let keyed = key_slots(self.card.as_mut(), &link.client, &link.short_id, want).await?;
-        let l = self.ops.as_mut().expect("set");
-        l.version = keyed.answer.version;
-        l.unkeyed = keyed.answer.unkeyed_slots.clone();
-        for (slot, pk) in &keyed.keys {
-            l.remote_slots.retain(|(s, _)| s != slot);
-            l.remote_slots.push((*slot, pk.clone()));
-            self.store.state.set_slot_pubkey(*slot, pk.clone());
-        }
-        self.store.save()?;
-        tracing::info!("ops: keyed slots {want:?} of card {} (version {})", link.short_id, keyed.answer.version);
-        Ok(want.to_vec())
+        let want = link.unkeyed[..n].to_vec();
+        self.ops_key_unkeyed(&want).await?;
+        Ok(want)
     }
 
     /// Whether this card's slot may be re-keyed. On ops, slot 0's key names the card (its short
@@ -888,6 +1028,13 @@ pub fn merge(st: &mut CardState, remote: &RemoteState) {
     }
 }
 
+/// Whether `err` is the card refusing the holder's PIN (`63 CX`, or blocked).
+pub fn pin_refused(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|c| c.downcast_ref::<fedimint_card_host_card::StatusWord>())
+        .any(|s| matches!(s.0, 0x63C0..=0x63CF | fedimint_card_host_card::SW_PIN_BLOCKED))
+}
+
 /// Whether ops gave no definitive answer (unreachable, timed out, 5xx): the write may or may not
 /// have landed.
 pub fn unanswered(err: &anyhow::Error) -> bool {
@@ -926,6 +1073,23 @@ mod tests {
             open_txs: open,
             releases: vec![],
         }
+    }
+
+    #[test]
+    fn the_spare_reserve_keys_the_shortfall_within_the_taps_budget() {
+        let cfg = SpareConfig::default();
+        assert_eq!((cfg.target, cfg.max_per_tap), (6, 2));
+        assert_eq!(spares_to_key(6, cfg, 0, 0), 0, "full");
+        assert_eq!(spares_to_key(9, cfg, 0, 0), 0);
+        assert_eq!(spares_to_key(5, cfg, 0, 0), 1, "the shortfall");
+        assert_eq!(spares_to_key(0, cfg, 0, 0), 2, "never more than the cap");
+        // A tap busy with a release or a few notes has room for one key; with more, none.
+        assert_eq!(spares_to_key(0, cfg, 1, 0), 1);
+        assert_eq!(spares_to_key(0, cfg, 0, 3), 1);
+        assert_eq!(spares_to_key(0, cfg, 4, 0), 0);
+        assert_eq!(spares_to_key(0, cfg, 0, 16), 0);
+        assert_eq!(spares_to_key(0, SpareConfig { target: 0, max_per_tap: 2 }, 0, 0), 0, "off");
+        assert_eq!(spares_to_key(0, SpareConfig { target: 6, max_per_tap: 0 }, 0, 0), 0, "off");
     }
 
     #[test]
