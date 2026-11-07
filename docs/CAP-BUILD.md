@@ -131,9 +131,61 @@ staging registry, one card per batch, on the same J3R180:
 
 | Phone | Card | Tap, card detected to last APDU | Result |
 |---|---|---|---|
-| Pixel 8 Pro | blank | 6.0 s (Android NFC log) | programmed, `…9FAC`, one tap |
+| Pixel 8 Pro | blank | 6.0 s (Android NFC log) | programmed, `…9FAC`, one tap; **applet 2.0, see below** |
 | iPhone 13 Pro Max | the Pixel's card, applet swept first | 5.35 s, 75 APDUs (nfcd log) | programmed, `…C038`, one tap |
 
 Both include the load (25 LOAD blocks), both installs, keys for slots 0–7, SET_PIN and the
 post-install checks. Keying all 32 would add about 7.6 s (24 × 318 ms), which is why the other 24
 are keyed by the till at the taps that need them (`4c19cff`).
+
+Correction (2026-11-06): the Pixel's build carried a stale copy of cardkit (yarn copies `file:`
+dependencies at install), so `…9FAC` got the 8-slot applet: SELECT answers `02 00`, slot 8 answers
+`6B00`, and the registry has `slot_count: 8`. Its 6.0 s is the 2.0 load file (23 LOAD blocks), not
+2.1. The Max row is a 2.1 install. `apps/provisioner/src/cardkitCopy.test.ts` now fails on a stale
+copy.
+
+## End to end on staging (2026-11-06)
+
+A 32-slot card (`1e1b01ef`) set up by the Pixel (fresh cardkit) against the staging registry in the
+Island Bitcoin Community federation; a laptop till (`till serve`, claimed on staging); the Android
+POS paired to it over `adb reverse`.
+
+**Load.** `card load 50000000` from the till's wallet through ops, card on the ACR122U: 12 notes
+into slots 0–11, 7.2 s. The card arrived with slots 0–7 keyed; the load keyed 8–11 with the till's
+token (split keying, `e7ac900`).
+
+**Ten charges** at the POS, PIN each time. None refused; federation fees 0.
+
+| Price (sat) | Inputs | Change notes | Overpay (msat) |
+|---|---|---|---|
+| 21 | 2 | 1 | 1,528 |
+| 100 | 2 | 1 | 352 |
+| 333 | 1 | 5 | 824 |
+| 1,000 | 3 | 1 | 1,472 |
+| 2,500 | 3 | 4 | 608 |
+| 5,000 | 3 | 4 | 1,216 |
+| 7,777 | 3 | 5 | 1,304 |
+| 12,000 | 2 | 4 | 1,280 |
+| 50 | 3 | 0 | 1,200 |
+| 4,200 | 2 | 3 | 448 |
+
+Change went back to slots up to 20; at the end the card held 16 notes. No charge reached the
+3-input cap. Neither the till nor the POS logs the card's signing time; taps were 15–24 s apart
+including typing the price and PIN, and SIGN alone is 847 ms (above).
+
+**Drain.** Six charges chosen with the planner's own objective (zero change, ≤ 3 inputs, overpay
+≤ `MAX_TILL_OVERPAY`) emptied the card exactly: 12,583, 2,361, 1,572, 262, 131 and 98 sat, every
+one with no change. The till's wallet ended where it started (51,499 sat), so the whole run moved
+50,000 sat onto the card and back with nothing lost. The registry then let the Setup app reset the
+card; it refuses while any note is live, however small.
+
+Two findings from the run, both fixed: the stale cardkit copy above, and a Setup app whose saved
+federation was a placeholder (`de0fed…c0ffe`), which the till refuses to load (`card … belongs to
+federation …`). The Setup app has no federation preset; check its settings before a batch.
+
+## In production (2026-11-06)
+
+Registry v9 (Worker version `185ded41`) on registry.fedimintcard.org, after a restore drill of that
+night's backup; the StartOS till `0.1.0:1` (upstream `e7ac900`); Setup and POS apps from `e13773e`
+on both phones. Card `a25e66d7` was set up on Live with the 32-slot applet, topped up by Lightning
+through the zion till and charged.

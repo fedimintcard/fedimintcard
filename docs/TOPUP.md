@@ -1,6 +1,6 @@
 # Top-up at the POS by Lightning
 
-Status: agreed 2026-11-05 (owner: "yes", amount rule "nearest card amount"), being built. O6 step 3
+Status: agreed 2026-11-05 (owner: "yes", amount rule "nearest card amount"), built and in production (verified 2026-11-06). O6 step 3
 in `OPS-PLAN.md`.
 
 The holder pays a Lightning invoice from any wallet on their own phone; the till receives eCash

@@ -1,6 +1,6 @@
 # Plan: a hosted ops service, and no laptop in the operator's loop
 
-Status: **accepted** (2026-11-04), against `main` @ `ea7c12f`. **O1 is done; O2 is built and tested locally, not yet deployed** (§ 7); the rest is not built.
+Status: **accepted** (2026-11-04), against `main` @ `ea7c12f`. **Built and in production** (2026-11-06): O0–O4 and O6, verified end to end with 32-slot cards (`CAP-BUILD.md`, End to end on staging); O5's store forms wait on the store submissions.
 The owner's decisions are in § 9. This plan replaces § 4 of `PROVISIONER-PLAN.md` ("hosted
 registry, local wallet"); where the two disagree, this plan wins.
 

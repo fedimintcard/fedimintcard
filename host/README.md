@@ -35,6 +35,12 @@ CARD_BACKEND=bridge CARD_BRIDGE_URL=http://127.0.0.1:9876 cargo test --workspace
 CARD_BACKEND=pcsc [CARD_PCSC_READER=name] cargo test --workspace --features fedimint-card-host-card/pcsc
 ```
 
+The CLI reads the same variable. A `card` command against a USB reader (`card load`, `card balance`)
+needs a binary built with `cargo build -p fedimint-card-sidecar --features pcsc` and
+`CARD_BACKEND=pcsc` set; without them it talks to an empty in-process SoftCard, which answers
+`6985` ("reading the card's slot 0 key") however the real card is provisioned. `CARD_PIN` names the
+PIN for commands that sign; it defaults to the test PIN `1234`, and a wrong guess costs a try.
+
 Bridge wire format: `POST /apdu` `{"apdu":"<hex>"}` -> `{"response":"<hex data||SW>"}`; `POST /reset`; `GET /health`.
 Verified against the Java bridge from spike/applet (`bridge.jar --port N`): the whole workspace passes with `CARD_BACKEND=bridge`, and `card_roundtrip` passed 20/20 loops. `bridge_roundtrip_when_configured` runs only if `CARD_BRIDGE_URL` is set. Tests use slots 0 and 1 and create keys on demand (`get_or_gen`), so they work against a persistent card.
 

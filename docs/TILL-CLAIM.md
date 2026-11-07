@@ -1,6 +1,6 @@
 # Till claim: connecting a till to the registry without a password on the server
 
-Status: agreed 2026-11-05 (owner: "build B"), being built.
+Status: agreed 2026-11-05 (owner: "build B"), built and in production (verified 2026-11-06).
 
 A till needs a till token (`till_…`) to use the registry. Today an operator makes one with
 `registry/scripts/new-till.sh` on a computer and pastes it into the till. The claim flow lets the

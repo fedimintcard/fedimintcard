@@ -1,6 +1,6 @@
 # POS link: a POS phone and the till over the network
 
-Status: agreed 2026-11-04, being built. Replaces the two `adb` tunnels for any POS phone, and is the
+Status: agreed 2026-11-04, built and in production (verified 2026-11-06). Replaces the two `adb` tunnels for any POS phone, and is the
 only way an iPhone reaches the till. The USB path (`CARD_BRIDGE_URL` + `adb forward`/`reverse`) keeps
 working as a fallback.
 

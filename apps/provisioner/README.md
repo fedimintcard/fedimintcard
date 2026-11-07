@@ -43,6 +43,17 @@ Note that `yarn install` here and the engine's own `yarn install` in
 `tools/cardkit` are separate: cardkit checks its dependency versions in its own
 lockfile, the app bundles the source through Metro.
 
+yarn copies the engine into `node_modules` at install time; it does not link
+it. After any change under `tools/cardkit`, refresh the copy before building,
+or the app installs whatever applet the old copy carries:
+
+```sh
+rm -rf node_modules/@fedimintcard/cardkit && yarn install --frozen-lockfile --check-files
+```
+
+`src/cardkitCopy.test.ts` fails while the copy differs from `tools/cardkit`, so
+`yarn test` before a build catches it.
+
 ## Identity
 
 Decided 2026-10-28 (plan § 8.6). Do not change one of these without the others:

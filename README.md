@@ -7,18 +7,39 @@ till does the rest. Because Fedimint notes are spent with a Schnorr signature fr
 note's own key, this needs no change to the Fedimint protocol and works with existing
 federations.
 
-Status: spike done, including on a real J3R180. Plan: [docs/SPIKE-PLAN.md](docs/SPIKE-PLAN.md). Results: [docs/SPIKE.md](docs/SPIKE.md). Design: [docs/DESIGN-NOTE.md](docs/DESIGN-NOTE.md).
+Status: running in production for the Island Bitcoin Community federation, with 32-slot cards
+(applet 2.1) since 2026-11-06: a registry, a till on StartOS, a Setup app for operators and a POS
+app for merchants. Results on silicon and end to end: [docs/CAP-BUILD.md](docs/CAP-BUILD.md).
 
-This is experimental software. Do not put real funds on a card.
+This is experimental software. Put on a card only what you can afford to lose.
 
 ## Layout
 
 ```
-applet/   JavaCard applet (GEN_KEY, GET_PUB, SIGN, PIN) and jCardSim tests
-bridge/   HTTP bridge that serves the simulated applet on 127.0.0.1
-host/     Rust workspace: card transport and federation tests (see host/README.md)
-docs/     spike plan, results, CAP build notes, design note
+applet/         JavaCard applet: 32 slots, GEN_KEY, GET_PUB, SIGN, PIN, STATE_KEY; jCardSim tests
+bridge/         HTTP bridge that serves the simulated applet on 127.0.0.1
+host/           Rust workspace: card transport, the till (card-sidecar) and federation tests (host/README.md)
+registry/       Cloudflare Worker: cards, notes, tills and operators; nightly encrypted backup
+apps/provisioner/  Fedimint Card Setup, the operator's app (React Native, Android and iOS)
+tools/cardkit/  the GlobalPlatform engine the Setup app installs the applet with
+android-relay/  Fedimint Card POS for Android
+ios-pos/        Fedimint Card POS for iOS
+scripts/        release builds
+docs/           plans, protocols and results (below)
 ```
+
+## Docs
+
+| Read | For |
+|---|---|
+| [DESIGN-NOTE.md](docs/DESIGN-NOTE.md) | the design: how a card holds Fedimint notes, and what it trusts |
+| [SPIKE.md](docs/SPIKE.md), [SPIKE-PLAN.md](docs/SPIKE-PLAN.md) | the first spike: one card, one federation |
+| [CAP-BUILD.md](docs/CAP-BUILD.md) | building and installing the applet; 32 slots on silicon; the end-to-end run and the production rollout |
+| [OPS-PLAN.md](docs/OPS-PLAN.md) | the registry ("ops") and how tills, holders and operators use it |
+| [PROVISIONER-PLAN.md](docs/PROVISIONER-PLAN.md), [PROVISIONER-HANDOFF.md](docs/PROVISIONER-HANDOFF.md) | the Setup app and cardkit |
+| [TILL-API.md](docs/TILL-API.md), [TILL-CLAIM.md](docs/TILL-CLAIM.md), [POS-LINK.md](docs/POS-LINK.md) | the till's HTTP API, connecting a till to the registry, pairing a POS |
+| [TOPUP.md](docs/TOPUP.md) | Lightning top-up at the POS |
+| [DEMO.md](docs/DEMO.md) | the first demo script (2026-10-27, laptop till) |
 
 ## Build
 
