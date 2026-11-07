@@ -81,6 +81,8 @@ enum class ChargeErrorCode(val wire: String) {
     UNKNOWN_CARD("unknown_card"),
     OPS_UNREACHABLE("ops_unreachable"),
     OPS_REFUSED("ops_refused"),
+    /** Offline, the price needs change and the card has no slot for it; `suggested_msat` may say what it can pay. */
+    OFFLINE_NO_CHANGE_ROOM("offline_no_change_room"),
     INTERNAL("internal"),
     UNKNOWN("");
 
