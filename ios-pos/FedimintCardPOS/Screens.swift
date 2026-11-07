@@ -66,6 +66,10 @@ struct AmountScreen: View {
                 .onLongPressGesture(perform: openSettings)
             Text(pos.status.map { "Till balance: \(formatSats($0.walletBalanceMsat)) sats" } ?? " ")
                 .font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.top, 2)
+            if let waiting = pos.status.flatMap({ waitingToSyncText($0.offlineQueued) }) {
+                Text(waiting).font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.top, 1)
+                    .accessibilityIdentifier("waiting-to-sync")
+            }
             if let problem {
                 Button(action: openSettings) {
                     Text(problem.uppercased()).font(Fig.medium(11)).kerning(1.3)
@@ -274,7 +278,7 @@ struct ReceiptScreen: View {
 
 extension ReceiptScreen {
     /// A sale: the price only. Change and sub-sat rounding stay in the till's sales record.
-    init(receipt: ChargeReceipt) { self.init(headline: "Paid \(formatSats(receipt.priceMsat)) sats", txid: receipt.txid) }
+    init(receipt: ChargeReceipt) { self.init(headline: receiptHeadline(receipt), txid: receipt.txid) }
 }
 
 /// The top-up amount: the amount keypad again, with "Create invoice".

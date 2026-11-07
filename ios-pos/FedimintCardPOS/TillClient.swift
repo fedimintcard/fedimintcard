@@ -242,6 +242,10 @@ enum TillParse {
         guard let n = o[k] as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { throw Bad(msg: "missing \(k)") }
         return n.boolValue
     }
+    private static func optBool(_ o: [String: Any], _ k: String) -> Bool {
+        guard let n = o[k] as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { return false }
+        return n.boolValue
+    }
     private static func optStr(_ o: [String: Any], _ k: String) -> String? { o[k] as? String }
 
     private static func notes(_ a: Any?) throws -> [Note] {
@@ -252,12 +256,17 @@ enum TillParse {
     static func status(_ body: Data) -> TillResult<TillStatus> {
         do {
             let o = try obj(body)
+            // Absent on a till from before offline payments, or not an object: read as nothing queued.
+            let offline = o["offline"] as? [String: Any] ?? [:]
             return .ok(TillStatus(
                 federationId: try reqStr(o, "federation_id"),
                 federationName: optStr(o, "federation_name"),
                 walletBalanceMsat: try reqLong(o, "wallet_balance_msat"),
                 cardRelayOk: try reqBool(o, "card_relay_ok"),
-                busy: try reqBool(o, "busy")))
+                busy: try reqBool(o, "busy"),
+                offlineQueued: optLong(offline, "queued"),
+                offlineQueuedMsat: optLong(offline, "queued_msat"),
+                offlineDoubleSpent: optLong(offline, "double_spent")))
         } catch let e as Bad { return .err(.badResponse(e.msg)) } catch { return .err(.badResponse("bad json")) }
     }
 
@@ -279,7 +288,8 @@ enum TillParse {
                 change: try notes(o["change"]),
                 collectionPending: (o["collection_pending"] as? NSNumber)?.boolValue ?? false,
                 warnings: (o["warnings"] as? [Any])?.compactMap { $0 as? String } ?? [],
-                durationMs: optLong(o, "duration_ms")))
+                durationMs: optLong(o, "duration_ms"),
+                offline: optBool(o, "offline")))
         } catch {
             let msg = (error as? Bad)?.msg ?? "bad json"
             switch status {

@@ -58,3 +58,16 @@ enum Hex {
         }
     }
 }
+
+/// What the receipt and the NFC sheet say for a paid sale: the price only, and "Paid offline" for a
+/// charge the till took with no registry or federation reachable.
+func receiptHeadline(_ receipt: ChargeReceipt) -> String {
+    receipt.offline
+        ? "Paid offline · \(formatSats(receipt.priceMsat)) sats"
+        : "Paid \(formatSats(receipt.priceMsat)) sats"
+}
+
+/// "N payments waiting to sync" for the till's offline queue; nil when nothing is waiting.
+func waitingToSyncText(_ queued: Int64) -> String? {
+    queued > 0 ? "\(queued) \(queued == 1 ? "payment" : "payments") waiting to sync" : nil
+}
