@@ -216,3 +216,11 @@ slowest multiplication; since 3.0 answers a repeated SIGN from storage, each key
 signature in its life and the split had nothing left to defend, so it was taken out. The commit
 buffer is not a constraint for SIGN's commit (about 110 bytes). cashucard's "a dozen places per
 commit" was its own write pattern, not this chip's limit.
+
+### RELEASE on silicon (2026-11-07)
+
+Applet 3.0 with RELEASE (`5fc182a`) on the J3R180 (chip `…63205547`, wiped from `1c0d527e`), a
+P-256 key made with openssl standing in for the registry: SET_REGISTRY_KEY 50 ms; slot 1 spent on
+one txid (SIGN 952 ms), another txid refused 6985; a release with one byte of its DER signature
+flipped 6982 (116 ms); the valid release 9000, state NOTE (133 ms); the other txid then signed
+(945 ms); the old release replayed onto the new spend 6985. The card was left blank.
