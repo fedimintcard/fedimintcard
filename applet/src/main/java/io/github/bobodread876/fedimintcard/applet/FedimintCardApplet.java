@@ -49,7 +49,7 @@ import javacard.security.Signature;
  * 18 SET_LIMIT   Lc=8                 the day's limit in msat (0: none). Only before SET_PIN
  * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work (6A93)
  * 30 ATTEST_INIT                      -> P-256 public key (65). Makes the attestation key; only before SET_PIN and the certificate
- * 31 SET_CERT    Lc=1..128            the registry's certificate over this card; once, before SET_PIN
+ * 31 SET_CERT    Lc=1..160            the registry's certificate over this card; once, before SET_PIN
  * 32 GET_CERT                         -> the certificate
  * 33 ATTEST      Lc=32 (challenge)    -> ECDSA-SHA256 (DER) over "fedimintcard/at1" || challenge || slot 0's x-only pubkey
  * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN
@@ -128,7 +128,7 @@ public final class FedimintCardApplet extends Applet {
     static final short NOTE_LEN = 56;
     /** Change owed to a slot: the transaction (32), the output's index (2), its blinding key (32). */
     static final short OPEN_LEN = 66;
-    static final short CERT_MAX = 128;
+    static final short CERT_MAX = 160;
     static final short HEADER_LEN = 80;
 
     /** The clock record: now (4), the day's window start (4), the hardest bits taken (4), limit (8), spent in the window (8). */
