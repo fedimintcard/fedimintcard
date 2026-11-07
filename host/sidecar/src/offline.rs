@@ -427,10 +427,11 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
             _ => {}
         }
     }
-    // A KEYED slot the till's copy of the card knows to hold a note (a load not yet written to
-    // the card) is not a slot for change.
+    // A KEYED slot whose key the till's copy of the card knows to have carried a note is not a
+    // slot for change: a load not yet written to the card, or a key whose note died (a rejected
+    // online charge's change slot), which the registry refuses as change until it is renewed.
     let local = StateStore::open(ops.card_path(&short_id))?;
-    keyed.retain(|s| !local.state.notes_on_current_key(*s).any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending)));
+    keyed.retain(|s| local.state.notes_on_current_key(*s).next().is_none());
 
     // 5. Plan from the card's own notes; change into KEYED slots.
     let fee_cfg = cw.wallet.mint_cfg.fee_consensus.clone();
@@ -716,7 +717,9 @@ pub async fn report(off: &Offline, ops: &Ops, short_id: Option<&str>, sent: &mut
                 tracing::warn!("offline charge {} on card {} is a double spend: {conflicts}", c.txid, c.short_id);
                 let r = off.queue.lock().unwrap().set(&c.txid, |x| {
                     x.state = ChargeState::DoubleSpent;
-                    x.detail = Some(format!("the registry: inputs already spent {conflicts}"));
+                    x.detail = Some(format!(
+                        "the registry: inputs already spent {conflicts}; the card's change slots are released at its next online tap"
+                    ));
                 });
                 match r {
                     Ok(()) => sent.double_spent.push(c.txid.clone()),
@@ -839,7 +842,11 @@ pub async fn settle(cw: &mut CardWallet, off: &Offline, ops: &Ops, sent: &mut Se
                 sent.rejected.push(c.txid.clone());
                 off.queue.lock().unwrap().set(&c.txid, |x| {
                     x.state = ChargeState::Rejected;
-                    x.detail = Some("the federation rejected it: an input spent elsewhere, or a fee it no longer covers".into());
+                    x.detail = Some(
+                        "the federation rejected it: an input spent elsewhere, or a fee it no longer covers; the card's notes and \
+                         change slots are released at its next online tap"
+                            .into(),
+                    );
                 })
             } else {
                 sent.settled.push(c.txid.clone());

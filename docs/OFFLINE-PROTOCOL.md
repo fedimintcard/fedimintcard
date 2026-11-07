@@ -136,3 +136,13 @@ and undoes exactly that.
   rejection); a released change slot is a free keyed slot.
 - **Setup app.** SET_REGISTRY_KEY in the install tap before SET_PIN, with the key fetched from
   `GET /registry/cert-key`; GET_STATE byte 58 tells a resumed tap whether it is done.
+
+As built (registry migration v12, `offline.ts` `recordReleases`; till `ops.rs` `card_releases`):
+a rejected load (no inputs) gets no release, since a load never moves a slot's state. Releases are
+signed after the transaction that recorded the refusal and written in one that checks it still
+stands and that slot 0 is unchanged; without `CERT_SIGNING_KEY` none is written and the outcome
+or refusal stands. Releases are in the nightly backup. A rejected offline charge's inputs, pending
+under its txid since the report, are live again (before this they stayed pending). A replayed
+outcome or double-spend report signs nothing new. The till's offline planner no longer puts change
+in a KEYED slot whose key carried a note of any status: a rejected online charge's change slot
+stays KEYED under its dead note's key until renewed, and the registry refuses that key as change.

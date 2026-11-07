@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use fedimint_card_host_card::{Card, SW_NO_SPACE, status_word};
+use fedimint_card_host_card::{Card, SW_NO_SPACE, SlotState, status_word};
 use fedimint_core::secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -100,6 +100,20 @@ pub struct RemoteState {
     pub unkeyed_slots: Vec<u8>,
     pub notes: Vec<RemoteNote>,
     pub open_txs: Vec<RemoteTx>,
+    /// The registry's releases for this card (docs/OFFLINE-PROTOCOL.md § 6). Empty from a registry
+    /// older than releases.
+    #[serde(default)]
+    pub releases: Vec<RemoteRelease>,
+}
+
+/// A release: the registry's signature that `txid` will never be accepted, for one slot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteRelease {
+    pub slot: u8,
+    /// 32 bytes, hex.
+    pub txid: String,
+    /// DER ECDSA P-256, hex.
+    pub sig: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -398,6 +412,8 @@ pub struct OpsLink {
     /// Charges open in ops as last read, plus any this job posted an intent for. Only these get an
     /// outcome: one another till already recorded needs nothing from this one.
     pub open: Vec<String>,
+    /// The card's releases as ops last answered them ([`CardWallet::card_releases`]).
+    pub releases: Vec<RemoteRelease>,
 }
 
 /// A card's short id: the last 4 bytes of its slot-0 x-only key, lower-case hex.
@@ -428,7 +444,9 @@ impl Ops {
     pub async fn attach(&self, cw: &mut CardWallet) -> Result<StateStore> {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
         let base = self.attach_id(cw, &short_id_of(&pk)).await?;
-        // A 3.0 card: its clock, and any live note it lacks (a load or change finished elsewhere).
+        // A 3.0 card: what the registry released (before planning, so this tap can use it), its
+        // clock, and any live note it lacks (a load or change finished elsewhere).
+        cw.card_releases();
         cw.card_tick();
         Ok(base)
     }
@@ -437,7 +455,7 @@ impl Ops {
     pub async fn attach_id(&self, cw: &mut CardWallet, short_id: &str) -> Result<StateStore> {
         let card = StateStore::open(self.card_path(short_id))?;
         let base = std::mem::replace(&mut cw.store, card);
-        cw.ops = Some(OpsLink { client: self.client.clone(), short_id: short_id.to_owned(), version: 0, remote_slots: vec![], unkeyed: vec![], open: vec![] });
+        cw.ops = Some(OpsLink { client: self.client.clone(), short_id: short_id.to_owned(), version: 0, remote_slots: vec![], unkeyed: vec![], open: vec![], releases: vec![] });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
             Err(e) => {
@@ -505,7 +523,64 @@ impl CardWallet {
         link.remote_slots = remote.slots.iter().map(|s| (s.slot, s.pubkey.clone())).collect();
         link.unkeyed = remote.unkeyed_slots.clone();
         link.open = remote.open_txs.iter().map(|t| t.txid.clone()).collect();
+        link.releases = remote.releases.clone();
         Ok(remote)
+    }
+
+    /// Send a 3.0 card the registry's releases (docs/OFFLINE-PROTOCOL.md § 6) that still fit it:
+    /// a slot SPENT on that txid, or CHANGE owed by it. A released input slot is NOTE again (ops
+    /// recorded its note live with the rejection) and a released change slot is a free KEYED one
+    /// (ops never issued its note), so the working copy from ops already reads them so and the
+    /// card is brought in line with it. Answers how many were released; never fails the tap: a
+    /// release that does not take is logged and comes again with the card's next state.
+    pub fn card_releases(&mut self) -> usize {
+        let Some((releases, short_id)) = self.ops.as_ref().map(|l| (l.releases.clone(), l.short_id.clone())) else { return 0 };
+        if releases.is_empty() || !self.card_sign_once() {
+            return 0;
+        }
+        let st = match on_card(|| self.card.get_state()) {
+            Ok(st) => st,
+            Err(e) => {
+                tracing::warn!("releases for card {short_id}: GET_STATE: {e:#}");
+                return 0;
+            }
+        };
+        if !st.registry_key {
+            tracing::warn!("card {short_id} has no registry key (set at provisioning); {} release(s) not sent", releases.len());
+            return 0;
+        }
+        let mut n = 0;
+        for r in releases {
+            let (Some(txid), Ok(sig)) = (hex::decode(&r.txid).ok().and_then(|t| <[u8; 32]>::try_from(t).ok()), hex::decode(&r.sig)) else {
+                tracing::warn!("release for slot {} of card {short_id}: not hex", r.slot);
+                continue;
+            };
+            if !matches!(st.states.get(r.slot as usize), Some(SlotState::Spent | SlotState::Change)) {
+                continue;
+            }
+            let fits = match on_card(|| self.card.get_slot(r.slot)) {
+                Ok(info) => match info.state {
+                    SlotState::Spent => info.spent_hash == txid,
+                    SlotState::Change => info.opening.txid == txid,
+                    _ => false,
+                },
+                Err(e) => {
+                    tracing::warn!("release for slot {} of card {short_id}: GET_SLOT: {e:#}", r.slot);
+                    continue;
+                }
+            };
+            if !fits {
+                continue;
+            }
+            match on_card(|| self.card.release(r.slot, &txid, &sig)) {
+                Ok(now) => {
+                    tracing::info!("card {short_id}: slot {} released from {} ({now:?})", r.slot, r.txid);
+                    n += 1;
+                }
+                Err(e) => tracing::warn!("card {short_id}: RELEASE of slot {} for {}: {e:#}", r.slot, r.txid),
+            }
+        }
+        n
     }
 
     /// Deliver what this till owes ops, then replace the card side of the local file with what
@@ -849,6 +924,7 @@ mod tests {
             unkeyed_slots: vec![],
             notes,
             open_txs: open,
+            releases: vec![],
         }
     }
 
@@ -862,6 +938,17 @@ mod tests {
         assert_eq!(new.unkeyed_slots, vec![8, 9]);
         let free: FreeSlots = serde_json::from_value(json!({"version": 1, "federation_id": "f", "free": []})).unwrap();
         assert!(free.unkeyed_slots.is_empty());
+    }
+
+    #[test]
+    fn releases_parse_and_default_to_none_from_an_older_registry() {
+        let old: RemoteState = serde_json::from_value(json!({"version": 1, "slots": [], "notes": [], "open_txs": []})).unwrap();
+        assert!(old.releases.is_empty());
+        let new: RemoteState = serde_json::from_value(
+            json!({"version": 1, "slots": [], "notes": [], "open_txs": [], "releases": [{"slot": 3, "txid": "ab", "sig": "30"}]}),
+        )
+        .unwrap();
+        assert_eq!((new.releases[0].slot, new.releases[0].txid.as_str(), new.releases[0].sig.as_str()), (3, "ab", "30"));
     }
 
     #[test]

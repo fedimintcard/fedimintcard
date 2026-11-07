@@ -1083,6 +1083,7 @@ pub async fn send_offline_job(cw: &mut CardWallet, ops: &Ops, off: &crate::offli
         "settled": sent.settled,
         "double_spent": sent.double_spent,
         "refused": sent.refused,
+        "rejected": sent.rejected,
         "errors": sent.errors,
     }))
 }

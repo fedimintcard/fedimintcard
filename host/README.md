@@ -72,7 +72,9 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
   (default 200) cap what the till holds unsettled from offline charges. Charges taken offline
   wait in `offline_queue.json` (0600) and are sent every 30 s while the till is on ops; the
   registry's certificate key is kept as `cert_key` in `till-ops.json`. Back up both with the
-  wallet: the queue is the merchant's money until it is sent.
+  wallet: the queue is the merchant's money until it is sent. At an online tap of a 3.0 card the
+  till first sends the registry's releases (§ 6) for charges the federation rejected or the
+  registry refused as double spends, logging any the card does not take.
 
 ## Findings (step 5 transaction)
 
