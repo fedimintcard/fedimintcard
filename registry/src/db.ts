@@ -220,6 +220,26 @@ export const MIGRATIONS: readonly string[] = [
   DROP TABLE card_slots;
   ALTER TABLE card_slots_v9 RENAME TO card_slots;
   `,
+  // v10 (docs/OFFLINE-PROTOCOL.md § 3): a card's attestation key with the
+  // certificate issued for it (stored, because ECDSA signatures are randomized
+  // and the same key must answer the same bytes), and the log of charges a card
+  // signed offline. The key is (txid, till_id): one report per txid per till, so
+  // a till retrying is idempotent, while two tills reporting the same txid each
+  // leave their own row.
+  `
+  ALTER TABLE cards ADD COLUMN attest_pub TEXT;
+  ALTER TABLE cards ADD COLUMN attest_cert TEXT;
+  CREATE TABLE offline_reports (
+    txid       TEXT    NOT NULL,
+    short_id   TEXT    NOT NULL,
+    till_id    INTEGER NOT NULL,
+    result     TEXT    NOT NULL CHECK (result IN ('recorded', 'double_spend')),
+    detail     TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (txid, till_id)
+  );
+  CREATE INDEX offline_reports_card ON offline_reports (short_id, created_at);
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

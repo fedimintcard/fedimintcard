@@ -55,6 +55,15 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
 - `GET /registry/offline-reports?short_id=` — operator: every report, with its result.
 - Secret `CERT_SIGNING_KEY`: the P-256 private key, PKCS#8 DER base64. Migration: `cards.attest_pub`,
   table `offline_reports (txid, short_id, till_id, result, detail, created_at)`.
+- As built (registry/src/offline.ts, migration v10): `cards.attest_cert` also stores the issued
+  certificate, since ECDSA signatures are randomized and the same key must answer the same bytes;
+  `offline_reports` is keyed `(txid, till_id)`, and `detail` is JSON (`client_ref`, `signed_at`,
+  `inputs`, and `conflicts` for a double spend). Both are in the nightly backup. Without
+  `CERT_SIGNING_KEY`, `/registry/cert-key` and the attestation route answer 503. An offline charge
+  does not repeat `/intent`'s change-slot checks (the card chose its slots offline); it refuses only
+  a change nonce that already carried a note (409). A replay of a double spend answers the stored
+  conflicts. `GET /registry/offline-reports` lists at most 200, newest first, only for the
+  operator's own cards.
 
 ## 4. Till (F3)
 

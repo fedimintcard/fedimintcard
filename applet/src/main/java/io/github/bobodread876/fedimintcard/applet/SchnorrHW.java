@@ -55,17 +55,17 @@ import javacard.security.*;
  *
  *   No `new` may appear anywhere outside the constructor and init().
  *
- *   Transient footprint: `sc` (320 B scratchpad) + `work` (320 B arithmetic
+ *   Transient footprint: `sc` (256 B scratchpad) + `work` (320 B arithmetic
  *   scratch, see WORK_LEN).
  *
  * --- Side channels (F1, docs/OFFLINE-PLAN.md) ---
  *
  *   No branch or loop length depends on a secret: reductions subtract and
  *   keep the result by mask, the parity negations of d and k are masked, and
- *   the carry fold runs four rounds always. e·d is computed as e·d1 + e·d2
- *   with d1 fresh randomness per signature, so the key never meets the
- *   public, varying e whole. getS still copies d into RAM for the nonce and
- *   the split; it is wiped before the multiplications.
+ *   the carry fold runs four rounds always. A key signs once in its life
+ *   (the applet keeps the signature for a repeat), which leaves a power
+ *   analysis of e·d one trace per key; d is still copied into RAM by getS,
+ *   and wiped when the call ends.
  *
  * ENG-182 — cashucard/javacard
  */
@@ -129,10 +129,7 @@ final class SchnorrHW {
     private static final short SC_TMP  = (short) 96;
     private static final short SC_E    = (short)192;
     private static final short SC_ED   = (short)224;
-    // The key's two shares for e·d (F1, docs/OFFLINE-PLAN.md): d = d1 + d2 mod n, d1 fresh per signature.
-    private static final short SC_D1   = (short)256;
-    private static final short SC_D2   = (short)288;
-    private static final short SC_LEN  = (short)320;
+    private static final short SC_LEN  = (short)256;
 
     // ── Transient arithmetic scratch (CLEAR_ON_DESELECT, WORK_LEN bytes) ──
     // Threaded into mulModN as (work, workOff) so that nothing on the signing
@@ -468,20 +465,13 @@ final class SchnorrHW {
         // and is not read again.
         Util.arrayCopy(sc, SC_TMP, out, outOff, (short)32);  // Rx
 
-        // ── Step 7: s = (k + e·d) mod n, with d in two shares (F1) ───
-        // e is public and changes with every message: e·d is the textbook
-        // target of a power analysis that learns d one multiplication at a
-        // time. So d never meets e whole: d1 is fresh randomness each time,
-        // d2 = d − d1, and e·d = e·d1 + e·d2. Each product is with a value
-        // that is new for this signature, and d itself is wiped first.
-        rng.generateData(sc, SC_D1, (short)32);
-        reduceModN(sc, SC_D1, work, W_CT);                        // d1 < n
-        subtractFromN(sc, SC_D1, sc, SC_D2);                      // n − d1 (== n when d1 is 0)
-        addModN(sc, SC_D, sc, SC_D2, sc, SC_D2, work, W_CT);      // d2 = d + n − d1 mod n
-        Util.arrayFillNonAtomic(sc, SC_D, (short)32, (byte)0);    // d, whole, is gone
-        mulModN(sc, SC_E, sc, SC_D1, sc, SC_ED, work, (short)0);  // e·d1
-        mulModN(sc, SC_E, sc, SC_D2, sc, SC_TMP, work, (short)0); // e·d2
-        addModN(sc, SC_ED, sc, SC_TMP, sc, SC_ED, work, W_CT);    // e·d mod n
+        // ── Step 7: s = (k + e·d) mod n ──────────────────────────────
+        // e·d is what a power analysis over many signatures attacks (a known,
+        // varying e times a fixed d). Applet 3.0 computes one signature per
+        // key in its life and answers a repeat from storage, so there are no
+        // many signatures to compare; splitting d into shares measured 1.7 s
+        // per signature on the J3R180 against 0.85 s, and was dropped (F0).
+        mulModN(sc, SC_E, sc, SC_D, sc, SC_ED, work, (short)0);  // ed = e * d mod n
         addModN(sc, SC_ED, sc, SC_K, out, (short)(outOff + 32), work, W_CT); // s = ed + k mod n
 
         return (short)64;

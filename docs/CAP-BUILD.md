@@ -189,3 +189,30 @@ Registry v9 (Worker version `185ded41`) on registry.fedimintcard.org, after a re
 night's backup; the StartOS till `0.1.0:1` (upstream `e7ac900`); Setup and POS apps from `e13773e`
 on both phones. Card `a25e66d7` was set up on Live with the 32-slot applet, topped up by Lightning
 through the zion till and charged.
+
+## Applet 3.0 on silicon (F0, 2026-11-07)
+
+Measured with `tools/j3r180-probe` on a blank J3R180 over the ACR122U (contactless), then applet 3.0
+installed and driven by `gp`. Times are APDU round trips; a NOOP is 13 ms.
+
+| What | Result |
+|---|---|
+| `getMaxCommitCapacity()` | 5,120 bytes; one transaction held 255 one-byte writes and 128 writes of 32 bytes |
+| P-256 keygen / ECDSA sign / verify (native) | 66 / 112 / 75 ms |
+| secp256k1 ECDSA sign (native, explicit curve) | 106 ms: the chip has it, but Fedimint needs BIP-340 |
+| One k·G (ECDH plain XY) | 87–91 ms |
+| SHA-256d of 80 bytes (a header's work) | 33 ms |
+| Install of applet 3.0 (opener, then the applet) | passes; the attestation key pair is built at install |
+| SIGN, hardened (masked arithmetic, F1) | 956 ms; its repeat, from storage, 54 ms; another hash 6985 |
+| SIGN with the key split into two shares | 1.74 s: dropped (see below) |
+| SET_HEADER (900000) / ATTEST / ATTEST_INIT | 66 / 123 / 99 ms |
+
+The SIGN signature (BIP-340) and the ATTEST signature (P-256 over the label, challenge and slot 0's
+key) were verified off the card.
+
+Findings: a 130-byte SET_CERT came in pieces over contactless and one `setIncomingAndReceive` took
+only the first, so the applet now loops `receiveBytes`. Splitting the key for e·d doubled the
+slowest multiplication; since 3.0 answers a repeated SIGN from storage, each key computes one
+signature in its life and the split had nothing left to defend, so it was taken out. The commit
+buffer is not a constraint for SIGN's commit (about 110 bytes). cashucard's "a dozen places per
+commit" was its own write pattern, not this chip's limit.
