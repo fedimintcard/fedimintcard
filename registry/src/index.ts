@@ -102,7 +102,15 @@ import {
   Unprocessable,
 } from './http';
 import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
-import {certPublicKey, listOfflineReports, recordAttestation, recordOfflineCharge} from './offline';
+import {
+  certPublicKey,
+  chargeRejected,
+  listOfflineReports,
+  recordAttestation,
+  recordOfflineCharge,
+  recordReleases,
+  reportRefused,
+} from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
 import {completeReset, resetCheck, resetOwner} from './reset';
 import {closedReason, closeSuperseded, parseSupersedes, pinIsSet, resumeCheck} from './resume';
@@ -139,6 +147,8 @@ export class Registry {
   private readonly env: Env;
   /** Why the object cannot serve, when the setup command was refused. */
   private broken: string | null = null;
+  /** Test-only (`/test/cert-key`): act as a deployment without `CERT_SIGNING_KEY` for releases. */
+  private releaseKeyOff = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -193,6 +203,11 @@ export class Registry {
       if (e instanceof ServiceUnavailable) return fail(503, e.message);
       throw e;
     }
+  }
+
+  /** The certificate key releases are signed with (`recordReleases`). */
+  private certSecret(): string | undefined {
+    return this.releaseKeyOff ? undefined : this.env.CERT_SIGNING_KEY;
   }
 
   private async caller(request: Request): Promise<Caller | null> {
@@ -449,11 +464,21 @@ export class Registry {
       return json(200, {ok: true, ...recordSubmitted(storage, shortId, body)});
     }
     if (rest === '/outcome' && method === 'POST') {
-      return json(200, {ok: true, ...recordOutcome(storage, shortId, body, now)});
+      const {release, ...done} = recordOutcome(storage, shortId, body, now);
+      if (release) {
+        await recordReleases(storage, this.certSecret(), shortId, release.txid, release.slots, chargeRejected(release.txid), now);
+      }
+      return json(200, {ok: true, ...done});
     }
     if (rest === '/offline-charges' && method === 'POST') {
       const done = recordOfflineCharge(storage, shortId, caller.till.till_id, body, now);
-      if (!done.recorded) return json(409, {ok: false, reason: 'double_spend', conflicts: done.conflicts});
+      if (!done.recorded) {
+        if (done.release) {
+          const {txid, slots} = done.release;
+          await recordReleases(storage, this.certSecret(), shortId, txid, slots, reportRefused(txid, shortId), now);
+        }
+        return json(409, {ok: false, reason: 'double_spend', conflicts: done.conflicts});
+      }
       return json(200, {ok: true, version: done.version});
     }
     const slot = /^\/slots\/(\d{1,2})$/.exec(rest);
@@ -513,10 +538,11 @@ export class Registry {
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
         'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys', 'card_resets',
-        'till_claims', 'till_claim_budget', 'offline_reports',
+        'till_claims', 'till_claim_budget', 'offline_reports', 'releases',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }
+      this.releaseKeyOff = false;
       return json(200, {ok: true});
     }
     if (path === '/test/reset-notes') {
@@ -538,6 +564,11 @@ export class Registry {
         await hashPassword(String(body.password)),
         Date.now(),
       );
+      return json(200, {ok: true});
+    }
+    if (path === '/test/cert-key') {
+      const b = (await objectBody(request)) ?? {};
+      this.releaseKeyOff = b.off === true;
       return json(200, {ok: true});
     }
     if (path === '/test/note') {

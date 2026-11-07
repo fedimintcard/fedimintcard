@@ -26,7 +26,7 @@ export const STALE_AFTER_MS = 26 * 60 * 60 * 1000;
 const TABLES = [
   'operators', 'batches', 'cards', 'card_slots', 'card_versions', 'notes', 'card_txs',
   'tills', 'federations', 'federation_keys', 'holder_loads', 'manager_keys', 'card_resets',
-  'offline_reports',
+  'offline_reports', 'releases',
 ] as const;
 /** Columns that never leave the object. */
 const SECRET_COLUMNS = new Set(['password_hash', 'token_hash', 'poll_secret_hash']);

@@ -373,6 +373,10 @@ export function completeReset(
     for (const id of closing) {
       sql.exec('UPDATE cards SET reset_at = ? WHERE short_id = ? AND reset_at IS NULL', now, id);
     }
+    // The applet and its slots are gone: no release can fit them again.
+    for (const id of [shortId, ...closing]) {
+      sql.exec('DELETE FROM releases WHERE short_id = ?', id);
+    }
     const record: ResetCompletion = {
       short_id: shortId,
       chip: done.chip,
