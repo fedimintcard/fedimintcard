@@ -70,11 +70,10 @@ class OfflineTest {
         assertEquals(64, first.length);
         assertTrue(verifies(c, 0, h(1), first));
         assertEquals(ST_SPENT, c.slotState(0));
-        // the same transaction again: a lost answer, signed afresh (BIP-340 aux randomness)
+        // the same transaction again: a lost answer, given back from storage, not signed again
         ResponseAPDU again = c.tx(SIGN, 0, h(1));
         assertSw(0x9000, again);
-        assertTrue(verifies(c, 0, h(1), again.getData()));
-        assertFalse(Arrays.equals(first, again.getData()));
+        assertArrayEquals(first, again.getData());
         // any other transaction is the same note spent twice
         assertSw(0x6985, c.tx(SIGN, 0, h(2)));
         // GET_SLOT shows what it spent on
@@ -252,7 +251,7 @@ class OfflineTest {
         byte[] w = init.getData();
         assertEquals(65, w.length);
         assertSw(0x6985, c.tx(ATTEST, 0, h(7)), "no certificate yet");
-        byte[] certBytes = fill(100, 0x5C);
+        byte[] certBytes = fill(130, 0x5C);   // the registry's certificate is 130 bytes
         assertSw(0x9000, c.tx(SET_CERT, 0, certBytes));
         assertArrayEquals(certBytes, c.tx(GET_CERT, 0, null).getData());
         byte[] challenge = new byte[32];
@@ -269,7 +268,7 @@ class OfflineTest {
         assertSw(0x6985, c.tx(SET_CERT, 0, certBytes));
         assertSw(0x6985, c.tx(ATTEST_INIT, 0, null));
         byte[] st = c.tx(GET_STATE, 0, null).getData();
-        assertEquals(100, st[56] & 0xFF);
+        assertEquals(130, st[56] & 0xFF);
         assertEquals(1, st[57]);
     }
 
