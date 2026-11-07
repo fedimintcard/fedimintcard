@@ -316,3 +316,133 @@ fn client_speaks_3_0() {
     old.select().unwrap();
     assert_eq!(old.applet_version().unwrap(), AppletVersion::V2_1);
 }
+
+// ------------------------------------------------------------------ releases (§ 6), as ReleaseTest.java
+
+fn registry() -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::random(&mut rand::thread_rng())
+}
+
+fn point(k: &p256::ecdsa::SigningKey) -> [u8; 65] {
+    k.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap()
+}
+
+fn release(k: &p256::ecdsa::SigningKey, slot0: &[u8; 32], slot: u8, txid: &[u8; 32]) -> Vec<u8> {
+    v3::sign_release(k, slot0, slot, txid)
+}
+
+/// A card with the registry key, slot 0 its identity, slot 1 a note, slot 2 keyed; PIN verified.
+fn released_card(k: &p256::ecdsa::SigningKey) -> (SoftCard, [u8; 32]) {
+    let mut c = SoftCard::v3();
+    let slot0 = c.gen_key(0).unwrap().serialize();
+    c.gen_key(1).unwrap();
+    c.gen_key(2).unwrap();
+    c.set_note(1, 2048, &sig48()).unwrap();
+    c.set_registry_key(&point(k)).unwrap();
+    c.set_pin(PIN).unwrap();
+    c.verify_pin(PIN).unwrap();
+    (c, slot0)
+}
+
+fn opening(txid: [u8; 32]) -> Opening {
+    Opening { txid, out_idx: 0, blinding_key: [0; 32] }
+}
+
+#[test]
+fn a_released_input_is_a_note_again_and_signs_another_transaction() {
+    let k = registry();
+    let (mut c, slot0) = released_card(&k);
+    let (t1, t2) = (h(0x31), h(0x32));
+    c.sign(1, &t1).unwrap();
+    assert_eq!(sw(c.sign(1, &t2)), 0x6985, "spent on t1");
+    assert_eq!(c.release(1, &t1, &release(&k, &slot0, 1, &t1)).unwrap(), SlotState::Note);
+    let slot = c.get_slot(1).unwrap();
+    assert_eq!((slot.state, slot.amount_msat, slot.spent_hash), (SlotState::Note, 2048, [0; 32]));
+    let sig = c.sign(1, &t2).unwrap();
+    assert!(verifies(&mut c, 1, &t2, &sig), "the note signs its new transaction");
+    // the old release cannot undo the new spend
+    assert_eq!(sw(c.release(1, &t1, &release(&k, &slot0, 1, &t1))), 0x6985);
+}
+
+#[test]
+fn a_released_change_slot_is_keyed_again() {
+    let k = registry();
+    let (mut c, slot0) = released_card(&k);
+    let t = h(0x44);
+    c.set_change(2, 1024, &opening(t)).unwrap();
+    assert_eq!(sw(c.gen_key_overwrite(2)), 0x6985, "change owed: never re-keyed");
+    assert_eq!(c.release(2, &t, &release(&k, &slot0, 2, &t)).unwrap(), SlotState::Keyed);
+    let slot = c.get_slot(2).unwrap();
+    assert_eq!(slot.opening, Opening::from_bytes(&[0; 66]), "the opening is gone");
+    assert_eq!(slot.amount_msat, 0);
+    c.set_note(2, 4096, &sig48()).unwrap();
+    assert_eq!(c.get_slot(2).unwrap().state, SlotState::Note, "the slot takes a new note");
+}
+
+#[test]
+fn only_the_registrys_signature_over_this_card_slot_and_transaction() {
+    let (k, other) = (registry(), registry());
+    let (mut c, slot0) = released_card(&k);
+    let t = h(0x55);
+    c.sign(1, &t).unwrap();
+    assert_eq!(sw(c.release(1, &t, &release(&other, &slot0, 1, &t))), 0x6982, "another key");
+    assert_eq!(sw(c.release(1, &t, &release(&k, &h(7), 1, &t))), 0x6982, "another card");
+    assert_eq!(sw(c.release(1, &t, &release(&k, &slot0, 2, &t))), 0x6982, "signed for another slot");
+    assert_eq!(sw(c.release(2, &t, &release(&k, &slot0, 2, &t))), 0x6985, "slot 2 never spent on t");
+    assert_eq!(sw(c.release(1, &h(0x56), &release(&k, &slot0, 1, &h(0x56)))), 0x6985, "another transaction");
+    let mut bad = release(&k, &slot0, 1, &t);
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert_eq!(sw(c.release(1, &t, &bad)), 0x6982);
+    assert_eq!(c.slot_state(1), Some(SlotState::Spent), "nothing was released");
+}
+
+#[test]
+fn the_registry_key_is_set_before_the_pin_and_without_it_nothing_is_released() {
+    let k = registry();
+    let mut c = SoftCard::v3();
+    let slot0 = c.gen_key(0).unwrap().serialize();
+    c.gen_key(1).unwrap();
+    c.set_note(1, 2048, &sig48()).unwrap();
+    assert!(!c.get_state().unwrap().registry_key);
+    c.set_pin(PIN).unwrap();
+    c.verify_pin(PIN).unwrap();
+    assert_eq!(sw(c.set_registry_key(&point(&k))), 0x6985, "only before the PIN");
+    let t = h(0x66);
+    c.sign(1, &t).unwrap();
+    assert_eq!(sw(c.release(1, &t, &release(&k, &slot0, 1, &t))), 0x6985, "no registry key");
+    assert_eq!(c.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])).unwrap().len(), 59);
+}
+
+#[test]
+fn a_malformed_key_or_release_is_refused() {
+    let mut c = SoftCard::v3();
+    assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_SET_REGISTRY_KEY, 0, &[0; 64]))), 0x6700);
+    let mut compressed = [0u8; 65];
+    compressed[0] = 2;
+    assert_eq!(sw(c.set_registry_key(&compressed)), 0x6A80);
+    let mut off_curve = [0u8; 65];
+    off_curve[0] = 4;
+    assert_eq!(sw(c.set_registry_key(&off_curve)), 0x6A80);
+    let k = registry();
+    c.set_registry_key(&point(&k)).unwrap();
+    assert!(c.get_state().unwrap().registry_key);
+    assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_RELEASE, 0, &[0; 33]))), 0x6700);
+    assert!(c.release(0, &h(1), &[0; 7]).is_err(), "refused before the card sees it");
+}
+
+#[test]
+fn client_speaks_release() {
+    let k = registry();
+    let mut c = CardClient::new(Direct(SoftCard::v3()));
+    c.select().unwrap();
+    let slot0 = c.gen_key(0).unwrap().serialize();
+    c.gen_key(1).unwrap();
+    c.set_note(1, 2048, &sig48()).unwrap();
+    c.set_registry_key(&point(&k)).unwrap();
+    assert!(c.get_state().unwrap().registry_key);
+    c.set_pin(PIN).unwrap();
+    c.verify_pin(PIN).unwrap();
+    c.sign(1, &h(3)).unwrap();
+    assert_eq!(c.release(1, &h(3), &release(&k, &slot0, 1, &h(3))).unwrap(), SlotState::Note);
+}
