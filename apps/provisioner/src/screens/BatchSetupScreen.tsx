@@ -216,6 +216,8 @@ export function BatchSetupScreen({
           contentContainerStyle={local.scroll}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
+          // fits one screen on a phone; no rubber band when it does
+          alwaysBounceVertical={false}
           testID="setup-scroll">
           <View style={local.section}>
             <SectionHeader help={SETUP.federationHelp} testID="federation-help">
@@ -417,8 +419,8 @@ function PolicyRow({
 
 const local = StyleSheet.create({
   grow: {flex: 1},
-  scroll: {gap: 24, paddingTop: 4, paddingBottom: 24},
-  section: {gap: 10},
+  scroll: {gap: 16, paddingTop: 2, paddingBottom: 8},
+  section: {gap: 8},
   center: {textAlign: 'center'},
   inset: {paddingHorizontal: 18, paddingBottom: 14},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
@@ -428,8 +430,8 @@ const local = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 18,
-    paddingVertical: 12,
-    minHeight: 60,
+    paddingVertical: 8,
+    minHeight: 54,
   },
   fieldLabel: {fontFamily: FONT.medium, fontSize: 16},
   stepper: {flexDirection: 'row', alignItems: 'center', gap: 6},
@@ -456,7 +458,7 @@ const local = StyleSheet.create({
     alignItems: 'center',
     gap: 14,
     paddingHorizontal: 18,
-    paddingVertical: 15,
+    paddingVertical: 12,
   },
   radio: {
     width: 22,
@@ -467,8 +469,8 @@ const local = StyleSheet.create({
     justifyContent: 'center',
   },
   radioDot: {width: 10, height: 10, borderRadius: 5},
-  pinBox: {paddingHorizontal: 18, paddingBottom: 14, gap: 6},
-  pinInput: {fontSize: 16, minHeight: 50},
+  pinBox: {paddingHorizontal: 18, paddingBottom: 12, gap: 6},
+  pinInput: {fontSize: 16, minHeight: 46},
   pinSpaced: {fontSize: 20, letterSpacing: 6},
   notes: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, padding: 14},
   noteChip: {

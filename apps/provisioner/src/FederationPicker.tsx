@@ -136,11 +136,11 @@ export function FederationPicker({
 }
 
 const local = StyleSheet.create({
-  body: {paddingHorizontal: 18, paddingVertical: 16, gap: 4},
+  body: {paddingHorizontal: 18, paddingVertical: 12, gap: 2},
   title: {fontFamily: FONT.semibold, fontSize: 20, letterSpacing: -0.3},
   small: {fontFamily: FONT.regular, fontSize: 13, lineHeight: 19},
   actions: {flexDirection: 'row'},
-  action: {flex: 1, alignItems: 'center', paddingVertical: 14},
+  action: {flex: 1, alignItems: 'center', paddingVertical: 12},
   actionText: {fontFamily: FONT.semibold, fontSize: 15},
   vline: {width: StyleSheet.hairlineWidth},
   empty: {padding: 18, gap: 12},
