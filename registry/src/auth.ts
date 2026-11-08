@@ -81,7 +81,8 @@ export async function verifyPassword(
 /* ------------------------------------------------------------------------- */
 
 interface Setup {
-  action: 'bootstrap' | 'recover';
+  /** bootstrap: the first operator; recover: a new password; add: another operator (e.g. a store reviewer). */
+  action: 'bootstrap' | 'recover' | 'add';
   nonce: string;
   name: string;
   password: string;
@@ -97,7 +98,7 @@ export function parseSetup(raw: string): Setup {
   const s = value as Partial<Setup> | null;
   if (
     !s ||
-    (s.action !== 'bootstrap' && s.action !== 'recover') ||
+    (s.action !== 'bootstrap' && s.action !== 'recover' && s.action !== 'add') ||
     typeof s.nonce !== 'string' ||
     !/^[A-Za-z0-9_-]{16,128}$/.test(s.nonce) ||
     typeof s.name !== 'string' ||
@@ -151,9 +152,12 @@ export async function applySetup(
       return {operator_id: Number(raced.operator_id), applied: false};
     }
     let id: number;
-    if (setup.action === 'bootstrap') {
-      if (sql.exec('SELECT id FROM operators LIMIT 1').toArray().length > 0) {
-        throw new Error('bootstrap needs an empty operators table; use recover');
+    if (setup.action === 'bootstrap' || setup.action === 'add') {
+      if (setup.action === 'bootstrap' && sql.exec('SELECT id FROM operators LIMIT 1').toArray().length > 0) {
+        throw new Error('bootstrap needs an empty operators table; use recover or add');
+      }
+      if (setup.action === 'add' && sql.exec('SELECT id FROM operators WHERE name = ?', setup.name).toArray().length > 0) {
+        throw new Error('add needs a new operator name; use recover for an existing one');
       }
       id = Number(
         (

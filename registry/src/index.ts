@@ -119,7 +119,8 @@ export interface Env {
   readonly REGISTRY: DurableObjectNamespace;
   /**
    * The operator setup command, a secret, as JSON:
-   * {"action":"bootstrap"|"recover","nonce":"…16+ chars…","name":"…","password":"…12+ chars…"}
+   * {"action":"bootstrap"|"recover"|"add","nonce":"…16+ chars…","name":"…","password":"…12+ chars…"}
+   * (add: another operator with a name not yet used, e.g. an app-store reviewer on staging)
    * Applied once per nonce when the object starts. `wrangler secret put OPERATOR_SETUP`.
    */
   readonly OPERATOR_SETUP?: string;

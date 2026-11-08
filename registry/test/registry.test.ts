@@ -241,6 +241,23 @@ describe('the setup command', () => {
     });
   });
 
+  it('add makes another operator, with its own empty account, and refuses a name in use', async () => {
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const add = JSON.stringify({action: 'add', nonce: 'add-reviewer-0000001', name: 'reviewer', password: 'a reviewer passphrase'});
+      expect((await applySetup(state.storage, add, Date.now()))?.applied).toBe(true);
+      // the same command again: already applied, nothing new
+      expect((await applySetup(state.storage, add, Date.now()))?.applied).toBe(false);
+      const taken = JSON.stringify({action: 'add', nonce: 'add-operator-000002', name: 'operator', password: 'yet another passphrase'});
+      await expect(applySetup(state.storage, taken, Date.now())).rejects.toThrow(/new operator name/);
+    });
+    const reviewer = await signIn('reviewer', 'a reviewer passphrase');
+    const res = await get('/registry/batches', reviewer);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as {batches: unknown[]}).batches).toEqual([]);
+    // the first operator is untouched
+    expect((await get('/registry/batches', await signIn())).status).toBe(200);
+  });
+
   it('recover resets the password and revokes live sessions', async () => {
     const old = await signIn();
     await runInDurableObject(stub(), async (_instance, state) => {
