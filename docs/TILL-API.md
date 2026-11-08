@@ -63,9 +63,8 @@ transaction would owe under a headroom fee schedule, less its fees now (floored 
 headroom is `--offline-fee-base-msat` (`TILL_OFFLINE_FEE_BASE_MSAT`, default 100 msat per input
 and per output) plus `--offline-fee-headroom-ppm` (`TILL_OFFLINE_FEE_HEADROOM_PPM`, default 0),
 fedimint's default mint fees; 0 and 0 turn it off. A federation already charging the default fees
-gives a margin of 0. The holder pays the margin out of the change, the till getting at least what
-an exact charge gives it; with no change it may come out of the till's overpay (the till still
-gets the price). A margin that would need another change note, slot or input is not taken: the
+gives a margin of 0. The margin comes out of the change or out of the till's overpay (its
+rounding surplus over the price); the till always gets at least the price. A margin that would need another change note, slot or input is not taken: the
 charge is then exact, never refused for it. The margin is `fee_margin_msat` in the answer and in
 the queue entry. Online charges always balance exactly. On an older federation (no surplus
 allowed) offline charges balance exactly, and a fee change before the charge is sent gets it

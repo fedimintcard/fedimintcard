@@ -159,9 +159,10 @@ tests.
   charge's inputs also pay a surplus the federation burns: the fees the transaction would owe
   under a headroom schedule (default fedimint's default mint fees, 100 msat per input and output,
   0 ppm; `--offline-fee-base-msat`, `--offline-fee-headroom-ppm`) less its fees now, floored at 0
-  (`host/sidecar/src/plan.rs`, `solve_with_margin`). The holder's change pays it; with no change
-  the till's overpay may; the till always gets at least what the exact charge gives it (at least
-  the price with no change). It covers a rise of the federation's fees up to the headroom, e.g.
+  (`host/sidecar/src/plan.rs`, `solve_with_margin`). The change or the till's overpay pays it; the
+  till always gets at least the price. (First built with the change alone paying when there was
+  change; in the second e2e run every margin was dropped, since a power-of-two change note cannot
+  be trimmed by a few hundred msat without more notes.) It covers a rise of the federation's fees up to the headroom, e.g.
   a zero-fee federation turning on the default base fee. It does not cover a rise beyond the
   headroom; a charge where neither the change nor the overpay can pay the margin without another
   change note, slot or input (it goes exact rather than being refused, `fee_margin_msat: 0`); or
@@ -186,3 +187,13 @@ tests.
   `double_spend` even if that charge later fails.
 - **Production**: registry v11 needs its own `CERT_SIGNING_KEY` (set by the owner), then the
   registry, the zion till package and the apps.
+
+### Second e2e run (2026-11-07, staging)
+
+Card `4f5e6da3` (the wiped chip `…63205547`), set up by the Setup app with no daily limit, the
+registry key and a certificate; 30,000 sat loaded (10 notes). Online: a 50 sat charge and five
+balance taps brought the spare reserve to 12 fresh slots. Offline (registry unreachable): 30, 10
+and 7 sat, all "Paid offline" (10 sat had been refused in the first drill). Back online: the queue
+of 3 settled with no double spend or rejection, the till's wallet rose by exactly the 49.152 sat it
+was owed, and a balance tap finished both change slots. Found: every fee margin was 0 (fixed, as
+above).

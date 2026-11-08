@@ -1135,13 +1135,13 @@ async fn an_offline_charge_with_a_fee_margin_is_sent_and_accepted() -> anyhow::R
     assert_eq!(c["fees_msat"], 0);
     assert_eq!(ins, till_msat + change + margin, "{c}");
     assert!(margin >= 100 * (n_in + n_till + n_change), "{margin} for {n_in} in, {n_till} + {n_change} out");
-    // The same charge planned exactly: the till gets at least as much; the change carries the
-    // margin (and any rise of the till's overpay).
+    // The same charge planned exactly spends as much: the margin comes out of the change or the
+    // till's overpay, and the till still gets at least the price.
     let exact = plan::solve(&loaded, price, n_keyed, &|_| 0, 1)?;
     let exact_till = exact.till.iter().sum::<u64>();
     assert!(!exact.change.is_empty() && exact.surplus == 0);
-    assert!(till_msat >= exact_till, "the margin is not the till's: {till_msat} < {exact_till}");
-    assert_eq!(change + margin + (till_msat - exact_till), exact.change.iter().sum::<u64>(), "the card's change pays the margin");
+    assert!(till_msat >= price, "the till gets the price: {till_msat} < {price}");
+    assert_eq!(till_msat + change + margin, exact_till + exact.change.iter().sum::<u64>(), "the margin is paid from change or overpay");
 
     t.set_down(false);
     let sent = t.send().await;

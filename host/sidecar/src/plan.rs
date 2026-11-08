@@ -638,9 +638,11 @@ const MARGIN_ROUNDS: usize = 4;
 /// [`fee_margin`] of its own inputs and outputs under `headroom`, so the transaction still
 /// balances if the federation's fees rise to `headroom` before it is sent.
 ///
-/// The margin comes out of what the card gets back: its change, the till getting at least what
-/// the exact plan gives it; or, when the exact plan has no change, the till's overpay, the till
-/// still getting at least `price`. A margin plan is
+/// The margin comes out of the change, or out of the till's overpay (its rounding surplus over
+/// the price), the till always getting at least `price`. With notes in powers of two, trimming a
+/// change note by a few hundred msat usually takes more notes than a card has slots for, so in the
+/// second e2e run (2026-11-07) every margin was dropped until the overpay could pay it too. A
+/// margin plan is
 /// taken only when it is no worse than the exact plan on room left, change notes and inputs (card
 /// slots and signatures are what a tap is short of); otherwise, or when the notes cannot pay it,
 /// the exact plan is returned with `surplus == 0`. Only for a federation at core consensus 2.1 or
@@ -662,8 +664,8 @@ pub fn solve_with_margin(
         let (ins, outs) = p.items(notes);
         fee_margin(&ins, &outs, fee, headroom)
     };
-    // With change to give, the till's side stays as it was or grows: the change pays.
-    let min_overpay = if exact.change.is_empty() { 0 } else { exact.overpay };
+    // The till keeps at least the price; the change or its overpay pays the margin.
+    let min_overpay = 0;
     let mut margin = need(&exact);
     for _ in 0..MARGIN_ROUNDS {
         if margin == 0 {
@@ -1129,8 +1131,8 @@ mod tests {
         assert_eq!(fee_margin(&ins, &outs, &zero, FeeHeadroom::OFF), 0);
     }
 
-    /// Zero fees, change to give: the change pays the margin, the till gets what it would have,
-    /// and the transaction still balances once fees rise to the headroom.
+    /// Zero fees, change to give: the change or the till's overpay pays the margin, the till gets
+    /// at least the price, and the transaction still balances once fees rise to the headroom.
     #[test]
     fn the_margin_comes_out_of_the_change() {
         let notes = [65_536u64, 16_384];
@@ -1141,13 +1143,27 @@ mod tests {
         assert!(p.surplus > 0 && p.surplus >= fee_margin(&ins, &outs, &zero, FeeHeadroom::DEFAULT), "{p:?}");
         assert!(p.balances(&notes, &zero), "{p:?}");
         assert_eq!(p.till.iter().sum::<u64>(), 50_000 + p.overpay);
-        assert!(p.overpay >= exact.overpay, "the till gets at least what it would have: {p:?} {exact:?}");
         let in_sum: u64 = ins.iter().sum();
-        assert_eq!(p.change.iter().sum::<u64>(), in_sum - 50_000 - p.overpay - p.surplus, "the change pays it");
+        assert_eq!(p.change.iter().sum::<u64>(), in_sum - 50_000 - p.overpay - p.surplus, "it balances: change, till, surplus");
         assert_eq!(in_sum, exact.inputs.iter().map(|&i| notes[i]).sum::<u64>());
         // Under the default fees the inputs still cover outputs and fees.
         assert!(in_sum >= outs.iter().sum::<u64>() + headroom_fees(&p, &notes, FeeHeadroom::DEFAULT), "{p:?}");
         assert!(p.change.len() <= exact.change.len() && p.inputs.len() <= exact.inputs.len());
+    }
+
+    /// The second e2e run's 30 sat charge (2026-11-07): one 32,768 msat note, 2,048 msat change,
+    /// 720 msat overpay. Trimming the change note would take more notes; the overpay pays instead.
+    #[test]
+    fn with_change_the_overpay_pays_the_margin_when_the_change_cannot() {
+        let notes = [32_768u64];
+        let exact = check(&notes, 30_000, 6, &zero);
+        assert_eq!((exact.change.clone(), exact.overpay), (vec![2_048], 720));
+        let p = solve_with_margin(&notes, 30_000, 6, &zero, 1, FeeHeadroom::DEFAULT).unwrap();
+        let (ins, outs) = p.items(&notes);
+        assert!(p.surplus > 0 && p.surplus >= fee_margin(&ins, &outs, &zero, FeeHeadroom::DEFAULT), "{p:?}");
+        assert!(p.balances(&notes, &zero), "{p:?}");
+        assert!(p.till.iter().sum::<u64>() >= 30_000, "the till still gets the price: {p:?}");
+        assert!(p.change.len() <= exact.change.len(), "{p:?}");
     }
 
     /// No change to give: the margin may come out of the till's overpay (the price is still paid).
@@ -1220,9 +1236,6 @@ mod tests {
                 assert!(p.change.len() <= exact.change.len() && p.inputs.len() <= exact.inputs.len(), "{p:?} {exact:?}");
                 if p.surplus > 0 {
                     with_margin += 1;
-                    if !exact.change.is_empty() {
-                        assert!(p.overpay >= exact.overpay, "{notes:?} {price} {p:?} {exact:?}");
-                    }
                     let (ins, outs) = p.items(&notes);
                     assert!(ins.iter().sum::<u64>() >= outs.iter().sum::<u64>() + headroom_fees(&p, &notes, h), "{notes:?} {price} {p:?}");
                 } else {
