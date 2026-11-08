@@ -40,6 +40,16 @@ enum Cmd {
     /// Lightning through the federation's gateways.
     #[command(subcommand)]
     Ln(LnCmd),
+    /// Serve the USB (PC/SC) reader's card over the bridge protocol, for `till serve --relay`:
+    /// the till then charges, checks and loads the card on the reader. Loopback only; needs a
+    /// build with `--features pcsc`. Takes no wallet, so it runs beside `till serve`.
+    Relay {
+        #[arg(long, default_value = "127.0.0.1:9876")]
+        listen: std::net::SocketAddr,
+        /// A reader whose name contains this (the first reader otherwise).
+        #[arg(long, env = "CARD_PCSC_READER")]
+        reader: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -243,6 +253,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).with_writer(std::io::stderr).init();
     let cli = Cli::parse();
     match &cli.cmd {
+        Cmd::Relay { listen, reader } => {
+            fedimint_card_sidecar::relay::serve(*listen, reader.clone()).await?;
+        }
         Cmd::Join { invite } => {
             let w = Wallet::join(&cli.data_dir, invite).await?;
             println!("joined federation {}", w.federation_id());

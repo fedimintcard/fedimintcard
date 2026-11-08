@@ -46,6 +46,12 @@ Verified against the Java bridge from spike/applet (`bridge.jar --port N`): the 
 
 ## Till service
 
+A card on a USB reader can stand in for one behind a phone: `card-sidecar relay` (a build with
+`--features pcsc`; loopback only; `--listen`, default 127.0.0.1:9876, `--reader` or
+`CARD_PCSC_READER`) serves the reader over the bridge protocol, and `till serve --relay
+http://127.0.0.1:9876` then charges, checks and loads that card. It takes no wallet, so it runs
+beside `till serve`.
+
 `card-sidecar till serve [--listen 127.0.0.1:9877] [--relay http://127.0.0.1:9876]` runs the
 point-of-sale HTTP API described in `docs/TILL-API.md` (charge, card balance, sales, status). The
 relay URL also comes from `CARD_BRIDGE_URL`. It starts without a card; every charge or balance

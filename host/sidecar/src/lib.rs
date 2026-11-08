@@ -7,6 +7,7 @@ pub mod link;
 pub mod offline;
 pub mod ops;
 pub mod plan;
+pub mod relay;
 pub mod pos;
 pub mod sales;
 pub mod shares;
