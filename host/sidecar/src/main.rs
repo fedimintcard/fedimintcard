@@ -64,6 +64,16 @@ enum LnCmd {
         #[arg(long)]
         gateway: Option<String>,
     },
+    /// Pay a BOLT11 invoice (with an amount) from the wallet's balance through a gateway, follow
+    /// it for up to 90 s, and print the outcome as JSON: `status` paid, pending (still in flight:
+    /// keep the operation id), refunded, failed or refused (nothing spent). Exits 1 unless paid or
+    /// pending.
+    Pay {
+        bolt11: String,
+        /// Refuse, before spending anything, a gateway whose fee for this invoice is above this.
+        #[arg(long)]
+        max_fee_msat: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -307,6 +317,15 @@ async fn main() -> Result<()> {
                 }
             }
             println!("wallet balance now {} msat", w.balance_msat().await?);
+        }
+        Cmd::Ln(LnCmd::Pay { bolt11, max_fee_msat }) => {
+            use fedimint_card_sidecar::wallet::LnPayOutcome;
+            let w = Wallet::open(&cli.data_dir).await?;
+            let outcome = w.pay_bolt11(bolt11, *max_fee_msat).await?;
+            println!("{}", serde_json::to_string(&outcome)?);
+            if !matches!(outcome, LnPayOutcome::Paid { .. } | LnPayOutcome::Pending { .. }) {
+                std::process::exit(1);
+            }
         }
         Cmd::Info => {
             let w = Wallet::open(&cli.data_dir).await?;

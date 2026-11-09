@@ -44,6 +44,16 @@ PIN for commands that sign; it defaults to the test PIN `1234`, and a wrong gues
 Bridge wire format: `POST /apdu` `{"apdu":"<hex>"}` -> `{"response":"<hex data||SW>"}`; `POST /reset`; `GET /health`.
 Verified against the Java bridge from spike/applet (`bridge.jar --port N`): the whole workspace passes with `CARD_BACKEND=bridge`, and `card_roundtrip` passed 20/20 loops. `bridge_roundtrip_when_configured` runs only if `CARD_BRIDGE_URL` is set. Tests use slots 0 and 1 and create keys on demand (`get_or_gen`), so they work against a persistent card.
 
+## Lightning
+
+`card-sidecar ln gateways` lists the federation's gateways and their fees; `ln receive <amount_msat>`
+prints an invoice and waits until the eCash is in the wallet. `ln pay <bolt11> [--max-fee-msat N]`
+pays an invoice (with an amount) from the wallet's balance and prints the outcome as JSON
+(`status`: `paid` with the preimage and gateway fee, `pending` with the operation id after 90 s,
+`refunded`, `failed`, or `refused` with nothing spent; exit 1 unless paid or pending). It goes
+through the federation's `ln` module, else its lnv2 module; the till registers the lnv2 client only
+on a federation without `ln`, so on one with both (Island Bitcoin Community) only `ln` is used.
+
 ## Till service
 
 A card on a USB reader can stand in for one behind a phone: `card-sidecar relay` (a build with

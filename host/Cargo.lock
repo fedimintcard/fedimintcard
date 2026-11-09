@@ -2393,6 +2393,8 @@ dependencies = [
  "fedimint-dummy-server",
  "fedimint-ln-client",
  "fedimint-ln-common",
+ "fedimint-lnv2-client",
+ "fedimint-lnv2-server",
  "fedimint-mint-client",
  "fedimint-mint-common",
  "fedimint-mint-server",
@@ -3098,6 +3100,31 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fedimint-lnv2-server"
+version = "0.13.0-beta.1"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0-beta.1#f9dccb6656cdad6760d6ed4bc33da585ca87a32a"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bls12_381",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-lnv2-common",
+ "fedimint-logging",
+ "fedimint-metrics",
+ "fedimint-server-core",
+ "fedimint-tpe",
+ "futures",
+ "group",
+ "rand 0.8.8",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -32,6 +32,7 @@ fedimint-core = { workspace = true }
 fedimint-mint-client = { workspace = true }
 fedimint-ln-client = { workspace = true }
 fedimint-ln-common = { workspace = true }
+fedimint-lnv2-client = { workspace = true }
 fedimint-mint-common = { workspace = true }
 fedimint-rocksdb = { workspace = true }
 futures = "0.3"
@@ -52,6 +53,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 fedimint-dummy-client = { workspace = true }
 fedimint-dummy-server = { workspace = true }
 fedimint-mint-server = { workspace = true }
+fedimint-lnv2-server = { workspace = true }
 fedimint-testing = { workspace = true }
 p256 = { version = "0.13", features = ["ecdsa"] }
 tempfile = "3"
