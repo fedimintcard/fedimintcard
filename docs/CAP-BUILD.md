@@ -224,3 +224,24 @@ P-256 key made with openssl standing in for the registry: SET_REGISTRY_KEY 50 ms
 one txid (SIGN 952 ms), another txid refused 6985; a release with one byte of its DER signature
 flipped 6982 (116 ms); the valid release 9000, state NOTE (133 ms); the other txid then signed
 (945 ms); the old release replayed onto the new spend 6985. The card was left blank.
+
+## Two applets on one J3R180 (2026-11-09)
+
+Fedimint Card 3.0 (`5fc182a` CAP) and Cashu Card 2.2 (`cashu-javacard-2.1.0.cap`, sha `86839ccf…`,
+applet version 2.2) on a blank J3R180 (the reset card `15594670`) through the ACR122U, `gp` with
+the factory keys, in both install orders. Memory is JCOP's `GET DATA DF25` on the ISD.
+
+| | Persistent free | Transient COD | COR |
+|---|---|---|---|
+| Blank | 163,744 (164,176 after a delete cycle) | 3,990 | 3,984 |
+| Fedimint 3.0 (opener + applet) | 143,644 | 2,564 | 3,984 |
+| + Cashu 2.2 (opener, card, tag), either order | 87,996 | 2,556 | 3,968 |
+| + all 32 Fedimint slots keyed, 3 notes, 1 spend | 64,060 | 2,556 | 3,968 |
+| + Cashu owner and card record (its lazy 16 KB reserve) | 47,436 | 2,556 | 3,968 |
+
+Installs: Fedimint 9.3–9.7 s, Cashu 17.9–18.7 s (three instances). Beside each other: GEN_KEY
+32/32 at 300–329 ms (median 318), SIGN 943–955 ms, repeat from storage 53–54 ms; cashucard
+`selftest` 12/12, `set-owner` and `set-card` fine, `auth` valid five times interleaved with
+Fedimint signatures. A power cycle (card lifted and replaced) kept both applets' state: spent
+slots, PIN, notes, owner and record. Cashu's transient take is 8 B of COD and 16 B of COR at
+install, so RAM is not the constraint for the pair. The card was left blank on factory keys.
