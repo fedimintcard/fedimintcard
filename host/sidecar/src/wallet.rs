@@ -92,6 +92,59 @@ pub fn parse_bolt11(text: &str) -> Result<Bolt11Invoice> {
     Ok(invoice)
 }
 
+/// How long one guardian gets to list the gateways in the fallback below.
+const GATEWAY_PEER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The lnv1 gateway to pay through. The stock refresh (`update_gateway_cache`) needs every guardian
+/// to answer, so one unreachable guardian (a poor connection, a guardian down) stops every payment.
+/// When it fails, use the gateways saved by an earlier refresh, then whatever guardians answer on
+/// their own. That is safe for a payout: a gateway claims an lnv1 contract only by paying the
+/// invoice, and a contract it never claims times out and returns to the wallet.
+async fn lnv1_gateway(
+    ln: &fedimint_client::module::ClientModuleInstance<'_, fedimint_ln_client::LightningClientModule>,
+    invoice: &Bolt11Invoice,
+) -> std::result::Result<fedimint_ln_common::LightningGateway, String> {
+    let refresh = ln.update_gateway_cache().await;
+    match ln.select_available_gateway(None, Some(invoice.clone())).await {
+        Ok(gw) => return Ok(gw),
+        Err(e) if refresh.is_ok() => return Err(format!("no Lightning gateway answers: {e:?}")),
+        Err(_) => {}
+    }
+    let refresh_err = refresh.err().map(|e| format!("{e:?}")).unwrap_or_default();
+    tracing::warn!("gateway refresh failed ({refresh_err}); asking the guardians one by one");
+    gateway_from_any_peer(&ln.api).await.ok_or_else(|| {
+        format!("reading the federation's gateways: {refresh_err}; no guardian listed a gateway on its own either")
+    })
+}
+
+/// Ask each guardian for its gateway list on its own and pick a live gateway, vetted ones first.
+async fn gateway_from_any_peer(api: &fedimint_api_client::api::DynModuleApi) -> Option<fedimint_ln_common::LightningGateway> {
+    use fedimint_api_client::api::FederationApiExt as _;
+    use fedimint_core::module::ApiRequestErased;
+    use fedimint_ln_common::LightningGatewayAnnouncement;
+    let asks = api.all_peers().iter().map(|peer| {
+        let peer = *peer;
+        async move {
+            tokio::time::timeout(
+                GATEWAY_PEER_TIMEOUT,
+                api.request_single_peer::<Vec<LightningGatewayAnnouncement>>(
+                    fedimint_ln_common::federation_endpoint_constants::LIST_GATEWAYS_ENDPOINT.to_string(),
+                    ApiRequestErased::default(),
+                    peer,
+                ),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+        }
+    });
+    let mut all: Vec<LightningGatewayAnnouncement> = futures::future::join_all(asks).await.into_iter().flatten().collect();
+    all.retain(|a| !a.ttl.is_zero());
+    all.sort_by_key(|a| !a.vetted);
+    all.into_iter().next().map(|a| a.info)
+}
+
 /// Whether the till registers the lnv2 client for `cfg`: only when the federation has lnv2 and
 /// no ln module, so a till on a federation with ln (Island Bitcoin Community: its lnv2 is older
 /// than this client speaks) builds exactly the client it built before.
@@ -242,12 +295,9 @@ impl Wallet {
     async fn pay_v1(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>) -> LnPayOutcome {
         let Ok(ln) = self.lightning() else { return LnPayOutcome::refused("no ln module") };
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
-        if let Err(e) = ln.update_gateway_cache().await {
-            return LnPayOutcome::refused(format!("reading the federation's gateways: {e:?}"));
-        }
-        let gw = match ln.select_available_gateway(None, Some(invoice.clone())).await {
+        let gw = match lnv1_gateway(&ln, &invoice).await {
             Ok(gw) => gw,
-            Err(e) => return LnPayOutcome::refused(format!("no Lightning gateway answers: {e:?}")),
+            Err(reason) => return LnPayOutcome::refused(reason),
         };
         let fee_msat = gw.fees.to_amount(&Amount::from_msats(amount_msat)).msats;
         if let Some(r) = refuse_fee_or_balance(fee_msat, max_fee_msat, amount_msat, self.balance_msat().await.ok()) {
