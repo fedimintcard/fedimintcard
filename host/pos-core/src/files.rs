@@ -60,13 +60,21 @@ pub fn private_options() -> std::fs::OpenOptions {
 /// Write `value` as JSON to `path` (mode 0600) durably: a temporary file in the same directory,
 /// fsynced, renamed over `path`, then the directory fsynced so the rename itself is durable.
 pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_private(path, &serde_json::to_vec_pretty(value)?, "json.tmp")
+}
+
+/// [`write_private_json`] for a line of text (a phone's id).
+pub fn write_private_text(path: &Path, text: &str) -> Result<()> {
+    write_private(path, text.as_bytes(), "tmp")
+}
+
+fn write_private(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     create_private_dir(dir)?;
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_vec_pretty(value)?;
+    let tmp = path.with_extension(tmp_ext);
     {
         let mut f = private_options().truncate(true).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(&json)?;
+        f.write_all(bytes)?;
         f.write_all(b"\n")?;
         f.sync_all()?;
     }

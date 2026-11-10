@@ -14,9 +14,11 @@ uniffi::setup_scaffolding!();
 
 pub mod charge;
 pub mod files;
+pub mod kit;
 pub mod plan;
 pub mod queue;
 pub mod refusal;
+pub mod store;
 
 pub use refusal::{Refusal, class_of, refusal};
 

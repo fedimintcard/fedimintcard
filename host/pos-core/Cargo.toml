@@ -39,4 +39,5 @@ uniffi = { version = "0.32", optional = true, default-features = false }
 
 [dev-dependencies]
 fedimint-card-host-card = { path = "../card", features = ["softkit"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 tempfile = "3"

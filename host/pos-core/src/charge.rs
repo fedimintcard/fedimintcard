@@ -479,10 +479,14 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         pool: pool_refs,
         synced: false,
     };
-    // Every secret on disk, and the notes in the spent list, before the card hears of it.
+    // Every secret on disk, and the notes in the spent list, before the card hears of it. A
+    // phone keeps the latest time it has seen, so a clock set back cannot revive its kit.
     lock(queue).commit(|f| {
         f.charges.push(entry.clone());
         f.spent.extend(entry.inputs.iter().map(|i| i.nonce.clone()));
+        if env.expires_at_ms.is_some() {
+            f.high_water_ms = f.high_water_ms.max(env.now_ms);
+        }
     })?;
     // The card keeps the change's opening, then signs. Any failure before a slot is spent leaves
     // nothing to send: the entry and its spent marks go again.
