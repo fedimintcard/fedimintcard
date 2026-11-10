@@ -93,8 +93,10 @@ class PosUi(
         retry.setOnClickListener { onEvent(PosEvent.RetryPressed) }
         v<View>(R.id.btn_error_back).setOnClickListener { onEvent(PosEvent.BackPressed) }
         abandon.setOnClickListener {
+            val (title, message) = abandonCopy((last as? PosState.Error)?.held == true)
             AlertDialog.Builder(act)
-                .setMessage("Abandon sale? If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
+                .apply { if (title != null) setTitle(title) }
+                .setMessage(message)
                 .setPositiveButton("Abandon") { _, _ -> onEvent(PosEvent.AbandonPressed) }
                 .setNegativeButton("Keep", null)
                 .show()
@@ -140,15 +142,30 @@ class PosUi(
         }
     }
 
+    private var tillStatus: TillStatus? = null
+    private var phone = PhoneCounts()
+
     fun setStatus(s: TillStatus?) {
+        tillStatus = s
+        renderBalance()
+    }
+
+    /** The phone's own offline counts: added to the till's waiting count, and the held line (docs/POS-OFFLINE.md § Android). */
+    fun setPhone(p: PhoneCounts) {
+        phone = p
+        renderBalance()
+    }
+
+    /** The till's balance once it has answered, then what waits to sync (the till's and this phone's) and what waits for its card. */
+    private fun renderBalance() {
+        val s = tillStatus
         fedName.text = s?.federationName ?: act.getString(R.string.app_name)
-        balance.text = if (s == null) "" else {
-            val line = "Till balance: ${formatSats(s.walletBalanceMsat)} sats"
-            if (s.offlineQueued > 0) {
-                val n = s.offlineQueued.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                line + "\n" + act.resources.getQuantityString(R.plurals.payments_waiting_to_sync, n, n)
-            } else line
-        }
+        val lines = ArrayList<String>()
+        if (s != null) lines += "Till balance: ${formatSats(s.walletBalanceMsat)} sats"
+        val n = waitingToSync(s, phone).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        if (n > 0) lines += act.resources.getQuantityString(R.plurals.payments_waiting_to_sync, n, n)
+        if (phone.signing > 0) lines += heldLine(phone.signing)
+        balance.text = lines.joinToString("\n")
     }
 
     /** The amount keypad types a sale, or a top-up on [PosState.TopUpEntering] and while its invoice is made. */
@@ -301,16 +318,17 @@ class PosUi(
     }
 
     private fun renderError(e: PosState.Error) {
-        val (title, detail) = errorCopy(e.kind, e.detail, e.suggestedMsat)
+        val unresolved = e.unresolvedRef != null
+        val (title, detail) = errorCopy(e.kind, e.detail, e.suggestedMsat, unresolved)
         errTitle.text = title
         errDetail.text = detail
-        val unresolved = e.unresolvedRef != null
         abandon.visibility = if (unresolved) View.VISIBLE else View.GONE
         retry.text = act.getString(if (unresolved) R.string.try_again else R.string.retry)
         retry.visibility = if (e.kind.retryable) View.VISIBLE else View.GONE
         errBack.visibility = if (unresolved) View.GONE else View.VISIBLE
         (errBack as TextView).text = act.getString(R.string.back)
-        checkSales.visibility = if (unresolved) View.VISIBLE else View.GONE
+        // A sale held on the phone is not in the till's sales until its card finishes it here.
+        checkSales.visibility = if (unresolved && !e.held) View.VISIBLE else View.GONE
     }
 
     /** A failed top-up step borrows the error screen too. */
@@ -386,18 +404,21 @@ class PosUi(
     }
 
     /**
-     * Settings: the till URL, pairing (scan the till's QR code, or paste its text), and the relay.
-     * [paired] is the paired till's URL, or null. [onPairText] returns false for text that is not
-     * a pairing code.
+     * Settings: the till URL, pairing (scan the till's QR code, or paste its text), offline payments
+     * (the kit, what is on this phone, charges the till refused), and the relay. [paired] is the
+     * paired till's URL, or null. [onPairText] returns false for text that is not a pairing code.
+     * [onDismiss] deletes a refused charge's record and says, on the UI thread, whether it did.
      */
     fun settingsDialog(
         current: String,
         paired: String?,
+        offline: OfflineView,
         onSave: (String) -> Unit,
         onRelay: () -> Unit,
         onScan: () -> Unit,
         onPairText: (String) -> Boolean,
         onUnpair: () -> Unit,
+        onDismiss: (txid: String, done: (Boolean) -> Unit) -> Unit,
     ) {
         val pad = (16 * act.resources.displayMetrics.density).toInt()
         val input = EditText(act).apply { setText(current); inputType = InputType.TYPE_TEXT_VARIATION_URI; setSingleLine() }
@@ -419,10 +440,16 @@ class PosUi(
             visibility = if (paired != null) View.VISIBLE else View.GONE
             setOnClickListener { onUnpair(); dialog?.dismiss() }
         }
+        val offlineText = TextView(act).apply {
+            text = offlineLines(offline, System.currentTimeMillis()).joinToString("\n")
+            setPadding(0, pad, 0, pad / 2)
+        }
         val body = android.widget.LinearLayout(act).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(pad, pad / 2, pad, 0)
             addView(input); addView(state); addView(scan); addView(pasted); addView(usePasted); addView(unpair)
+            addView(offlineText)
+            for (r in offline.refused) addView(refusedRow(r, onDismiss))
         }
         AlertDialog.Builder(act)
             .setTitle("Till")
@@ -440,6 +467,42 @@ class PosUi(
                     }
                 }
             }.show()
+    }
+
+    /** A charge the till refused, with Dismiss behind a confirm: the record is the only one of a charge the card paid. */
+    private fun refusedRow(r: RefusedEntry, onDismiss: (String, (Boolean) -> Unit) -> Unit): View {
+        val row = android.widget.LinearLayout(act).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        val label = TextView(act).apply {
+            text = refusedRowCopy(r)
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val dismiss = Button(act).apply { text = "Dismiss" }
+        dismiss.setOnClickListener {
+            AlertDialog.Builder(act)
+                .setTitle(DISMISS_TITLE)
+                .setMessage(DISMISS_COPY)
+                .setPositiveButton("Delete") { _, _ ->
+                    dismiss.isEnabled = false
+                    onDismiss(r.txid) { ok -> if (ok) row.visibility = View.GONE else dismiss.isEnabled = true }
+                }
+                .setNegativeButton("Keep", null)
+                .show()
+        }
+        row.addView(label); row.addView(dismiss)
+        return row
+    }
+
+    /** A yes-or-cancel question before [onYes]. */
+    fun confirm(title: String, message: String, positive: String, onYes: () -> Unit) {
+        AlertDialog.Builder(act)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton(positive) { _, _ -> onYes() }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private inner class SalesAdapter : BaseAdapter() {
@@ -474,10 +537,11 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
 }
 
 /**
- * Title and detail copy for a charge error. [suggestedMsat] is the price the till says the card
- * can pay instead, for `offline_no_change_room`.
+ * Title and detail copy for a charge error. [suggestedMsat] is a price that pays instead, for
+ * `offline_no_change_room` (the card's) and `offline_pool_exhausted` (the kit's). [unresolved]: an
+ * earlier attempt at this sale reached the till and its reply was lost.
  */
-fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null): Pair<String, String> = when (kind) {
+fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unresolved: Boolean = false): Pair<String, String> = when (kind) {
     ErrorKind.NO_CARD -> "Card not detected" to "Hold card flat on the phone's NFC antenna"
     ErrorKind.INSUFFICIENT -> "Card balance too low" to ""
     ErrorKind.NO_EXACT_PLAN -> "Card needs a top up" to ""
@@ -492,7 +556,21 @@ fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null): Pai
     ErrorKind.CARD_ERROR -> "Card error" to detail
     ErrorKind.UNDECIDED -> "Payment pending" to "Waiting for the federation. This screen updates when the sale is recorded; Try again re-checks without charging twice."
     ErrorKind.TIMEOUT_UNKNOWN -> "Outcome unknown" to "The till did not answer. The card may have been charged. This screen updates when the sale is recorded; Try again re-checks without charging twice."
-    ErrorKind.TILL_UNREACHABLE -> "Till service unreachable" to "Check adb reverse tcp:9877 tcp:9877"
+    ErrorKind.TILL_UNREACHABLE -> TILL_UNREACHABLE_TITLE to
+        if (unresolved) "The last reply was lost, so this sale can't be taken on the phone. Try again once the till answers."
+        else "Check adb reverse tcp:9877 tcp:9877"
+    // The phone's own charge (docs/POS-OFFLINE.md § Android): the unreachable screen says which case it is.
+    ErrorKind.OFFLINE_NOT_READY -> TILL_UNREACHABLE_TITLE to "No offline kit yet. Reach the till once while online."
+    ErrorKind.OFFLINE_KIT_EXPIRED -> TILL_UNREACHABLE_TITLE to "The offline kit has expired. Reach the till to renew it."
+    ErrorKind.OFFLINE_CAP_REACHED -> TILL_UNREACHABLE_TITLE to "Offline limit reached. Reach the till so waiting payments can sync."
+    ErrorKind.OFFLINE_NOTE_INVALID -> TILL_UNREACHABLE_TITLE to "This card can't be checked without the till. It pays online only."
+    ErrorKind.OFFLINE_POOL_EXHAUSTED -> "Amount not available offline" to
+        ((suggestedMsat?.let { "Try ${formatSats(it)} sats" } ?: "Try another amount") + ", or reach the till for a new kit.")
+    ErrorKind.HELD_ON_PHONE -> "Payment not finished" to
+        "The card was taken away while it signed. Hold the same card to the phone and press Try again. It won't be charged twice."
+    ErrorKind.OFFLINE_UNSUPPORTED_CARD -> "This card pays online only" to "It can't be taken without the till."
+    ErrorKind.CARD_NOT_GENUINE -> "Card declined" to "This isn't a genuine Fedimint Card."
+    ErrorKind.CARD_LIMIT -> "Card limit reached" to "This card has reached its daily limit."
     ErrorKind.WRONG_PIN -> wrongPinCopy(parseTriesLeft(detail)) to "Ask the card holder to enter it again"
     ErrorKind.PIN_BLOCKED -> "PIN blocked" to "This card's PIN is blocked. The card can't pay."
     ErrorKind.PIN_REQUIRED -> "Something went wrong" to "The app sent the charge without the holder's PIN. This is an app bug; the card was not touched."
@@ -502,6 +580,70 @@ fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null): Pai
     ErrorKind.OPS_UNREACHABLE -> "Card service unreachable" to "Check the network, then try again"
     ErrorKind.OPS_REFUSED -> "Card service refused the till" to "Check the till token"
     ErrorKind.BAD_REQUEST, ErrorKind.INTERNAL, ErrorKind.UNKNOWN -> "Something went wrong" to detail
+}
+
+/** The title of every screen that says the till can't be reached; the detail says which case it is. */
+const val TILL_UNREACHABLE_TITLE = "Till service unreachable"
+
+/**
+ * The Abandon alert's title (or null) and message. [held]: the phone holds the sale signing, and
+ * abandoning only hides it (docs/POS-OFFLINE.md § Android).
+ */
+fun abandonCopy(held: Boolean): Pair<String?, String> =
+    if (held) "Abandon sale?" to "The card already signed part of this payment. Its next tap on this phone still finishes it."
+    else null to "Abandon sale? If the payment did go through, the customer will have paid without a receipt. Check Sales first."
+
+/** The home screen's line while sales wait for their cards (after a restart, the only trace of them). */
+fun heldLine(n: Int): String =
+    if (n == 1) "1 payment is waiting for its card: tap that card to finish it."
+    else "$n payments are waiting for their cards: tap those cards to finish them."
+
+/** The confirm before unpairing or pairing another till while [n] payments are on this phone. */
+fun pendingCopy(n: Int): String =
+    if (n == 1) "1 payment is waiting to sync with this till. It stays on this phone and can't be synced to another till."
+    else "$n payments are waiting to sync with this till. They stay on this phone and can't be synced to another till."
+
+const val UNPAIR_TITLE = "Unpair anyway?"
+const val REPAIR_TITLE = "Pair anyway?"
+const val DISMISS_TITLE = "Delete this record?"
+const val DISMISS_COPY = "The card was charged; this deletes the only record of it."
+
+/** A charge the till refused at sync, as Settings lists it. */
+fun refusedRowCopy(r: RefusedEntry): String = "${formatSats(r.priceMsat)} sats · ${r.code}: the till refused it after the card paid."
+
+/** A duration in its largest whole unit: "40 s", "12 min", "3 h", "6 days". */
+fun span(ms: Long): String {
+    val s = ms.coerceAtLeast(0) / 1000
+    return when {
+        s < 60 -> "$s s"
+        s < 3_600 -> "${s / 60} min"
+        s < 86_400 -> "${s / 3_600} h"
+        s < 172_800 -> "1 day"
+        else -> "${s / 86_400} days"
+    }
+}
+
+/** Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone, what failed last. */
+fun offlineLines(v: OfflineView, nowMs: Long): List<String> {
+    val lines = ArrayList<String>()
+    when {
+        v.starting -> lines += "Offline payments: starting…"
+        v.off != null -> lines += "Offline payments are off: ${v.off}"
+        !v.paired -> lines += "Offline payments: pair with a till to take them."
+        else -> {
+            val k = v.kit
+            lines += when {
+                k == null -> "Offline kit: none yet. Reach the till once while online."
+                nowMs >= k.expiresAtMs -> "Offline kit: fetched ${span(nowMs - k.fetchedAtMs)} ago, expired ${span(nowMs - k.expiresAtMs)} ago. Reach the till to renew it."
+                else -> "Offline kit: fetched ${span(nowMs - k.fetchedAtMs)} ago, good for ${span(k.expiresAtMs - nowMs)}. " +
+                    "What waits to sync is capped at ${formatSats(k.capMsat)} sats and ${k.capCount} payments."
+            }
+        }
+    }
+    v.stats?.let { lines += "On this phone: ${it.waiting} waiting to sync, ${it.signing} waiting for their cards, ${it.synced} synced." }
+    v.kitError?.let { lines += "Last kit fetch failed: $it" }
+    v.syncError?.let { lines += "Last sync stopped: $it" }
+    return lines
 }
 
 /** The line over the PIN pad after a refused PIN. Never includes the PIN. */

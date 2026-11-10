@@ -7,6 +7,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.ServerSocket
+import java.net.SocketTimeoutException
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -104,6 +105,34 @@ class TillLinkTest {
         server.close()
     }
 
+    /**
+     * A till that ends the link the moment it is ready (a job that fails at once) gets its close
+     * answered: the phone's side closes as close() does even before open() has returned the link.
+     */
+    @Test fun aTillThatClosesAtOnceGetsItsCloseAnswered() {
+        val server = ServerSocket(0)
+        val got = LinkedBlockingQueue<Any>()
+        val till = Thread {
+            server.accept().use { s ->
+                val input = s.getInputStream(); val out = s.getOutputStream()
+                val head = StringBuilder()
+                while (!head.endsWith("\r\n\r\n")) head.append(input.read().toChar())
+                val key = head.lines().first { it.startsWith("Sec-WebSocket-Key:") }.substringAfter(':').trim()
+                out.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${Ws.accept(key)}\r\n\r\n".toByteArray())
+                Ws.writeFrame(out, Ws.TEXT, """{"type":"ready","link":"00aa11bb22cc33dd"}""".toByteArray(), null)
+                Ws.writeFrame(out, Ws.CLOSE, ByteArray(0), null)
+                got.add(try { Ws.readMessage(input).opcode } catch (e: IOException) { e })
+            }
+        }.apply { start() }
+        val link = TillLink.open("http://127.0.0.1:${server.localPort}", null, CardLink { byteArrayOf(0x90.toByte(), 0) })
+        assertEquals(Ws.CLOSE, got.poll(5, TimeUnit.SECONDS))
+        till.join(5000)
+        val deadline = System.currentTimeMillis() + 5000
+        while (!link.closed && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertTrue(link.closed)
+        server.close()
+    }
+
     @Test fun aRefusedLinkThrows() {
         val server = ServerSocket(0)
         Thread {
@@ -121,6 +150,115 @@ class TillLinkTest {
             assertTrue(e.message!!.contains("401"))
         }
         server.close()
+    }
+
+    /** A till that answers the link's upgrade with [head] and closes. */
+    private fun linkAnsweredWith(head: (key: String) -> String): Exception {
+        val server = ServerSocket(0)
+        Thread {
+            server.accept().use { s ->
+                val input = s.getInputStream()
+                val req = StringBuilder()
+                while (!req.endsWith("\r\n\r\n")) req.append(input.read().toChar())
+                val key = req.lines().first { it.startsWith("Sec-WebSocket-Key:") }.substringAfter(':').trim()
+                s.getOutputStream().write(head(key).toByteArray())
+            }
+        }.start()
+        try {
+            TillLink.open("http://127.0.0.1:${server.localPort}", "f".repeat(64), CardLink { ByteArray(0) })
+            fail("opened")
+            throw AssertionError()
+        } catch (e: IOException) {
+            return e
+        } finally {
+            server.close()
+        }
+    }
+
+    /**
+     * Decision 4 (docs/POS-OFFLINE.md § Android): a till that is not serving lets a charge go on the
+     * phone; a dead pairing (401, 403) never does, since the kit could not be renewed either.
+     */
+    @Test fun onlyADeadPairingKeepsAChargeOffThePhone() {
+        for ((status, fallsBack) in listOf(401 to false, 403 to false, 500 to true, 502 to true, 503 to true, 404 to true)) {
+            val e = linkAnsweredWith { "HTTP/1.1 $status X\r\nContent-Length: 0\r\n\r\n" }
+            assertEquals("$status", status, (e as LinkRefused).status)
+            assertEquals("$status", fallsBack, linkFailureFallsBack(e))
+        }
+        // A handshake that is not the WebSocket's.
+        val bad = linkAnsweredWith { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: nope\r\n\r\n" }
+        assertFalse(bad is LinkRefused); assertTrue(linkFailureFallsBack(bad))
+        // No till listening at all.
+        val port = ServerSocket(0).use { it.localPort }
+        val none = try { TillLink.open("http://127.0.0.1:$port", null, CardLink { ByteArray(0) }); null } catch (e: IOException) { e }
+        assertTrue(linkFailureFallsBack(none!!))
+    }
+
+    /** Opens a link to a till that took the connection, on a thread: what open() threw within [ms], or null if it still waits. */
+    private fun openWithin(port: Int, ms: Long, connectMs: Int? = null): Exception? {
+        val out = LinkedBlockingQueue<Any>()
+        Thread {
+            out.add(
+                try {
+                    if (connectMs == null) TillLink.open("http://127.0.0.1:$port", "f".repeat(64), CardLink { ByteArray(0) })
+                    else TillLink.open("http://127.0.0.1:$port", "f".repeat(64), CardLink { ByteArray(0) }, connectMs)
+                } catch (e: Exception) { e }
+            )
+        }.apply { isDaemon = true; start() }
+        return when (val r = out.poll(ms, TimeUnit.MILLISECONDS)) {
+            null -> null
+            is Exception -> r
+            else -> { (r as TillLink).close(); fail("opened"); null }
+        }
+    }
+
+    /**
+     * Decision 4: a till (or the proxy before it) that takes the connection and never answers the
+     * upgrade is not serving. The link gives up within the quick timeout, not the 130 s a job's
+     * read may take, and the sale may go on the phone: nothing was posted for it.
+     */
+    @Test fun aTillThatNeverAnswersTheUpgradeFallsBackQuickly() {
+        val server = ServerSocket(0)
+        Thread {
+            try { server.accept().use { s -> val input = s.getInputStream(); while (input.read() >= 0) {} } } catch (_: IOException) {}
+        }.apply { isDaemon = true; start() }
+        try {
+            // The default quick timeout: 3 s to connect, then 5 s for the upgrade's answer.
+            val e = openWithin(server.localPort, 10_000)
+            assertNotNull("still opening after 10 s", e)
+            assertTrue("$e", e is SocketTimeoutException)
+            assertTrue(linkFailureFallsBack(e!!))
+        } finally {
+            server.close()
+        }
+    }
+
+    /** The quick timeout bounds the whole answer: one that trickles in byte by byte gets no longer. */
+    @Test fun aTillThatTricklesItsAnswerFallsBackQuickly() {
+        val server = ServerSocket(0)
+        Thread {
+            try {
+                server.accept().use { s ->
+                    val input = s.getInputStream()
+                    val req = StringBuilder()
+                    while (!req.endsWith("\r\n\r\n")) req.append(input.read().toChar())
+                    val out = s.getOutputStream()
+                    for (b in "HTTP/1.1 101 Switching Protocols\r\nX-Slow: ${"x".repeat(300)}".toByteArray()) { out.write(b.toInt()); out.flush(); Thread.sleep(50) }
+                }
+            } catch (_: Exception) {}
+        }.apply { isDaemon = true; start() }
+        try {
+            val started = System.nanoTime()
+            // 500 ms to connect, so 2.5 s for the answer, while each of its bytes comes within 50 ms.
+            val e = openWithin(server.localPort, 10_000, connectMs = 500)
+            val ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+            assertNotNull("still opening after 10 s", e)
+            assertTrue("$ms ms", ms < 6_000)
+            assertTrue("$e", e is SocketTimeoutException)
+            assertTrue(linkFailureFallsBack(e!!))
+        } finally {
+            server.close()
+        }
     }
 
     @Test fun linkTargetFollowsTheTillScheme() {

@@ -40,8 +40,20 @@ sealed class TillResult<out T> {
 
 sealed class ChargeResult {
     data class Success(val receipt: ChargeReceipt) : ChargeResult()
-    /** [suggestedMsat]: `suggested_msat`, a price the card can pay instead (`offline_no_change_room`). */
-    data class Declined(val code: ChargeErrorCode, val detail: String, val httpStatus: Int, val suggestedMsat: Long? = null) : ChargeResult()
+    /**
+     * [suggestedMsat]: `suggested_msat`, a price the card can pay instead (`offline_no_change_room`,
+     * `offline_pool_exhausted`). [local]: the phone's own core answered (an offline charge; no
+     * HTTP status, 0). [held]: the phone holds the sale `signing` after this answer, so only that
+     * card's next tap on this phone finishes it (docs/POS-OFFLINE.md); never the till.
+     */
+    data class Declined(
+        val code: ChargeErrorCode,
+        val detail: String,
+        val httpStatus: Int,
+        val suggestedMsat: Long? = null,
+        val held: Boolean = false,
+        val local: Boolean = false,
+    ) : ChargeResult()
     data class Failed(val error: TillError) : ChargeResult()
 }
 
@@ -141,6 +153,27 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
             is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body)
         }
 
+    /**
+     * `GET /v1/offline/kit?phone=`: this phone's offline kit (docs/TILL-API.md). The till's whole
+     * answer on a 200, which the core takes as it is; any other status is a [TillError.BadResponse].
+     */
+    fun offlineKit(phoneId: String): TillResult<String> =
+        answer(call("GET", "/v1/offline/kit?phone=" + encode(phoneId), null, OFFLINE_READ_MS))
+
+    /**
+     * `POST /v1/offline/charges` with [body], the core's `drain` as it is: the till's answer on a
+     * 200, for the core's `mark_synced`; any other status is a [TillError.BadResponse]. Safe to
+     * repeat: the till answers a charge it has as `already`.
+     */
+    fun postOfflineCharges(body: String): TillResult<String> =
+        answer(call("POST", "/v1/offline/charges", body, OFFLINE_READ_MS))
+
+    private fun answer(r: TillResult<RawResponse>): TillResult<String> = when (r) {
+        is TillResult.Err -> r
+        is TillResult.Ok -> if (r.value.status == 200) TillResult.Ok(r.value.body)
+        else TillResult.Err(TillError.BadResponse("HTTP ${r.value.status}" + (errorCode(r.value.body)?.let { " $it" } ?: "")))
+    }
+
     private fun encode(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
 
     companion object {
@@ -148,6 +181,8 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
         const val QUICK_READ_MS = 10_000
         const val CHARGE_READ_MS = 125_000 // contract: at least 120 s
         const val CARD_BALANCE_READ_MS = 60_000
+        /** A kit is at most 128 KB, a sync at most 50 charges (1 MiB). */
+        const val OFFLINE_READ_MS = 30_000
     }
 }
 
@@ -193,6 +228,13 @@ class UrlConnectionTransport : Transport {
 }
 
 // ---- pure parsing ----
+
+/** The `error` code of a till's `{"ok":false,"error":…}` answer, or null. */
+internal fun errorCode(body: String): String? = try {
+    JSONObject(body).let { if (it.isNull("error")) null else it.optString("error").ifEmpty { null } }
+} catch (e: JSONException) {
+    null
+}
 
 private fun JSONObject.reqLong(k: String): Long {
     if (!has(k) || isNull(k)) throw JSONException("missing $k")

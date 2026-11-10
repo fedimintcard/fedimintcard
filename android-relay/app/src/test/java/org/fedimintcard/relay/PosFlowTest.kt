@@ -229,4 +229,159 @@ class PosFlowTest {
         assertFalse(g.isCurrent(a)); assertTrue(g.isCurrent(b))
         g.cancel(); assertFalse(g.isCurrent(b))
     }
+
+    // ---- the phone's own charge (docs/POS-OFFLINE.md § Android) ----
+
+    private fun local(c: ChargeErrorCode, held: Boolean = false, detail: String = "d", suggested: Long? = null) =
+        ChargeResult.Declined(c, detail, 0, suggested, held = held, local = true)
+
+    @Test fun aSaleHeldOnThePhoneIsUnresolvedWithoutBackAndTryAgainSendsTheSameRef() {
+        val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.HELD_ON_PHONE, e.kind); assertTrue(e.held)
+        assertEquals(fx.clientRef, e.unresolvedRef); assertTrue(f.unresolvedHeld)
+        assertNull(f.systemBack())
+        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
+        // Try again: the PIN, then the same sale at once, card or not (the core finds the card).
+        f.dispatch(PosEvent.CardLost)
+        val again = f.retry().single() as PosEffect.StartCharge
+        assertEquals(fx.clientRef, again.clientRef); assertNotEquals(fx.chargeId, again.chargeId)
+        assertEquals(fx.clientRef, f.unresolvedRef)
+    }
+
+    @Test fun whateverTheRetapAnswersAHeldSaleStaysHeld() {
+        for (c in listOf(ChargeErrorCode.UNDECIDED, ChargeErrorCode.NO_CARD, ChargeErrorCode.OFFLINE_KIT_EXPIRED, ChargeErrorCode.CARD_ERROR,
+            ChargeErrorCode.INSUFFICIENT, ChargeErrorCode.OFFLINE_NOT_READY)) {
+            val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+            f.retry()
+            f.dispatch(PosEvent.ChargeDone(f.signingId(), local(c, held = true)))
+            val e = f.state as PosState.Error
+            assertEquals(c.name, ErrorKind.HELD_ON_PHONE, e.kind); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
+            assertNull(f.systemBack())
+        }
+    }
+
+    @Test fun aHeldSaleSettlesOnlyOnThePhone() {
+        val (f, _) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.retry()
+        val paid = receipt.copy(saleId = 0, offline = true, collectionPending = true)
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), ChargeResult.Success(paid)))
+        assertEquals(PosState.Receipt(paid), f.state)
+        assertNull(f.unresolvedRef); assertFalse(f.unresolvedHeld)
+    }
+
+    @Test fun aHeldWrongPinAsksAgainAndReturnsToTheHeldSale() {
+        val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.WRONG_PIN, held = true, detail = "wrong PIN; 2 tries left before the card blocks")))
+        val ask = f.state as PosState.EnteringPin
+        assertTrue(ask.wrongPin); assertEquals(2, ask.triesLeft); assertEquals(fx.clientRef, ask.clientRef)
+        assertEquals(ErrorKind.HELD_ON_PHONE, ask.returnTo!!.kind); assertTrue(ask.returnTo!!.held)
+        assertTrue(f.unresolvedHeld); assertEquals(fx.clientRef, f.unresolvedRef)
+        // Cancel goes back to the held sale, never to the amount.
+        f.dispatch(PosEvent.CancelPressed)
+        assertEquals(ErrorKind.HELD_ON_PHONE, (f.state as PosState.Error).kind)
+        // The PIN again sends the same sale at once.
+        f.dispatch(PosEvent.RetryPressed); f.typePin()
+        val again = f.dispatch(PosEvent.PinConfirmed).single() as PosEffect.StartCharge
+        assertEquals(fx.clientRef, again.clientRef)
+    }
+
+    @Test fun aHeldWrongPinWithNoTriesLeftIsBlockedAndStillHeld() {
+        val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.WRONG_PIN, held = true, detail = "wrong PIN; 0 tries left before the card blocks")))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertEquals(fx.clientRef, e.unresolvedRef); assertTrue(e.held)
+        assertNull(f.systemBack()); assertTrue(f.unresolvedHeld)
+        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
+        f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
+    }
+
+    /** The card was blocked elsewhere after its held tap: the retap's pin_blocked is said, with no Try again to loop on. */
+    @Test fun aHeldRetapAnsweredPinBlockedIsBlockedAndStillHeld() {
+        val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.PIN_BLOCKED, held = true, detail = "the card's PIN is blocked")))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
+        assertFalse(e.kind.retryable) // the error screen hides Try again
+        assertNull(f.systemBack()); assertTrue(f.unresolvedHeld)
+        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
+        f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
+    }
+
+    @Test fun aWrongPinOnALocalChargeThatHoldsNothingIsAFreshAttempt() {
+        val (f, _) = unresolved(local(ChargeErrorCode.WRONG_PIN, detail = "wrong PIN; 2 tries left before the card blocks"))
+        val ask = f.state as PosState.EnteringPin
+        assertTrue(ask.wrongPin); assertNull(ask.returnTo); assertFalse(f.unresolvedHeld); assertNull(f.unresolvedRef)
+    }
+
+    @Test fun abandoningAHeldSaleOnlyHidesIt() {
+        val (f, _) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.dispatch(PosEvent.AbandonPressed)
+        assertEquals(PosState.Entering, f.state); assertNull(f.unresolvedRef); assertEquals(0L, f.pad.sats)
+    }
+
+    @Test fun codesFromThePhoneMapToTheirOwnKinds() {
+        val cases = mapOf(
+            ChargeErrorCode.OFFLINE_NOT_READY to ErrorKind.OFFLINE_NOT_READY,
+            ChargeErrorCode.OFFLINE_KIT_EXPIRED to ErrorKind.OFFLINE_KIT_EXPIRED,
+            ChargeErrorCode.OFFLINE_CAP_REACHED to ErrorKind.OFFLINE_CAP_REACHED,
+            ChargeErrorCode.OFFLINE_NOTE_INVALID to ErrorKind.OFFLINE_NOTE_INVALID,
+            ChargeErrorCode.OFFLINE_POOL_EXHAUSTED to ErrorKind.OFFLINE_POOL_EXHAUSTED,
+            ChargeErrorCode.OFFLINE_UNSUPPORTED_CARD to ErrorKind.OFFLINE_UNSUPPORTED_CARD,
+            ChargeErrorCode.CARD_NOT_GENUINE to ErrorKind.CARD_NOT_GENUINE,
+            ChargeErrorCode.CARD_LIMIT to ErrorKind.CARD_LIMIT,
+            ChargeErrorCode.OFFLINE_NO_CHANGE_ROOM to ErrorKind.OFFLINE_NO_CHANGE_ROOM,
+            ChargeErrorCode.INSUFFICIENT to ErrorKind.INSUFFICIENT,
+            ChargeErrorCode.NO_CARD to ErrorKind.NO_CARD,
+            ChargeErrorCode.CARD_ERROR to ErrorKind.CARD_ERROR,
+        )
+        for ((c, k) in cases) {
+            val (f, _) = unresolved(local(c))
+            val e = f.state as PosState.Error
+            assertEquals(c.name, k, e.kind); assertNull(c.name, e.unresolvedRef); assertFalse(e.held)
+            f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
+        }
+        val (f, _) = unresolved(local(ChargeErrorCode.OFFLINE_POOL_EXHAUSTED, suggested = 49_000))
+        assertEquals(49_000L, (f.state as PosState.Error).suggestedMsat)
+    }
+
+    @Test fun phoneOnlyCodesFromTheTillReadAsBefore() {
+        for (c in listOf(ChargeErrorCode.OFFLINE_NOT_READY, ChargeErrorCode.OFFLINE_KIT_EXPIRED, ChargeErrorCode.OFFLINE_CAP_REACHED,
+            ChargeErrorCode.OFFLINE_NOTE_INVALID, ChargeErrorCode.OFFLINE_POOL_EXHAUSTED, ChargeErrorCode.OFFLINE_UNSUPPORTED_CARD)) {
+            val (f, _) = unresolved(declined(c))
+            assertEquals(c.name, ErrorKind.UNKNOWN, (f.state as PosState.Error).kind)
+        }
+        // The card's own refusals say the same from either.
+        assertEquals(ErrorKind.CARD_NOT_GENUINE, (unresolved(declined(ChargeErrorCode.CARD_NOT_GENUINE)).first.state as PosState.Error).kind)
+        assertEquals(ErrorKind.CARD_LIMIT, (unresolved(declined(ChargeErrorCode.CARD_LIMIT)).first.state as PosState.Error).kind)
+        // A till's undecided is not held on the phone: its sales are polled as before.
+        val (f, _) = unresolved(declined(ChargeErrorCode.UNDECIDED))
+        assertEquals(ErrorKind.UNDECIDED, (f.state as PosState.Error).kind); assertFalse(f.unresolvedHeld)
+    }
+
+    @Test fun phoneCodesNeverSettleAnUnresolvedSale() {
+        for (k in listOf(ErrorKind.OFFLINE_NOT_READY, ErrorKind.OFFLINE_KIT_EXPIRED, ErrorKind.OFFLINE_CAP_REACHED, ErrorKind.OFFLINE_NOTE_INVALID,
+            ErrorKind.OFFLINE_POOL_EXHAUSTED, ErrorKind.HELD_ON_PHONE)) assertFalse(k.name, k.definitive)
+        assertTrue(ErrorKind.HELD_ON_PHONE.needsSalesCheck); assertTrue(ErrorKind.HELD_ON_PHONE.retryable)
+    }
+
+    @Test fun anOfflineReceipt() {
+        val paid = receipt.copy(saleId = 0, txid = "tx-local", offline = true, collectionPending = true)
+        val (f, _) = unresolved(ChargeResult.Success(paid))
+        val r = (f.state as PosState.Receipt).receipt
+        assertTrue(r.offline); assertEquals("tx-local", r.txid); assertEquals(5000L, r.priceMsat)
+    }
+
+    /** Decision 3: a lost reply, then a retry whose link cannot open, stays on the unreachable screen, unresolved. */
+    @Test fun aLostReplyThatCannotReachTheTillStaysUnresolved() {
+        val (f, fx) = unresolved(ChargeResult.Failed(TillError.Timeout))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), ChargeResult.Failed(TillError.Unreachable)))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.TILL_UNREACHABLE, e.kind); assertEquals(fx.clientRef, e.unresolvedRef); assertFalse(e.held)
+        assertFalse(f.unresolvedHeld)
+    }
 }

@@ -5,10 +5,22 @@ import java.util.UUID
 enum class ErrorKind {
     BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NO_EXACT_PLAN,
     DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_BLOCKED, CARD_CHANGED,
-    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN;
+    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN,
+    OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED,
+    OFFLINE_UNSUPPORTED_CARD, CARD_NOT_GENUINE, CARD_LIMIT,
+    /** The phone holds the sale signing: only that card's next tap on this phone finishes it. */
+    HELD_ON_PHONE;
 
     /** Outcome may already have happened: starts an unresolved sale. */
-    val needsSalesCheck: Boolean get() = this == UNDECIDED || this == TIMEOUT_UNKNOWN
+    val needsSalesCheck: Boolean get() = this == UNDECIDED || this == TIMEOUT_UNKNOWN || this == HELD_ON_PHONE
+
+    /**
+     * Said only of the phone's own offline charge (their copy speaks of the kit and the till). From
+     * the till's own offline path they read as [UNKNOWN], as before the phone took charges.
+     */
+    val phoneOnly: Boolean get() = this in setOf(
+        OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED, OFFLINE_UNSUPPORTED_CARD,
+    )
 
     /**
      * Nothing moved: clears an unresolved sale. A PIN refusal comes from inside the spend, after
@@ -45,7 +57,11 @@ sealed class PosState {
     data class WaitingForCard(val priceMsat: Long, val mustRemoveFirst: Boolean) : PosState()
     data class Signing(val priceMsat: Long, val chargeId: Int, val clientRef: String, val unresolvedRef: String? = null) : PosState()
     data class Receipt(val receipt: ChargeReceipt) : PosState()
-    /** [suggestedMsat]: a price the card can pay instead (`offline_no_change_room`), when the till said one. */
+    /**
+     * [suggestedMsat]: a price that pays instead (`offline_no_change_room`, `offline_pool_exhausted`),
+     * when one was said. [held]: the phone holds this unresolved sale signing (docs/POS-OFFLINE.md):
+     * the till never saw it, so its sales are not polled, and only the core retries it.
+     */
     data class Error(
         val priceMsat: Long,
         val kind: ErrorKind,
@@ -53,6 +69,7 @@ sealed class PosState {
         val clientRef: String,
         val unresolvedRef: String? = null,
         val suggestedMsat: Long? = null,
+        val held: Boolean = false,
     ) : PosState()
     /** [returnTo] is the unresolved Error to go back to, or null to go back to Entering. */
     data class Sales(val returnTo: Error? = null) : PosState()
@@ -210,6 +227,15 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             else -> null
         }
 
+    /** The unresolved sale is one the phone holds signing: the till's sales cannot tell its outcome. */
+    val unresolvedHeld: Boolean
+        get() = when (val s = state) {
+            is PosState.Error -> s.held
+            is PosState.Sales -> s.returnTo?.held == true
+            is PosState.EnteringPin -> s.returnTo?.held == true
+            else -> false
+        }
+
     /** True while any PIN digits are typed on the pad or held for the card. */
     val holdsPin: Boolean get() = heldPin != null || pinPad.length > 0
 
@@ -347,6 +373,33 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         return PosState.Error(s.priceMsat, kind, detail, s.clientRef, unresolved, suggestedMsat)
     }
 
+    /**
+     * A refused charge. One the phone holds signing stays unresolved and held, whatever the card's
+     * checks answered on the retap (docs/POS-OFFLINE.md): a wrong PIN asks again and comes back to
+     * it, and a blocked PIN says so, with Abandon and no Try again.
+     */
+    private fun declined(s: PosState.Signing, r: ChargeResult.Declined) {
+        val held = if (r.held) PosState.Error(s.priceMsat, ErrorKind.HELD_ON_PHONE, r.detail, s.clientRef, s.clientRef, held = true) else null
+        if (r.code == ChargeErrorCode.WRONG_PIN) {
+            // Nothing moved; the same ref is a fresh attempt (TILL-API, wrong_pin).
+            val left = parseTriesLeft(r.detail)
+            if (left == 0) state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, held?.unresolvedRef, held = held != null)
+            else askPin(s.priceMsat, s.clientRef, wrongPin = true, triesLeft = left, returnTo = held)
+            return
+        }
+        if (held != null && r.code == ChargeErrorCode.PIN_BLOCKED) {
+            // Blocked since the tap that left it held: Try again would only answer this again.
+            state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, s.clientRef, held = true)
+            return
+        }
+        if (held != null) {
+            state = held
+            return
+        }
+        val kind = ErrorKind.from(r.code).let { if (it.phoneOnly && !r.local) ErrorKind.UNKNOWN else it }
+        state = error(s, kind, r.detail, r.suggestedMsat)
+    }
+
     fun dispatch(e: PosEvent): List<PosEffect> {
         val s = state
         when (e) {
@@ -414,12 +467,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                 dropPin()
                 when (val r = e.result) {
                     is ChargeResult.Success -> state = PosState.Receipt(r.receipt)
-                    is ChargeResult.Declined -> if (r.code == ChargeErrorCode.WRONG_PIN) {
-                        // Nothing moved; the same ref is a fresh attempt (TILL-API, wrong_pin).
-                        val left = parseTriesLeft(r.detail)
-                        if (left == 0) state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, null)
-                        else askPin(s.priceMsat, s.clientRef, wrongPin = true, triesLeft = left)
-                    } else state = error(s, ErrorKind.from(r.code), r.detail, r.suggestedMsat)
+                    is ChargeResult.Declined -> declined(s, r)
                     is ChargeResult.Failed -> state = error(
                         s,
                         when (r.error) {

@@ -15,6 +15,8 @@ import android.os.Looper
 import android.widget.Toast
 import android.view.WindowManager
 import android.widget.TextView
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class MainActivity : Activity(), NfcAdapter.ReaderCallback {
@@ -32,6 +34,8 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     private lateinit var ui: PosUi
     private lateinit var client: TillClient
     private lateinit var settings: Settings
+    /** The phone's offline side (docs/POS-OFFLINE.md § Android): local charges, the kit, the sync. */
+    private lateinit var offline: OfflineTill
     private val handler = Handler(Looper.getMainLooper())
     private var elapsed = 0
     private var failures = 0
@@ -43,6 +47,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         setContentView(R.layout.activity_main)
         settings = Settings(this)
         client = TillClient({ settings.baseUrl }, UrlConnectionTransport(), { settings.pairing?.token })
+        offline = OfflineTill(
+            { OfflineRuntime.core }, KitStore(noBackupFilesDir), client,
+            { settings.pairing?.let(::pairingId) }, { OfflineRuntime.failure },
+        )
         flow = PosFlow()
         ui = PosUi(this, ::dispatch, ::onKey, ::onPinKey)
         status = ui.relayStatus; last = ui.relayLast; info = ui.relayInfo
@@ -50,11 +58,18 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         cardListener = { present -> dispatch(if (present) PosEvent.CardPresent else PosEvent.CardLost) }
         ui.setPad(flow.pad)
         ui.render(flow.state)
+        // Opens the core's store once per process, off the main thread; the home screen then shows
+        // what the phone holds (a sale held for its card included, after a restart).
+        OfflineRuntime.start(noBackupFilesDir) {
+            val c = offline.counts()
+            runOnUiThread { ui.setPhone(c) }
+        }
         nfc = NfcAdapter.getDefaultAdapter(this)
         if (nfc == null) status.text = "no NFC"
         else if (nfc?.isEnabled == false) last.text = "NFC is switched off"
         try {
-            server = ApduServer(PORT, { isoDep.get()?.takeIf { it.isConnected }?.let { d -> cardOf(d) } }) { ev ->
+            // While the phone's core drives the card, the USB relay has no card to offer anyone else.
+            server = ApduServer(PORT, { if (offline.localCharging) null else isoDep.get()?.takeIf { it.isConnected }?.let { d -> cardOf(d) } }) { ev ->
                 runOnUiThread { last.text = ev }
             }.also { it.start() }
         } catch (e: Exception) {
@@ -67,7 +82,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         super.onResume()
         handler.post(poll)
         resumed = true
-        if (flow.unresolvedRef != null) scheduleSalesPoll()
+        if (flow.unresolvedRef != null && !flow.unresolvedHeld) scheduleSalesPoll()
         nfc?.enableReaderMode(
             this, this,
             NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
@@ -133,6 +148,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         runOnUiThread { status.text = "no card"; if (lost) cardListener?.invoke(false) }
     }
 
+    /** The card on the phone now, or one that has left (every APDU fails). */
+    private fun currentCard(): CardLink = isoDep.get()?.let { cardOf(it) } ?: CardLink { throw TagLostException() }
+
     /** The link of the job in flight, if it runs over one. */
     @Volatile private var activeLink: TillLink? = null
 
@@ -140,9 +158,10 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
      * Runs a card job. Paired: opens a card link answered from the card on the phone now, runs
      * [job] with its id (the till uses only that link as the card), and closes it. Unpaired: runs
      * [job] with null, and the till reaches the card through the USB relay as before. A link that
-     * cannot be opened is [unreachable] (nothing was sent).
+     * cannot be opened is [unreachable] (nothing was sent), told whether the failure lets a charge
+     * go on the phone ([linkFailureFallsBack]).
      */
-    private fun <T> withCard(job: (String?) -> T, unreachable: () -> T): T {
+    private fun <T> withCard(job: (String?) -> T, unreachable: (fallsBack: Boolean) -> T): T {
         val p = settings.pairing ?: return job(null)
         val d = isoDep.get()
         val card = if (d != null) cardOf(d) else CardLink { throw TagLostException() }
@@ -150,7 +169,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             TillLink.open(settings.baseUrl, p.token, card)
         } catch (e: Exception) {
             Log.w(TAG, "card link failed: ${e.javaClass.simpleName}")
-            return unreachable()
+            return unreachable(linkFailureFallsBack(e))
         }
         activeLink = link
         if (isoDep.get() !== d || d == null) link.cardLost()
@@ -162,26 +181,67 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         }
     }
 
+    /** Settings, with the phone's offline side read off the main thread (core calls). */
     private fun openSettings() {
-        ui.settingsDialog(
-            settings.baseUrl,
-            settings.pairing?.url,
-            { settings.baseUrl = it; failures = 0; pollNow() },
-            { ui.showRelay() },
-            { startActivityForResult(Intent(this, ScanActivity::class.java), SCAN_REQUEST) },
-            { text -> pairWith(text) },
-            { settings.pairing = null; failures = 0; pollNow(); Toast.makeText(this, "Unpaired: using USB", Toast.LENGTH_SHORT).show() },
-        )
+        Thread {
+            val view = offline.view()
+            runOnUiThread {
+                ui.settingsDialog(
+                    settings.baseUrl,
+                    settings.pairing?.url,
+                    view,
+                    { settings.baseUrl = it; failures = 0; pollNow() },
+                    { ui.showRelay() },
+                    { startActivityForResult(Intent(this, ScanActivity::class.java), SCAN_REQUEST) },
+                    { text -> pairWith(text) },
+                    {
+                        confirmPending(UNPAIR_TITLE, "Unpair") {
+                            settings.pairing = null; failures = 0; pollNow()
+                            Toast.makeText(this, "Unpaired: using USB", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    { txid, done ->
+                        Thread {
+                            val ok = offline.dismiss(txid)
+                            runOnUiThread { done(ok); showPhoneCounts() }
+                        }.start()
+                    },
+                )
+            }
+        }.start()
     }
 
     /** Stores a pairing code (scanned or pasted). False if [text] is not one. */
     private fun pairWith(text: String): Boolean {
         val p = parsePairing(text) ?: return false
-        settings.pairing = p
-        failures = 0
-        pollNow()
-        Toast.makeText(this, "Paired with ${p.url}", Toast.LENGTH_SHORT).show()
+        val pair = {
+            settings.pairing = p
+            failures = 0
+            pollNow()
+            Toast.makeText(this, "Paired with ${p.url}", Toast.LENGTH_SHORT).show()
+        }
+        val now = settings.pairing
+        if (now == null || now == p) pair() else confirmPending(REPAIR_TITLE, "Pair", pair)
         return true
+    }
+
+    /**
+     * Payments waiting on this phone sync only to the till they were taken for: before unpairing or
+     * pairing another till, say how many stay behind (they are kept and listed, never dropped).
+     */
+    private fun confirmPending(title: String, positive: String, action: () -> Unit) {
+        Thread {
+            val n = offline.view().pending
+            runOnUiThread { if (n == 0) action() else ui.confirm(title, pendingCopy(n), positive, action) }
+        }.start()
+    }
+
+    /** Reads the phone's counts off the main thread and shows them. */
+    private fun showPhoneCounts() {
+        Thread {
+            val c = offline.counts()
+            runOnUiThread { ui.setPhone(c) }
+        }.start()
     }
 
     @Deprecated("Deprecated in Java")
@@ -229,19 +289,25 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         }
         if (now is PosState.Sales && before !is PosState.Sales) loadSales()
         val refNow = flow.unresolvedRef
-        if (refNow == null) salesGen.cancel()
+        // A sale held on the phone is not in the till's sales: only its card's tap here settles it.
+        if (refNow == null || flow.unresolvedHeld) salesGen.cancel()
         else if (refNow != refBefore) scheduleSalesPoll()
         if (now is PosState.Receipt || now is PosState.TopUpLoaded) pollNow()
         // The waiting top-up arriving changes the state, not the read: the countdown keeps going.
         if (now is PosState.BalanceShown && (before !is PosState.BalanceShown || before.readId != now.readId)) startBalanceCountdown(now.readId)
         if (now is PosState.TopUpInvoice && (before !is PosState.TopUpInvoice || before.topUp.topupId != now.topUp.topupId)) watchInvoice(now.topUp)
         for (fx in effects) when (fx) {
+            // The till first, unless the phone holds the sale; on the phone when the link cannot
+            // open and nothing was ever posted for the sale (OfflineTill.runCharge). Wipes fx.pin.
             is PosEffect.StartCharge -> Thread {
-                val r = withCard(
-                    { link -> client.charge(fx.priceMsat, fx.clientRef, fx.pin, link) }, // wipes fx.pin
-                    { fx.pin?.wipe(); ChargeResult.Failed(TillError.Unreachable) },
-                )
-                runOnUiThread { dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
+                val r = offline.runCharge(fx.priceMsat, fx.clientRef, fx.pin, ::currentCard) { sent ->
+                    withCard(
+                        { link -> sent(); client.charge(fx.priceMsat, fx.clientRef, fx.pin, link) },
+                        { fallsBack -> if (fallsBack) null else ChargeResult.Failed(TillError.Unreachable) },
+                    )
+                }
+                val counts = offline.counts()
+                runOnUiThread { ui.setPhone(counts); dispatch(PosEvent.ChargeDone(fx.chargeId, r)) }
             }.start()
             is PosEffect.StartBalanceRead -> readCardBalance(fx.readId)
             is PosEffect.CreateTopUp -> Thread {
@@ -253,7 +319,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                 runOnUiThread { dispatch(PosEvent.WaitingFetched(fx.readId, r)) }
             }.start()
             is PosEffect.LoadTopUp -> Thread {
-                val r = withCard({ link -> client.loadTopUp(fx.topupId, link) }, { TopUpReply.Failed(TillError.Unreachable) })
+                val r = withCard({ link -> client.loadTopUp(fx.topupId, link) }, { TopUpReply.Failed(TillError.Unreachable) }) // never offline
                 runOnUiThread { dispatch(PosEvent.TopUpLoadDone(fx.loadId, r)) }
             }.start()
         }
@@ -330,7 +396,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     }
 
     private fun runSalesPoll(gen: Int) {
-        if (!salesGen.isCurrent(gen)) return
+        if (!salesGen.isCurrent(gen) || flow.unresolvedHeld) return
         val ref = flow.unresolvedRef ?: return
         Thread {
             val r = client.sales()
@@ -350,7 +416,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
      */
     private fun readCardBalance(readId: Int) {
         Thread {
-            val r = withCard({ link -> client.cardBalance(link) }, { BalanceResult.Failed(TillError.Unreachable) })
+            val r = withCard({ link -> client.cardBalance(link) }, { BalanceResult.Failed(TillError.Unreachable) }) // never offline
             runOnUiThread { dispatch(PosEvent.BalanceDone(readId, r)) }
         }.start()
     }
@@ -358,6 +424,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     private fun pollNow() {
         if (flow.state is PosState.Signing || flow.state is PosState.TopUpLoading || pollInFlight) return
         pollInFlight = true
+        val mark = offline.pollMark()
         Thread {
             val r = client.status()
             runOnUiThread {
@@ -369,9 +436,32 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                     // till's probe of a fixed relay says nothing about it: on a StartOS till there
                     // is no such relay, and the probe always fails.
                     ui.setHealth(tillOk = true, relayOk = settings.pairing != null || r.value.cardRelayOk)
+                    afterPoll(mark)
                 } else if (++failures >= 2) ui.setHealth(tillOk = false, relayOk = false)
             }
         }.start()
+    }
+
+    private val afterPollQueued = AtomicBoolean(false)
+    private val lastMark = AtomicLong(0)
+
+    /**
+     * The till answered a status poll (every 5 s, on reconnect, on foreground, after a charge): on
+     * the core's thread, the charges synced before that poll stop counting as the phone's, the kit is
+     * fetched when due, what waits is synced, and the home screen's counts are read again. At most
+     * one is queued; it uses the newest poll's mark.
+     */
+    private fun afterPoll(mark: Long) {
+        lastMark.set(mark)
+        if (!afterPollQueued.compareAndSet(false, true)) return
+        OfflineRuntime.post {
+            afterPollQueued.set(false)
+            offline.statusShown(lastMark.get())
+            offline.refreshKit()
+            offline.sync()
+            val c = offline.counts()
+            runOnUiThread { ui.setPhone(c) }
+        }
     }
 
     private fun loadSales() {

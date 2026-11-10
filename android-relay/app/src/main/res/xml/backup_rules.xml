@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 11 and earlier: android:allowBackup="false" already stops every backup there; should it
+  ever be turned on, the phone's offline store (no_backup/) still stays out (data_extraction_rules.xml
+  has why).
+-->
+<full-backup-content>
+    <exclude domain="root" path="no_backup/" />
+</full-backup-content>

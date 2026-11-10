@@ -11,12 +11,14 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URI
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -43,6 +45,17 @@ internal fun linkTarget(baseUrl: String): LinkTarget {
     val hostHeader = if (port == default) host else "$host:$port"
     return LinkTarget(host.removePrefix("[").removeSuffix("]"), port, tls, u.rawPath, hostHeader)
 }
+
+/** The till answered the card link's upgrade with [status] instead of 101. */
+class LinkRefused(val status: Int?) : IOException("till refused the card link: HTTP $status")
+
+/**
+ * Whether a card link that could not open lets a charge go on the phone (docs/POS-OFFLINE.md
+ * § Android): every failure of a till that is not serving does (no connection, the quick timeout,
+ * a TLS or WebSocket handshake that fails, a 5xx or any other answer but 101). A 401 or 403 never
+ * does: the pairing is dead, and the kit could not be renewed either.
+ */
+fun linkFailureFallsBack(e: Exception): Boolean = !(e is LinkRefused && (e.status == 401 || e.status == 403))
 
 /**
  * The card link (docs/POS-LINK.md): while a tap is in progress this phone holds a WebSocket open
@@ -209,14 +222,21 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
 
     companion object {
         private const val CONNECT_MS = 3_000
+        /**
+         * The rest of the quick timeout: past the connect's own time, what the till has for each of
+         * its first two answers, the upgrade's and `ready`. A till that misses either is not
+         * serving, and the sale may go on the phone (docs/POS-OFFLINE.md § Android).
+         */
+        private const val ANSWER_MARGIN_MS = 2_000
         /** The till ends a link after 120 s; a little margin before the read gives up. */
         private const val READ_MS = 130_000
 
-        /** Open a link to the till at [baseUrl]. Throws IOException if it cannot (incl. 401). */
+        /** Open a link to the till at [baseUrl]. Throws IOException if it cannot ([LinkRefused]: an answer but 101, such as a 401). */
         @Throws(IOException::class)
         fun open(baseUrl: String, token: String?, card: CardLink, connectMs: Int = CONNECT_MS): TillLink {
             val t = linkTarget(baseUrl)
             val s = if (t.tls) SSLSocketFactory.getDefault().createSocket() else Socket()
+            val answerMs = connectMs + ANSWER_MARGIN_MS
             try {
                 s.connect(InetSocketAddress(t.host, t.port), connectMs)
                 if (s is SSLSocket) {
@@ -229,7 +249,9 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                     s.soTimeout = connectMs
                     s.startHandshake()
                 }
-                s.soTimeout = READ_MS
+                // The quick timeout until the link is open: a till (or a proxy before it) that takes
+                // the connection and never answers the upgrade is not serving. Nothing is posted yet.
+                s.soTimeout = answerMs
                 s.tcpNoDelay = true
                 val out = s.getOutputStream()
                 val input = s.getInputStream().buffered()
@@ -242,18 +264,20 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                 if (token != null) req.append("Authorization: Bearer $token\r\n")
                 req.append("\r\n")
                 out.write(req.toString().toByteArray(Charsets.ISO_8859_1)); out.flush()
-                val head = readHead(input)
+                val head = readHead(input, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(answerMs.toLong()))
                 val status = head.firstOrNull()?.split(" ")?.getOrNull(1)?.toIntOrNull()
-                if (status != 101) throw IOException("till refused the card link: HTTP $status")
+                if (status != 101) throw LinkRefused(status)
                 val accept = head.drop(1).firstOrNull { it.lowercase().startsWith("sec-websocket-accept:") }?.substringAfter(':')?.trim()
                 if (accept != Ws.accept(key)) throw IOException("bad WebSocket handshake")
+                // Open: from here the till may take its time over each APDU of the job.
+                s.soTimeout = READ_MS
                 val rng = SecureRandom()
                 val writeLock = Any()
                 val writer: (Int, ByteArray) -> Unit = { op, p ->
                     synchronized(writeLock) { Ws.writeFrame(out, op, p, ByteArray(4).also { rng.nextBytes(it) }) }
                 }
                 val session = LinkSession(card) { text -> try { writer(Ws.TEXT, text.toByteArray(Charsets.UTF_8)) } catch (_: IOException) {} }
-                var link: TillLink? = null
+                val link = AtomicReference<TillLink?>(null)
                 val reader = Thread({
                     try {
                         while (true) {
@@ -266,16 +290,20 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                         }
                     } catch (_: Exception) {
                     } finally {
-                        link?.close() ?: try { s.close() } catch (_: Exception) {}
+                        // The till ended the link (or the socket failed): answer its close and close
+                        // this side as close() does, even before open() has handed the link out.
+                        try { writer(Ws.CLOSE, ByteArray(0)) } catch (_: Exception) {}
+                        try { s.close() } catch (_: Exception) {}
+                        link.get()?.closed = true
                     }
                 }, "till-link")
                 reader.isDaemon = true
                 reader.start()
-                val id = session.awaitReady(connectMs.toLong() + 2_000) ?: run {
+                val id = session.awaitReady(answerMs.toLong()) ?: run {
                     try { s.close() } catch (_: Exception) {}
                     throw IOException("no ready from the till")
                 }
-                return TillLink(s, id, session, writer).also { link = it; if (s.isClosed) it.closed = true }
+                return TillLink(s, id, session, writer).also { link.set(it); if (s.isClosed) it.closed = true }
             } catch (e: Exception) {
                 try { s.close() } catch (_: Exception) {}
                 throw e as? IOException ?: IOException(e.message, e)
@@ -285,10 +313,15 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
         private fun isIpLiteral(host: String) =
             host.contains(':') || host.all { it.isDigit() || it == '.' }
 
-        private fun readHead(input: InputStream): List<String> {
+        /**
+         * The upgrade's answer, up to its blank line. The till has until [deadline] (`System.nanoTime`)
+         * for all of it, so an answer that trickles in byte by byte is bounded too, not each read only.
+         */
+        private fun readHead(input: InputStream, deadline: Long): List<String> {
             val head = ByteArrayOutputStream()
             var tail = 0
             while (true) {
+                if (System.nanoTime() - deadline > 0) throw SocketTimeoutException("the till did not answer the card link in time")
                 val b = input.read()
                 if (b < 0) throw EOFException("till closed during the handshake")
                 head.write(b)

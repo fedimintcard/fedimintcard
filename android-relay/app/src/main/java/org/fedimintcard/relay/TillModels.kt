@@ -83,6 +83,24 @@ enum class ChargeErrorCode(val wire: String) {
     OPS_REFUSED("ops_refused"),
     /** Offline, the price needs change and the card has no slot for it; `suggested_msat` may say what it can pay. */
     OFFLINE_NO_CHANGE_ROOM("offline_no_change_room"),
+    // The phone's own offline charge answers these (docs/POS-OFFLINE.md § Refusals). Some come from
+    // the till's own offline path too: from the till, the first six read as they did before (PosFlow).
+    /** No offline kit for this pairing yet (or no core): nothing was asked of the card. */
+    OFFLINE_NOT_READY("offline_not_ready"),
+    /** The kit is past its expiry, by the phone's clock or the card's. */
+    OFFLINE_KIT_EXPIRED("offline_kit_expired"),
+    /** What waits to sync has reached the kit's caps. */
+    OFFLINE_CAP_REACHED("offline_cap_reached"),
+    /** Notes that do not check against the kit's keys, and the rest do not pay. */
+    OFFLINE_NOTE_INVALID("offline_note_invalid"),
+    /** The kit has run out of a till note the price needs; `suggested_msat` is a price it still pays. */
+    OFFLINE_POOL_EXHAUSTED("offline_pool_exhausted"),
+    /** An applet 2.x card, which is taken online only. */
+    OFFLINE_UNSUPPORTED_CARD("offline_unsupported_card"),
+    /** The card's certificate or attestation does not check (a clone). */
+    CARD_NOT_GENUINE("card_not_genuine"),
+    /** The card's own daily limit. */
+    CARD_LIMIT("card_limit"),
     INTERNAL("internal"),
     UNKNOWN("");
 
