@@ -45,6 +45,17 @@ internal fun linkTarget(baseUrl: String): LinkTarget {
     return LinkTarget(host.removePrefix("[").removeSuffix("]"), port, tls, u.rawPath, hostHeader)
 }
 
+/** The till answered the card link's upgrade with [status] instead of 101. */
+class LinkRefused(val status: Int?) : IOException("till refused the card link: HTTP $status")
+
+/**
+ * Whether a card link that could not open lets a charge go on the phone (docs/POS-OFFLINE.md
+ * § Android): every failure of a till that is not serving does (no connection, the quick timeout,
+ * a TLS or WebSocket handshake that fails, a 5xx or any other answer but 101). A 401 or 403 never
+ * does: the pairing is dead, and the kit could not be renewed either.
+ */
+fun linkFailureFallsBack(e: Exception): Boolean = !(e is LinkRefused && (e.status == 401 || e.status == 403))
+
 /**
  * The card link (docs/POS-LINK.md): while a tap is in progress this phone holds a WebSocket open
  * to the till, and the till sends the card's APDUs down it. The phone answers each from the card
@@ -213,7 +224,7 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
         /** The till ends a link after 120 s; a little margin before the read gives up. */
         private const val READ_MS = 130_000
 
-        /** Open a link to the till at [baseUrl]. Throws IOException if it cannot (incl. 401). */
+        /** Open a link to the till at [baseUrl]. Throws IOException if it cannot ([LinkRefused]: an answer but 101, such as a 401). */
         @Throws(IOException::class)
         fun open(baseUrl: String, token: String?, card: CardLink, connectMs: Int = CONNECT_MS): TillLink {
             val t = linkTarget(baseUrl)
@@ -245,7 +256,7 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                 out.write(req.toString().toByteArray(Charsets.ISO_8859_1)); out.flush()
                 val head = readHead(input)
                 val status = head.firstOrNull()?.split(" ")?.getOrNull(1)?.toIntOrNull()
-                if (status != 101) throw IOException("till refused the card link: HTTP $status")
+                if (status != 101) throw LinkRefused(status)
                 val accept = head.drop(1).firstOrNull { it.lowercase().startsWith("sec-websocket-accept:") }?.substringAfter(':')?.trim()
                 if (accept != Ws.accept(key)) throw IOException("bad WebSocket handshake")
                 val rng = SecureRandom()

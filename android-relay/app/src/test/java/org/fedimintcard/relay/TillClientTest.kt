@@ -204,6 +204,48 @@ class TillClientTest {
         assertEquals("GET", f.method); assertEquals("http://h:1/v1/topups/waiting?short_id=6f94b19b", f.url)
     }
 
+    // ---- the phone's offline kit and sync (docs/TILL-API.md) ----
+
+    @Test fun offlineKitAsksForThisPhoneUnderTheTokenAndAnswersTheWholeBody() {
+        val body = """{"ok":true,"kit":{"phone_id":"0123456789abcdef0123456789abcdef","expires_at_ms":9}}"""
+        val f = HeaderFake(raw(200, body))
+        val r = TillClient({ "http://h:1/" }, f, { "tok" }).offlineKit("0123456789abcdef0123456789abcdef") as TillResult.Ok
+        assertEquals(body, r.value)
+        assertEquals("GET", f.method); assertEquals("http://h:1/v1/offline/kit?phone=0123456789abcdef0123456789abcdef", f.url)
+        assertNull(f.body); assertEquals("Bearer tok", f.headers["Authorization"])
+    }
+
+    @Test fun postOfflineChargesSendsTheDrainAsItIs() {
+        val drain = """{"phone_id":"0123456789abcdef0123456789abcdef","charges":[{"txid":"aa"}]}"""
+        val answer = """{"ok":true,"results":[{"txid":"aa","status":"queued","retry":false}]}"""
+        val f = HeaderFake(raw(200, answer))
+        val r = TillClient({ "http://h:1" }, f, { "tok" }).postOfflineCharges(drain) as TillResult.Ok
+        assertEquals(answer, r.value)
+        assertEquals("POST", f.method); assertEquals("http://h:1/v1/offline/charges", f.url)
+        assertEquals(drain, f.body); assertEquals("Bearer tok", f.headers["Authorization"])
+    }
+
+    @Test fun theOfflineRoutesAnswerOnlyA200() {
+        val c = { r: RawResponse -> client(Fake(r)) }
+        assertEquals(TillResult.Err(TillError.BadResponse("HTTP 503 offline_not_ready")), c(raw(503, """{"ok":false,"error":"offline_not_ready","detail":"x"}""")).offlineKit("p"))
+        assertEquals(TillResult.Err(TillError.BadResponse("HTTP 404")), c(raw(404, "<html>")).offlineKit("p"))
+        assertEquals(TillResult.Err(TillError.BadResponse("HTTP 413")), c(raw(413, "")).postOfflineCharges("{}"))
+        assertEquals(TillResult.Err(TillError.BadResponse("HTTP 400 bad_request")), c(raw(400, """{"ok":false,"error":"bad_request"}""")).postOfflineCharges("{}"))
+        assertEquals(TillResult.Err(TillError.Unreachable), client(Fake(ex = IOException("x"))).offlineKit("p"))
+        assertEquals(TillResult.Err(TillError.Interrupted), client(Fake(ex = PostConnectException(IOException("reset")))).postOfflineCharges("{}"))
+        assertEquals(TillResult.Err(TillError.Timeout), client(Fake(ex = SocketTimeoutException())).postOfflineCharges("{}"))
+    }
+
+    @Test fun theOfflineCodesParse() {
+        for (wire in listOf("offline_not_ready", "offline_kit_expired", "offline_cap_reached", "offline_note_invalid", "offline_pool_exhausted",
+            "offline_unsupported_card", "card_not_genuine", "card_limit")) {
+            val d = parseCharge(409, """{"ok":false,"error":"$wire","detail":"x"}""") as ChargeResult.Declined
+            assertEquals(wire, d.code.wire); assertFalse(d.local); assertFalse(d.held)
+        }
+        val p = parseCharge(409, """{"ok":false,"error":"offline_pool_exhausted","suggested_msat":49000}""") as ChargeResult.Declined
+        assertEquals(49_000L, p.suggestedMsat)
+    }
+
     @Test fun waitingTopUpsIsNullOnAnyError() {
         assertNull(client(Fake(raw(404, """{"ok":false,"error":"not_found","detail":""}"""))).waitingTopUps("x"))
         assertNull(client(Fake(raw(200, "not json"))).waitingTopUps("x"))

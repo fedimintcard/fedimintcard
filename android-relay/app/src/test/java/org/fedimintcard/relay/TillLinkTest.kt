@@ -151,6 +151,48 @@ class TillLinkTest {
         server.close()
     }
 
+    /** A till that answers the link's upgrade with [head] and closes. */
+    private fun linkAnsweredWith(head: (key: String) -> String): Exception {
+        val server = ServerSocket(0)
+        Thread {
+            server.accept().use { s ->
+                val input = s.getInputStream()
+                val req = StringBuilder()
+                while (!req.endsWith("\r\n\r\n")) req.append(input.read().toChar())
+                val key = req.lines().first { it.startsWith("Sec-WebSocket-Key:") }.substringAfter(':').trim()
+                s.getOutputStream().write(head(key).toByteArray())
+            }
+        }.start()
+        try {
+            TillLink.open("http://127.0.0.1:${server.localPort}", "f".repeat(64), CardLink { ByteArray(0) })
+            fail("opened")
+            throw AssertionError()
+        } catch (e: IOException) {
+            return e
+        } finally {
+            server.close()
+        }
+    }
+
+    /**
+     * Decision 4 (docs/POS-OFFLINE.md § Android): a till that is not serving lets a charge go on the
+     * phone; a dead pairing (401, 403) never does, since the kit could not be renewed either.
+     */
+    @Test fun onlyADeadPairingKeepsAChargeOffThePhone() {
+        for ((status, fallsBack) in listOf(401 to false, 403 to false, 500 to true, 502 to true, 503 to true, 404 to true)) {
+            val e = linkAnsweredWith { "HTTP/1.1 $status X\r\nContent-Length: 0\r\n\r\n" }
+            assertEquals("$status", status, (e as LinkRefused).status)
+            assertEquals("$status", fallsBack, linkFailureFallsBack(e))
+        }
+        // A handshake that is not the WebSocket's.
+        val bad = linkAnsweredWith { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: nope\r\n\r\n" }
+        assertFalse(bad is LinkRefused); assertTrue(linkFailureFallsBack(bad))
+        // No till listening at all.
+        val port = ServerSocket(0).use { it.localPort }
+        val none = try { TillLink.open("http://127.0.0.1:$port", null, CardLink { ByteArray(0) }); null } catch (e: IOException) { e }
+        assertTrue(linkFailureFallsBack(none!!))
+    }
+
     @Test fun linkTargetFollowsTheTillScheme() {
         assertEquals(LinkTarget("192.168.1.20", 9877, false, "/v1/card/link", "192.168.1.20:9877"), linkTarget("http://192.168.1.20:9877"))
         assertEquals(LinkTarget("till.example.com", 443, true, "/v1/card/link", "till.example.com"), linkTarget("https://till.example.com/"))
