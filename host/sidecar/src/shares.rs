@@ -20,6 +20,9 @@ use tbs::{BlindedMessage, BlindedSignature, BlindedSignatureShare, BlindingKey};
 
 use crate::wallet::Wallet;
 
+// Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old path.
+pub use fedimint_card_pos_core::blind;
+
 /// How long to wait for one output's shares during a normal flow.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -101,9 +104,4 @@ pub async fn note_signature(
     let blinded = blind(nonce, key);
     let sig = fetch_blind_signature(w, outpoint.txid, OutSpec { out_idx: outpoint.out_idx, amount, blinded }, timeout).await?;
     finish_note(w, amount, nonce, key, blinded, sig)
-}
-
-/// The blinded message for a nonce under a blinding key.
-pub fn blind(nonce: Nonce, key: BlindingKey) -> BlindedMessage {
-    tbs::blind_message(nonce.to_message(), key)
 }

@@ -26,7 +26,7 @@ use fedimint_core::module::Amounts;
 use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
-use fedimint_core::secp256k1::{Keypair, Message, Parity, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
+use fedimint_core::secp256k1::{Keypair, Message, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
 use fedimint_core::transaction::{
     Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome,
 };
@@ -43,6 +43,9 @@ use crate::state::{
     HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
 };
 use crate::wallet::Wallet;
+
+// Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old paths.
+pub use fedimint_card_pos_core::{nonce_for, sig48_of};
 
 /// Short wait used when recovering old records, where the answer may simply not exist.
 const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -127,12 +130,6 @@ fn enc<T: Encodable>(t: &T) -> String {
 /// Decode a stored value. The input may be secret, so it is never put in the error.
 fn dec<T: Decodable>(s: &str) -> Result<T> {
     T::consensus_decode_hex(s, &ModuleRegistry::default()).map_err(|e| anyhow!("decoding a stored value failed: {e}"))
-}
-
-/// The nonce for a card key. Parity is fixed to even so the 33 bytes blinded at issue are the
-/// 33 bytes the federation sees at spend.
-pub fn nonce_for(key: XOnlyPublicKey) -> Nonce {
-    Nonce(PublicKey::from_x_only_public_key(key, Parity::Even))
 }
 
 /// Mint outputs for card notes, `(msat, blinded nonce)` each, with no state machine: the caller
@@ -1616,11 +1613,6 @@ impl CardWallet {
 }
 
 // -------------------------------------------------------------------- applet 3.0
-
-/// The 48 bytes a note's stored signature (consensus hex) is on the card.
-pub fn sig48_of(hex_sig: &str) -> Result<[u8; 48]> {
-    hex::decode(hex_sig).ok().and_then(|b| b.try_into().ok()).context("a note signature that is not 48 bytes")
-}
 
 /// Write live notes to a 3.0 card that lacks them (`SET_NOTE`): each `(slot, x-only key,
 /// msat, signature hex)` whose slot is KEYED, or CHANGE owed that amount, under that key. A slot

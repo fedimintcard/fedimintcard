@@ -29,6 +29,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 /// Largest amount (msat) by which the till may be paid more than the price.
 pub const MAX_TILL_OVERPAY: u64 = 2_048;
 /// Largest denomination exponent the planner will use (2^50 msat is about 11,000 BTC).
@@ -599,7 +601,7 @@ impl Plan {
 /// A fee schedule an offline charge keeps room for: `base_msat + amount * ppm / 1_000_000` per
 /// input and per output, as fedimint's mint v1 `FeeConsensus::fee`
 /// (`modules/fedimint-mint-common/src/config.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeHeadroom {
     pub base_msat: u64,
     pub ppm: u64,

@@ -2,15 +2,42 @@
 //! (docs/POS-OFFLINE.md). Synchronous, with no tokio code, fedimint client, rocksdb or registry
 //! client, so it builds for iOS and Android as well as for the till.
 
+use anyhow::{Context as _, Result};
 use fedimint_core::encoding::Decodable;
 use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::secp256k1::{Keypair, Message, SECP256K1, SecretKey};
+use fedimint_core::secp256k1::{Keypair, Message, Parity, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
 use fedimint_mint_common::{Nonce, Note};
+use tbs::{BlindedMessage, BlindingKey};
 
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 
+pub mod files;
 pub mod plan;
+pub mod queue;
+
+/// The nonce for a card key. Parity is fixed to even so the 33 bytes blinded at issue are the
+/// 33 bytes the federation sees at spend.
+pub fn nonce_for(key: XOnlyPublicKey) -> Nonce {
+    Nonce(PublicKey::from_x_only_public_key(key, Parity::Even))
+}
+
+/// The 48 bytes a note's stored signature (consensus hex) is on the card.
+pub fn sig48_of(hex_sig: &str) -> Result<[u8; 48]> {
+    hex::decode(hex_sig).ok().and_then(|b| b.try_into().ok()).context("a note signature that is not 48 bytes")
+}
+
+/// A card's short id: the last 4 bytes of its slot-0 x-only key, lower-case hex.
+pub fn short_id_of(slot0: &XOnlyPublicKey) -> String {
+    let hex = slot0.to_string();
+    hex[hex.len() - 8..].to_owned()
+}
+
+/// The blinded message for a nonce under a blinding key.
+pub fn blind(nonce: Nonce, key: BlindingKey) -> BlindedMessage {
+    tbs::blind_message(nonce.to_message(), key)
+}
+
 
 /// A scalar from a small integer: its consensus encoding is 32 bytes little-endian.
 fn scalar<T: Decodable>(n: u64) -> T {
