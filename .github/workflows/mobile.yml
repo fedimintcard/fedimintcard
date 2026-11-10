@@ -1,13 +1,14 @@
 name: Mobile
 # The POS apps' Rust core (host/pos-core, docs/POS-OFFLINE.md) for Android and iOS, with its
 # Kotlin and Swift bindings. Proves the cross-compile on every change under host/; the libraries,
-# the bindings and their sizes are uploaded for the apps.
+# the bindings and their sizes are uploaded for the apps. The Android POS app (android-relay/)
+# builds on them: its unit tests and a debug APK whose libraries are 16 KB aligned.
 on:
   push:
     branches: ['**']
-    paths: ['host/**', '.github/workflows/mobile.yml']
+    paths: ['host/**', 'android-relay/**', '.github/workflows/mobile.yml']
   pull_request:
-    paths: ['host/**', '.github/workflows/mobile.yml']
+    paths: ['host/**', 'android-relay/**', '.github/workflows/mobile.yml']
 permissions: { contents: read }
 # Block form, not a flow mapping: a `{ ... }` map containing `${{ }}` does not parse.
 concurrency:
@@ -48,6 +49,21 @@ jobs:
             host/target/pos-core-mobile/android
             host/target/pos-core-mobile/bindings/kotlin
             host/target/pos-core-mobile/sizes.txt
+      # The POS app: Gradle reruns the two steps above through the same script (cargo finds them
+      # built), so its bindings and libraries come from this tree.
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: '17', cache: gradle }
+      - name: the POS app (unit tests, debug APK)
+        working-directory: android-relay
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - name: the APK's libraries, 16 KB aligned
+        # Named, the shell runs with pipefail: a zipalign that fails fails the step.
+        shell: bash
+        run: |
+          apk=android-relay/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$apk" | grep -E 'lib/(arm64-v8a|x86_64)/'
+          zipalign="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/zipalign"
+          "$zipalign" -c -P 16 -v 4 "$apk" | tail -n 1
   ios:
     # macos-14 runners are retired; the newest image has the Xcode the targets need.
     runs-on: macos-latest

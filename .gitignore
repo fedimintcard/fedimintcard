@@ -6,6 +6,7 @@ host/build.log
 android-relay/build/
 android-relay/app/build/
 android-relay/.gradle/
+android-relay/.kotlin/
 android-relay/local.properties
 node_modules/
 tools/cardkit/dist/

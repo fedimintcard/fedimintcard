@@ -16,15 +16,27 @@ APDU data is never logged; only INS and SW.
 
 ## Build
 
-JDK 17, Android SDK with platform 35.
+JDK 17, Android SDK with platform 36, and the Rust that builds the phone's offline core
+(`host/pos-core`, docs/POS-OFFLINE.md § Android): rustup (the toolchain `host/rust-toolchain.toml`
+pins), its Android targets, cargo-ndk 4.1.2 and an NDK r27 or newer.
 
 ```sh
+rustup target add --toolchain 1.91.1 aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk --locked --version 4.1.2
+export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/<r27 or newer>
 cd android-relay
 echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
 ./gradlew test assembleDebug
 ```
 
-APK: `android-relay/app/build/outputs/apk/debug/app-debug.apk`
+Every build runs `host/scripts/pos-core-mobile.sh bindings kotlin` first (Rust only: the unit tests
+need no NDK), and packaging runs `pos-core-mobile.sh android` for arm64-v8a and x86_64; Gradle
+skips both while nothing the core is built from has changed.
+Both write under `host/target/pos-core-mobile/` and are never committed: the bindings and the
+libraries must come from one tree. The first build compiles the core (a few minutes).
+
+APK: `android-relay/app/build/outputs/apk/debug/app-debug.apk` (arm64-v8a and x86_64 only; check
+the 16 KB alignment with `zipalign -c -P 16 -v 4 <apk>` from build-tools 35 or newer).
 
 ## Run (USB, normal path)
 
