@@ -45,7 +45,7 @@ import {
   FACTORY_KEYS,
   type KeySet,
   type Reply,
-  type Session,
+  type SecureSession,
   type Transceiver,
   WrongKeys,
   deleteAid,
@@ -272,7 +272,7 @@ export async function factoryReset(
         `the card's key set is version ${kvn}, not ${FACTORY_KEY_VERSION}: nothing was written`,
       );
     }
-    let session: Session = await externalAuthenticate(
+    let session: SecureSession = await externalAuthenticate(
       run.timed,
       (ownKeys ?? factoryKeys)!,
       hs,
@@ -322,7 +322,7 @@ export async function factoryReset(
     await beforeWrite();
     expectOk(
       await send(
-        putKeys(FACTORY_KEYS, session.keys.dek, {
+        putKeys(FACTORY_KEYS, session, {
           p1: kvn,
           newKvn: FACTORY_KEY_VERSION,
         }),

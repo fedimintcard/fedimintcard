@@ -12,7 +12,8 @@
  *
  * Guards, in the order they act:
  * - the load file's sha256 is checked before the first APDU;
- * - the card cryptogram is checked before EXTERNAL AUTHENTICATE (scp02.ts);
+ * - the card's proof of the keys is checked before EXTERNAL AUTHENTICATE
+ *   (scp02.ts, and scp03.ts for an SCP03 card);
  * - DELETE names only the AIDs of the whitelist, never the ISD (scp02.ts).
  *
  * What this card does NOT have: a GET_INFO, so `fedimintPlan` sets no `guard`.
@@ -32,7 +33,7 @@ import {
   type KeySet,
   type Random,
   type Reply,
-  type Session,
+  type SecureSession,
   type Transceiver,
   TransportError,
   WrongKeys,
@@ -495,9 +496,9 @@ export async function provision(
   let keys: KeySet = candidates[0] ?? FACTORY_KEYS;
   let keySet: number | undefined;
   const sessionOptions = {macOverModifiedApdu: options.macOverModifiedApdu};
-  let session: Session | null = null;
+  let session: SecureSession | null = null;
   let blocks: number[][] = [];
-  const open = (): Session => {
+  const open = (): SecureSession => {
     if (!session) {
       throw new Error('no secure channel');
     }
@@ -719,7 +720,7 @@ export async function rotateKeys(
     );
     run.enter('putKey');
     const kvn = hs.reply.kvn;
-    const command = putKeys(to, session.keys.dek, {
+    const command = putKeys(to, session, {
       p1: options.putKey?.p1 ?? kvn,
       newKvn: options.putKey?.newKvn ?? kvn,
     });
