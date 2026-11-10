@@ -2461,6 +2461,8 @@ name = "fedimint-card-host-card"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fedimint-core",
+ "fedimint-tbs",
  "hex",
  "p256",
  "pcsc",

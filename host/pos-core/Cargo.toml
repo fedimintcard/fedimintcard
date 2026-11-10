@@ -38,4 +38,5 @@ tracing = { workspace = true }
 uniffi = { version = "0.32", optional = true, default-features = false }
 
 [dev-dependencies]
+fedimint-card-host-card = { path = "../card", features = ["softkit"] }
 tempfile = "3"
