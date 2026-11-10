@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "charges": [
+    {
+      "txid": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+      "short_id": "df3d0fd6",
+      "client_ref": "golden-1",
+      "state": "queued",
+      "unsigned_hex": "0101580056fe0001000002027d1bbfbbe778f181edb2b99e6d6a22427d2a84be00493904e41819df3d0fd69805216bb46edc9cec86620710f58032873459d19a8910c0ff6da7fdfb10dc165a9f48da3ac3521ee3311924d2c6812b0901350033fd800086eca983a7bfbd3f9223eaa296a37ecd9c1824818118ebf154cd2bc57ecc598be0d68323d9ce9ff068b5b0e5d5383da001350033fd40008be9afcc441c24c44620e59fb9992d4b49b2768369377d60c9920fafd72eaad71d43a43321c01bb56bfd81985b005b0801350033fd0800a8d659c4da73c48888c252a434a225848c57d634aa847c8718ec17fcd529627b010fa6070330feb5f2a9c6b7744a3d5301350033fd02008d7f25d78b37f2a7d19933efac9889d13d994d4fddabe41f46f89eb585ddfbe25b8b5552987b627a8fc14a9367a982c40133003110837cef7633af191759e5914ada2dfb68938e19ebe0e7bf16a1a324b5a1169d3dec5fbfcb2554690d1d79fa32d6b8146d01330031088dab2e90050e3beeadadc1fddf57ed26fc585607a10c8c8c4e009c4e0cb0ebd0308d3ebdb1616a68ee7a11179d307a2801350033fd20008c8b3543822b84f2f3605df9d3e2e873d098c50f2403845ea010bb61a926406c039af90abbd8e4a5e42ac15e532d234d01350033fd1000b18d23ed130603d0fa6db0ec045e8374a0d0d3b15de38d58f2b1582d30bb24d1eca8ce14f2bdfb281bc91245a2033e3701350033fd0200a32d527cce4beb41ab78a671fe7b905023359e16dabce8a33a94db9445cf60bfe30b6fed8f9699556a103f1edb7c00f232f677319679c8df000100",
+      "signed_hex": "0101580056fe0001000002027d1bbfbbe778f181edb2b99e6d6a22427d2a84be00493904e41819df3d0fd69805216bb46edc9cec86620710f58032873459d19a8910c0ff6da7fdfb10dc165a9f48da3ac3521ee3311924d2c6812b0901350033fd800086eca983a7bfbd3f9223eaa296a37ecd9c1824818118ebf154cd2bc57ecc598be0d68323d9ce9ff068b5b0e5d5383da001350033fd40008be9afcc441c24c44620e59fb9992d4b49b2768369377d60c9920fafd72eaad71d43a43321c01bb56bfd81985b005b0801350033fd0800a8d659c4da73c48888c252a434a225848c57d634aa847c8718ec17fcd529627b010fa6070330feb5f2a9c6b7744a3d5301350033fd02008d7f25d78b37f2a7d19933efac9889d13d994d4fddabe41f46f89eb585ddfbe25b8b5552987b627a8fc14a9367a982c40133003110837cef7633af191759e5914ada2dfb68938e19ebe0e7bf16a1a324b5a1169d3dec5fbfcb2554690d1d79fa32d6b8146d01330031088dab2e90050e3beeadadc1fddf57ed26fc585607a10c8c8c4e009c4e0cb0ebd0308d3ebdb1616a68ee7a11179d307a2801350033fd20008c8b3543822b84f2f3605df9d3e2e873d098c50f2403845ea010bb61a926406c039af90abbd8e4a5e42ac15e532d234d01350033fd1000b18d23ed130603d0fa6db0ec045e8374a0d0d3b15de38d58f2b1582d30bb24d1eca8ce14f2bdfb281bc91245a2033e3701350033fd0200a32d527cce4beb41ab78a671fe7b905023359e16dabce8a33a94db9445cf60bfe30b6fed8f9699556a103f1edb7c00f232f677319679c8df004101ce69d51480954ceb4fc942d4704deac4fe0720f064126ac819879b48b717274889b2875a3683eadae0b497ef1737bf2a8b165b52a779fa301ba6456dbb9784ea",
+      "signed_at": 1794270634558,
+      "inputs": [
+        {
+          "slot": 0,
+          "amount_msat": 65536,
+          "nonce": "02027d1bbfbbe778f181edb2b99e6d6a22427d2a84be00493904e41819df3d0fd6",
+          "signature": "9805216bb46edc9cec86620710f58032873459d19a8910c0ff6da7fdfb10dc165a9f48da3ac3521ee3311924d2c6812b"
+        }
+      ],
+      "change": [
+        {
+          "slot": 2,
+          "amount_msat": 8192,
+          "nonce": "02a335730adaa146d54e982c8fea8230ec5740cc7633504164099d16029c0aad62",
+          "blinding_key": "be0d24672e346fcbd4ccca9ce19da33bc56e4603affa63916031aa40eaaefa3a",
+          "out_idx": 6
+        },
+        {
+          "slot": 3,
+          "amount_msat": 4096,
+          "nonce": "02a4ba5065c7d69ef427520b1bb82183a9072a536cc9bc34bb4e9a7e10891f0060",
+          "blinding_key": "99a510648210d51d332b493543c299469bd7674f59fc8a67a13ec0ebd06e7731",
+          "out_idx": 7
+        },
+        {
+          "slot": 4,
+          "amount_msat": 512,
+          "nonce": "022ef0cb306a294af228f19e4f0c2af03a754f76800530c99c8843e887543ac205",
+          "blinding_key": "7f1fbd052c75da311542739446d432d134d84c6b02f837f26cc9a5d2d83ade04",
+          "out_idx": 8
+        }
+      ],
+      "host": [
+        {
+          "amount_msat": 32768,
+          "secret_key": "e461b6ace92c57342d9b1386ce4b04ff899f33676914fa898432d76dd0c1dbfe",
+          "blinding_key": "d09a9e07970ec42e205a937d9afd344965bb711d38d30d0e0b541a7f4ffaae04",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 0
+        },
+        {
+          "amount_msat": 16384,
+          "secret_key": "9bb25c65f39f13ed76e991bc111194dd2d09612f0d4da64134a1bbdd444e7fff",
+          "blinding_key": "d297c67577b800a764872599572c8a66954e8233b40f0125ae22a12fb5a4b020",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 1
+        },
+        {
+          "amount_msat": 2048,
+          "secret_key": "5027ed52ae69d00b6b7e175d7e14c627d0c3cd176a05a016b5128a3381f98b60",
+          "blinding_key": "bdbd92d78b8b37a68b38a49adda1c626e82a3abf423121058247a8b479ab1906",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 2
+        },
+        {
+          "amount_msat": 512,
+          "secret_key": "af9375cd23d638ba9c3649271af7f9ca025383ec10142b5dca0bb35a5a34cbed",
+          "blinding_key": "04d26066289c300d2802c7937f7e118e53fe2fdb4994cfd454134e067add4a4a",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 3
+        },
+        {
+          "amount_msat": 16,
+          "secret_key": "b2d2a92f3ef1eaf2cf1d3be9ae50d9724d2cee59f76f68a15bd0a866427bb568",
+          "blinding_key": "a2208ce37ffb351cd2207a5088b6fe4e9d4ab2c260be65dfecc49c91584e3245",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 4
+        },
+        {
+          "amount_msat": 8,
+          "secret_key": "0ec7b6c9cc9aeaf9db9b6b14ce439187e842578aac5375b3e0475aaa4bea5624",
+          "blinding_key": "f53cf4ba913d6828b91f44498c0c15b9e881e9967320c3150eb2e2bf69347946",
+          "kind": "till",
+          "group": "0bef8ea95fc4b78bfbe08cdf4efa6eecd67fe962f732e98f67be63c1149e6151",
+          "out_idx": 5
+        }
+      ],
+      "price_msat": 50000,
+      "till_msat": 51736,
+      "overpay_msat": 1736,
+      "fees_msat": 1000,
+      "fee_margin_msat": 0,
+      "ts_unix_ms": 1794270634550
+    }
+  ],
+  "spent": [
+    "02027d1bbfbbe778f181edb2b99e6d6a22427d2a84be00493904e41819df3d0fd6"
+  ]
+}

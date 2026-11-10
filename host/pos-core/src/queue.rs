@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -12,6 +12,8 @@ use crate::files::{HostPending, LoadNote, write_private_json};
 use crate::plan::FeeHeadroom;
 
 pub const QUEUE_FILE: &str = "offline_queue.json";
+/// The queue file's format. A file of a later one is refused, not misread.
+pub const QUEUE_VERSION: u32 = 1;
 /// The till's caps on what it holds unsettled (OFFLINE-PLAN.md § 8 defaults).
 pub const DEFAULT_CAP_MSAT: u64 = 100_000_000;
 pub const DEFAULT_CAP_COUNT: usize = 200;
@@ -30,26 +32,73 @@ pub enum OfflineError {
     /// The price needs change and the card has no fresh KEYED slot (or too few) to take it
     /// offline; an exact plan would exist with room. The nearest prices the card pays with the
     /// slots it has, in whole sats (msat), below and above the asked one, when there are any.
-    NoChangeRoom { detail: String, below_msat: Option<u64>, above_msat: Option<u64> },
+    NoChangeRoom { detail: String, price_msat: u64, below_msat: Option<u64>, above_msat: Option<u64> },
+    /// A phone's offline kit is past its expiry, by the phone's clock or the card's: it charges
+    /// offline again once it has a new kit from the till.
+    KitExpired(String),
+    /// A phone's offline kit has no till note left of a tier the price needs (the card could pay
+    /// it with every tier). The nearest prices the pool still pays, as for `NoChangeRoom`.
+    PoolExhausted { detail: String, price_msat: u64, below_msat: Option<u64>, above_msat: Option<u64> },
+    /// No plan from the card's notes that check, and some did not: a note of no denomination of
+    /// the federation's, or whose federation signature does not verify.
+    NoteInvalid(String),
+    /// The request itself: a price, `client_ref` or PIN of the wrong shape. Nothing was asked of
+    /// the card, so no PIN try was spent.
+    BadRequest(String),
+    /// This `client_ref` was used for a charge of another price.
+    Conflict(String),
+    /// An earlier attempt with this `client_ref` is waiting for its card, pulled while it signed:
+    /// only that card's next tap can finish it, and nothing was charged again.
+    Undecided(String),
 }
 
 impl OfflineError {
-    /// The suggestion of [`OfflineError::NoChangeRoom`]: the nearer of its two prices, the
-    /// higher one on a tie.
-    pub fn suggested_msat(&self, price: u64) -> Option<u64> {
-        let OfflineError::NoChangeRoom { below_msat, above_msat, .. } = self else { return None };
-        match (below_msat, above_msat) {
-            (Some(b), Some(a)) => Some(if price - b < a - price { *b } else { *a }),
-            (b, a) => b.or(*a),
+    /// The till API's HTTP status and code for this refusal (docs/TILL-API.md).
+    pub fn class(&self) -> (u16, &'static str) {
+        match self {
+            OfflineError::Unsupported(_) => (409, "offline_unsupported_card"),
+            OfflineError::NotReady(_) => (503, "offline_not_ready"),
+            OfflineError::NotGenuine(_) => (403, "card_not_genuine"),
+            OfflineError::Cap(_) => (503, "offline_cap_reached"),
+            OfflineError::NoChangeRoom { .. } => (409, "offline_no_change_room"),
+            OfflineError::KitExpired(_) => (403, "offline_kit_expired"),
+            OfflineError::PoolExhausted { .. } => (409, "offline_pool_exhausted"),
+            OfflineError::NoteInvalid(_) => (403, "offline_note_invalid"),
+            OfflineError::BadRequest(_) => (400, "bad_request"),
+            OfflineError::Conflict(_) => (409, "conflict"),
+            OfflineError::Undecided(_) => (202, "undecided"),
         }
+    }
+
+    /// The prices of [`OfflineError::NoChangeRoom`] and [`OfflineError::PoolExhausted`]:
+    /// `(suggested, below, above)`, the suggestion the nearer of the two, the higher on a tie.
+    pub fn suggestions(&self) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
+        let (OfflineError::NoChangeRoom { price_msat, below_msat, above_msat, .. }
+        | OfflineError::PoolExhausted { price_msat, below_msat, above_msat, .. }) = self
+        else {
+            return None;
+        };
+        let suggested = match (below_msat, above_msat) {
+            (Some(b), Some(a)) => Some(if price_msat - b < a - price_msat { *b } else { *a }),
+            (b, a) => b.or(*a),
+        };
+        Some((suggested, *below_msat, *above_msat))
     }
 }
 
 impl std::fmt::Display for OfflineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OfflineError::Unsupported(m) | OfflineError::NotReady(m) | OfflineError::NotGenuine(m) | OfflineError::Cap(m) => f.write_str(m),
-            OfflineError::NoChangeRoom { detail, .. } => f.write_str(detail),
+            OfflineError::Unsupported(m)
+            | OfflineError::NotReady(m)
+            | OfflineError::NotGenuine(m)
+            | OfflineError::Cap(m)
+            | OfflineError::KitExpired(m)
+            | OfflineError::NoteInvalid(m)
+            | OfflineError::BadRequest(m)
+            | OfflineError::Conflict(m)
+            | OfflineError::Undecided(m) => f.write_str(m),
+            OfflineError::NoChangeRoom { detail, .. } | OfflineError::PoolExhausted { detail, .. } => f.write_str(detail),
         }
     }
 }
@@ -128,11 +177,30 @@ pub struct OfflineCharge {
     pub ts_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// A phone's charge: the till's outputs, taken from the offline kit's pool (the till keeps
+    /// their secrets). Empty on a till's own charge, whose `host` has them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<PoolRef>,
+    /// A phone's charge the till has (its answer at sync was `queued` or `already`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synced: bool,
+}
+
+/// One of a phone charge's outputs to the till: a pool entry of the offline kit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolRef {
+    pub amount_msat: u64,
+    /// The blinded nonce, 48 bytes, hex.
+    pub blinded: String,
+    /// Its output's index in the transaction.
+    pub out_idx: u64,
 }
 
 impl OfflineCharge {
+    /// Waiting to settle, and still this store's to send: a phone's charge the till has is the
+    /// till's.
     fn unsettled(&self) -> bool {
-        matches!(self.state, ChargeState::Signing | ChargeState::Queued | ChargeState::Reported)
+        matches!(self.state, ChargeState::Signing | ChargeState::Queued | ChargeState::Reported) && !self.synced
     }
 
     /// The body of `POST /offline-charges`: the intent's fields, the signed bytes and when.
@@ -161,27 +229,75 @@ pub struct QueueFile {
     /// Nonces (hex) of every note this till took offline: never taken offline again.
     #[serde(default)]
     pub spent: Vec<String>,
+    /// A phone's pool entries (blinded, hex) that a charge no longer in `charges` took: never
+    /// taken again, signed or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_used: Vec<String>,
+    /// The latest time a phone has seen (ms): a clock set back cannot make an expired kit young.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub high_water_ms: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// The durable queue: saved like the state file (0600, fsync, rename, fsync of the directory).
+/// Every change goes through [`Queue::commit`], so what is in memory is never ahead of the disk.
 pub struct Queue {
     path: PathBuf,
     pub file: QueueFile,
+    /// Tests: writes left before one fails ([`Queue::fail_write_after`]).
+    fault: Option<usize>,
 }
 
 impl Queue {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let path = data_dir.join(QUEUE_FILE);
-        let file = match std::fs::read(&path) {
+        let file: QueueFile = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => QueueFile { version: 1, ..Default::default() },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => QueueFile { version: QUEUE_VERSION, ..Default::default() },
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Self { path, file })
+        if file.version > QUEUE_VERSION {
+            bail!("{} has version {}, this build understands {QUEUE_VERSION}", path.display(), file.version);
+        }
+        Ok(Self { path, file, fault: None })
     }
 
-    pub fn save(&self) -> Result<()> {
-        write_private_json(&self.path, &self.file)
+    /// Save the file as it is in memory.
+    pub fn save(&mut self) -> Result<()> {
+        let file = std::mem::take(&mut self.file);
+        let r = self.write(&file);
+        self.file = file;
+        r
+    }
+
+    /// Change the file with `f` and save it: `f` edits a copy, which replaces what is in memory
+    /// only once it is on disk. A failed write leaves memory as the disk has it.
+    pub fn commit<R>(&mut self, f: impl FnOnce(&mut QueueFile) -> R) -> Result<R> {
+        let mut next = self.file.clone();
+        let r = f(&mut next);
+        self.write(&next)?;
+        self.file = next;
+        Ok(r)
+    }
+
+    /// Tests: fail the write after the next `n` (0: the next one), once.
+    #[doc(hidden)]
+    pub fn fail_write_after(&mut self, n: Option<usize>) {
+        self.fault = n;
+    }
+
+    fn write(&mut self, file: &QueueFile) -> Result<()> {
+        if let Some(n) = self.fault {
+            if n == 0 {
+                self.fault = None;
+                bail!("writing {} failed (an injected fault)", self.path.display());
+            }
+            self.fault = Some(n - 1);
+        }
+        write_private_json(&self.path, file)
     }
 
     pub fn path(&self) -> &Path {
@@ -201,10 +317,11 @@ impl Queue {
 
     /// Change the charge `txid` and save.
     pub fn set(&mut self, txid: &str, f: impl FnOnce(&mut OfflineCharge)) -> Result<()> {
-        if let Some(c) = self.file.charges.iter_mut().find(|c| c.txid == txid) {
-            f(c);
-        }
-        self.save()
+        self.commit(|file| {
+            if let Some(c) = file.charges.iter_mut().find(|c| c.txid == txid) {
+                f(c);
+            }
+        })
     }
 }
 
@@ -242,6 +359,8 @@ mod tests {
             fee_margin_msat: 0,
             ts_unix_ms: 0,
             detail: None,
+            pool: vec![],
+            synced: false,
         }
     }
 
@@ -263,6 +382,44 @@ mod tests {
         let q = Queue::open(dir.path()).unwrap();
         assert_eq!(q.stats(), Stats { queued: 3, queued_msat: 11_000, double_spent: 1, refused: 0, rejected: 0 });
         assert_eq!(q.file.spent, vec!["02aa".to_string()]);
+    }
+
+    #[test]
+    fn a_newer_queue_is_refused_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(QUEUE_FILE), br#"{"version": 2, "charges": [], "spent": []}"#).unwrap();
+        let e = Queue::open(dir.path()).err().expect("refused");
+        assert!(format!("{e:#}").contains("version 2"), "{e:#}");
+        std::fs::write(dir.path().join(QUEUE_FILE), br#"{"version": 1, "charges": [], "spent": []}"#).unwrap();
+        assert!(Queue::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_memory_as_the_disk_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::open(dir.path()).unwrap();
+        q.commit(|f| f.charges.push(charge("a", ChargeState::Queued, 1000))).unwrap();
+        // The second write from now fails: the first goes through, the second changes nothing.
+        q.fail_write_after(Some(1));
+        q.commit(|f| f.charges.push(charge("b", ChargeState::Queued, 2000))).unwrap();
+        let e = q.set("a", |c| c.state = ChargeState::Reported).unwrap_err();
+        assert!(format!("{e:#}").contains("injected"), "{e:#}");
+        assert_eq!(q.file.charges.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![("a", ChargeState::Queued), ("b", ChargeState::Queued)]);
+        // Once: the next write goes through, and the disk has what memory has.
+        q.set("a", |c| c.state = ChargeState::Reported).unwrap();
+        let on_disk = Queue::open(dir.path()).unwrap();
+        assert_eq!(on_disk.file.charges, q.file.charges);
+        assert_eq!(on_disk.file.charges[0].state, ChargeState::Reported);
+    }
+
+    #[test]
+    fn a_phone_charge_the_till_has_no_longer_counts_against_the_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::open(dir.path()).unwrap();
+        let mut synced = charge("s", ChargeState::Queued, 4000);
+        synced.synced = true;
+        q.commit(|f| f.charges.extend([charge("a", ChargeState::Queued, 1000), synced])).unwrap();
+        assert_eq!((q.stats().queued, q.stats().queued_msat), (1, 1000));
     }
 
     #[test]

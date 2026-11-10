@@ -34,9 +34,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fedimint_card_host_card::{
-    BridgeError, BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, SW_PIN_BLOCKED, StatusWord, Transport, status_word,
-};
+use fedimint_card_host_card::{BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, Transport, status_word};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -45,7 +43,6 @@ use crate::link::{Link, Links};
 use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
 use crate::claim::{Claim, Poll};
 use crate::ops::{FederationReport, Ops, OpsConfig, OpsError};
-use crate::plan::PlanError;
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
 use crate::topup::{TopupRec, TopupState, Topups};
@@ -91,18 +88,13 @@ pub struct Class {
 }
 
 /// Map an error to its API code and HTTP status by looking for typed errors in its cause chain.
+/// The card's, the planner's and the offline charge's come from the core a phone shares
+/// ([`fedimint_card_pos_core::class_of`]): one vocabulary.
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
     for cause in err.chain() {
-        if let Some(o) = cause.downcast_ref::<crate::offline::OfflineError>() {
-            use crate::offline::OfflineError as E;
-            return match o {
-                E::Unsupported(_) => c(409, "offline_unsupported_card"),
-                E::NotReady(_) => c(503, "offline_not_ready"),
-                E::NotGenuine(_) => c(403, "card_not_genuine"),
-                E::Cap(_) => c(503, "offline_cap_reached"),
-                E::NoChangeRoom { .. } => c(409, "offline_no_change_room"),
-            };
+        if let Some((status, code)) = fedimint_card_pos_core::class_of(cause) {
+            return c(status, code);
         }
         if let Some(o) = cause.downcast_ref::<OpsError>() {
             return match o {
@@ -110,35 +102,6 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 OpsError::UnknownCard(_) => c(404, "unknown_card"),
                 OpsError::Unreachable(_) => c(502, "ops_unreachable"),
                 OpsError::Refused(..) => c(502, "ops_refused"),
-            };
-        }
-        if let Some(StatusWord(sw)) = cause.downcast_ref::<StatusWord>() {
-            match *sw {
-                0x63C0..=0x63CF => return c(403, "wrong_pin"),
-                SW_PIN_BLOCKED => return c(423, "pin_blocked"),
-                fedimint_card_host_card::v3::SW_OVER_LIMIT => return c(402, "card_limit"),
-                _ => {}
-            }
-        }
-        if let Some(b) = cause.downcast_ref::<BridgeError>() {
-            return match b {
-                BridgeError::NoCard(_) => c(409, "no_card"),
-                BridgeError::Unreachable(_) => c(502, "relay_unreachable"),
-                BridgeError::Http(..) => c(502, "card_error"),
-            };
-        }
-        if cause.downcast_ref::<StatusWord>().is_some() {
-            return c(502, "card_error");
-        }
-        if let Some(p) = cause.downcast_ref::<PlanError>() {
-            return match p {
-                PlanError::Insufficient { .. } => c(402, "insufficient"),
-                PlanError::NoExactPlan { .. }
-                | PlanError::TooManyNotes(_)
-                | PlanError::TooManyInputs { .. }
-                | PlanError::NoFreeSlots { .. } => {
-                    c(422, "no_exact_plan")
-                }
             };
         }
         if let Some(f) = cause.downcast_ref::<SpendFault>() {
@@ -156,13 +119,8 @@ pub fn classify(err: &anyhow::Error) -> Class {
 fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
     let detail = match class.code {
-        // Said plainly, for the holder: the status word is the card's, the tries left are its low
-        // nibble (`63 CX`).
-        "wrong_pin" => {
-            let left = err.chain().find_map(|c| c.downcast_ref::<StatusWord>()).map_or(0, |s| s.0 & 0x0F);
-            format!("wrong PIN; {left} tries left before the card blocks")
-        }
-        "pin_blocked" => "the card's PIN is blocked after too many wrong tries; the card cannot pay".into(),
+        // Said plainly, for the holder, as a phone says it.
+        "wrong_pin" | "pin_blocked" => fedimint_card_pos_core::refusal(err).detail,
         _ => format!("{err:#}"),
     };
     Reply::fail(class.status, class.code, detail)
@@ -1013,16 +971,19 @@ async fn offline_charge(
             tracing::warn!("offline charge of {price} msat refused: {e:#}");
             let mut r = error_reply(&e);
             // No room for change offline: the prices the card can pay instead.
-            if let Some(o @ crate::offline::OfflineError::NoChangeRoom { below_msat, above_msat, .. }) =
-                e.chain().find_map(|c| c.downcast_ref::<crate::offline::OfflineError>())
+            if let Some((suggested, below, above)) =
+                e.chain().find_map(|c| c.downcast_ref::<crate::offline::OfflineError>()).and_then(|o| o.suggestions())
             {
-                r.body["suggested_msat"] = json!(o.suggested_msat(price));
-                r.body["suggest_below_msat"] = json!(below_msat);
-                r.body["suggest_above_msat"] = json!(above_msat);
+                r.body["suggested_msat"] = json!(suggested);
+                r.body["suggest_below_msat"] = json!(below);
+                r.body["suggest_above_msat"] = json!(above);
             }
             return r;
         }
     };
+    // A charge the queue already had (a repeat whose sale was never recorded, or one a pulled card
+    // left signing that this tap finished) is recorded now, as a new one would be; `append` answers
+    // the sale already there.
     let mut rec = SaleRec {
         id: 0,
         ts_unix_ms: taken.ts_unix_ms,

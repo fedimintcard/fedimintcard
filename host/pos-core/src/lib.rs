@@ -12,9 +12,13 @@ use tbs::{BlindedMessage, BlindingKey};
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 
+pub mod charge;
 pub mod files;
 pub mod plan;
 pub mod queue;
+pub mod refusal;
+
+pub use refusal::{Refusal, class_of, refusal};
 
 /// The nonce for a card key. Parity is fixed to even so the 33 bytes blinded at issue are the
 /// 33 bytes the federation sees at spend.

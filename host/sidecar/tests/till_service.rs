@@ -560,6 +560,31 @@ fn classify_pins_codes_and_statuses() {
     assert_eq!(SpendFault::Declined("federation rejected the spend: e".into()).to_string(), "federation rejected the spend: e");
 }
 
+/// The codes a phone's offline charge adds (docs/TILL-API.md) come out of `classify` as every
+/// other code does: a status and a plain lower-case string, beside the older offline codes,
+/// whatever wraps them.
+#[test]
+fn classify_names_the_offline_codes_a_phone_answers_too() {
+    use fedimint_card_sidecar::offline::OfflineError;
+    let c = |e: anyhow::Error| classify(&e);
+    let k = |status, code| Class { status, code };
+    let wrap = |e: anyhow::Error| e.context("outer").context("outermost");
+    let prices = |detail: &str| (detail.to_owned(), 50_000u64, Some(49_000u64), Some(51_000u64));
+    let (detail, price_msat, below_msat, above_msat) = prices("p");
+    assert_eq!(c(wrap(OfflineError::KitExpired("k".into()).into())), k(403, "offline_kit_expired"));
+    assert_eq!(c(wrap(OfflineError::PoolExhausted { detail, price_msat, below_msat, above_msat }.into())), k(409, "offline_pool_exhausted"));
+    assert_eq!(c(wrap(OfflineError::NoteInvalid("n".into()).into())), k(403, "offline_note_invalid"));
+    let (detail, price_msat, below_msat, above_msat) = prices("c");
+    assert_eq!(c(wrap(OfflineError::NoChangeRoom { detail, price_msat, below_msat, above_msat }.into())), k(409, "offline_no_change_room"));
+    assert_eq!(c(wrap(OfflineError::Unsupported("u".into()).into())), k(409, "offline_unsupported_card"));
+    assert_eq!(c(wrap(OfflineError::NotReady("r".into()).into())), k(503, "offline_not_ready"));
+    assert_eq!(c(wrap(OfflineError::NotGenuine("g".into()).into())), k(403, "card_not_genuine"));
+    assert_eq!(c(wrap(OfflineError::Cap("c".into()).into())), k(503, "offline_cap_reached"));
+    for code in ["offline_kit_expired", "offline_pool_exhausted", "offline_note_invalid"] {
+        assert!(code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{code}");
+    }
+}
+
 /// Read one whole HTTP request (headers and body), so closing the socket afterwards cannot
 /// reset the connection before the client has read its answer.
 fn drain_request(s: &mut std::net::TcpStream) {

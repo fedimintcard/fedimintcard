@@ -713,6 +713,34 @@ async fn a_queued_charge_survives_a_restart_and_is_sent() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ------------------------------------------------------------------ the queue file from 4301b0a
+
+/// A queue an earlier till (4301b0a) wrote, with a charge queued offline, loads unchanged: the
+/// fields the phone charges added (`pool`, `synced`, `pool_used`, `high_water_ms`) are absent from
+/// it and default.
+#[test]
+fn a_queue_from_4301b0a_loads() -> anyhow::Result<()> {
+    let golden = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/offline_queue_4301b0a.json"))?;
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("offline_queue.json"), &golden)?;
+    let off = Offline::open(dir.path(), OfflineConfig::default())?;
+    let q = off.queue.lock().unwrap();
+    assert_eq!(q.file.version, 1);
+    let c = &q.file.charges[0];
+    assert_eq!((c.client_ref.as_deref(), c.state, c.price_msat, c.till_msat), (Some("golden-1"), fedimint_card_sidecar::offline::ChargeState::Queued, 50_000, 51_736));
+    assert_eq!((c.inputs.len(), c.change.len(), c.host.len()), (1, 3, 6));
+    assert!(c.pool.is_empty() && !c.synced && q.file.pool_used.is_empty() && q.file.high_water_ms == 0);
+    assert_eq!(q.file.spent, vec![c.inputs[0].nonce.clone()]);
+    assert_eq!(q.stats().queued, 1);
+    assert!(c.report_body()["signed_hex"].as_str().is_some_and(|s| !s.is_empty()));
+    // Saved again, it reads back the same.
+    drop(q);
+    off.queue.lock().unwrap().save()?;
+    let again = Offline::open(dir.path(), OfflineConfig::default())?;
+    assert_eq!(again.queue.lock().unwrap().file.charges, off.queue.lock().unwrap().file.charges);
+    Ok(())
+}
+
 // ------------------------------------------------------------------ status
 
 #[tokio::test(flavor = "multi_thread")]
