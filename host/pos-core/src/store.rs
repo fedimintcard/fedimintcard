@@ -31,6 +31,9 @@ pub const KEEP_SYNCED_MS: u64 = 30 * 86_400_000;
 pub struct Store {
     dir: PathBuf,
     queue: Mutex<Queue>,
+    /// Held for the whole of a charge: two charges at once (an app's retry while the first still
+    /// waits on its card) would plan from the same free pool entries.
+    charging: Mutex<()>,
     phone_id: String,
     /// Held while the store is open: `store.lock`, locked.
     _lock: File,
@@ -115,7 +118,7 @@ impl Store {
         }
         let phone_id = phone_id(dir)?;
         let queue = Queue::open(dir)?;
-        Ok(Self { dir: dir.to_owned(), queue: Mutex::new(queue), phone_id, _lock: lock })
+        Ok(Self { dir: dir.to_owned(), queue: Mutex::new(queue), charging: Mutex::new(()), phone_id, _lock: lock })
     }
 
     pub fn dir(&self) -> &Path {
@@ -136,8 +139,10 @@ impl Store {
     /// anything; its expiry against the latest of the phone's clock, the kit's issue and the
     /// latest time this store has seen, and again against the card's clock. A repeat of a sale the
     /// till refused at sync is `conflict`: that sale was not paid, and a new one needs a new
-    /// `client_ref`.
+    /// `client_ref`. Charges on one store run one at a time: a second waits for the first.
     pub fn charge(&self, card: &mut dyn Card, kit_json: &str, price: u64, client_ref: &str, pin: &[u8]) -> Result<Taken> {
+        // A panic never leaves the queue half-changed (`Queue::commit`), so a poisoned lock is safe.
+        let _one = self.charging.lock().unwrap_or_else(|e| e.into_inner());
         let t = self.charge_inner(card, kit_json, price, client_ref, pin)?;
         if t.replayed && t.charge.state == ChargeState::Refused {
             bail!(OfflineError::Conflict(format!(
@@ -213,16 +218,33 @@ impl Store {
         }
     }
 
+    /// The `client_ref`s of the charges a card taken away mid-tap left `signing`. Only that card's
+    /// next tap here finishes one, so the app retries such a sale with this store's `charge` only,
+    /// never on the till's `POST /v1/charge`: the card may have signed part of a transaction, and
+    /// an online charge would take the sale a second time (docs/POS-OFFLINE.md).
+    pub fn signing_refs(&self) -> Vec<String> {
+        self.q().file.charges.iter().filter(|c| c.state == ChargeState::Signing).filter_map(|c| c.client_ref.clone()).collect()
+    }
+
     /// Take the till's answer to a drain's body: `queued` and `already` are the till's now,
     /// `refused` is kept with its code (unless `retry`, which waits for the next sync). Charges the
-    /// till has had for [`KEEP_SYNCED_MS`] leave the queue; their pool entries stay used.
+    /// till has had, and abandoned ones, leave the queue after [`KEEP_SYNCED_MS`]; their pool
+    /// entries stay used.
     pub fn mark_synced(&self, answer_json: &str) -> Result<SyncReport> {
+        self.mark_synced_at(answer_json, now_ms())
+    }
+
+    /// [`Store::mark_synced`] with the phone's clock at `now`. The clock only decides what is old
+    /// enough to leave the queue: it is not kept as the store's latest time, which only a charge
+    /// moves (and never past its kit's expiry), so a clock set ahead once cannot expire every kit
+    /// for good.
+    #[doc(hidden)]
+    pub fn mark_synced_at(&self, answer_json: &str, now: u64) -> Result<SyncReport> {
         let a: Answer = serde_json::from_str(answer_json).map_err(|e| anyhow!("the till's answer is not one: {e}"))?;
         if !a.ok {
             bail!("the till refused the sync: {}", a.error.as_deref().unwrap_or("no reason given"));
         }
         let mut report = SyncReport::default();
-        let now = now_ms();
         self.q().commit(|f| {
             for r in &a.results {
                 let Some(c) = f.charges.iter_mut().find(|c| c.txid == r.txid && c.state == ChargeState::Queued) else { continue };
@@ -239,8 +261,10 @@ impl Store {
                     _ => report.retry += 1,
                 }
             }
-            f.high_water_ms = f.high_water_ms.max(now);
-            let old = |c: &OfflineCharge| c.synced && c.ts_unix_ms.saturating_add(KEEP_SYNCED_MS) < f.high_water_ms;
+            let clock = now.max(f.high_water_ms);
+            let old = |c: &OfflineCharge| {
+                (c.synced || c.state == ChargeState::Abandoned) && c.ts_unix_ms.saturating_add(KEEP_SYNCED_MS) < clock
+            };
             let gone: Vec<String> = f.charges.iter().filter(|c| old(c)).flat_map(|c| c.pool.iter().map(|p| p.blinded.clone())).collect();
             f.charges.retain(|c| !old(c));
             f.pool_used.extend(gone);

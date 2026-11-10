@@ -112,7 +112,13 @@ leaves the charge `signing` (the answer is `no_card`). Tapped again with the sam
 the till finishes that charge from the card's stored signatures and answers it, as a repeat; it
 never signs a second transaction for the sale. Another card tapped with that `client_ref` while
 the first card's charge is still signing is answered `undecided` (202) with nothing signed: only
-the first card's next tap can say whether it paid. Notes the till's checks refuse (no
+the first card's next tap can say whether it paid. So is a tap with that `client_ref` once the
+till is online again: the online charge would take the sale a second time from the card's other
+notes, so the charge waits for that card's next offline tap here. A charge left signing that can
+never be finished (an input slot of it has since paid another transaction, or was re-keyed) is
+set aside at the card's next offline tap (`abandoned` in the queue, kept for the operator: the
+notes the card signed for it stay spent on the card); nothing was charged for it, and the tap
+goes on as a new charge, for the same `client_ref` too. Notes the till's checks refuse (no
 denomination of the federation's, or a federation signature that does not verify) are skipped;
 when the rest do not pay, the charge is `offline_note_invalid` (403), not `insufficient`.
 
@@ -122,10 +128,10 @@ next reaches the till: it fetches an offline kit while online (`GET /v1/offline/
 sends its charges with `POST /v1/offline/charges`, which puts each into this till's offline queue
 as `queued`; the sender above reports and settles it as the till's own, and its sale is in
 `sales.json` with `offline: true`. A kit lasts `--offline-kit-ttl-hours`
-(`TILL_OFFLINE_KIT_TTL_HOURS`, default 168, a week); the charges taken with it are taken for
-`--offline-kit-grace-days` (`TILL_OFFLINE_KIT_GRACE_DAYS`, default 30) after that, then the
-kit's unused entries are wiped. A phone's charges count toward this till's caps above; one is never
-refused for them (the money is already taken).
+(`TILL_OFFLINE_KIT_TTL_HOURS`, default 168, a week) from the fetch that answered it; the charges
+taken with it are taken for `--offline-kit-grace-days` (`TILL_OFFLINE_KIT_GRACE_DAYS`, default
+30) after that, then the kit's unused entries are dropped with their secrets. A phone's charges
+count toward this till's caps above; one is never refused for them (the money is already taken).
 
 ### Connecting by claim
 
@@ -242,7 +248,7 @@ earlier attempt.
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline: an earlier attempt with this `client_ref` waits for the card taken away while it signed, and this card was not charged | show "pending", then poll /v1/sales; offline, ask for the first card again |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: an earlier attempt with this `client_ref` waits for the card taken away while it signed, and this card was not charged | show "pending", then poll /v1/sales; offline, ask for the first card again |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
@@ -285,8 +291,12 @@ largest at or below `cap_msat`, 40 blinded nonces each (fewer when the kit would
 till logs it). Their spend keys and blinding keys stay on the till, in `offline_pool.json` (0600),
 written before the kit is answered. Asked again within an hour, while every tier has 4 entries
 left, the phone gets the same kit (its entries still unused); else a new one, but never more than
-3 kits that have not expired (at the cap, the newest again). Each call wipes the unused entries
-of kits past their grace. Pass the whole answer to the core's `charge`.
+3 kits that have not expired: at the cap, the newest again, its tiers topped up to 40 under the
+same `kit_id` once one has fewer than 4 left. A kit given again is good for
+`--offline-kit-ttl-hours` from that fetch, and its charges are taken for the grace after that
+(both move at most once an hour). Each call drops the unused entries of kits past their grace,
+with their secrets; the entries charges used stay, so a charge sent again is still `already`.
+Pass the whole answer to the core's `charge`.
 
 `400 bad_request` for a missing or malformed `phone`; `503 offline_not_ready` when the till has no
 certificate key from the registry yet (it fetches one while online), or takes no offline charges.
@@ -306,16 +316,17 @@ the card's key) or a pool entry this till issued to this phone, unused, within i
 window, of the same amount. A charge that checks is put into the till's offline queue as
 `queued`, with the till's secrets for its pool outputs, then its pool entries are marked used,
 then its sale is recorded (a `client_ref` this ledger has under another transaction is dropped
-from the sale, with a warning). A txid the queue or the ledger already has is `already`: send it
-again freely. The sender reports and settles it like the till's own charges.
+from the sale, with a warning); a request's charges are one write of the queue and one of the
+ledger. A txid the queue or the ledger already has is `already`: send it again freely. The sender
+reports and settles it like the till's own charges.
 
 | code | retry | meaning |
 |---|---|---|
 | `bad_charge` | false | the bytes do not decode, or are not the charge it declares |
 | `bad_note` | false | an input note's federation signature does not verify, or its amount is no denomination |
 | `bad_signature` | false | a card signature does not verify over the txid |
-| `pool_entry_unknown` | false | a pool output this till did not issue to this phone |
-| `pool_entry_expired` | false | a pool output of a kit past its redeem window (its secrets are wiped) |
+| `pool_entry_unknown` | false | a pool output this till did not issue to this phone, or one of a kit past its redeem window whose unused entries are dropped |
+| `pool_entry_expired` | false | a pool output of a kit past its redeem window (its secrets are dropped at the next kit call) |
 | `pool_entry_reused` | false | a pool output another charge already paid to (a phone store restored from a backup) |
 | `internal` | true | the till could not write its queue: send it again later |
 

@@ -5,7 +5,12 @@
 //! card, and a directory in its protected storage for the [`PosCore`] store. Every call blocks
 //! until it is done; `charge` waits on the card, so the app calls it off the NFC delegate's queue
 //! (iOS) or the NFC callback's thread (Android), never on them.
+//!
+//! Every method but `phone_id` returns a `Result` (Swift `throws`): a panic in the core is caught
+//! and answered as [`PosCoreError::Internal`], never a trap in the app (Swift calls an export that
+//! does not throw with `try!`).
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use fedimint_card_host_card::{BridgeError, CardClient, SELECT_APDU, Transport};
@@ -63,18 +68,20 @@ impl Transport for Nfc {
     }
 }
 
-/// The store could not be opened or written, or the till's answer was not one.
+/// The store could not be opened or written, the till's answer was not one, or the core failed
+/// in a way it does not know (a panic, caught: `Internal`).
 #[derive(Debug, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum PosCoreError {
     Store(String),
     Answer(String),
+    Internal(String),
 }
 
 impl std::fmt::Display for PosCoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PosCoreError::Store(m) | PosCoreError::Answer(m) => f.write_str(m),
+            PosCoreError::Store(m) | PosCoreError::Answer(m) | PosCoreError::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -164,6 +171,15 @@ fn store_error(e: anyhow::Error) -> PosCoreError {
     PosCoreError::Store(format!("{e:#}"))
 }
 
+/// Run `f`, answering a panic in it as [`PosCoreError::Internal`]. The store stays usable: its
+/// queue is never half-changed (`Queue::commit`) and its locks are taken back after a panic.
+fn guarded<T>(what: &str, f: impl FnOnce() -> Result<T, PosCoreError>) -> Result<T, PosCoreError> {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let m = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+        Err(PosCoreError::Internal(format!("{what}: the core failed unexpectedly ({m}); nothing more is known")))
+    })
+}
+
 fn slots(v: impl Iterator<Item = (u8, u64)>) -> Vec<SlotMsat> {
     v.map(|(slot, msat)| SlotMsat { slot, msat }).collect()
 }
@@ -173,20 +189,80 @@ impl PosCore {
     /// Open the store in `dir` (made if missing). Fails if it is open elsewhere.
     #[uniffi::constructor]
     pub fn open(dir: String) -> Result<Arc<Self>, PosCoreError> {
-        Ok(Arc::new(Self { store: Store::open(std::path::Path::new(&dir)).map_err(store_error)? }))
+        guarded("open", || Ok(Arc::new(Self { store: Store::open(std::path::Path::new(&dir)).map_err(store_error)? })))
     }
 
-    /// The id to ask the till's kit for (`GET /v1/offline/kit?phone=`).
+    /// The id to ask the till's kit for (`GET /v1/offline/kit?phone=`). A field read: it cannot
+    /// fail.
     pub fn phone_id(&self) -> String {
         self.store.phone_id().to_owned()
     }
 
     /// Take `price_msat` from the card on `transport`, offline, with the kit the till answered
     /// (`kit_json`, the kit or the whole `{"ok":true,"kit":…}`), for the sale `client_ref` (1 to 128
-    /// ASCII characters, the same on a retry) and the holder's `pin`. Blocks on the card.
-    pub fn charge(&self, transport: Arc<dyn ApduTransport>, kit_json: String, price_msat: u64, client_ref: String, pin: String) -> ChargeOutcome {
+    /// ASCII characters, the same on a retry) and the holder's `pin`. Blocks on the card, and on a
+    /// charge already running on this store. A refusal is `Refused`; an error is the core failing
+    /// unexpectedly (`Internal`), the sale's outcome unknown as for `no_card`.
+    pub fn charge(
+        &self,
+        transport: Arc<dyn ApduTransport>,
+        kit_json: String,
+        price_msat: u64,
+        client_ref: String,
+        pin: String,
+    ) -> Result<ChargeOutcome, PosCoreError> {
+        guarded("charge", || Ok(self.charge_now(transport, &kit_json, price_msat, &client_ref, &pin)))
+    }
+
+    pub fn stats(&self) -> Result<PhoneStats, PosCoreError> {
+        guarded("stats", || {
+            let s: store::PhoneStats = self.store.stats();
+            Ok(PhoneStats { waiting: s.waiting as u32, waiting_msat: s.waiting_msat, signing: s.signing as u32, refused: s.refused as u32, synced: s.synced as u32 })
+        })
+    }
+
+    /// The `client_ref`s of sales a card taken away mid-tap left signing here. Retry such a sale
+    /// only with `charge`, never on the till's `POST /v1/charge` (docs/POS-OFFLINE.md).
+    pub fn signing_refs(&self) -> Result<Vec<String>, PosCoreError> {
+        guarded("signing_refs", || Ok(self.store.signing_refs()))
+    }
+
+    /// The charges waiting for the till (at most `max`, and 50) as the body to post, and the ones
+    /// it refused.
+    pub fn drain(&self, max: u32) -> Result<Drain, PosCoreError> {
+        guarded("drain", || {
+            let d = self.store.drain(max as usize);
+            Ok(Drain {
+                body: d.body,
+                txids: d.txids,
+                refused: d
+                    .refused
+                    .into_iter()
+                    .map(|r| RefusedCharge { txid: r.txid, code: r.code, price_msat: r.price_msat, ts_unix_ms: r.ts_unix_ms })
+                    .collect(),
+            })
+        })
+    }
+
+    /// Take the till's answer to the drained body (`200 {"ok":true,"results":[…]}`).
+    pub fn mark_synced(&self, answer_json: String) -> Result<SyncReport, PosCoreError> {
+        guarded("mark_synced", || {
+            let r = self.store.mark_synced(&answer_json).map_err(|e| PosCoreError::Answer(format!("{e:#}")))?;
+            Ok(SyncReport { synced: r.synced as u32, refused: r.refused as u32, retry: r.retry as u32 })
+        })
+    }
+
+    /// Remove a refused charge once the app has shown it; only a refused one. Answers whether
+    /// there was one.
+    pub fn dismiss(&self, txid: String) -> Result<bool, PosCoreError> {
+        guarded("dismiss", || self.store.dismiss(&txid).map_err(store_error))
+    }
+}
+
+impl PosCore {
+    fn charge_now(&self, transport: Arc<dyn ApduTransport>, kit_json: &str, price_msat: u64, client_ref: &str, pin: &str) -> ChargeOutcome {
         let mut card = CardClient::new(Nfc { t: transport, selected: false });
-        match self.store.charge(&mut card, &kit_json, price_msat, &client_ref, pin.as_bytes()) {
+        match self.store.charge(&mut card, kit_json, price_msat, client_ref, pin.as_bytes()) {
             Ok(Taken { charge: c, replayed }) => ChargeOutcome::Paid {
                 txid: c.txid.clone(),
                 price_msat: c.price_msat,
@@ -210,37 +286,5 @@ impl PosCore {
                 }
             }
         }
-    }
-
-    pub fn stats(&self) -> PhoneStats {
-        let s: store::PhoneStats = self.store.stats();
-        PhoneStats { waiting: s.waiting as u32, waiting_msat: s.waiting_msat, signing: s.signing as u32, refused: s.refused as u32, synced: s.synced as u32 }
-    }
-
-    /// The charges waiting for the till (at most `max`, and 50) as the body to post, and the ones
-    /// it refused.
-    pub fn drain(&self, max: u32) -> Drain {
-        let d = self.store.drain(max as usize);
-        Drain {
-            body: d.body,
-            txids: d.txids,
-            refused: d
-                .refused
-                .into_iter()
-                .map(|r| RefusedCharge { txid: r.txid, code: r.code, price_msat: r.price_msat, ts_unix_ms: r.ts_unix_ms })
-                .collect(),
-        }
-    }
-
-    /// Take the till's answer to the drained body (`200 {"ok":true,"results":[…]}`).
-    pub fn mark_synced(&self, answer_json: String) -> Result<SyncReport, PosCoreError> {
-        let r = self.store.mark_synced(&answer_json).map_err(|e| PosCoreError::Answer(format!("{e:#}")))?;
-        Ok(SyncReport { synced: r.synced as u32, refused: r.refused as u32, retry: r.retry as u32 })
-    }
-
-    /// Remove a refused charge once the app has shown it; only a refused one. Answers whether
-    /// there was one.
-    pub fn dismiss(&self, txid: String) -> Result<bool, PosCoreError> {
-        self.store.dismiss(&txid).map_err(store_error)
     }
 }

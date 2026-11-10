@@ -27,7 +27,7 @@ use fedimint_core::module::CommonModuleInit as _;
 use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
-use fedimint_core::secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
+use fedimint_core::secp256k1::{Keypair, Message, PublicKey, SECP256K1, XOnlyPublicKey};
 use fedimint_core::transaction::{Transaction, TransactionSignature};
 use fedimint_core::{Amount, Tiered, TransactionId};
 use fedimint_mint_common::config::FeeConsensus;
@@ -132,7 +132,8 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 /// 3. a phone's kit expiry, then the count cap;
 /// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
 /// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
-///    card for one is `undecided`;
+///    card for one is `undecided`; one that can never be finished is `abandoned` and frees its
+///    `client_ref`;
 /// 6. the card's notes, the plan, the value cap, the card's day, then `signing`, `SET_CHANGE` and
 ///    `SIGN`, and `queued`.
 pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client_ref: Option<&str>) -> Result<Taken> {
@@ -608,7 +609,10 @@ fn settle_failed_signing(card: &mut dyn Card, queue: &Mutex<Queue>, entry: &Offl
 
 /// Finish the entries a pulled card left `signing`: the card answers a spent slot's stored
 /// signature for the same hash, so the transaction is completed and queued. An entry none of
-/// whose slots signed it is dropped. Needs the PIN session. Answers the entries finished.
+/// whose slots signed it is dropped. One that can never be finished, because an input slot is
+/// neither spent for it nor still holding its note (spent by another transaction since, or
+/// re-keyed), is [`ChargeState::Abandoned`] and the charge goes on. Needs the PIN session.
+/// Answers the entries finished.
 fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id: &str) -> Result<Vec<OfflineCharge>> {
     let left: Vec<OfflineCharge> =
         lock(queue).file.charges.iter().filter(|c| c.state == ChargeState::Signing && c.short_id == short_id).cloned().collect();
@@ -618,15 +622,34 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
         let digest = txid.to_byte_array();
         let mut keys = vec![];
         let mut spent = 0;
+        let mut gone = None;
+        // Every input slot is read before any is signed: a transaction that cannot be finished
+        // must not spend another note.
         for i in &e.inputs {
+            let key = input_key(i)?;
             let info = card.get_slot(i.slot)?;
-            if info.state == SlotState::Spent && info.spent_hash == digest {
-                spent += 1;
+            let ours = info.xonly == Some(key);
+            match info.state {
+                // Signed for this transaction: SIGN answers its stored signature again.
+                SlotState::Spent if ours && info.spent_hash == digest => spent += 1,
+                // Not signed yet: SIGN spends the note for this transaction.
+                SlotState::Note if ours && info.amount_msat == i.amount_msat => {}
+                s => {
+                    gone.get_or_insert_with(|| match (ours, s) {
+                        (false, _) => format!("input slot {} was re-keyed", i.slot),
+                        (true, SlotState::Spent) => format!("input slot {} was spent by another transaction", i.slot),
+                        (true, s) => format!("input slot {} is {s:?}, not the note it held", i.slot),
+                    });
+                }
             }
-            keys.push((i.slot, info.xonly.context("an empty input slot")?));
+            keys.push((i.slot, key));
         }
         if spent == 0 {
             settle_failed_signing(card, queue, &e);
+            continue;
+        }
+        if let Some(why) = gone {
+            abandon(queue, &e, &why)?;
             continue;
         }
         let sigs = sign_inputs(card, &keys, digest)?;
@@ -644,4 +667,28 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
         done.extend(c);
     }
     Ok(done)
+}
+
+/// The key of a queued input: its nonce is `02 ‖ x-only key`.
+fn input_key(i: &OfflineInput) -> Result<XOnlyPublicKey> {
+    PublicKey::from_str(&i.nonce).map(XOnlyPublicKey::from).map_err(|_| anyhow!("a queued input's nonce {} is not a key", i.nonce))
+}
+
+/// An entry left `signing` that can never be sent: kept for the operator as `abandoned`, its
+/// `client_ref` freed (a retap of the sale is a new charge: this one was never paid), its pool
+/// entries never taken again. The card's slots spent for it stay spent.
+fn abandon(queue: &Mutex<Queue>, e: &OfflineCharge, why: &str) -> Result<()> {
+    let sale = e.client_ref.as_deref().map(|r| format!(" for client_ref {r:?}")).unwrap_or_default();
+    let detail = format!(
+        "{why} while this charge waited for the card's next tap, so it can never be sent; nothing was charged{sale}, and the notes the card signed for it stay spent on the card"
+    );
+    tracing::warn!("offline charge {} on card {} abandoned: {detail}", e.txid, e.short_id);
+    lock(queue).commit(|f| {
+        if let Some(c) = f.charges.iter_mut().find(|c| c.txid == e.txid) {
+            c.state = ChargeState::Abandoned;
+            c.client_ref = None;
+            c.detail = Some(detail);
+            f.pool_used.extend(std::mem::take(&mut c.pool).into_iter().map(|p| p.blinded));
+        }
+    })
 }

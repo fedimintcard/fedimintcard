@@ -129,11 +129,12 @@ enum TillCmd {
         /// Most slots one tap keys for that reserve (a key takes about 320 ms on the card).
         #[arg(long, env = "TILL_SPARE_KEYS_PER_TAP", default_value_t = fedimint_card_sidecar::ops::MAX_KEY_PER_TAP)]
         spare_keys_per_tap: usize,
-        /// How long a POS phone's offline kit lasts, in hours (`GET /v1/offline/kit`).
+        /// How long a POS phone's offline kit lasts from the fetch that answered it, in hours
+        /// (`GET /v1/offline/kit`).
         #[arg(long, env = "TILL_OFFLINE_KIT_TTL_HOURS", default_value_t = 168)]
         offline_kit_ttl_hours: u64,
         /// Days after a kit expires that the charges a phone took with it are still taken; then
-        /// its pool's secrets are wiped.
+        /// its unused pool entries are dropped with their secrets.
         #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
         offline_kit_grace_days: u64,
     },

@@ -842,6 +842,37 @@ async fn another_card_for_a_sale_a_card_left_signing_is_refused_undecided() -> a
     Ok(())
 }
 
+/// A sale whose card left mid-SIGN offline, tapped again once the registry is back: the online
+/// path answers `undecided` and signs nothing (the card's other notes would pay the sale a second
+/// time, and the half-signed charge would still be finished at the card's next offline tap). The
+/// card's next offline tap finishes the charge it began.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_retap_of_a_sale_left_signing_offline_is_undecided() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    let first = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!((first.len(), first[0].state), (1, ChargeState::Signing));
+
+    t.set_down(false);
+    let (status, body) = t.charge(&card, 90_000, "pulled").await;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    assert_eq!(spent_slots(&card), 1, "nothing signed online");
+    assert!(t.sales.lock().unwrap().find_ref("pulled").is_none(), "no sale");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, first, "the offline charge still waits for its card");
+
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 90_000, "pulled").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began: {body}");
+    assert_eq!((t.off.stats().queued, spent_slots(&card)), (1, 2));
+    Ok(())
+}
+
 // ------------------------------------------------------------------ phones charging offline (ENG-842)
 
 fn now_ms() -> u64 {
@@ -961,7 +992,8 @@ async fn kits_are_written_before_they_are_answered_given_again_capped_and_reclai
     assert_eq!(t.kit_at(&phone, now + 3 * HOUR_MS + 3)?.kit_id, k3.kit_id, "three live kits: the newest again");
     // Another phone gets its own.
     assert_ne!(t.kit_at(&"cd".repeat(16), now)?.kit_id, k1.kit_id);
-    // Past the redeem window (a week and 30 days): the kits' unused entries are wiped.
+    // Past the redeem window (a week and 30 days): the kits' unused entries are dropped, secrets
+    // and all, and each kit's record stays as its tombstone.
     let later = now + 38 * DAY_MS;
     let k4 = t.kit_at(&phone, later)?;
     assert!(![&k1, &k2, &k3].iter().any(|k| k.kit_id == k4.kit_id));
@@ -969,12 +1001,117 @@ async fn kits_are_written_before_they_are_answered_given_again_capped_and_reclai
     for k in [&k1, &k2, &k3] {
         let kit = l["kits"].as_array().unwrap().iter().find(|x| x["kit_id"] == json!(k.kit_id)).unwrap();
         assert_eq!(kit["reclaimed"], true, "{kit}");
-        let mine: Vec<&Value> = l["entries"].as_array().unwrap().iter().filter(|e| e["kit_id"] == json!(k.kit_id)).collect();
-        assert!(!mine.is_empty() && mine.iter().all(|e| e["state"] == json!({"kind": "reclaimed"})), "secrets wiped");
+        assert!(l["entries"].as_array().unwrap().iter().all(|e| e["kit_id"] != json!(k.kit_id)), "kit {}'s entries are gone", k.kit_id);
     }
+    // Only the live kit's entries are left: the other phone's kit is past its window too.
+    assert_eq!(l["entries"].as_array().unwrap().len(), 25 * pool::KIT_DEPTH);
     // A till that never fetched the registry's certificate key issues none.
     let e = pool::issue_kit(&t.off.pool, &t.keys(), &t.off.cfg, &t.off.kits, None, None, &phone, now).unwrap_err();
     assert_eq!(till::classify(&e), till::Class { status: 503, code: "offline_not_ready" });
+    Ok(())
+}
+
+/// A kit given again is good for a week from that fetch, and at the cap of three live kits the
+/// newest is given again with its tiers topped up once one runs low, under the same id: a shop
+/// fetching its kit every few minutes never runs on a kit about to expire or drained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kit_given_again_is_good_from_that_fetch_and_topped_up_at_the_cap() -> anyhow::Result<()> {
+    let t = Till::new(OfflineConfig::default()).await?;
+    let phone = "ab".repeat(16);
+    let now = now_ms();
+    t.kit_at(&phone, now)?;
+    t.kit_at(&phone, now + HOUR_MS + 1)?;
+    let k3 = t.kit_at(&phone, now + 2 * HOUR_MS + 2)?;
+    // Day 6, 23 h after the first fetch: three kits live, so the newest, good for a week from now.
+    let at = now + 6 * DAY_MS + 23 * HOUR_MS;
+    let again = t.kit_at(&phone, at)?;
+    assert_eq!((again.kit_id.as_str(), &again.pool), (k3.kit_id.as_str(), &k3.pool), "the same kit, the same entries");
+    assert_eq!((again.issued_at_ms, again.expires_at_ms), (k3.issued_at_ms, at + 7 * DAY_MS));
+    // Written before it was answered, with its redeem window moved too.
+    let rec = |l: &Value| l["kits"].as_array().unwrap().iter().find(|k| k["kit_id"] == json!(k3.kit_id)).unwrap().clone();
+    let l = t.ledger();
+    assert_eq!((rec(&l)["expires_at_ms"].as_u64(), rec(&l)["redeem_until_ms"].as_u64()), (Some(at + 7 * DAY_MS), Some(at + 37 * DAY_MS)));
+    assert_eq!(l["entries"].as_array().unwrap().len(), 3 * 25 * pool::KIT_DEPTH, "no entry added");
+    // Asked again ten minutes later: the kit as it is, and no write.
+    let file = t.dir.path().join(pool::POOL_FILE);
+    let bytes = std::fs::read(&file)?;
+    assert_eq!(t.kit_at(&phone, at + 10 * 60_000)?, again);
+    assert_eq!(std::fs::read(&file)?, bytes, "nothing written");
+
+    // The newest kit drained at the cap: one tier is down to 2 entries.
+    let tier = again.pool[3].clone();
+    let drained: Vec<String> = tier.blinded[2..].to_vec();
+    t.off.pool.lock().unwrap().commit(|f| {
+        for e in f.entries.iter_mut().filter(|e| drained.contains(&e.blinded)) {
+            e.state = pool::EntryState::Used { txid: "00".repeat(32) };
+        }
+    })?;
+    let topped = t.kit_at(&phone, at + 20 * 60_000)?;
+    assert_eq!(topped.kit_id, k3.kit_id);
+    assert!(topped.pool.iter().all(|t| t.blinded.len() == pool::KIT_DEPTH), "{:?}", topped.depth());
+    let same = topped.pool.iter().find(|t| t.amount_msat == tier.amount_msat).unwrap();
+    assert!(tier.blinded[..2].iter().all(|b| same.blinded.contains(b)), "the entries it had are still there");
+    assert!(same.blinded.iter().all(|b| !drained.contains(b)), "a used entry is never given again");
+    let l = t.ledger();
+    assert_eq!(l["entries"].as_array().unwrap().len(), 3 * 25 * pool::KIT_DEPTH + drained.len(), "only what was used is added");
+    assert_eq!(l["kits"].as_array().unwrap().iter().filter(|k| k["phone_id"] == json!(phone)).count(), 3, "never a fourth live kit");
+    Ok(())
+}
+
+/// The ledger keeps what it needs: a request's charges are one write of the queue and one of the
+/// ledger, and once a kit is past its redeem window its unused entries go while the used ones stay,
+/// so a charge sent again after the sender settled it is still `already`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ledger_takes_a_request_in_one_write_and_keeps_only_the_used_entries_of_old_kits() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, phone, kit) = phone_and_card(&mut t, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    let a = phone.take(&card, &kit, 20_000, "one")?;
+    let b = phone.take(&card, &kit, 20_000, "two")?;
+    // A fault armed for the second write of each file: one request writes each once.
+    t.off.queue.lock().unwrap().fail_write_after(Some(1));
+    t.off.pool.lock().unwrap().fail_write_after(Some(1));
+    assert_eq!(statuses(&t.ingest(&phone.id(), phone.drained())), vec![("queued", None), ("queued", None)]);
+    t.off.queue.lock().unwrap().fail_write_after(None);
+    t.off.pool.lock().unwrap().fail_write_after(None);
+    let used_by = |l: &Value, txid: &str| l["entries"].as_array().unwrap().iter().filter(|e| e["state"]["txid"] == json!(txid)).count();
+    let l = t.ledger();
+    assert_eq!((used_by(&l, &a.txid), used_by(&l, &b.txid)), (a.pool.len(), b.pool.len()), "both marked used on disk");
+    assert_eq!(t.off.stats().queued, 2);
+    // Settled: the sender takes them out of the queue.
+    let sent = t.send().await;
+    assert_eq!(sent["settled"].as_array().unwrap().len(), 2, "{sent}");
+    assert!(t.off.queue.lock().unwrap().file.charges.is_empty());
+    // Past the kit's redeem window, the next kit call drops its unused entries.
+    let later = kit.expires_at_ms + 31 * DAY_MS;
+    t.kit_at(&phone.id(), later)?;
+    let l = t.ledger();
+    let of_kit: Vec<&Value> = l["entries"].as_array().unwrap().iter().filter(|e| e["kit_id"] == json!(kit.kit_id)).collect();
+    assert_eq!(of_kit.len(), a.pool.len() + b.pool.len(), "only the used entries are kept");
+    assert!(of_kit.iter().all(|e| e["state"]["kind"] == "used"));
+    // Sent again: the ledger knows them.
+    assert_eq!(statuses(&t.ingest_at(&phone.id(), phone.drained(), later)), vec![("already", None), ("already", None)]);
+    assert!(t.off.queue.lock().unwrap().file.charges.is_empty(), "nothing queued twice");
+    Ok(())
+}
+
+/// A request whose queue write fails is `retry` for every charge it held, a charge sent twice in
+/// it included: nothing is the till's, and no sale is recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_the_queue_cannot_take_is_retry_for_each_charge_in_it() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, phone, kit) = phone_and_card(&mut t, &[1 << 16, 1 << 16]).await?;
+    let taken = phone.take(&card, &kit, 20_000, "twice")?;
+    let c = phone.drained().remove(0);
+    let twice = vec![c.clone(), c];
+    t.off.queue.lock().unwrap().fail_write_after(Some(0));
+    let r = t.ingest(&phone.id(), twice.clone());
+    assert_eq!(r.iter().map(|x| (x.status, x.code, x.retry)).collect::<Vec<_>>(), vec![("refused", Some("internal"), true); 2]);
+    assert_eq!(t.off.stats().queued, 0);
+    assert!(t.sales.lock().unwrap().find_ref("twice").is_none(), "no sale for a charge the till does not have");
+    assert!(t.ledger()["entries"].as_array().unwrap().iter().all(|e| e["state"]["kind"] == "issued"));
+    // Sent again: the first is taken, and the second is the first.
+    assert_eq!(statuses(&t.ingest(&phone.id(), twice)), vec![("queued", None), ("already", None)]);
+    assert_eq!((t.off.stats().queued, t.sale("twice").txid), (1, taken.txid));
     Ok(())
 }
 
@@ -1157,7 +1294,10 @@ async fn the_offline_routes_answer_through_the_tills_api() -> anyhow::Result<()>
     let sales = SalesStore::open(t.dir.path().join("sales-http.json"))?;
     let off = t.off.clone();
     let (handle, _actor) = till::new_with_conn(t.cw, "http://127.0.0.1:1".into(), sales, Box::new(|| anyhow::bail!("no card")), conn).await;
-    let app = till::router(handle.with_offline(off));
+    // The till keeps a block header (it has an Esplora by default): its kits carry it.
+    let headers = fedimint_card_sidecar::clock::Headers::new(None, t.dir.path());
+    assert!(headers.offer(hex::decode(H900200)?.try_into().unwrap())?);
+    let app = till::router(handle.with_offline(off).with_headers(headers));
     let call = |req: axum::http::Request<axum::body::Body>| {
         let app = app.clone();
         async move {
@@ -1174,7 +1314,11 @@ async fn the_offline_routes_answer_through_the_tills_api() -> anyhow::Result<()>
     assert_eq!((s, cache.as_deref()), (200, Some("no-store")), "{v}");
     let kit = Kit::parse(&v.to_string())?;
     assert_eq!(kit.phone_id, phone.id());
+    assert_eq!(kit.block_header.as_deref(), Some(H900200), "the till's newest header");
+    kit.decode(&phone.id())?;
     phone.take(&card, &kit, 20_000, "http")?;
+    let header_time = fedimint_card_host_card::v3::header_time(&hex::decode(H900200)?.try_into().unwrap());
+    assert_eq!(card.borrow_mut().get_state()?.now, header_time, "the card's clock moved to the kit's header");
     let post = |body: String| axum::http::Request::post("/v1/offline/charges").header("content-type", "application/json").body(axum::body::Body::from(body)).unwrap();
     let (s, _, v) = call(post(phone.store.drain(50).body)).await;
     assert_eq!(s, 200, "{v}");

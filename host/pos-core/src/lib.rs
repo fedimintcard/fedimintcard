@@ -56,9 +56,14 @@ fn scalar<T: Decodable>(n: u64) -> T {
 
 /// The crypto the offline charge needs, run where it runs: a note signed by a one-share mint,
 /// unblinded and checked as `Note::verify` checks a card's note, a tampered one refused, and a
-/// BIP340 signature as the card makes them. True when all three hold.
+/// BIP340 signature as the card makes them. True when all three hold; false, never a panic, when
+/// the crypto does not run here (it is exported to the apps without an error type).
 #[cfg_attr(feature = "ffi", uniffi::export)]
 pub fn self_check() -> bool {
+    std::panic::catch_unwind(crypto_holds).unwrap_or(false)
+}
+
+fn crypto_holds() -> bool {
     let sk: tbs::SecretKeyShare = scalar(0x1234_5678);
     let pk = tbs::AggregatePublicKey(tbs::derive_pk_share(&sk).0);
     let key = |b: u8| Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[b; 32]).expect("a key"));

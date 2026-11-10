@@ -33,7 +33,8 @@ routes for paired phones (`docs/TILL-API.md`): `GET /v1/offline/kit` and
 ordinary recovery send it to the federation and collect its notes, and posts the outcome, as for
 the till's own offline charges. Idempotent by txid. The registry is unchanged.
 
-**The offline kit.** Fetched while online and on every sync, expiring (a week by default): the
+**The offline kit.** Fetched while online and on every sync, and good for a week (by default)
+from the fetch that answered it, a kit the till gives again included: the
 federation's id and mint module instance, its note keys per tier, its mint fees and the fee
 headroom, the registry's certificate key the till pins, the phone's caps (count and msat, the
 till's `--offline-cap-*`), the validity, the newest block header, and a **pool of till outputs per
@@ -43,18 +44,29 @@ signatures. The pool covers every tier from the smallest note the planner gives 
 on fedimint's default fees, 1 msat otherwise; with fees the till's side takes what they leave,
 and a pool from the economical denomination up could pay no price on a card with no room for
 change) to the largest at or below the phone's value cap, 40 entries a tier, fewer when the kit
-would pass 128 KB. The till never reuses an entry, and wipes those of a kit past its grace.
+would pass 128 KB. A phone holds at most 3 live kits; at that cap the till gives the newest
+again, its tiers topped up once one runs low. The till never reuses an entry, and drops the
+unused entries of a kit past its grace, secrets and all.
 
 **When the phone goes local.** Only before anything reached the till's charge route: the app's
 `linkFailed` at card-link open. A timeout after `POST /v1/charge` was sent stays "outcome unknown"
 and never falls back (the double-charge guard). Order: try the till with the quick timeout; fall
 back when the link cannot open and the kit is valid and under its caps.
 
+**A sale the local charge answered `no_card` is retried locally only** (the core's `charge`, the
+same `client_ref`), never on the till's `POST /v1/charge`, while `PosCore.signing_refs()` lists
+its `client_ref`. The card may have signed part of a transaction that only its next local tap on
+this phone finishes; an online charge would take the sale a second time from the card's other
+notes, or spend the note that transaction still needs. The apps (ENG-843, ENG-844) check
+`signing_refs()` before they try the till. The till keeps the same rule for its own offline
+queue: a tap whose `client_ref` it holds `signing` is answered `undecided` online.
+
 **Caps and the attacker.** The kit's caps are enforced by the core; an expired kit stops offline
 acceptance; the card's own daily limit applies as with any till. Double spends across phones and
 tills are found by the registry at report, as today, and counted.
 
-**What does not change.** Applet 3.0, the online charge path, the registry API and the Setup app.
+**What does not change.** Applet 3.0, the online charge path (but for the `undecided` above, for a
+sale the till's own offline queue holds `signing`), the registry API and the Setup app.
 
 ## One charge
 
@@ -70,7 +82,10 @@ spends no PIN try:
 4. a 3.0 card (`offline_unsupported_card`), its certificate and attestation (`card_not_genuine`),
    its clock (`SET_HEADER` when older; the kit's expiry again, by the card's clock), the PIN;
 5. charges this card left `signing` are finished from its stored signatures: a repeat of one is
-   that charge (`replayed`), and another card tapped for one is `undecided`;
+   that charge (`replayed`), and another card tapped for one is `undecided`. One that can never be
+   finished (an input slot since spent by another transaction, or re-keyed) is set aside as
+   `abandoned`, nothing charged for it and its pool entries never taken again, and the tap goes
+   on as a new charge, for the same `client_ref` too;
 6. the card's notes (skipping those taken offline here already, and those that do not check),
    the plan, the value cap, the card's day (`card_limit`), then `signing`, `SET_CHANGE`, `SIGN` and
    `queued`.
@@ -97,18 +112,29 @@ UniFFI, feature `ffi`: Swift module `FedimintCardPosCore`, Kotlin package
 - `PosCore.open(dir)`, `phone_id()`, `charge(transport, kit_json, price_msat, client_ref, pin)`
   returning `Paid { txid, price_msat, till_msat, overpay_msat, fees_msat, fee_margin_msat,
   inputs, change, replayed }` or `Refused { code, detail, suggested_msat, below_msat, above_msat,
-  tries_left }`, `stats()`, `drain(max)`, `mark_synced(answer_json)`, `dismiss(txid)`.
+  tries_left }`, `stats()`, `signing_refs()`, `drain(max)`, `mark_synced(answer_json)`,
+  `dismiss(txid)`.
+- Every method but `phone_id()` throws `PosCoreError` (`Store`, `Answer`, or `Internal` for a
+  failure the core did not expect, a panic caught); a refusal is `Refused`, not an error. A
+  `charge` that throws has an unknown outcome, as `no_card`: retry it locally with the same
+  `client_ref`.
 
 **Threading.** Every call blocks until it is done, and `charge` waits on the card (each SIGN is
 about a second on a J3R180). `transmit` is called on the thread that called `charge`, and waits
 for the tag's answer there: call `charge` from a worker thread or queue of the app's own, never on
 the NFC delegate's queue (iOS) or the NFC callback's thread (Android), where the tag's completion
-handler runs and would wait behind it forever. One `PosCore` per store; its calls are serialized.
+handler runs and would wait behind it forever. One `PosCore` per store (a second open of the
+store fails). Its charges run one at a time: a `charge` called while another runs waits for it,
+so the two never plan from the same pool entries; the other calls take the queue's lock only
+briefly.
 
 **Sync.** On reconnect, on app foreground and after every online charge: `drain(50)`, post its
 `body` to `POST /v1/offline/charges` while it lists charges, pass the answer to `mark_synced`, and
 fetch the kit again. `stats().waiting` plus the till's queue is "N payments waiting to sync".
-Charges the till refused are listed in `drain().refused` with their code until `dismiss`.
+Charges the till refused are listed in `drain().refused` with their code until `dismiss`. The
+phone's clock at a sync only decides which synced charges are old enough to leave the store; the
+store's latest-seen time (which an expired kit is judged by) moves only with a charge, and never
+past its kit's expiry.
 
 ## Refusals
 

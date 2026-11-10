@@ -66,8 +66,10 @@ inherits = "dev"
 debug = false
 opt-level = 1
 
-# The POS apps' library (scripts/pos-core-mobile.sh): small, and panics unwind so UniFFI can turn
-# one into an error instead of taking the app down.
+# The POS apps' library (scripts/pos-core-mobile.sh): small, and panics unwind so the core can
+# catch one. Every `PosCore` method but `phone_id` returns a Result and answers a panic as
+# `PosCoreError::Internal`, and `self_check` answers false; an export that does not throw would
+# trap the app instead (Swift calls those with `try!`).
 [profile.mobile]
 codegen-units = 1
 inherits = "release"

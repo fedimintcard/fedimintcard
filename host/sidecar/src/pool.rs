@@ -7,11 +7,11 @@
 //! A kit's pool holds blinded nonces only: the till keeps each one's spend key and blinding key
 //! (`Issued`) until a charge that pays to it is ingested, when they move to the queue entry's
 //! `host` (the ledger keeps `Used` and the txid). An entry is used once, by one phone, within its
-//! kit's redeem window (expiry plus a grace); past it, its secrets are wiped (`Reclaimed`). Writes
-//! go to the queue first, then the ledger: [`reconcile`] finishes a ledger that a crash left
-//! behind.
+//! kit's redeem window (expiry plus a grace); past it, the entries never used are dropped with
+//! their secrets, and the kit's record stays as its tombstone. Writes go to the queue first, then
+//! the ledger: [`reconcile`] finishes a ledger that a crash left behind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Mutex;
@@ -47,8 +47,12 @@ pub const KIT_DEPTH: usize = 40;
 /// [`REDELIVER_MIN_LEFT`] entries left.
 pub const REDELIVER_WITHIN_MS: u64 = 3_600_000;
 pub const REDELIVER_MIN_LEFT: usize = 4;
-/// Most kits a phone holds that have not expired; at the cap it gets the newest again.
+/// Most kits a phone holds that have not expired; at the cap it gets the newest again, its tiers
+/// topped up when one has run low.
 pub const MAX_LIVE_KITS: usize = 3;
+/// A kit given again is good for the kit lifetime from that fetch: its expiry and redeem window
+/// move then, at most once in this long (each move is a write of the ledger).
+pub const REFRESH_STEP_MS: u64 = 3_600_000;
 /// Most charges one `POST /v1/offline/charges` takes.
 pub const MAX_INGEST: usize = 50;
 const DAY_MS: u64 = 86_400_000;
@@ -83,7 +87,7 @@ pub struct KitRec {
     pub phone_id: String,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
-    /// Its entries are redeemed until then; then their secrets are wiped.
+    /// Its entries are redeemed until then; then those never used are dropped with their secrets.
     pub redeem_until_ms: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reclaimed: bool,
@@ -103,9 +107,12 @@ pub struct PoolRec {
 pub enum EntryState {
     /// In a kit, its secrets here: the note's spend key and blinding key, hex.
     Issued { secret_key: String, blinding_key: String },
-    /// A phone's charge that pays to it was ingested: its secrets are in that queue entry.
+    /// A phone's charge that pays to it was ingested: its secrets are in that queue entry. Kept
+    /// after its kit is reclaimed: how a charge sent again is known once the sender has settled
+    /// it out of the queue.
     Used { txid: String },
-    /// Its kit's redeem window passed unused: secrets wiped.
+    /// Its kit's redeem window passed unused, secrets wiped: what an earlier build kept. The next
+    /// kit call drops it.
     Reclaimed,
 }
 
@@ -218,10 +225,11 @@ impl TillKeys {
 
 // ------------------------------------------------------------------ kits
 
-/// The kit for `phone_id` (`GET /v1/offline/kit`): the one it has, while it is young and full
-/// enough (or the phone is at its cap of live kits), else a new one, written to the ledger before
-/// it is answered. Each call reclaims kits past their redeem window. `NotReady` without the
-/// registry's certificate key.
+/// The kit for `phone_id` (`GET /v1/offline/kit`): the one it has while it is young and full
+/// enough, or while the phone is at its cap of live kits (its tiers topped up if one ran low),
+/// good for the kit lifetime from this fetch; else a new one. What is answered is in the ledger
+/// first. Each call reclaims kits past their redeem window. `NotReady` without the registry's
+/// certificate key.
 pub fn issue_kit(
     pool: &Mutex<PoolLedger>,
     keys: &TillKeys,
@@ -240,11 +248,15 @@ pub fn issue_kit(
     let mut pool = pool.lock().unwrap();
     reclaim(&mut pool, now)?;
     let live: Vec<&KitRec> = pool.file.kits.iter().filter(|k| k.phone_id == phone_id && !k.reclaimed && k.expires_at_ms > now).collect();
-    let newest = live.iter().max_by_key(|k| k.issued_at_ms).copied();
-    let again = newest.filter(|k| live.len() >= MAX_LIVE_KITS || (now.saturating_sub(k.issued_at_ms) < REDELIVER_WITHIN_MS && fewest_left(&pool, k) >= REDELIVER_MIN_LEFT));
-    let rec = match again {
-        Some(k) => k.clone(),
-        None => mint_kit(&mut pool, keys, cfg, kits, &cert_key, header, phone_id, now)?,
+    let at_cap = live.len() >= MAX_LIVE_KITS;
+    let newest = live.iter().max_by_key(|k| k.issued_at_ms).map(|k| (*k).clone());
+    let kit = KitParts { keys, cfg, cert_key: &cert_key, header };
+    let rec = match newest {
+        Some(k) if at_cap => redeliver(&mut pool, k, &kit, kits, now, true)?,
+        Some(k) if now.saturating_sub(k.issued_at_ms) < REDELIVER_WITHIN_MS && fewest_left(&pool, &k) >= REDELIVER_MIN_LEFT => {
+            redeliver(&mut pool, k, &kit, kits, now, false)?
+        }
+        _ => mint_kit(&mut pool, &kit, kits, phone_id, now)?,
     };
     let kit = kit_of(&pool, &rec, keys, cfg, &cert_key, header);
     let len = serde_json::to_vec(&kit)?.len();
@@ -300,18 +312,16 @@ fn kit_of(pool: &PoolLedger, rec: &KitRec, keys: &TillKeys, cfg: &OfflineConfig,
     }
 }
 
-/// A new kit: [`KIT_DEPTH`] entries per tier, fewer if the kit would pass [`KIT_MAX_BYTES`].
-#[allow(clippy::too_many_arguments)]
-fn mint_kit(
-    pool: &mut PoolLedger,
-    keys: &TillKeys,
-    cfg: &OfflineConfig,
-    kits: &KitConfig,
-    cert_key: &str,
+/// What every kit of this call carries besides its own record and pool.
+struct KitParts<'a> {
+    keys: &'a TillKeys,
+    cfg: &'a OfflineConfig,
+    cert_key: &'a str,
     header: Option<[u8; 80]>,
-    phone_id: &str,
-    now: u64,
-) -> Result<KitRec> {
+}
+
+/// A new kit: [`KIT_DEPTH`] entries per tier, fewer if the kit would pass [`KIT_MAX_BYTES`].
+fn mint_kit(pool: &mut PoolLedger, kit: &KitParts, kits: &KitConfig, phone_id: &str, now: u64) -> Result<KitRec> {
     let rec = KitRec {
         kit_id: hex::encode(rand::random::<[u8; 16]>()),
         phone_id: phone_id.to_owned(),
@@ -320,13 +330,50 @@ fn mint_kit(
         redeem_until_ms: now + kits.ttl_ms + kits.grace_ms,
         reclaimed: false,
     };
-    let tiers = keys.pool_tiers(cfg.cap_msat);
+    let entries = top_up(pool, &rec, kit)?;
+    pool.commit(|f| {
+        f.kits.push(rec.clone());
+        f.entries.extend(entries);
+    })?;
+    Ok(rec)
+}
+
+/// The kit `rec` again, good for the kit lifetime from `now` and redeemed for the grace after
+/// that (moved at most every [`REFRESH_STEP_MS`]); with `refill`, a kit with a tier under
+/// [`REDELIVER_MIN_LEFT`] entries has every tier topped up to a new kit's depth, under its id. The
+/// entries it already had stay, so the ledger grows only by what was used. Written before it is
+/// answered.
+fn redeliver(pool: &mut PoolLedger, mut rec: KitRec, kit: &KitParts, kits: &KitConfig, now: u64, refill: bool) -> Result<KitRec> {
+    let moved = now.saturating_add(kits.ttl_ms) >= rec.expires_at_ms.saturating_add(REFRESH_STEP_MS);
+    if moved {
+        rec.expires_at_ms = now + kits.ttl_ms;
+        rec.redeem_until_ms = rec.redeem_until_ms.max(rec.expires_at_ms + kits.grace_ms);
+    }
+    let fresh = if refill && fewest_left(pool, &rec) < REDELIVER_MIN_LEFT { top_up(pool, &rec, kit)? } else { vec![] };
+    if moved || !fresh.is_empty() {
+        if !fresh.is_empty() {
+            tracing::info!("offline kit {} for phone {}: {} pool entries added to its tiers", rec.kit_id, rec.phone_id, fresh.len());
+        }
+        pool.commit(|f| {
+            if let Some(r) = f.kits.iter_mut().find(|r| r.kit_id == rec.kit_id) {
+                *r = rec.clone();
+            }
+            f.entries.extend(fresh);
+        })?;
+    }
+    Ok(rec)
+}
+
+/// New entries that fill each of the pool's tiers in kit `rec` up to the depth a kit of them
+/// holds: [`KIT_DEPTH`], fewer if the kit would pass [`KIT_MAX_BYTES`].
+fn top_up(pool: &PoolLedger, rec: &KitRec, kit: &KitParts) -> Result<Vec<PoolRec>> {
+    let tiers = kit.keys.pool_tiers(kit.cfg.cap_msat);
     if tiers.is_empty() {
         bail!("the federation has no note tier a kit's pool could hold");
     }
     // The kit's size: what it is with an empty pool, a tier's brackets, and 99 bytes an entry (its
     // 96 hex characters, quotes and a comma).
-    let mut bare = kit_of(pool, &rec, keys, cfg, cert_key, header);
+    let mut bare = kit_of(pool, rec, kit.keys, kit.cfg, kit.cert_key, kit.header);
     bare.pool = tiers.iter().map(|t| PoolTier { amount_msat: *t, blinded: vec![] }).collect();
     let base = serde_json::to_vec(&bare)?.len();
     let room = KIT_MAX_BYTES.saturating_sub(base + 1_024) / (tiers.len() * 99);
@@ -337,9 +384,13 @@ fn mint_kit(
     if depth == 0 {
         bail!("an offline kit of {} tiers does not fit in {KIT_MAX_BYTES} bytes", tiers.len());
     }
-    let mut entries = Vec::with_capacity(tiers.len() * depth);
+    let mut have: HashMap<u64, usize> = HashMap::new();
+    for e in pool.file.entries.iter().filter(|e| e.kit_id == rec.kit_id && matches!(e.state, EntryState::Issued { .. })) {
+        *have.entry(e.amount_msat).or_default() += 1;
+    }
+    let mut entries = vec![];
     for t in &tiers {
-        for _ in 0..depth {
+        for _ in have.get(t).copied().unwrap_or(0)..depth {
             let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
             let bk = BlindingKey::random();
             entries.push(PoolRec {
@@ -350,27 +401,31 @@ fn mint_kit(
             });
         }
     }
-    pool.commit(|f| {
-        f.kits.push(rec.clone());
-        f.entries.extend(entries);
-    })?;
-    Ok(rec)
+    Ok(entries)
 }
 
-/// Kits past their redeem window: their entries never used are wiped (`Reclaimed`).
+/// Kits past their redeem window are reclaimed: each kit's record stays as its tombstone, and its
+/// entries never used are dropped with their secrets (a charge naming one is refused all the
+/// same). Entries a charge used stay.
 fn reclaim(pool: &mut PoolLedger, now: u64) -> Result<()> {
     let due: HashSet<String> = pool.file.kits.iter().filter(|k| !k.reclaimed && k.redeem_until_ms <= now).map(|k| k.kit_id.clone()).collect();
-    if due.is_empty() {
+    let stale = pool.file.entries.iter().any(|e| matches!(e.state, EntryState::Reclaimed));
+    if due.is_empty() && !stale {
         return Ok(());
     }
+    let before = pool.file.entries.len();
     pool.commit(|f| {
         for k in f.kits.iter_mut().filter(|k| due.contains(&k.kit_id)) {
             k.reclaimed = true;
         }
-        for e in f.entries.iter_mut().filter(|e| due.contains(&e.kit_id) && matches!(e.state, EntryState::Issued { .. })) {
-            e.state = EntryState::Reclaimed;
-        }
-    })
+        f.entries.retain(|e| match e.state {
+            EntryState::Used { .. } => true,
+            EntryState::Issued { .. } => !due.contains(&e.kit_id),
+            EntryState::Reclaimed => false,
+        });
+    })?;
+    tracing::info!("offline pool: {} kit(s) reclaimed, {} unused entries dropped", due.len(), before - pool.file.entries.len());
+    Ok(())
 }
 
 // ------------------------------------------------------------------ ingest
@@ -409,8 +464,9 @@ struct Checked {
 
 /// Take `charges` from phone `phone_id` into the till's queue (`POST /v1/offline/charges`).
 /// Each is checked from its signed bytes alone: no federation, no registry. A charge whose txid
-/// the queue or the ledger has is `already`; one that checks is queued with the till's secrets for
-/// its pool outputs, then its pool entries are marked used, then its sale is recorded.
+/// the queue or the ledger has is `already`; those that check are queued with the till's secrets
+/// for their pool outputs, then their pool entries are marked used (one write of each file for
+/// the whole request), then their sales are recorded.
 pub fn ingest(
     queue: &Mutex<Queue>,
     pool: &Mutex<PoolLedger>,
@@ -421,66 +477,138 @@ pub fn ingest(
     now: u64,
 ) -> Vec<Ingested> {
     let decoders = mint_decoders(keys.mint_id);
-    charges
+    // The bytes of each, checked with no lock held.
+    let checked: Vec<Result<(OfflineCharge, Checked), Ingested>> = charges
         .into_iter()
         .map(|v| {
             let hint = v.get("txid").and_then(Value::as_str).unwrap_or_default().to_owned();
-            match serde_json::from_value::<OfflineCharge>(v) {
-                Ok(c) => ingest_one(queue, pool, keys, &decoders, sales, phone_id, c, now),
-                Err(e) => Ingested::refused(&hint, "bad_charge", format!("not an offline charge: {e}"), false),
+            let c = serde_json::from_value::<OfflineCharge>(v)
+                .map_err(|e| Ingested::refused(&hint, "bad_charge", format!("not an offline charge: {e}"), false))?;
+            match check(&c, keys, &decoders) {
+                Ok(x) => Ok((c, x)),
+                Err((code, detail)) => Err(Ingested::refused(&c.txid, code, detail, false)),
             }
         })
-        .collect()
+        .collect();
+    let mut results: Vec<Ingested> = vec![];
+    // Charges whose sale to record, in order, each with whether it stands or falls with the
+    // queue's write (taken by this request, or the same charge again within it).
+    let mut record: Vec<(OfflineCharge, bool)> = vec![];
+    // The answers that stand or fall with that write.
+    let mut pending: Vec<usize> = vec![];
+    {
+        // The queue's lock, then the ledger's: the order every writer of both keeps.
+        let mut q = queue.lock().unwrap();
+        let mut pl = pool.lock().unwrap();
+        let mut taken: Vec<OfflineCharge> = vec![];
+        for item in checked {
+            let (c, x) = match item {
+                Ok(p) => p,
+                Err(r) => {
+                    results.push(r);
+                    continue;
+                }
+            };
+            match decide(&q, &pl, &taken, phone_id, c, x, now) {
+                Decision::Already(entry) => {
+                    let this_request = taken.iter().any(|t| t.txid == entry.txid);
+                    if this_request {
+                        pending.push(results.len());
+                    }
+                    results.push(Ingested::ok(&entry.txid, "already"));
+                    record.push((entry, this_request));
+                }
+                Decision::Refused(r) => results.push(r),
+                Decision::Take(entry) => {
+                    pending.push(results.len());
+                    results.push(Ingested::ok(&entry.txid, "queued"));
+                    record.push((entry.clone(), true));
+                    taken.push(entry);
+                }
+            }
+        }
+        if !taken.is_empty() {
+            let r = q.commit(|f| {
+                for e in &taken {
+                    f.charges.push(e.clone());
+                    for i in &e.inputs {
+                        if !f.spent.contains(&i.nonce) {
+                            f.spent.push(i.nonce.clone());
+                        }
+                    }
+                }
+            });
+            match r {
+                Ok(()) => {
+                    let used: HashMap<&str, &str> =
+                        taken.iter().flat_map(|e| e.pool.iter().map(|p| (p.blinded.as_str(), e.txid.as_str()))).collect();
+                    let r = pl.commit(|f| {
+                        for e in f.entries.iter_mut() {
+                            if let Some(txid) = used.get(e.blinded.as_str()) {
+                                e.state = EntryState::Used { txid: (*txid).to_owned() };
+                            }
+                        }
+                    });
+                    if let Err(e) = r {
+                        // The queue has the charges and their secrets: the ledger catches up when it
+                        // is next opened.
+                        tracing::warn!("{} phone charge(s) queued, their pool entries not yet marked used: {e:#}", taken.len());
+                    }
+                }
+                Err(e) => {
+                    // Nothing was queued: each is refused for now, and the phone sends it again.
+                    let detail = format!("{e:#}");
+                    for i in &pending {
+                        results[*i] = Ingested::refused(&results[*i].txid, "internal", detail.clone(), true);
+                    }
+                    record.retain(|(_, written)| !written);
+                }
+            }
+        }
+    }
+    // A repeat after an answer that was lost records the sale too, if it was not recorded.
+    for (c, _) in &record {
+        record_sale(sales, c, phone_id);
+    }
+    results
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ingest_one(
-    queue: &Mutex<Queue>,
-    pool: &Mutex<PoolLedger>,
-    keys: &TillKeys,
-    decoders: &ModuleDecoderRegistry,
-    sales: &Mutex<SalesStore>,
-    phone_id: &str,
-    c: OfflineCharge,
-    now: u64,
-) -> Ingested {
-    let checked = match check(&c, keys, decoders) {
-        Ok(x) => x,
-        Err((code, detail)) => return Ingested::refused(&c.txid, code, detail, false),
-    };
-    // The queue's lock, then the ledger's: the order every writer of both keeps.
-    let mut q = queue.lock().unwrap();
-    let mut pl = pool.lock().unwrap();
+/// What becomes of one checked charge, given the queue, the ledger and the charges this request
+/// takes before it.
+enum Decision {
+    Already(OfflineCharge),
+    Refused(Ingested),
+    Take(OfflineCharge),
+}
+
+fn decide(q: &Queue, pl: &PoolLedger, taken: &[OfflineCharge], phone_id: &str, c: OfflineCharge, checked: Checked, now: u64) -> Decision {
+    let refused = |code, detail| Decision::Refused(Ingested::refused(&c.txid, code, detail, false));
+    if let Some(entry) = q.file.charges.iter().chain(taken).find(|x| x.txid == c.txid) {
+        return Decision::Already(entry.clone());
+    }
+    // Settled out of the queue since: the ledger has its pool entries used by it.
     let mine = |state: &EntryState| matches!(state, EntryState::Used { txid } if *txid == c.txid);
-    let had = q.file.charges.iter().any(|x| x.txid == c.txid)
-        || c.pool.iter().any(|p| pl.file.entries.iter().any(|e| e.blinded == p.blinded && mine(&e.state)));
-    if had {
-        let entry = q.file.charges.iter().find(|x| x.txid == c.txid).cloned();
-        drop(pl);
-        drop(q);
-        // A repeat after an answer that was lost: the sale, if it was not recorded.
-        record_sale(sales, entry.as_ref().unwrap_or(&c), phone_id);
-        return Ingested::ok(&c.txid, "already");
+    if c.pool.iter().any(|p| pl.file.entries.iter().any(|e| e.blinded == p.blinded && mine(&e.state))) {
+        return Decision::Already(c);
     }
     let mut host = vec![];
     for p in &c.pool {
         let Some(e) = pl.file.entries.iter().find(|e| e.blinded == p.blinded) else {
-            return Ingested::refused(&c.txid, "pool_entry_unknown", format!("pool entry {} was never issued by this till", p.blinded), false);
+            return refused(
+                "pool_entry_unknown",
+                format!("pool entry {} is not one this till holds: never issued, or of a kit past its redeem window", p.blinded),
+            );
         };
         let Some(kit) = pl.kit(&e.kit_id).filter(|k| k.phone_id == phone_id) else {
-            return Ingested::refused(&c.txid, "pool_entry_unknown", format!("pool entry {} was not issued to phone {phone_id}", p.blinded), false);
+            return refused("pool_entry_unknown", format!("pool entry {} was not issued to phone {phone_id}", p.blinded));
         };
         if e.amount_msat != p.amount_msat {
-            return Ingested::refused(&c.txid, "bad_charge", format!("pool entry {} is {} msat, not {}", p.blinded, e.amount_msat, p.amount_msat), false);
+            return refused("bad_charge", format!("pool entry {} is {} msat, not {}", p.blinded, e.amount_msat, p.amount_msat));
         }
-        let reused = q.file.charges.iter().any(|x| x.txid != c.txid && x.pool.iter().any(|y| y.blinded == p.blinded));
+        let reused = q.file.charges.iter().chain(taken).any(|x| x.txid != c.txid && x.pool.iter().any(|y| y.blinded == p.blinded));
         match &e.state {
-            EntryState::Used { .. } => {
-                return Ingested::refused(&c.txid, "pool_entry_reused", format!("pool entry {} paid another charge", p.blinded), false);
-            }
-            _ if reused => {
-                return Ingested::refused(&c.txid, "pool_entry_reused", format!("pool entry {} paid another charge", p.blinded), false);
-            }
+            EntryState::Used { .. } => return refused("pool_entry_reused", format!("pool entry {} paid another charge", p.blinded)),
+            _ if reused => return refused("pool_entry_reused", format!("pool entry {} paid another charge", p.blinded)),
             EntryState::Issued { secret_key, blinding_key } if kit.redeem_until_ms > now => host.push(HostPending {
                 amount_msat: p.amount_msat,
                 secret_key: secret_key.clone(),
@@ -490,11 +618,15 @@ fn ingest_one(
                 out_idx: Some(p.out_idx),
             }),
             EntryState::Issued { .. } | EntryState::Reclaimed => {
-                return Ingested::refused(&c.txid, "pool_entry_expired", format!("pool entry {}'s kit {} is past its redeem window", p.blinded, kit.kit_id), false);
+                return refused("pool_entry_expired", format!("pool entry {}'s kit {} is past its redeem window", p.blinded, kit.kit_id));
             }
         }
     }
-    let entry = OfflineCharge {
+    let spent_before = |n: &String| q.file.spent.contains(n) || taken.iter().any(|t| t.inputs.iter().any(|i| i.nonce == *n));
+    if let Some(i) = c.inputs.iter().find(|i| spent_before(&i.nonce)) {
+        tracing::warn!("phone charge {}: note {} was already taken offline here; the registry decides which is a double spend", c.txid, i.nonce);
+    }
+    Decision::Take(OfflineCharge {
         state: ChargeState::Queued,
         unsigned_hex: checked.unsigned_hex,
         signed_at: if c.signed_at > 0 { c.signed_at } else { now },
@@ -506,36 +638,7 @@ fn ingest_one(
         detail: None,
         synced: false,
         ..c
-    };
-    let nonces: Vec<String> = entry.inputs.iter().map(|i| i.nonce.clone()).collect();
-    if let Some(n) = nonces.iter().find(|n| q.file.spent.contains(n)) {
-        tracing::warn!("phone charge {}: note {n} was already taken offline here; the registry decides which is a double spend", entry.txid);
-    }
-    let r = q.commit(|f| {
-        f.charges.push(entry.clone());
-        for n in &nonces {
-            if !f.spent.contains(n) {
-                f.spent.push(n.clone());
-            }
-        }
-    });
-    if let Err(e) = r {
-        return Ingested::refused(&entry.txid, "internal", format!("{e:#}"), true);
-    }
-    let blinded: Vec<&str> = entry.pool.iter().map(|p| p.blinded.as_str()).collect();
-    let r = pl.commit(|f| {
-        for e in f.entries.iter_mut().filter(|e| blinded.contains(&e.blinded.as_str())) {
-            e.state = EntryState::Used { txid: entry.txid.clone() };
-        }
-    });
-    if let Err(e) = r {
-        // The queue has the charge and its secrets: the ledger catches up when it is next opened.
-        tracing::warn!("phone charge {} queued, its pool entries not yet marked used: {e:#}", entry.txid);
-    }
-    drop(pl);
-    drop(q);
-    record_sale(sales, &entry, phone_id);
-    Ingested::ok(&entry.txid, "queued")
+    })
 }
 
 /// The sale of a phone's charge, `offline` as the till's own; a `client_ref` the ledger has under

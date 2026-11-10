@@ -937,7 +937,8 @@ pub async fn charge_job(
 /// [`charge_job`] for a till that takes cards offline (`off`): when the registry or the
 /// federation does not answer within 2 s, a 3.0 card is charged offline
 /// ([`crate::offline::charge`]); while both answer, charges taken offline for any card are reported
-/// first, so the registry knows which notes they spent.
+/// first, so the registry knows which notes they spent. A sale whose offline charge a card left
+/// signing here is `undecided` online: only that card's next offline tap finishes it.
 pub async fn charge_job_with(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -954,6 +955,9 @@ pub async fn charge_job_with(
         let (reg, fed) = off.reach.probe(Some(ops), &cw.wallet, &off.dir).await;
         if reg != Some(true) || !fed {
             return offline_charge(cw, ops, off, price, client_ref, sales).await;
+        }
+        if let Some(r) = left_signing(off, client_ref.as_deref()) {
+            return r;
         }
         let mut sent = crate::offline::Sent::default();
         crate::offline::report(off, ops, None, &mut sent).await;
@@ -973,6 +977,24 @@ pub async fn charge_job_with(
     let r = charge_with(cw, price, client_ref, sales).await;
     Ops::finish(cw, base).await;
     r
+}
+
+/// `undecided` for a sale whose offline charge a card taken away mid-SIGN left `signing` in this
+/// till's queue. The card may have signed part of that transaction, which its next offline tap
+/// here finishes; an online charge would take the sale a second time from its other notes, or
+/// spend the note that transaction still needs.
+fn left_signing(off: &crate::offline::Offline, client_ref: Option<&str>) -> Option<Reply> {
+    let r = client_ref?;
+    let q = off.queue.lock().unwrap();
+    let c = q.file.charges.iter().find(|c| c.state == crate::offline::ChargeState::Signing && c.client_ref.as_deref() == Some(r))?;
+    Some(Reply::fail(
+        202,
+        "undecided",
+        format!(
+            "an earlier attempt with this client_ref was taken offline and card {} left while it signed (transaction {}); only that card's next offline tap here finishes it, so nothing was charged online",
+            c.short_id, c.txid
+        ),
+    ))
 }
 
 /// The offline path of a charge: take it, record the sale (`offline`), answer 200 with
