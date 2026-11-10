@@ -90,6 +90,10 @@ back to the USB path above.
 To try the UI without the Rust service: `MOCK_SCENARIO=success python3 tools/mock_till.py`
 (also `change`, `undecided` which records the sale after 8 s, or any error code such as `insufficient`), then `adb reverse` as above.
 
+Paired, the phone takes a 3.0 card itself when the till cannot be reached ("Paid offline") and
+syncs it when the till answers again; Settings shows the offline kit, what waits on the phone and
+any charge the till refused (docs/POS-OFFLINE.md § Android).
+
 Keep the app in the foreground while a card is being charged. The power button, Recents and
 pulling down notifications drop the NFC reader mode and with it the card. The till copes: the
 charge ends as `no_card` (nothing moved) or `undecided`/outcome unknown, in which case the app
