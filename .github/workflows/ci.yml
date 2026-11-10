@@ -76,3 +76,9 @@ jobs:
         run: cargo test --locked --workspace --profile ci -- --test-threads=2
         env:
           RUST_BACKTRACE: "1"
+      # The POS apps' interface (UniFFI) is a feature the workspace run leaves off.
+      - name: cargo test (pos-core with ffi)
+        working-directory: host
+        run: cargo test --locked -p fedimint-card-pos-core --features ffi --profile ci
+        env:
+          RUST_BACKTRACE: "1"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["card", "fed-tests", "sidecar"]
+members = ["card", "fed-tests", "pos-core", "sidecar"]
 
 [workspace.package]
 edition = "2024"
@@ -54,6 +54,7 @@ secp256k1-sys = { opt-level = 3 }
 subtle = { opt-level = 3 }
 
 # The planner searches a few million combinations; keep it fast in debug builds.
+fedimint-card-pos-core = { opt-level = 2 }
 fedimint-card-sidecar = { opt-level = 2 }
 
 [profile.ci]
@@ -64,3 +65,13 @@ inherits = "dev"
 [profile.ci.build-override]
 debug = false
 opt-level = 1
+
+# The POS apps' library (scripts/pos-core-mobile.sh): small, and panics unwind so UniFFI can turn
+# one into an error instead of taking the app down.
+[profile.mobile]
+codegen-units = 1
+inherits = "release"
+lto = true
+opt-level = "z"
+panic = "unwind"
+strip = true
