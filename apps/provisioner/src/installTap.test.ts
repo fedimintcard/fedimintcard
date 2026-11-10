@@ -459,7 +459,7 @@ describe('a J3R452 as it ships, at key set version FF', () => {
   /** GET DATA E0 with no secure channel: first contact's read of the key information. */
   const KEY_INFORMATION = [0x80, 0xca, 0x00, 0xe0, 0x00];
 
-  test('on the public default: installed, moved to version 01 under its own keys by first contact, keyed and PINned in one tap', async () => {
+  test('on the public default: installed, moved to version 01 under its own keys by first contact, keyed and given its PIN in one tap', async () => {
     const card = shipped();
     const {opts, managerKeys} = options();
     const r = await installTap(card.transceive, opts);

@@ -313,7 +313,7 @@ describe('provision: the Fedimint card', () => {
     });
   }
 
-  it("leaves a J3R452's own applets where they were: the sweep's DELETEs of this card's AIDs answer 6A88, and only this card's objects are added", async () => {
+  it("leaves a J3R452's own applets where they were: each DELETE of the sweep, naming this card's AIDs, answers 6A88, and only this card's objects are added", async () => {
     const card = new FakeCard({scp: 3, sellerApplets: true});
     const seller = SELLER_APPLETS.map(a => a.instance);
     const sellerPackages = SELLER_APPLETS.map(a => a.pkg);
