@@ -174,19 +174,19 @@ queue, where the NFC tag answers; an APDU the card does not answer in 15 s is lo
 
 **When the phone takes the card.** At `linkFailed` of a charge only, in the same NFC session, when
 the till is not serving (no connection, the link's quick timeout, a handshake that fails, a 5xx),
-no earlier attempt of the sale reached the till's charge route without an answer that proves
-nothing moved, and the kit is there, unexpired and under its caps. The answers that prove it are
-the definitive refusals (`insufficient`, `no_exact_plan`, `offline_no_change_room`, `declined`,
-`bad_request`, `no_card`, `card_error`, `wrong_pin`, `pin_blocked`). After any other answer to a
-`POST /v1/charge` (a 500, a 5xx the app cannot read, a code it does not know, no answer at all)
-the till may have taken the sale, and only the till's own `client_ref` guard stops a second
-charge, so a retry that cannot reach the till shows the unreachable screen and takes nothing.
-A 401 or 403 never falls back: the pairing is dead. An unresolved sale whose retry cannot reach the
-till stays on the unreachable screen with the lost reply's copy, and "Outcome unknown" is as it
-was. Otherwise the unreachable screen says which: no kit yet, the kit expired, or the caps reached.
-Balance reads and top-ups never fall back. The till's own answers with the codes of its offline
-path (`offline_cap_reached`, `offline_not_ready`, `offline_note_invalid`) read as before, in the
-till's words: the phone's copy for them is about the phone's kit and queue.
+no earlier attempt of the sale was sent to the till's charge route at all, and the kit is there,
+unexpired and under its caps. A till on ops refuses from its card checks (`no_card`, `wrong_pin`)
+before it looks at an earlier attempt with that `client_ref`, so a refusal proves nothing about
+the attempt before it. Once a `POST /v1/charge` was sent for the sale, whatever it answered (a
+refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at all), only the
+till's own `client_ref` guard stops a second charge, so a retry that cannot reach the till shows
+the unreachable screen and takes nothing. A 401 or 403 never falls back: the pairing is dead. An
+unresolved sale whose retry cannot reach the till stays on the unreachable screen with the lost
+reply's copy, and "Outcome unknown" is as it was. Otherwise the unreachable screen says which: no
+kit yet, the kit expired, or the caps reached. Balance reads and top-ups never fall back. The
+till's own answers with the codes of its offline path (`offline_cap_reached`, `offline_not_ready`,
+`offline_note_invalid`) read as before, in the till's words: the phone's copy for them is about
+the phone's kit and queue.
 
 **Local only.** A sale in `signing_refs()`, or whose last local charge answered `undecided` or
 threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatever the till's
@@ -208,15 +208,28 @@ kept, when the kept one is 10 minutes old, after a sync that synced a charge, an
 waits a minute before the next. A kit is kept only when it is `ok:true`, for this phone, and of
 the till's federation. The sync runs on reconnect, on foreground and after every charge, until a
 drain finds nothing waiting: up to 20 rounds of `drain(50)`, its body to
-`POST /v1/offline/charges`, the 200 answer to `mark_synced`; any HTTP failure or a round that
-moves nothing stops it. Both talk to the till the poll reached, whatever is paired by the time
-they ask. After a sync that synced, the till's status is read again, so the home screen's count
-(the till's queue plus the phone's) moves once.
+`POST /v1/offline/charges`, the 200 answer to `mark_synced`. It stops on an HTTP error, a round
+the till took none of, or charges the till does not know, then waits a minute. A till answers
+`pool_entry_unknown`, `bad_note` or `bad_charge` for a charge taken with another till's kit (pool
+entries it never issued, notes of another federation). The till a charge was taken for never does
+within the charge's redeem window: the core checked the notes against that till's kit, and the
+pool entries stay that till's. So the phone does not take those answers as final: the charge
+keeps waiting, Settings says "N payments wait for the till they were taken for", and it syncs
+once the phone is paired with that till again. Any other refusal is as the till says: final, or
+sent again when it says `retry`. Both talk to the till the poll reached, whatever is paired by
+the time they ask. After a sync that synced, the till's status is read again, so the home
+screen's count (the till's queue plus the phone's) moves once.
 
 **Settings.** The kit's age, its expiry and the caps; the payments waiting to sync, held for their
-cards and synced, or why offline is off; and each charge the till refused, with its code and
-Dismiss behind "Delete this record?". Pairing another till, or forgetting this one, with payments
-on the phone asks "Unpair anyway?" first; they stay on the phone, and another till refuses them.
+cards and synced, or why offline is off; why the last sync stopped short ("Sync stopped: the till
+did not answer"), until a sync finds nothing waiting; and each charge the till refused, with its
+code and Dismiss behind "Delete this record?". Pairing another till, or forgetting this one, with
+payments on the phone asks "Unpair anyway?" first; they stay on the phone, and sync only to the
+till they were taken for.
+
+**Limits.** 50 or more charges for another till at the head of the queue hold back the charges
+taken since with the new till's kit. A charge its own till no longer knows (synced after its
+redeem window) waits for good instead of being listed refused.
 
 **The owner's pass on the Max.**
 
@@ -231,6 +244,8 @@ on the phone asks "Unpair anyway?" first; they stay on the phone, and another ti
 6. The phone locked mid-tap: the sale is held or not taken, never taken twice.
 7. The file class of the core's files (`offline_queue.json`, `phone-id`, `store.lock`) and of
    `kit.json`: complete.
+8. With a second till at hand, pair it while payments wait (they keep waiting, "N payments wait
+   for the till they were taken for"), then pair back (they sync).
 
 ## Refusals
 

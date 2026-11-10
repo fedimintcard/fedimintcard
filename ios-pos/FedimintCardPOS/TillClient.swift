@@ -205,7 +205,13 @@ extension TillClient {
 
     /// `POST /v1/offline/charges` with the body the core drained: the till's answer on 200.
     func postOfflineCharges(_ body: String) async -> TillResult<Data> {
-        Self.raw(await call(request("POST", "/v1/offline/charges", body: Data(body.utf8), timeout: Self.offlineTimeout)))
+        Self.raw(await offlineChargesReply(body))
+    }
+
+    /// The same request, the till's reply whatever its status: the sync names the status that
+    /// stopped it.
+    func offlineChargesReply(_ body: String) async -> Result<RawResponse, TillError> {
+        await call(request("POST", "/v1/offline/charges", body: Data(body.utf8), timeout: Self.offlineTimeout))
     }
 
     private static func raw(_ r: Result<RawResponse, TillError>) -> TillResult<Data> {

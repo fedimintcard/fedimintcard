@@ -114,7 +114,7 @@ struct SettingsView: View {
 }
 
 /// The phone's offline side: the kit's age, expiry and caps, what the store holds (or why offline
-/// is off), and the charges the till refused, each with Dismiss.
+/// is off), why the last sync stopped short, and the charges the till refused, each with Dismiss.
 struct OfflinePanel: View {
     let phone: OfflineSnapshot
     let onDismiss: (RefusedOfflineCharge) -> Void

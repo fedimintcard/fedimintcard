@@ -115,8 +115,8 @@ func unpairWarningText(_ count: Int) -> String {
         : "\(count) payments are waiting to sync with this till. They stay on this phone and can't be synced to another till."
 }
 
-/// Settings' offline lines: why offline is off, or the kit (its age and expiry, the phone's caps)
-/// and what the store holds.
+/// Settings' offline lines: why offline is off, or the kit (its age and expiry, the phone's caps),
+/// what the store holds and why the last sync stopped short.
 func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64) -> [String] {
     guard phone.enabled else {
         return ["Offline payments are off on this phone" + (phone.disabledReason.map { ": \($0)" } ?? ".")]
@@ -130,5 +130,6 @@ func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64) -> [String] {
     }
     let s = phone.stats
     lines.append("\(s.waiting) waiting to sync · \(s.signing) held for their cards · \(s.synced) synced")
+    if let why = phone.syncStopped { lines.append("Sync stopped: \(why)") }
     return lines
 }

@@ -204,7 +204,7 @@ final class PosControllerOfflineTests: XCTestCase {
         guard case .error(let e) = r.pos.state else { return XCTFail("\(r.pos.state)") }
         XCTAssertEqual(e.kind, .noCard)
         XCTAssertEqual(e.unresolvedRef, ref, "still held")
-        XCTAssertEqual(abandonCopy(held: r.pos.phone.localOnlyRefs.contains(e.clientRef)), heldAbandon)
+        XCTAssertEqual(r.pos.abandonMessage(for: e), heldAbandon)
         r.pos.send(.backPressed)
         XCTAssertEqual(r.pos.state, .error(e))
         // Its card again: the sale is finished on the phone.
@@ -220,5 +220,63 @@ final class PosControllerOfflineTests: XCTestCase {
         XCTAssertEqual(r.core.charges.map(\.ref), [ref, ref])
         XCTAssertFalse(r.till.paths.contains("/v1/charge"), "a held sale never reaches the till's charge route")
         await r.until("the receipt's poll") { !r.pos.pollInFlight }
+    }
+
+    /// The Abandon alert's copy is the controller's, from the phone's snapshot: the online one for
+    /// an unresolved sale of the till's, the held one for a sale the phone holds, whatever its
+    /// retry answered.
+    func testTheAbandonAlertSaysWhetherThePhoneHoldsTheSale() async {
+        let r = ControllerRig()
+        await r.open()
+        await r.poll()
+        // The till's sale, its reply lost.
+        r.till.fail("/v1/charge", .timeout)
+        r.ring(5)
+        r.pos.send(.cardPresent)
+        await r.until("the till's answer") { if case .error = r.pos.state { return true }; return false }
+        guard case .error(let online) = r.pos.state else { return XCTFail("\(r.pos.state)") }
+        XCTAssertEqual(online.kind, .timeoutUnknown)
+        XCTAssertEqual(online.unresolvedRef, online.clientRef)
+        XCTAssertEqual(r.pos.abandonMessage(for: online),
+                       "If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
+        r.pos.send(.abandonPressed)
+        XCTAssertEqual(r.pos.state, .entering)
+        // A sale the phone holds (its card was taken away mid-SIGN), whose retry answers no_card.
+        r.pos.key(5)
+        r.pos.send(.chargePressed)
+        guard case .enteringPin(_, let ref, _, _, _) = r.pos.state else { return XCTFail("\(r.pos.state)") }
+        r.core.signing = [ref]
+        await r.phone.refresh()
+        r.core.outcomes = [.refused(code: "no_card", detail: "the card left", suggestedMsat: nil, triesLeft: nil)]
+        r.typePin()
+        r.reader.onCard?(MockCard())
+        await r.until("the core's answer") { if case .error = r.pos.state { return true }; return false }
+        guard case .error(let held) = r.pos.state else { return XCTFail("\(r.pos.state)") }
+        XCTAssertEqual(held.kind, .noCard)
+        XCTAssertEqual(held.unresolvedRef, ref)
+        XCTAssertEqual(r.pos.abandonMessage(for: held), heldAbandon)
+        r.pos.stop()
+    }
+
+    /// Charges another till does not know wait for the till they were taken for, and the polls of
+    /// the next minute do not post them again; the sync stays wanted and goes a minute on.
+    func testChargesKeptForTheirTillArePostedOnceAMinute() async {
+        let r = ControllerRig()
+        await r.open()
+        r.core.waiting = ["t1", "t2"]
+        r.till.answer("/v1/offline/charges", 200, OfflineFlowTests.answer([("t1", "refused", "pool_entry_unknown", false),
+                                                                           ("t2", "refused", "pool_entry_unknown", false)]))
+        await r.poll()
+        XCTAssertEqual(r.posts, 1)
+        XCTAssertEqual(r.pos.phone.syncStopped, "2 payments wait for the till they were taken for")
+        XCTAssertEqual(r.pos.phone.stats.waiting, 2)
+        XCTAssertTrue(r.pos.phone.refused.isEmpty)
+        r.now = Offline.t0 + 30_000
+        await r.poll()
+        XCTAssertEqual(r.posts, 1, "two polls within the minute post once")
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs
+        await r.poll()
+        XCTAssertEqual(r.posts, 2, "still wanted: a minute on, the sync asks again")
+        XCTAssertEqual(r.core.waiting, ["t1", "t2"])
     }
 }

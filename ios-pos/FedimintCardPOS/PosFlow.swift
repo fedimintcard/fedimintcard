@@ -75,9 +75,12 @@ enum ErrorKind: Equatable {
     /// Outcome may already have happened: starts an unresolved sale.
     var needsSalesCheck: Bool { self == .undecided || self == .timeoutUnknown || self == .heldOnPhone }
 
-    /// Nothing moved: clears an unresolved sale. A PIN refusal comes from inside the spend, after the
-    /// till has settled any earlier attempt with the same ref. `pin_required`, the ops codes, and the
-    /// link/auth refusals are answered before that, so they prove nothing about an earlier attempt.
+    /// Nothing moved: clears an unresolved sale. A till without ops refuses the PIN from inside the
+    /// spend, after it has settled any earlier attempt with the same ref; a till on ops answers its
+    /// card attach's `no_card`, `card_error`, `wrong_pin` and `pin_blocked` before it looks at one,
+    /// so no refusal lets a sale sent to the till fall back to the phone (`PosFlow.sentToTill`).
+    /// `pin_required`, the ops codes and the link/auth refusals come before the earlier attempt on
+    /// every till, so they prove nothing about it.
     var definitive: Bool {
         [.insufficient, .noExactPlan, .offlineNoChangeRoom, .declined, .badRequest, .noCard, .cardError, .wrongPin, .pinBlocked].contains(self)
     }
@@ -268,10 +271,13 @@ final class PosFlow {
     private var localSession = false
     /// The charge in progress is on the phone.
     private var localChargeId: Int?
-    /// Sales sent to the till's charge route with no answer since that proves nothing moved (a
-    /// definitive refusal): never taken on the phone, whatever their unresolved state. A 500, a
-    /// 5xx the app cannot read or a code it does not know leave nothing unresolved, yet the till
-    /// may have taken the sale; its `client_ref` guard is the till's alone (docs/POS-OFFLINE.md).
+    /// Sales sent to the till's charge route: never taken on the phone, whatever the till answered
+    /// since or their unresolved state. The route had the sale, and nothing it answers later proves
+    /// the earlier attempt was not taken: a till on ops answers `no_card`, `card_error`, `wrong_pin`
+    /// and `pin_blocked` from its card attach before it looks at an earlier attempt with the same
+    /// `client_ref`, and a 500, a 5xx the app cannot read or a code it does not know leave nothing
+    /// unresolved. Only the till's own `client_ref` guard stops a second charge
+    /// (docs/POS-OFFLINE.md). Dropped on success, when the sale is done.
     private var sentToTill: Set<String> = []
 
     init(newRef: @escaping () -> String = { UUID().uuidString.lowercased() }) { self.newRef = newRef }
@@ -449,7 +455,8 @@ final class PosFlow {
                 localChargeId = cid
                 return [.startLocalCharge(chargeId: cid, priceMsat: price, clientRef: ref, pin: pin)]
             }
-            // The till's charge route has the sale now, until it answers that nothing moved.
+            // The till's charge route has the sale now: nothing it answers later proves this attempt
+            // was not taken, so the sale never falls back to the phone.
             sentToTill.insert(ref)
             return [.startCharge(chargeId: cid, priceMsat: price, clientRef: ref, pin: pin)]
 
@@ -469,9 +476,10 @@ final class PosFlow {
             let unresolved = returnTo?.unresolvedRef
             if te == .unreachable || te == .timeout {
                 // The till is not serving. The phone takes the card itself, in the same NFC session,
-                // only for a sale no earlier attempt sent to the till's charge route without an
-                // answer that proves nothing moved (an unresolved one's reply may only have been
-                // lost), while the kit is valid and under its caps (docs/POS-OFFLINE.md).
+                // only for a sale no attempt was ever sent to the till's charge route for (an
+                // unresolved one's reply may only have been lost, and a refusal proves nothing about
+                // the attempt before it), while the kit is valid and under its caps
+                // (docs/POS-OFFLINE.md).
                 let sent = unresolved != nil || sentToTill.contains(ref)
                 let avail = offline.availability(priceMsat: price, nowMs: clock())
                 if !sent && avail == .ready {
@@ -554,8 +562,8 @@ final class PosFlow {
                 sentToTill.remove(ref)
                 state = .receipt(receipt)
             case .declined(let code, let detail, _, _) where code == .wrongPin:
-                // Nothing moved; the same ref is a fresh attempt (TILL-API, wrong_pin).
-                if !local { sentToTill.remove(ref) }
+                // The same ref is a fresh attempt (TILL-API, wrong_pin). A sale sent to the till
+                // stays in `sentToTill`: the refusal proves nothing about an earlier attempt.
                 let left = parseTriesLeft(detail)
                 if left == 0 {
                     state = .error(PosErrorInfo(priceMsat: price, kind: .pinBlocked, detail: "", clientRef: ref, unresolvedRef: held ? ref : nil))
@@ -565,7 +573,6 @@ final class PosFlow {
                 }
             case .declined(let code, let detail, _, let suggested):
                 let kind = Self.kind(code, local: local)
-                if !local && kind.definitive { sentToTill.remove(ref) }
                 state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: kind, detail: detail, suggestedMsat: suggested, held: held)
             case .failed(let te):
                 var detail = ""

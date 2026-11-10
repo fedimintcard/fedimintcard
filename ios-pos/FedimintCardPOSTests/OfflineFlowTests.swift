@@ -365,23 +365,33 @@ final class OfflineFlowTests: XCTestCase {
         }
     }
 
-    /// The till's definitive refusals prove nothing moved: the sale is free to go to the phone.
-    func testARetryAfterTheTillSaidNothingMovedStillFallsBack() {
+    /// A refusal from the till's charge route proves nothing about the attempt before it: a till on
+    /// ops answers `no_card`, `card_error`, `wrong_pin` and `pin_blocked` from its card attach,
+    /// before it looks at an earlier attempt with the same `client_ref`. So once `POST /v1/charge`
+    /// was sent for a sale, a retry whose link fails never takes the card on the phone, whatever
+    /// the till answered, with a kit that would take it.
+    func testARetryAfterAnyAnswerFromTheTillsChargeRouteNeverFallsBack() {
         let answers: [ChargeResult] = [
             .declined(code: .noCard, detail: "", httpStatus: 409),
             .declined(code: .insufficient, detail: "", httpStatus: 402),
             .declined(code: .wrongPin, detail: "wrong PIN; 2 tries left before the card blocks", httpStatus: 403),
         ]
         for answer in answers {
-            let f = flow()
+            let f = flow(offline: Offline.ready())
             _ = toWaiting(f)
             guard case .startCharge(let id, _, let ref, _)? = f.dispatch(.cardPresent).first else { return XCTFail("\(answer)") }
             f.dispatch(.chargeDone(chargeId: id, result: answer))
             if case .error = f.state { f.dispatch(.retryPressed) }
             guard case .startCardSession(.charge)? = toWaiting(f).first else { return XCTFail("\(answer): \(f.state)") }
+            XCTAssertEqual(f.offline.availability(priceMsat: 5000, nowMs: Offline.t0), .ready, "\(answer): the kit would take it")
             let fx = f.dispatch(.linkFailed(.unreachable))
-            guard case .startLocalCharge(_, 5000, let local, _)? = fx.first, fx.count == 1 else { return XCTFail("\(answer): \(fx)") }
-            XCTAssertEqual(local, ref, "\(answer)")
+            guard case .failCardSession("Can't reach the till")? = fx.first, fx.count == 1 else { return XCTFail("\(answer): \(fx)") }
+            XCTAssertFalse(fx.contains { if case .startLocalCharge = $0 { return true }; return false }, "\(answer)")
+            guard let e = errorInfo(f) else { return XCTFail("\(answer): \(f.state)") }
+            XCTAssertEqual(e.kind, .tillUnreachable, "\(answer)")
+            XCTAssertEqual(e.clientRef, ref, "\(answer)")
+            XCTAssertNil(e.unresolvedRef, "\(answer)")
+            XCTAssertFalse(f.holdsPin, "\(answer)")
         }
     }
 
@@ -709,10 +719,178 @@ final class OfflineFlowTests: XCTestCase {
         let out = await r.phone.sync(client: r.client, tillURL: Offline.base)
         XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 0, drainedEmpty: false))
         XCTAssertEqual(r.till.paths.filter { $0 == "/v1/offline/charges" }.count, 1, "one round, not twenty")
-        // Another till paired meanwhile: nothing is sent to it.
+        // Another till paired meanwhile: nothing is sent to it (a minute on, past the stop's wait:
+        // the sync drains, and stops at the pairing).
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs
         r.phone.tillChanged(to: "http://10.0.0.9:9877")
         _ = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(syncDrains(r), 2)
         XCTAssertEqual(r.till.paths.filter { $0 == "/v1/offline/charges" }.count, 1)
+    }
+
+    /// A round that moved nothing says so in Settings, and the syncs of the next minute neither
+    /// drain nor post.
+    func testARoundTheTillTookNoneOfSaysSoAndWaitsAMinute() async {
+        let r = Runner()
+        await r.ready()
+        r.core.waiting = ["t1", "t2"]
+        r.till.answer("/v1/offline/charges", 200, Self.answer([("t1", "refused", "internal", true), ("t2", "refused", "internal", true)]))
+        let out = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 0, drainedEmpty: false))
+        XCTAssertEqual(r.phone.snapshot.syncStopped, "the till took none of 2 (it asked for them again later)")
+        XCTAssertEqual(offlinePanelLines(r.phone.snapshot, nowMs: r.now).last, "Sync stopped: the till took none of 2 (it asked for them again later)")
+        XCTAssertEqual(posts(r).count, 1)
+        let drains = syncDrains(r)
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs - 1
+        let quiet = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(quiet, OfflinePhone.SyncOutcome())
+        XCTAssertEqual(posts(r).count, 1, "not again within the minute")
+        XCTAssertEqual(syncDrains(r), drains, "nor drained")
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs
+        r.till.answer("/v1/offline/charges", 200, Self.answer([("t1", "queued", nil, nil), ("t2", "queued", nil, nil)]))
+        let again = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(again, OfflinePhone.SyncOutcome(synced: 2, drainedEmpty: true))
+        XCTAssertEqual(posts(r).count, 2)
+        XCTAssertNil(r.phone.snapshot.syncStopped, "a drain that finds nothing clears the line")
+        XCTAssertEqual(offlinePanelLines(r.phone.snapshot, nowMs: r.now).last, "0 waiting to sync · 0 held for their cards · 0 synced")
+    }
+
+    /// Every HTTP failure, and a 200 the core refuses, stops the sync with its reason in Settings
+    /// and marks nothing; the next post is a minute on.
+    func testAFailedPostSaysWhyAndWaitsAMinute() async {
+        let cases: [(String, (FakeTill) -> Void)] = [
+            ("the till did not answer", { $0.fail("/v1/offline/charges", .unreachable) }),
+            ("the till took too long", { $0.fail("/v1/offline/charges", .timeout) }),
+            ("the connection broke off", { $0.fail("/v1/offline/charges", .interrupted) }),
+            ("the till refused the sync (HTTP 503)", { $0.answer("/v1/offline/charges", 503, #"{"ok":false,"error":"offline_not_ready"}"#) }),
+            ("the till refused the sync (HTTP 403)", { $0.answer("/v1/offline/charges", 403, #"{"ok":false,"error":"unauthorized"}"#) }),
+            // The core's words for an answer it refuses (the fake core's here).
+            ("not an answer", { $0.answer("/v1/offline/charges", 200, #"{"ok":false,"error":"internal"}"#) }),
+        ]
+        for (why, set) in cases {
+            let r = Runner()
+            await r.ready()
+            r.core.waiting = ["t1"]
+            set(r.till)
+            let out = await r.phone.sync(client: r.client, tillURL: Offline.base)
+            XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 0, drainedEmpty: false), why)
+            XCTAssertEqual(r.core.waiting, ["t1"], why)
+            XCTAssertEqual(r.phone.snapshot.syncStopped, why)
+            XCTAssertEqual(offlinePanelLines(r.phone.snapshot, nowMs: r.now).last, "Sync stopped: \(why)")
+            r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs - 1
+            _ = await r.phone.sync(client: r.client, tillURL: Offline.base)
+            XCTAssertEqual(posts(r).count, 1, why)
+            r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs
+            _ = await r.phone.sync(client: r.client, tillURL: Offline.base)
+            XCTAssertEqual(posts(r).count, 2, why)
+        }
+    }
+
+    /// Till A is out of reach, the phone takes sales with A's kit, and the operator pairs till B
+    /// ("Unpair anyway?": they stay on the phone). B does not know them: its refusals are never
+    /// final, it is not asked again within the minute, and the charges sync once the phone is
+    /// paired with A again.
+    func testChargesAnotherTillDoesNotKnowWaitForTheTillTheyWereTakenFor() async {
+        let r = Runner()
+        await r.ready()
+        r.core.waiting = ["t1", "t2"]
+        let tillB = "http://10.0.0.9:9877"
+        let clientB = TillClient(pairing: { TillPairing(baseURL: tillB, token: "tok") }, transport: r.till)
+        r.phone.tillChanged(to: tillB)
+        r.till.answer("/v1/offline/charges", 200,
+                      Self.answer([("t1", "refused", "pool_entry_unknown", false), ("t2", "refused", "pool_entry_unknown", false)]))
+        let out = await r.phone.sync(client: clientB, tillURL: tillB)
+        XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 0, drainedEmpty: false))
+        XCTAssertEqual(r.core.waiting, ["t1", "t2"], "not refused for good")
+        XCTAssertTrue(r.core.refused.isEmpty)
+        XCTAssertTrue(r.phone.snapshot.refused.isEmpty)
+        XCTAssertEqual(r.phone.snapshot.stats.waiting, 2)
+        XCTAssertEqual(posts(r).count, 1)
+        XCTAssertEqual(r.phone.snapshot.syncStopped, "2 payments wait for the till they were taken for")
+        XCTAssertEqual(offlinePanelLines(r.phone.snapshot, nowMs: r.now).last, "Sync stopped: 2 payments wait for the till they were taken for")
+        // B's answer would not change: within the minute a sync neither drains nor posts.
+        let drains = syncDrains(r)
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs - 1
+        let quiet = await r.phone.sync(client: clientB, tillURL: tillB)
+        XCTAssertEqual(quiet, OfflinePhone.SyncOutcome())
+        XCTAssertEqual(posts(r).count, 1)
+        XCTAssertEqual(syncDrains(r), drains)
+        // A minute on it asks again, and B still does not know them.
+        r.now = Offline.t0 + OfflinePhone.syncRetryAfterMs
+        _ = await r.phone.sync(client: clientB, tillURL: tillB)
+        XCTAssertEqual(posts(r).count, 2)
+        XCTAssertEqual(r.core.waiting, ["t1", "t2"])
+        XCTAssertTrue(r.phone.snapshot.refused.isEmpty)
+        // Paired with A again, which takes them.
+        r.phone.tillChanged(to: Offline.base)
+        r.now = Offline.t0 + 2 * OfflinePhone.syncRetryAfterMs
+        r.till.answer("/v1/offline/charges", 200, Self.answer([("t1", "queued", nil, nil), ("t2", "queued", nil, nil)]))
+        let back = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(back, OfflinePhone.SyncOutcome(synced: 2, drainedEmpty: true))
+        XCTAssertTrue(r.core.waiting.isEmpty)
+        XCTAssertNil(r.phone.snapshot.syncStopped)
+        XCTAssertEqual(posts(r).map(\.url.absoluteString), [tillB, tillB, Offline.base].map { $0 + "/v1/offline/charges" })
+    }
+
+    /// What a till does know syncs; the rest of the batch waits for the till it was taken for.
+    func testABatchAnotherTillPartlyKnowsSyncsWhatItKnows() async {
+        let r = Runner()
+        await r.ready()
+        r.core.waiting = ["t1", "t2"]
+        r.till.answer("/v1/offline/charges", 200, Self.answer([("t1", "queued", nil, nil), ("t2", "refused", "bad_charge", false)]))
+        let out = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 1, drainedEmpty: false))
+        XCTAssertEqual(r.core.waiting, ["t2"])
+        XCTAssertTrue(r.phone.snapshot.refused.isEmpty)
+        XCTAssertEqual(posts(r).count, 1, "the next drain would start with t2 again")
+        XCTAssertEqual(r.phone.snapshot.syncStopped, "1 payment waits for the till it was taken for")
+        XCTAssertTrue(r.phone.kitRefreshDue(), "a sync that synced asks for a new kit")
+    }
+
+    /// Only the till that issued a charge's pool entries says they were reused or are past their
+    /// redeem window, and a card signature that does not verify fails at every till: final.
+    func testAReusedOrExpiredPoolEntryIsStillFinal() async {
+        let r = Runner()
+        await r.ready()
+        r.core.waiting = ["t1", "t2", "t3"]
+        r.till.answer("/v1/offline/charges", 200, Self.answer([("t1", "refused", "pool_entry_reused", false), ("t2", "refused", "pool_entry_expired", false),
+                                                               ("t3", "refused", "bad_signature", false)]))
+        let out = await r.phone.sync(client: r.client, tillURL: Offline.base)
+        XCTAssertEqual(out, OfflinePhone.SyncOutcome(synced: 0, drainedEmpty: true), "a refusal is progress")
+        XCTAssertTrue(r.core.waiting.isEmpty)
+        XCTAssertEqual(r.phone.snapshot.refused.map(\.code), ["pool_entry_reused", "pool_entry_expired", "bad_signature"])
+        XCTAssertNil(r.phone.snapshot.syncStopped)
+        XCTAssertEqual(posts(r).count, 1)
+    }
+
+    func testOnlyTheRefusalsOfATillThatDoesNotKnowTheChargeWait() throws {
+        let answer = Self.answer([
+            ("t1", "refused", "pool_entry_unknown", false), ("t2", "refused", "bad_note", false), ("t3", "refused", "bad_charge", nil),
+            ("t4", "refused", "pool_entry_reused", false), ("t5", "refused", "pool_entry_expired", false), ("t6", "refused", "bad_signature", false),
+            ("t7", "refused", "internal", true), ("t8", "queued", nil, nil), ("t9", "already", nil, nil),
+        ])
+        let (kept, n) = OfflinePhone.keepForTheirTill(answer)
+        XCTAssertEqual(n, 3)
+        let o = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(kept.utf8)) as? [String: Any])
+        XCTAssertEqual(o["ok"] as? Bool, true)
+        let results = try XCTUnwrap(o["results"] as? [[String: Any]])
+        XCTAssertEqual(results.map { $0["txid"] as? String }, (1...9).map { "t\($0)" })
+        XCTAssertEqual(results.map { $0["code"] as? String },
+                       ["pool_entry_unknown", "bad_note", "bad_charge", "pool_entry_reused", "pool_entry_expired", "bad_signature", "internal", nil, nil])
+        XCTAssertEqual(results.map { ($0["retry"] as? Bool).map { "\($0)" } ?? "absent" },
+                       ["true", "true", "true", "false", "false", "false", "true", "absent", "absent"])
+        // Nothing to keep, or not an answer: the till's words go to the core as they came.
+        for a in [
+            Self.answer([("t6", "refused", "bad_signature", false)]),
+            Self.answer([("t1", "refused", "pool_entry_unknown", true)]),
+            #"{"ok":true}"#,
+            #"{"ok":false,"error":"internal"}"#,
+            "not json",
+        ] {
+            let (same, none) = OfflinePhone.keepForTheirTill(a)
+            XCTAssertEqual(same, a)
+            XCTAssertEqual(none, 0, a)
+        }
     }
 
     func testRefusedChargesAreListedUntilDismissed() async {
@@ -910,6 +1088,24 @@ final class OfflineFlowTests: XCTestCase {
     }
 
     private func errorInfo(_ f: PosFlow) -> PosErrorInfo? { if case .error(let e) = f.state { return e }; return nil }
+
+    /// The sync's posts to the till, in order.
+    private func posts(_ r: Runner) -> [HTTPRequest] { r.till.requests.filter { $0.url.path == "/v1/offline/charges" } }
+    /// The sync's drains; the snapshot's are `drain(0)`.
+    private func syncDrains(_ r: Runner) -> Int { r.core.drains.filter { $0 > 0 }.count }
+
+    /// The till's 200 to `POST /v1/offline/charges`: per charge its txid, status, and `code` and
+    /// `retry` when not nil.
+    static func answer(_ results: [(String, String, String?, Bool?)]) -> String {
+        var items: [String] = []
+        for (txid, status, code, retry) in results {
+            var item = #"{"txid":"\#(txid)","status":"\#(status)""#
+            if let code { item += #","code":"\#(code)","detail":"d""# }
+            if let retry { item += #","retry":\#(retry)"# }
+            items.append(item + "}")
+        }
+        return #"{"ok":true,"results":["# + items.joined(separator: ",") + "]}"
+    }
 }
 
 /// The card's APDUs, as the core makes them: off the main thread, each waiting for the card.

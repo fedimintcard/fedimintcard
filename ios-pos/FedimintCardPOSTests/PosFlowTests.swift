@@ -362,4 +362,16 @@ final class OfflineCopyTests: XCTestCase {
                        ["No offline kit yet. Reach the till once while online.", "0 waiting to sync · 0 held for their cards · 0 synced"])
         XCTAssertEqual(offlinePanelLines(.disabled, nowMs: t0), ["Offline payments are off on this phone."])
     }
+
+    func testSettingsSaysWhyTheLastSyncStopped() {
+        var phone = OfflineSnapshot(enabled: true, stats: OfflineStats(waiting: 2))
+        phone.syncStopped = "2 payments wait for the till they were taken for"
+        XCTAssertEqual(offlinePanelLines(phone, nowMs: 0), [
+            "No offline kit yet. Reach the till once while online.",
+            "2 waiting to sync · 0 held for their cards · 0 synced",
+            "Sync stopped: 2 payments wait for the till they were taken for",
+        ])
+        phone.syncStopped = nil
+        XCTAssertFalse(offlinePanelLines(phone, nowMs: 0).contains { $0.hasPrefix("Sync stopped") })
+    }
 }

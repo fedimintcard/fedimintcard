@@ -100,6 +100,13 @@ final class PosController: ObservableObject {
         health = .notPaired
     }
 
+    /// The Abandon alert's message for the sale on `info`'s screen, decided here only: the held
+    /// copy while the phone holds the sale (its `client_ref` is in the snapshot's `localOnlyRefs`,
+    /// whatever its last tap answered), the online one otherwise.
+    func abandonMessage(for info: PosErrorInfo) -> String {
+        abandonCopy(held: phone.localOnlyRefs.contains(info.clientRef))
+    }
+
     /// Deletes the record of a charge the till refused at sync.
     func dismissRefused(_ txid: String) {
         Task { [weak self] in

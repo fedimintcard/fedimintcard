@@ -347,6 +347,9 @@ struct OfflineSnapshot: Equatable {
     /// signing here (`signing_refs()`), and those whose last local charge was `undecided` or threw.
     var localOnlyRefs: Set<String> = []
     var refused: [RefusedOfflineCharge] = []
+    /// Why the last sync stopped short (Settings' "Sync stopped" line); nil once a sync finds
+    /// nothing waiting.
+    var syncStopped: String?
 
     static let disabled = OfflineSnapshot()
 
@@ -372,6 +375,10 @@ final class OfflinePhone {
     static let kitRetryAfterMs: Int64 = 60 * 1000
     static let syncBatch = 50
     static let syncRounds = 20
+    /// After a sync that stopped short (an HTTP failure, a round the till took none of, charges
+    /// kept for their till), the syncs of the next minute return at once: the till's answer would
+    /// not change sooner.
+    static let syncRetryAfterMs: Int64 = 60 * 1000
     static let kitFile = "kit.json"
 
     private let queue = DispatchQueue(label: "org.fedimintcard.pos.offline")
@@ -400,6 +407,10 @@ final class OfflinePhone {
     /// Sales whose last local charge was `undecided` or threw: local only, with `signing_refs()`.
     private var heldRefs: Set<String> = []
     private var syncing = false
+    /// Why the last sync stopped short, until one finds nothing waiting.
+    private var syncStopped: String?
+    /// No sync before this (the clock's ms), after one that stopped short.
+    private var syncRetryAt: Int64 = 0
 
     private(set) var snapshot = OfflineSnapshot.disabled
 
@@ -515,6 +526,7 @@ final class OfflinePhone {
             if let failClosed { s.localOnlyRefs.insert(failClosed) }
         }
         if case .success(let d) = drained { s.refused = d.refused }
+        s.syncStopped = syncStopped
         snapshot = s
         return s
     }
@@ -625,28 +637,111 @@ final class OfflinePhone {
 
     /// Sends what waits here to the till `tillURL` (`client` asks that till only): up to
     /// `syncRounds` rounds of `drain(50)`, its body to `POST /v1/offline/charges`, the till's 200
-    /// answer to `mark_synced`. Stops on an empty drain, any HTTP failure, a round that moved
-    /// nothing, or another till paired meanwhile. One at a time.
+    /// answer to `mark_synced`, the refusals of a till that does not know the charges made
+    /// retries first (`keepForTheirTill`). Done at an empty drain, which clears `syncStopped`;
+    /// ends at another till paired meanwhile. Stops short at an HTTP failure, a round the till
+    /// took none of, charges kept for their till or a store failure: `syncStopped` says why, and
+    /// the syncs of the next minute return at once, draining and posting nothing. One at a time.
     func sync(client: TillClient, tillURL: String) async -> SyncOutcome {
-        guard let core, !syncing else { return SyncOutcome() }
+        guard let core, !syncing, clock() >= syncRetryAt else { return SyncOutcome() }
         syncing = true
         defer { syncing = false }
         var out = SyncOutcome()
         var last: [String] = []
-        for _ in 0..<Self.syncRounds {
-            guard case .success(let d) = await onQueue({ Result { try core.drain(max: Self.syncBatch) } }) else { break }
-            if d.txids.isEmpty { out.drainedEmpty = true; break }
-            if d.txids == last { break }
+        rounds: for _ in 0..<Self.syncRounds {
+            let d: CoreDrain
+            switch await onQueue({ Result { try core.drain(max: Self.syncBatch) } }) {
+            case .success(let drained): d = drained
+            case .failure(let e): stopSync("\(e)"); break rounds
+            }
+            if d.txids.isEmpty {
+                out.drainedEmpty = true
+                syncStopped = nil
+                break
+            }
+            if d.txids == last { stopSync(Self.noneTaken(d.txids.count)); break }
             last = d.txids
-            guard tillURL == currentTill, case .ok(let answer) = await client.postOfflineCharges(d.body) else { break }
-            let text = String(decoding: answer, as: UTF8.self)
-            guard case .success(let r) = await onQueue({ Result { try core.markSynced(answerJson: text) } }) else { break }
-            out.synced += r.synced
-            if r.synced + r.refused == 0 { break }
+            // Another till paired meanwhile: nothing goes to it.
+            guard tillURL == currentTill else { break }
+            let answer: String
+            switch await client.offlineChargesReply(d.body) {
+            case .failure(let e): stopSync(Self.syncFailure(e)); break rounds
+            case .success(let r) where r.status != 200: stopSync("the till refused the sync (HTTP \(r.status))"); break rounds
+            case .success(let r): answer = String(decoding: r.body, as: UTF8.self)
+            }
+            let (forCore, kept) = Self.keepForTheirTill(answer)
+            let report: CoreSyncReport
+            switch await onQueue({ Result { try core.markSynced(answerJson: forCore) } }) {
+            case .success(let r): report = r
+            case .failure(let e): stopSync("\(e)"); break rounds
+            }
+            out.synced += report.synced
+            // The next drain starts with them again, and this till's answer would not change.
+            if kept > 0 {
+                stopSync(kept == 1 ? "1 payment waits for the till it was taken for" : "\(kept) payments wait for the till they were taken for")
+                break
+            }
+            if report.synced + report.refused == 0 { stopSync(Self.noneTaken(d.txids.count)); break }
         }
         if out.synced > 0 { kitRefreshWanted = true }
         await refresh()
         return out
+    }
+
+    /// A sync that stopped short: Settings says why, and none runs for a minute.
+    private func stopSync(_ why: String) {
+        syncStopped = why
+        syncRetryAt = clock() + Self.syncRetryAfterMs
+    }
+
+    /// A round that moved nothing: every charge in it waits for a later sync, as the till asked.
+    private static func noneTaken(_ count: Int) -> String { "the till took none of \(count) (it asked for them again later)" }
+
+    /// Settings' words for a `POST /v1/offline/charges` that got no answer from the till.
+    private static func syncFailure(_ e: TillError) -> String {
+        switch e {
+        case .unreachable: return "the till did not answer"
+        case .timeout: return "the till took too long"
+        case .interrupted: return "the connection broke off"
+        case .badResponse(let detail): return detail
+        case .notPaired: return "no till is paired"
+        case .unauthorized: return "the till refused this phone"
+        }
+    }
+
+    /// `answerJson`, the till's 200 to `POST /v1/offline/charges`, with each refusal of a till that
+    /// does not know the charge made a retry, and how many it made one: `pool_entry_unknown`,
+    /// `bad_note` and `bad_charge` with `retry` false or absent (pool entries it never issued to
+    /// this phone, notes of another federation; docs/TILL-API.md). The core checked a charge's
+    /// notes against the kit it was taken with, and its pool entries stay that kit's till's until
+    /// their redeem window ends, so those refusals come from another till, paired since. The core
+    /// would keep them refused for good; they wait instead, and sync once the phone is paired with
+    /// their till again. `pool_entry_reused`, `pool_entry_expired` and `bad_signature` stay final.
+    /// An answer that is not JSON, or has no `results`, goes to the core as it came (which refuses
+    /// it), as does one with nothing to keep.
+    nonisolated static func keepForTheirTill(_ answerJson: String) -> (String, Int) {
+        let notTheirs: Set<String> = ["pool_entry_unknown", "bad_note", "bad_charge"]
+        guard var answer = (try? JSONSerialization.jsonObject(with: Data(answerJson.utf8))) as? [String: Any],
+              var results = answer["results"] as? [Any] else { return (answerJson, 0) }
+        var kept = 0
+        for (i, item) in results.enumerated() {
+            guard var r = item as? [String: Any], (r["status"] as? String) == "refused",
+                  let code = r["code"] as? String, notTheirs.contains(code), noRetry(r["retry"]) else { continue }
+            r["retry"] = true
+            results[i] = r
+            kept += 1
+        }
+        guard kept > 0 else { return (answerJson, 0) }
+        answer["results"] = results
+        guard let data = try? JSONSerialization.data(withJSONObject: answer, options: [.withoutEscapingSlashes]) else { return (answerJson, 0) }
+        return (String(decoding: data, as: UTF8.self), kept)
+    }
+
+    /// `retry` absent, or JSON `false`.
+    private nonisolated static func noRetry(_ v: Any?) -> Bool {
+        guard let v else { return true }
+        guard let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { return false }
+        return !n.boolValue
     }
 
     /// Deletes the record of a charge the till refused (the card paid; this is its only record).
