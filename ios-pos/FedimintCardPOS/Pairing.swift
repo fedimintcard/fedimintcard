@@ -51,6 +51,14 @@ struct TillPairing: Equatable {
     }
 }
 
+/// Whether pairing `newURL` leaves payments the phone holds (`onPhone`, waiting to sync or held for
+/// their cards) with no till to sync to: they are the till paired now's or, with none paired, the
+/// till the kit came from. Another till refuses them (docs/POS-OFFLINE.md).
+func strandsPayments(onPhone: Int, pairedURL: String?, kitTillURL: String?, newURL: String) -> Bool {
+    guard onPhone > 0, let holder = pairedURL ?? kitTillURL else { return false }
+    return holder != newURL
+}
+
 /// Persists the pairing. The app uses the Keychain; tests use a dictionary.
 protocol PairingStore: AnyObject {
     func load() -> TillPairing?

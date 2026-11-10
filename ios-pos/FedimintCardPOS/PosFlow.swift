@@ -12,6 +12,19 @@ enum ErrorKind: Equatable {
     case timeoutUnknown
     /// No till is paired on this phone.
     case notPaired
+    // The phone cannot take the card itself (docs/POS-OFFLINE.md): no kit yet (or offline is off),
+    // the kit expired, the caps on what waits to sync reached; the card's notes do not check
+    // offline; the kit has run out of a tier the price needs.
+    case offlineNoKit, offlineKitExpired, offlineCapReached, offlineNoteInvalid, offlinePoolExhausted
+    /// An applet 2.x card: it pays online only.
+    case offlineUnsupportedCard
+    /// Not a card the registry certified (a clone).
+    case cardNotGenuine
+    /// The card's daily limit.
+    case cardLimit
+    /// The card was taken away while it signed a charge on this phone: the sale is held here, and
+    /// only that card's next tap on this phone finishes it.
+    case heldOnPhone
 
     static func from(_ c: ChargeErrorCode) -> ErrorKind {
         switch c {
@@ -37,6 +50,14 @@ enum ErrorKind: Equatable {
         case .cardLinkGone: return .cardLinkGone
         case .unauthorized: return .unauthorized
         case .internal: return .internal
+        case .offlineKitExpired: return .offlineKitExpired
+        case .offlinePoolExhausted: return .offlinePoolExhausted
+        case .offlineNoteInvalid: return .offlineNoteInvalid
+        case .offlineCapReached: return .offlineCapReached
+        case .offlineNotReady: return .offlineNoKit
+        case .offlineUnsupportedCard: return .offlineUnsupportedCard
+        case .cardNotGenuine: return .cardNotGenuine
+        case .cardLimit: return .cardLimit
         case .unknown: return .unknown
         }
     }
@@ -52,7 +73,7 @@ enum ErrorKind: Equatable {
     }
 
     /// Outcome may already have happened: starts an unresolved sale.
-    var needsSalesCheck: Bool { self == .undecided || self == .timeoutUnknown }
+    var needsSalesCheck: Bool { self == .undecided || self == .timeoutUnknown || self == .heldOnPhone }
 
     /// Nothing moved: clears an unresolved sale. A PIN refusal comes from inside the spend, after the
     /// till has settled any earlier attempt with the same ref. `pin_required`, the ops codes, and the
@@ -62,7 +83,13 @@ enum ErrorKind: Equatable {
     }
 
     /// Whether trying the same sale again can help.
-    var retryable: Bool { ![.pinBlocked, .notPaired, .unauthorized].contains(self) }
+    var retryable: Bool { ![.pinBlocked, .notPaired, .unauthorized, .offlineUnsupportedCard, .cardNotGenuine, .cardLimit].contains(self) }
+
+    /// Kinds whose copy speaks of this phone's own kit and queue. The till answers some of their
+    /// codes for its own offline path; from the till they read as before (`unknown`, its words).
+    var phoneOnly: Bool {
+        [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlineNoteInvalid, .offlinePoolExhausted, .heldOnPhone].contains(self)
+    }
 }
 
 struct PosErrorInfo: Equatable {
@@ -106,7 +133,8 @@ func balanceProblem(_ r: BalanceResult) -> BalanceProblem {
     }
 }
 
-enum CardPurpose: Equatable { case charge, balance, topUp }
+/// `chargeLocal`: a sale the phone takes itself, with no card link to the till.
+enum CardPurpose: Equatable { case charge, chargeLocal, balance, topUp }
 
 enum PosState: Equatable {
     case entering
@@ -156,7 +184,8 @@ enum PosEvent: Equatable {
     case cardPresent
     /// The NFC session ended (cancelled, timed out) before a card was linked.
     case cardSessionEnded
-    /// The card link to the till could not be opened; nothing was sent.
+    /// The card link to the till could not be opened; nothing was sent. The NFC session is still
+    /// up: the phone may take the card itself.
     case linkFailed(TillError)
     case chargeDone(chargeId: Int, result: ChargeResult)
     case retryPressed
@@ -201,6 +230,11 @@ enum PosEffect {
     case endCardSession
     /// `pin` is handed over to the request, which wipes it once the body is built.
     case startCharge(chargeId: Int, priceMsat: Int64, clientRef: String, pin: Pin?)
+    /// The phone takes the card itself, with the card in the NFC session (docs/POS-OFFLINE.md);
+    /// answers `chargeDone` as `startCharge` does. `pin` is wiped before the core is called.
+    case startLocalCharge(chargeId: Int, priceMsat: Int64, clientRef: String, pin: Pin?)
+    /// Ends the NFC session, `message` on its sheet.
+    case failCardSession(message: String)
     case startBalanceRead(readId: Int)
     /// `POST /v1/topup`.
     case createTopUp(createId: Int, amountMsat: Int64, clientRef: String, shortId: String?)
@@ -227,6 +261,13 @@ final class PosFlow {
     private(set) var state: PosState = .entering
     private var nextId = 0
     private let newRef: () -> String
+    /// The phone's offline side as it is now; the controller sets it before every event.
+    var offline: OfflineSnapshot = .disabled
+    var clock: () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    /// The NFC session asked for at the PIN is for a charge on the phone.
+    private var localSession = false
+    /// The charge in progress is on the phone.
+    private var localChargeId: Int?
 
     init(newRef: @escaping () -> String = { UUID().uuidString.lowercased() }) { self.newRef = newRef }
 
@@ -257,6 +298,14 @@ final class PosFlow {
     }
 
     private func id() -> Int { nextId += 1; return nextId }
+
+    /// A refusal's kind. On the phone, `undecided` is a sale held here. From the till, the codes
+    /// whose copy speaks of this phone's kit and queue read as before: the till's own words.
+    private static func kind(_ code: ChargeErrorCode, local: Bool) -> ErrorKind {
+        let k = ErrorKind.from(code)
+        if local { return k == .undecided ? .heldOnPhone : k }
+        return k.phoneOnly ? .unknown : k
+    }
 
     private func back(to r: PosErrorInfo?) -> PosState { r.map { .error($0) } ?? .entering }
 
@@ -370,7 +419,11 @@ final class PosFlow {
             heldPin?.wipe()
             heldPin = pin
             state = .waitingForCard(priceMsat: price, clientRef: ref, returnTo: returnTo)
-            return [.startCardSession(.charge)]
+            // A sale held on this phone, or whose charge here threw, is retried here only, whatever
+            // the till's health: the card may have signed part of a transaction only its next tap
+            // here finishes, and the till would take the sale again (docs/POS-OFFLINE.md).
+            localSession = offline.localOnlyRefs.contains(ref)
+            return [.startCardSession(localSession ? .chargeLocal : .charge)]
 
         case (.cancelPressed, .enteringPin(_, _, _, _, let returnTo)):
             dropPin(); state = back(to: returnTo)
@@ -380,6 +433,10 @@ final class PosFlow {
             state = .signing(priceMsat: price, chargeId: cid, clientRef: ref, unresolvedRef: returnTo?.unresolvedRef)
             let pin = heldPin
             heldPin = nil // the request owns it now, and wipes it
+            if localSession {
+                localChargeId = cid
+                return [.startLocalCharge(chargeId: cid, priceMsat: price, clientRef: ref, pin: pin)]
+            }
             return [.startCharge(chargeId: cid, priceMsat: price, clientRef: ref, pin: pin)]
 
         case (.cardPresent, .balanceWaiting):
@@ -394,10 +451,38 @@ final class PosFlow {
 
         case (.linkFailed(let te), .waitingForCard(let price, let ref, let returnTo)):
             // Nothing reached the till's charge route: an unresolved sale stays unresolved.
+            let unresolved = returnTo?.unresolvedRef
+            if te == .unreachable || te == .timeout {
+                // The till is not serving. The phone takes the card itself, in the same NFC session,
+                // for a sale with no earlier attempt unresolved (its reply may only have been lost)
+                // while the kit is valid and under its caps (docs/POS-OFFLINE.md).
+                let avail = offline.availability(priceMsat: price, nowMs: clock())
+                if unresolved == nil && avail == .ready {
+                    let cid = id()
+                    localChargeId = cid
+                    state = .signing(priceMsat: price, chargeId: cid, clientRef: ref, unresolvedRef: nil)
+                    let pin = heldPin
+                    heldPin = nil // the local charge owns it now, and wipes it
+                    return [.startLocalCharge(chargeId: cid, priceMsat: price, clientRef: ref, pin: pin)]
+                }
+                dropPin()
+                // The unreachable screen says why: an unresolved sale's copy is the lost reply.
+                let kind: ErrorKind
+                switch (unresolved, avail) {
+                case (.some, _), (nil, .ready): kind = .tillUnreachable
+                case (nil, .noKit): kind = .offlineNoKit
+                case (nil, .kitExpired): kind = .offlineKitExpired
+                case (nil, .capsReached): kind = .offlineCapReached
+                }
+                state = .error(PosErrorInfo(priceMsat: price, kind: kind, detail: "", clientRef: ref, unresolvedRef: unresolved))
+                return [.failCardSession(message: "Can't reach the till")]
+            }
+            // Refused (401, 403) or not paired: never taken on the phone. The pairing is dead, and
+            // the kit could not be renewed either.
             dropPin()
             let kind = ErrorKind.from(te) == .timeoutUnknown ? .tillUnreachable : ErrorKind.from(te)
-            state = .error(PosErrorInfo(priceMsat: price, kind: kind, detail: "", clientRef: ref, unresolvedRef: returnTo?.unresolvedRef))
-            return [.endCardSession]
+            state = .error(PosErrorInfo(priceMsat: price, kind: kind, detail: "", clientRef: ref, unresolvedRef: unresolved))
+            return [.failCardSession(message: te == .unauthorized ? "The till refused this phone" : "Can't reach the till")]
         case (.linkFailed(let te), .balanceWaiting):
             state = .balanceFailed(balanceProblem(.failed(te == .timeout ? .unreachable : te)), detail: "")
             return [.endCardSession]
@@ -439,6 +524,8 @@ final class PosFlow {
 
         case (.chargeDone(let cid, let r), .signing(let price, let cur, let ref, let unresolved)) where cid == cur:
             dropPin()
+            let local = cid == localChargeId
+            localChargeId = nil
             switch r {
             case .success(let receipt):
                 state = .receipt(receipt)
@@ -451,7 +538,7 @@ final class PosFlow {
                     askPin(price, ref, wrongPin: true, triesLeft: left)
                 }
             case .declined(let code, let detail, _, let suggested):
-                state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: .from(code), detail: detail, suggestedMsat: suggested)
+                state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: Self.kind(code, local: local), detail: detail, suggestedMsat: suggested)
             case .failed(let te):
                 var detail = ""
                 if case .badResponse(let d) = te { detail = d }

@@ -66,9 +66,15 @@ struct AmountScreen: View {
                 .onLongPressGesture(perform: openSettings)
             Text(pos.status.map { "Till balance: \(formatSats($0.walletBalanceMsat)) sats" } ?? " ")
                 .font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.top, 2)
-            if let waiting = pos.status.flatMap({ waitingToSyncText($0.offlineQueued) }) {
+            // The till's offline queue and this phone's, as one count; the phone's shows with no
+            // till in reach too.
+            if let waiting = waitingToSyncText(till: pos.status, phone: pos.phone.stats) {
                 Text(waiting).font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.top, 1)
                     .accessibilityIdentifier("waiting-to-sync")
+            }
+            if let held = heldOnPhoneText(pos.phone.stats.signing) {
+                Text(held).font(Fig.regular(14)).foregroundStyle(Palette.goldHi).padding(.top, 1)
+                    .accessibilityIdentifier("held-on-phone")
             }
             if let problem {
                 Button(action: openSettings) {
@@ -399,8 +405,8 @@ struct ErrorScreen: View {
     @State private var confirmAbandon = false
 
     var body: some View {
-        let (title, detail) = errorCopy(info.kind, info.detail, suggestedMsat: info.suggestedMsat)
         let unresolved = info.unresolvedRef != nil
+        let (title, detail) = errorCopy(info.kind, info.detail, suggestedMsat: info.suggestedMsat, unresolved: unresolved)
         VStack(spacing: 10) {
             Spacer()
             Text(title).font(Fig.extraBold(28)).foregroundStyle(Palette.bad).multilineTextAlignment(.center)
@@ -423,7 +429,7 @@ struct ErrorScreen: View {
             Button("Abandon", role: .destructive) { pos.send(.abandonPressed) }
             Button("Keep", role: .cancel) {}
         } message: {
-            Text("If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
+            Text(abandonCopy(info.kind))
         }
     }
 }

@@ -71,3 +71,64 @@ func receiptHeadline(_ receipt: ChargeReceipt) -> String {
 func waitingToSyncText(_ queued: Int64) -> String? {
     queued > 0 ? "\(queued) \(queued == 1 ? "payment" : "payments") waiting to sync" : nil
 }
+
+/// The home screen's count: the till's offline queue (when its status is known) and this phone's.
+func waitingToSyncText(till: TillStatus?, phone: OfflineStats) -> String? {
+    waitingToSyncText((till?.offlineQueued ?? 0) + Int64(phone.waiting))
+}
+
+/// The home screen's line for sales a card left signing on this phone (`stats().signing`): only
+/// that card's next tap here finishes each. Nil when none.
+func heldOnPhoneText(_ count: Int) -> String? {
+    switch count {
+    case ..<1: return nil
+    case 1: return "1 payment is waiting for its card: tap that card to finish it."
+    default: return "\(count) payments are waiting for their cards: tap those cards to finish them."
+    }
+}
+
+/// A duration in the largest whole unit: "45 s", "12 min", "5 h", "6 days".
+func durationText(_ ms: Int64) -> String {
+    let s = max(0, ms) / 1000
+    if s < 60 { return "\(s) s" }
+    if s < 3600 { return "\(s / 60) min" }
+    if s < 2 * 86_400 { return "\(s / 3600) h" }
+    return "\(s / 86_400) days"
+}
+
+/// Settings' line for the offline kit: when the phone last had it from the till, and how long it
+/// is good for.
+func kitAgeText(fetchedAtMs: Int64, expiresAtMs: Int64, nowMs: Int64) -> String {
+    let fetched = "Kit fetched \(durationText(nowMs - fetchedAtMs)) ago"
+    return nowMs >= expiresAtMs ? fetched + " · expired" : fetched + " · expires in \(durationText(expiresAtMs - nowMs))"
+}
+
+/// Settings' row for a charge the till refused at sync: the card paid, the till did not take it.
+func refusedChargeText(priceMsat: Int64, code: String) -> String {
+    "\(formatSats(priceMsat)) sats · \(code.isEmpty ? "refused" : code): the till refused it after the card paid."
+}
+
+/// The confirm before re-pairing or forgetting a till with payments this phone still holds.
+func unpairWarningText(_ count: Int) -> String {
+    count == 1
+        ? "1 payment is waiting to sync with this till. It stays on this phone and can't be synced to another till."
+        : "\(count) payments are waiting to sync with this till. They stay on this phone and can't be synced to another till."
+}
+
+/// Settings' offline lines: why offline is off, or the kit (its age and expiry, the phone's caps)
+/// and what the store holds.
+func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64) -> [String] {
+    guard phone.enabled else {
+        return ["Offline payments are off on this phone" + (phone.disabledReason.map { ": \($0)" } ?? ".")]
+    }
+    var lines: [String] = []
+    if let kit = phone.kit {
+        lines.append(kitAgeText(fetchedAtMs: kit.fetchedAtMs, expiresAtMs: kit.expiresAtMs, nowMs: nowMs))
+        lines.append("Caps: \(kit.capCount) payments or \(formatSats(kit.capMsat)) sats waiting to sync")
+    } else {
+        lines.append("No offline kit yet. Reach the till once while online.")
+    }
+    let s = phone.stats
+    lines.append("\(s.waiting) waiting to sync · \(s.signing) held for their cards · \(s.synced) synced")
+    return lines
+}

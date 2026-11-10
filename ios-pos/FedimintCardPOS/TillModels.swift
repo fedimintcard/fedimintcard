@@ -84,6 +84,24 @@ enum ChargeErrorCode: String, CaseIterable {
     case cardLinkGone = "card_link_gone"
     case unauthorized
     case `internal`
+    // The offline charge's codes (docs/POS-OFFLINE.md § Refusals): the phone's own, and the till's
+    // offline path's.
+    /// A phone's offline kit is past its expiry; nothing was asked of the card.
+    case offlineKitExpired = "offline_kit_expired"
+    /// The kit has run out of a tier the price needs; `suggested_msat` is a price it pays.
+    case offlinePoolExhausted = "offline_pool_exhausted"
+    /// The card's notes do not check offline and the rest do not pay; nothing was signed.
+    case offlineNoteInvalid = "offline_note_invalid"
+    /// The caps on what waits to sync.
+    case offlineCapReached = "offline_cap_reached"
+    /// No kit (a phone), or no certificate key yet (a till).
+    case offlineNotReady = "offline_not_ready"
+    /// An applet 2.x card, taken only online.
+    case offlineUnsupportedCard = "offline_unsupported_card"
+    /// Not a card the registry certified (a clone).
+    case cardNotGenuine = "card_not_genuine"
+    /// The card's daily limit.
+    case cardLimit = "card_limit"
     case unknown = ""
 
     static func fromWire(_ s: String?) -> ChargeErrorCode {

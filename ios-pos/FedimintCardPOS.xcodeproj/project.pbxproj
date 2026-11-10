@@ -12,21 +12,26 @@
 		1724E279E92611527D686EE6 /* CardLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */; };
 		183A2BC4BCABE1E735E6FF0C /* TillClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD8734CE2845FF73DCFA1BCA /* TillClient.swift */; };
 		1D5EB784F49CA51113A217E3 /* OFL-Figtree.txt in Resources */ = {isa = PBXBuildFile; fileRef = D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */; };
+		260C07EF2F7A66ADC07D9BDA /* OfflinePhone.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC2BE08CA89C0DC00E5C9178 /* OfflinePhone.swift */; };
 		2771CB3B1D818A94D0FEDD9E /* TillModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3456E4AEA9C75E40A4730629 /* TillModels.swift */; };
 		28DB1EAC30B41406FEBB03F3 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = C39AEE1B854A9883FB8CC268 /* Theme.swift */; };
 		2D04077260B95DEE89B22082 /* card_front.png in Resources */ = {isa = PBXBuildFile; fileRef = 4EA9FEF5A783DC5F277E8949 /* card_front.png */; };
 		39C37991176CDEAC01CDCD83 /* CardLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 566A92ECDEB2DA9A031B11DA /* CardLink.swift */; };
+		3D99ED25480377BB7B018B61 /* OfflineStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE964C32564F10C57985D26D /* OfflineStoreTests.swift */; };
 		46BC3D29355500B390D8A336 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3685B2D3A58DEDD98FC5D81E /* Pairing.swift */; };
 		47FC7AFD6B1E63F51EC4636A /* Money.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80FF8DF36EA74756852185D9 /* Money.swift */; };
 		4A93A410EE7A943F1F8FD176 /* Screens.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32DF1049376C2E8D8027537 /* Screens.swift */; };
 		5223EC8F0E6EE1A74380EABA /* LinkSocketIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */; };
+		5701E4515BEA0E0013031DE9 /* PosCoreFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08FA69CD082D57FFCD63E730 /* PosCoreFixture.swift */; };
 		5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E997C08978966870EBE4456 /* PosFlowTests.swift */; };
 		64474BF43AFE8B19B3711F9C /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB46E83F11E1306121B63D09 /* App.swift */; };
+		66179A990AA24AA61D471757 /* OfflineFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC39083B8D2D27935CC5EE5F /* OfflineFlowTests.swift */; };
 		75C43F6D387CAA02844DDF5D /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC24BE04CC31D28A08266DDC /* SettingsView.swift */; };
 		75DC8B98C973917D81C49DE9 /* Pads.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7986F3432B14FF95BDD32A8 /* Pads.swift */; };
 		7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36D409088E3F90B17B12B0C4 /* TillClientTests.swift */; };
 		8106F75673DF6A1F71FC8562 /* Figtree.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 47C525FEABE9888F266B10B0 /* Figtree.ttf */; };
 		98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 915B237265E96624811EB5C1 /* PadTests.swift */; };
+		9B40247BE60AF8C7EBA47645 /* PosCoreAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D554A18E98750B4ACDF904AA /* PosCoreAdapterTests.swift */; };
 		A19D8686B3ABBF0A3734F4A5 /* TopUp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 668D284B6F2504B7F55524FF /* TopUp.swift */; };
 		BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = E518F954B819A02AAFC7253B /* NFCCardReader.swift */; };
 		CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9AEA85277653C319EC8C7B /* PairingTests.swift */; };
@@ -49,6 +54,7 @@
 /* Begin PBXFileReference section */
 		00A355F8AAFD6787CE5DE124 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		06114E2CE518EF1CE10315EF /* FedimintCardPOSTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = FedimintCardPOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		08FA69CD082D57FFCD63E730 /* PosCoreFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosCoreFixture.swift; sourceTree = "<group>"; };
 		0E65F454CD8BDECE17CF870C /* PosFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosFlow.swift; sourceTree = "<group>"; };
 		0E997C08978966870EBE4456 /* PosFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosFlowTests.swift; sourceTree = "<group>"; };
 		109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkSocketIntegrationTests.swift; sourceTree = "<group>"; };
@@ -66,10 +72,13 @@
 		7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardLinkTests.swift; sourceTree = "<group>"; };
 		80FF8DF36EA74756852185D9 /* Money.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Money.swift; sourceTree = "<group>"; };
 		915B237265E96624811EB5C1 /* PadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PadTests.swift; sourceTree = "<group>"; };
+		AC2BE08CA89C0DC00E5C9178 /* OfflinePhone.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflinePhone.swift; sourceTree = "<group>"; };
+		AC39083B8D2D27935CC5EE5F /* OfflineFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFlowTests.swift; sourceTree = "<group>"; };
 		B32DF1049376C2E8D8027537 /* Screens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Screens.swift; sourceTree = "<group>"; };
 		BB9AEA85277653C319EC8C7B /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
 		C39AEE1B854A9883FB8CC268 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		CB46E83F11E1306121B63D09 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		D554A18E98750B4ACDF904AA /* PosCoreAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosCoreAdapterTests.swift; sourceTree = "<group>"; };
 		D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OFL-Figtree.txt"; sourceTree = "<group>"; };
 		DD8734CE2845FF73DCFA1BCA /* TillClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillClient.swift; sourceTree = "<group>"; };
 		E1EDF39A4DF03C14A9F65E27 /* FedimintCardPosCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = FedimintCardPosCore; path = Packages/FedimintCardPosCore; sourceTree = SOURCE_ROOT; };
@@ -78,6 +87,7 @@
 		E86FE0870914BD0003EB671B /* PosController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosController.swift; sourceTree = "<group>"; };
 		F7986F3432B14FF95BDD32A8 /* Pads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pads.swift; sourceTree = "<group>"; };
 		FC24BE04CC31D28A08266DDC /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		FE964C32564F10C57985D26D /* OfflineStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineStoreTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -103,6 +113,7 @@
 				00A355F8AAFD6787CE5DE124 /* Info.plist */,
 				80FF8DF36EA74756852185D9 /* Money.swift */,
 				E518F954B819A02AAFC7253B /* NFCCardReader.swift */,
+				AC2BE08CA89C0DC00E5C9178 /* OfflinePhone.swift */,
 				F7986F3432B14FF95BDD32A8 /* Pads.swift */,
 				3685B2D3A58DEDD98FC5D81E /* Pairing.swift */,
 				E86FE0870914BD0003EB671B /* PosController.swift */,
@@ -133,8 +144,12 @@
 			children = (
 				7BFB4EC2D14070F4037D86CD /* CardLinkTests.swift */,
 				109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */,
+				AC39083B8D2D27935CC5EE5F /* OfflineFlowTests.swift */,
+				FE964C32564F10C57985D26D /* OfflineStoreTests.swift */,
 				915B237265E96624811EB5C1 /* PadTests.swift */,
 				BB9AEA85277653C319EC8C7B /* PairingTests.swift */,
+				D554A18E98750B4ACDF904AA /* PosCoreAdapterTests.swift */,
+				08FA69CD082D57FFCD63E730 /* PosCoreFixture.swift */,
 				0E997C08978966870EBE4456 /* PosFlowTests.swift */,
 				36D409088E3F90B17B12B0C4 /* TillClientTests.swift */,
 				E62BA1ACE633798338DC8889 /* TopUpTests.swift */,
@@ -273,8 +288,12 @@
 			files = (
 				1724E279E92611527D686EE6 /* CardLinkTests.swift in Sources */,
 				5223EC8F0E6EE1A74380EABA /* LinkSocketIntegrationTests.swift in Sources */,
+				66179A990AA24AA61D471757 /* OfflineFlowTests.swift in Sources */,
+				3D99ED25480377BB7B018B61 /* OfflineStoreTests.swift in Sources */,
 				98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */,
 				CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */,
+				9B40247BE60AF8C7EBA47645 /* PosCoreAdapterTests.swift in Sources */,
+				5701E4515BEA0E0013031DE9 /* PosCoreFixture.swift in Sources */,
 				5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */,
 				7D555EB486954111AB7558AA /* TillClientTests.swift in Sources */,
 				ECC448B79524C5673C9452B0 /* TopUpTests.swift in Sources */,
@@ -290,6 +309,7 @@
 				F07D7EFDA9A00794775899A1 /* ErrorCopy.swift in Sources */,
 				47FC7AFD6B1E63F51EC4636A /* Money.swift in Sources */,
 				BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */,
+				260C07EF2F7A66ADC07D9BDA /* OfflinePhone.swift in Sources */,
 				75DC8B98C973917D81C49DE9 /* Pads.swift in Sources */,
 				46BC3D29355500B390D8A336 /* Pairing.swift in Sources */,
 				EB7CB78117403AF777118344 /* PosController.swift in Sources */,
