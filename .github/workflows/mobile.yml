@@ -49,7 +49,8 @@ jobs:
             host/target/pos-core-mobile/bindings/kotlin
             host/target/pos-core-mobile/sizes.txt
   ios:
-    runs-on: macos-14
+    # macos-14 runners are retired; the newest image has the Xcode the targets need.
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5

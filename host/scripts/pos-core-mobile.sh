@@ -36,13 +36,20 @@ android() {
 	[ -n "$ANDROID_NDK_HOME" ] || { echo "set ANDROID_NDK_HOME to an NDK" >&2; exit 1; }
 	# aws-lc-sys (through fedimint-core) builds with CMake, which finds the NDK's toolchain here.
 	export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+	local prebuilt
+	prebuilt="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 	for abi in arm64-v8a x86_64; do
-		# Android 15 devices may use 16 KB pages: align the library's segments for them.
-		cargo ndk -t "$abi" -P "$API" rustc "${CARGO_FLAGS[@]}" --crate-type cdylib -- -C link-arg=-Wl,-z,max-page-size=16384
 		case "$abi" in
 			arm64-v8a) triple=aarch64-linux-android ;;
 			x86_64) triple=x86_64-linux-android ;;
 		esac
+		# aws-lc-sys runs bindgen with the unversioned triple, which NDK r28 and later refuse
+		# ("Unversioned target triples are not supported"). bindgen reads the hyphenated
+		# variable before the one cargo-ndk sets, so this one carries cargo-ndk's sysroot
+		# arguments and the triple with its API level. The link aligns the library's segments to
+		# 16 KB pages, which Android 15 devices may use.
+		env "BINDGEN_EXTRA_CLANG_ARGS_$triple=--sysroot=$prebuilt/sysroot -I$prebuilt/sysroot/usr/include/$triple --target=$triple$API" \
+			cargo ndk -t "$abi" -P "$API" rustc "${CARGO_FLAGS[@]}" --crate-type cdylib -- -C link-arg=-Wl,-z,max-page-size=16384
 		mkdir -p "$OUT/android/jniLibs/$abi"
 		cp "$TARGET/$triple/mobile/lib$LIB.so" "$OUT/android/jniLibs/$abi/"
 	done
