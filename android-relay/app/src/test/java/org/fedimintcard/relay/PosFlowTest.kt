@@ -298,6 +298,19 @@ class PosFlowTest {
         f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
     }
 
+    /** The card was blocked elsewhere after its held tap: the retap's pin_blocked is said, with no Try again to loop on. */
+    @Test fun aHeldRetapAnsweredPinBlockedIsBlockedAndStillHeld() {
+        val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.PIN_BLOCKED, held = true, detail = "the card's PIN is blocked")))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
+        assertFalse(e.kind.retryable) // the error screen hides Try again
+        assertNull(f.systemBack()); assertTrue(f.unresolvedHeld)
+        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
+        f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
+    }
+
     @Test fun aWrongPinOnALocalChargeThatHoldsNothingIsAFreshAttempt() {
         val (f, _) = unresolved(local(ChargeErrorCode.WRONG_PIN, detail = "wrong PIN; 2 tries left before the card blocks"))
         val ask = f.state as PosState.EnteringPin

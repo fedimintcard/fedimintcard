@@ -375,7 +375,8 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
 
     /**
      * A refused charge. One the phone holds signing stays unresolved and held, whatever the card's
-     * checks answered on the retap (docs/POS-OFFLINE.md): a wrong PIN asks again and comes back to it.
+     * checks answered on the retap (docs/POS-OFFLINE.md): a wrong PIN asks again and comes back to
+     * it, and a blocked PIN says so, with Abandon and no Try again.
      */
     private fun declined(s: PosState.Signing, r: ChargeResult.Declined) {
         val held = if (r.held) PosState.Error(s.priceMsat, ErrorKind.HELD_ON_PHONE, r.detail, s.clientRef, s.clientRef, held = true) else null
@@ -384,6 +385,11 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             val left = parseTriesLeft(r.detail)
             if (left == 0) state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, held?.unresolvedRef, held = held != null)
             else askPin(s.priceMsat, s.clientRef, wrongPin = true, triesLeft = left, returnTo = held)
+            return
+        }
+        if (held != null && r.code == ChargeErrorCode.PIN_BLOCKED) {
+            // Blocked since the tap that left it held: Try again would only answer this again.
+            state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, s.clientRef, held = true)
             return
         }
         if (held != null) {

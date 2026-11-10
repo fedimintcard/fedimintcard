@@ -1,5 +1,7 @@
 package org.fedimintcard.relay
 
+import org.json.JSONException
+import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** What the phone's core answered a charge ([PosCoreAdapter] maps the generated `ChargeOutcome`). */
@@ -229,10 +231,11 @@ class OfflineTill(
 
     /**
      * Sends what waits on this phone to the till: `drain(50)`, `POST /v1/offline/charges`, then
-     * `mark_synced` with a 200's answer, until nothing waits. Stops on an HTTP error or a round the
-     * till took none of, and then waits a minute. One at a time. What it synced counts as waiting
-     * until a status poll that started after it ([statusShown]), and is followed by a new kit (its
-     * pool entries are spent). Answers how many charges it synced. Blocks.
+     * `mark_synced` with a 200's answer, until nothing waits. Stops on an HTTP error, a round the
+     * till took none of, or charges it does not know ([keepForTheirTill]: they wait for the till
+     * they were taken for), and then waits a minute. One at a time. What it synced counts as
+     * waiting until a status poll that started after it ([statusShown]), and is followed by a new
+     * kit (its pool entries are spent). Answers how many charges it synced. Blocks.
      */
     fun sync(): Int {
         val c = core() ?: return 0
@@ -251,8 +254,17 @@ class OfflineTill(
                     stopSync(describe((r as TillResult.Err).error))
                     break
                 }
-                val report = c.markSynced(r.value)
+                val (answer, notTheirs) = keepForTheirTill(r.value)
+                val report = c.markSynced(answer)
                 synced += report.synced
+                if (notTheirs > 0) {
+                    // The next drain starts with them again: this till's answer would not change.
+                    stopSync(
+                        if (notTheirs == 1) "1 payment waits for the till it was taken for"
+                        else "$notTheirs payments wait for the till they were taken for",
+                    )
+                    break
+                }
                 if (report.synced + report.refused == 0) {
                     stopSync("the till took none of ${d.txids.size} (it asked for them again later)")
                     break
@@ -328,6 +340,36 @@ class OfflineTill(
         private const val UNDECIDED = "undecided"
         /** Local refusals a new kit may answer differently. */
         private val KIT_CODES = setOf("offline_kit_expired", "offline_pool_exhausted", "offline_cap_reached")
+        /**
+         * The sync's refusals of a till that does not know the charge (docs/TILL-API.md): pool
+         * entries it never issued to this phone, or notes and a mint of another federation.
+         */
+        private val NOT_THEIRS = setOf("pool_entry_unknown", "bad_note", "bad_charge")
+
+        /**
+         * [answerJson], the till's 200 to `POST /v1/offline/charges`, with each refusal in
+         * [NOT_THEIRS] made a retry, and how many it made one. A charge the core took checks
+         * against the federation of the kit it was taken with, and its pool entries stay that
+         * kit's till's until their redeem window ends (the kit's expiry and a grace, 30 days by
+         * default), so those refusals come from another till, paired since. The core would keep
+         * them refused for good; they wait instead, and sync once the phone is paired with their
+         * till again. `pool_entry_reused` and `pool_entry_expired` stay final: only the till that
+         * issued the entries says them. An answer that is not JSON goes to the core as it came,
+         * which refuses it.
+         */
+        internal fun keepForTheirTill(answerJson: String): Pair<String, Int> {
+            val a = try { JSONObject(answerJson) } catch (e: JSONException) { return answerJson to 0 }
+            val results = a.optJSONArray("results") ?: return answerJson to 0
+            var kept = 0
+            for (i in 0 until results.length()) {
+                val r = results.optJSONObject(i) ?: continue
+                if (r.optString("status") == "refused" && r.optString("code") in NOT_THEIRS && !r.optBoolean("retry")) {
+                    r.put("retry", true)
+                    kept++
+                }
+            }
+            return (if (kept > 0) a.toString() else answerJson) to kept
+        }
 
         private fun describe(e: TillError): String = when (e) {
             TillError.Unreachable -> "the till did not answer"

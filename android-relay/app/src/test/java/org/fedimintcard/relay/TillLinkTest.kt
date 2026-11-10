@@ -7,6 +7,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.ServerSocket
+import java.net.SocketTimeoutException
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -191,6 +192,73 @@ class TillLinkTest {
         val port = ServerSocket(0).use { it.localPort }
         val none = try { TillLink.open("http://127.0.0.1:$port", null, CardLink { ByteArray(0) }); null } catch (e: IOException) { e }
         assertTrue(linkFailureFallsBack(none!!))
+    }
+
+    /** Opens a link to a till that took the connection, on a thread: what open() threw within [ms], or null if it still waits. */
+    private fun openWithin(port: Int, ms: Long, connectMs: Int? = null): Exception? {
+        val out = LinkedBlockingQueue<Any>()
+        Thread {
+            out.add(
+                try {
+                    if (connectMs == null) TillLink.open("http://127.0.0.1:$port", "f".repeat(64), CardLink { ByteArray(0) })
+                    else TillLink.open("http://127.0.0.1:$port", "f".repeat(64), CardLink { ByteArray(0) }, connectMs)
+                } catch (e: Exception) { e }
+            )
+        }.apply { isDaemon = true; start() }
+        return when (val r = out.poll(ms, TimeUnit.MILLISECONDS)) {
+            null -> null
+            is Exception -> r
+            else -> { (r as TillLink).close(); fail("opened"); null }
+        }
+    }
+
+    /**
+     * Decision 4: a till (or the proxy before it) that takes the connection and never answers the
+     * upgrade is not serving. The link gives up within the quick timeout, not the 130 s a job's
+     * read may take, and the sale may go on the phone: nothing was posted for it.
+     */
+    @Test fun aTillThatNeverAnswersTheUpgradeFallsBackQuickly() {
+        val server = ServerSocket(0)
+        Thread {
+            try { server.accept().use { s -> val input = s.getInputStream(); while (input.read() >= 0) {} } } catch (_: IOException) {}
+        }.apply { isDaemon = true; start() }
+        try {
+            // The default quick timeout: 3 s to connect, then 5 s for the upgrade's answer.
+            val e = openWithin(server.localPort, 10_000)
+            assertNotNull("still opening after 10 s", e)
+            assertTrue("$e", e is SocketTimeoutException)
+            assertTrue(linkFailureFallsBack(e!!))
+        } finally {
+            server.close()
+        }
+    }
+
+    /** The quick timeout bounds the whole answer: one that trickles in byte by byte gets no longer. */
+    @Test fun aTillThatTricklesItsAnswerFallsBackQuickly() {
+        val server = ServerSocket(0)
+        Thread {
+            try {
+                server.accept().use { s ->
+                    val input = s.getInputStream()
+                    val req = StringBuilder()
+                    while (!req.endsWith("\r\n\r\n")) req.append(input.read().toChar())
+                    val out = s.getOutputStream()
+                    for (b in "HTTP/1.1 101 Switching Protocols\r\nX-Slow: ${"x".repeat(300)}".toByteArray()) { out.write(b.toInt()); out.flush(); Thread.sleep(50) }
+                }
+            } catch (_: Exception) {}
+        }.apply { isDaemon = true; start() }
+        try {
+            val started = System.nanoTime()
+            // 500 ms to connect, so 2.5 s for the answer, while each of its bytes comes within 50 ms.
+            val e = openWithin(server.localPort, 10_000, connectMs = 500)
+            val ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+            assertNotNull("still opening after 10 s", e)
+            assertTrue("$ms ms", ms < 6_000)
+            assertTrue("$e", e is SocketTimeoutException)
+            assertTrue(linkFailureFallsBack(e!!))
+        } finally {
+            server.close()
+        }
     }
 
     @Test fun linkTargetFollowsTheTillScheme() {

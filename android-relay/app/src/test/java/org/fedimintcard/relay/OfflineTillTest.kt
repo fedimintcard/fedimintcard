@@ -16,15 +16,21 @@ private const val PHONE = "0123456789abcdef0123456789abcdef"
 private fun kitAnswer(phone: String = PHONE, expires: Long = 9_000_000_000L) =
     """{"ok":true,"kit":{"version":1,"kit_id":"k1","phone_id":"$phone","issued_at_ms":1,"expires_at_ms":$expires,"cap_msat":100000000,"cap_count":200,"pool":[]}}"""
 
-/** The till's answer to a drained body: [status] for every charge in it. */
-private fun answerFor(body: String, status: String, retry: Boolean = false): String {
+/** One charge's result in the till's answer to a sync. */
+private fun result(txid: String, status: String, retry: Boolean = false, code: String = "pool_entry_reused"): JSONObject =
+    JSONObject().put("txid", txid).put("status", status).put("retry", retry).put("code", code)
+
+/** The till's answer to a drained body: each charge's result as [of] says. */
+private fun answerEach(body: String, of: (txid: String) -> JSONObject): String {
     val charges = JSONObject(body).getJSONArray("charges")
     val results = JSONArray()
-    for (i in 0 until charges.length()) {
-        results.put(JSONObject().put("txid", charges.getJSONObject(i).getString("txid")).put("status", status).put("retry", retry).put("code", "pool_entry_reused"))
-    }
+    for (i in 0 until charges.length()) results.put(of(charges.getJSONObject(i).getString("txid")))
     return JSONObject().put("ok", true).put("results", results).toString()
 }
+
+/** The till's answer to a drained body: [status] for every charge in it. */
+private fun answerFor(body: String, status: String, retry: Boolean = false, code: String = "pool_entry_reused"): String =
+    answerEach(body) { result(it, status, retry, code) }
 
 /** The phone's core, faked: what it was asked, and a store of waiting, signing, refused and synced charges. */
 private class FakeCore : OfflineCore {
@@ -419,6 +425,72 @@ class OfflineTillTest {
         assertTrue(offline.dismiss("t1"))
         assertTrue(offline.view().refused.isEmpty())
         assertFalse(offline.dismiss("t1"))
+    }
+
+    /**
+     * Till A is down, the phone takes the sales, and the operator pairs backup till B ("Pair
+     * anyway?": they stay on this phone). B does not know them: its refusals are never final, and
+     * the charges sync once the phone is paired with A again.
+     */
+    @Test fun chargesAnotherTillDoesNotKnowWaitForTheTillTheyWereTakenFor() {
+        core.waiting += listOf("t1", "t2")
+        pairing = "pairing-b"
+        till.charges = { body -> RawResponse(200, answerFor(body, "refused", code = "pool_entry_unknown")) }
+        assertEquals(0, offline.sync())
+        assertEquals(listOf("t1", "t2"), core.waiting)
+        assertTrue(core.refused.isEmpty()); assertTrue(offline.view().refused.isEmpty())
+        assertEquals(1, till.posted)
+        assertEquals("2 payments wait for the till they were taken for", offline.syncError)
+        // B's answer would not change: not again within the minute.
+        assertEquals(0, offline.sync()); assertEquals(1, till.posted)
+        // Paired with A again, which takes them.
+        pairing = "pairing-1"
+        clock += OfflineTill.RETRY_MS
+        till.charges = { body -> RawResponse(200, answerFor(body, "queued")) }
+        assertEquals(2, offline.sync())
+        assertEquals(listOf("t1", "t2"), core.synced); assertTrue(core.waiting.isEmpty())
+        assertNull(offline.syncError)
+    }
+
+    /** What B does know (charges taken with its own kit) syncs; the rest of the batch waits for A. */
+    @Test fun aBatchAnotherTillPartlyKnowsSyncsWhatItKnows() {
+        core.waiting += listOf("a1", "b1", "a2")
+        till.charges = { body ->
+            RawResponse(200, answerEach(body) { tx -> if (tx.startsWith("a")) result(tx, "refused", code = "bad_note") else result(tx, "queued") })
+        }
+        assertEquals(1, offline.sync())
+        assertEquals(listOf("b1"), core.synced)
+        assertEquals(listOf("a1", "a2"), core.waiting); assertTrue(core.refused.isEmpty())
+        assertEquals(1, till.posted) // the next drain would start with a1 and a2 again
+        assertEquals("2 payments wait for the till they were taken for", offline.syncError)
+        assertEquals(PhoneCounts(waiting = 3), offline.counts()) // b1 counts until a status poll shows it
+    }
+
+    @Test fun onlyTheRefusalsOfATillThatDoesNotKnowTheChargeWait() {
+        val answer = JSONObject().put("ok", true).put(
+            "results",
+            JSONArray()
+                .put(result("t1", "refused", code = "pool_entry_unknown"))
+                .put(result("t2", "refused", code = "bad_note"))
+                .put(result("t3", "refused", code = "bad_charge"))
+                .put(result("t4", "refused", code = "pool_entry_reused"))
+                .put(result("t5", "refused", code = "pool_entry_expired"))
+                .put(result("t6", "refused", code = "bad_signature"))
+                .put(result("t7", "refused", retry = true, code = "internal"))
+                .put(result("t8", "queued"))
+                .put(result("t9", "already")),
+        ).toString()
+        val (kept, n) = OfflineTill.keepForTheirTill(answer)
+        assertEquals(3, n)
+        val results = JSONObject(kept).getJSONArray("results")
+        val retry = (0 until results.length()).map { results.getJSONObject(it) }.associate { it.getString("txid") to it.getBoolean("retry") }
+        assertEquals(
+            mapOf("t1" to true, "t2" to true, "t3" to true, "t4" to false, "t5" to false, "t6" to false, "t7" to true, "t8" to false, "t9" to false),
+            retry,
+        )
+        // Nothing to keep, or not an answer: the till's words go to the core as they came.
+        val plain = JSONObject().put("ok", true).put("results", JSONArray().put(result("t1", "refused"))).toString()
+        for (a in listOf(plain, """{"ok":false,"error":"internal"}""", "not json")) assertEquals(a to 0, OfflineTill.keepForTheirTill(a))
     }
 
     @Test fun aSyncThatSyncedFetchesANewKit() {

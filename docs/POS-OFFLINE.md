@@ -198,20 +198,23 @@ charges go on as before.
 **When the phone takes the charge** (`OfflineTill.runCharge`). A paired phone tries the till first.
 When the card link cannot open (no connection, the quick timeout, a TLS or WebSocket handshake that
 fails, a 5xx or any other answer but 101) and no `POST /v1/charge` was ever sent for that sale, the
-core takes it with the kit kept for this pairing, and the receipt says "Paid offline". A 401 or 403
-at link open never falls back: the pairing is dead and the kit could not be renewed either. A sale
-that was posted once and whose retry cannot open the link stays on "Till service unreachable" ("The
-last reply was lost"). A sale the core lists in `signing_refs()`, or one this phone charged and
-still holds (or whose charge threw), goes to the core only, with the same `client_ref`, whether the
-till answers or not, "Try again" included. Balance reads and top-ups never go offline. While the
-core drives the card, the USB relay answers "no card".
+core takes it with the kit kept for this pairing, and the receipt says "Paid offline". The quick
+timeout is 3 s to connect, then 5 s each for the upgrade's whole answer and for the till's `ready`;
+the 130 s a job's APDUs may take start only once the link is open. A 401 or 403 at link open never
+falls back: the pairing is dead and the kit could not be renewed either. A sale that was posted
+once and whose retry cannot open the link stays on "Till service unreachable" ("The last reply was
+lost"). A sale the core lists in `signing_refs()`, or one this phone charged and still holds (or
+whose charge threw), goes to the core only, with the same `client_ref`, whether the till answers
+or not, "Try again" included. Balance reads and top-ups never go offline. While the core drives
+the card, the USB relay answers "no card".
 
 **A held sale.** A card taken away while it signed leaves "Payment not finished": no Back, no
 Check sales (the till has no record of it), Try again (the PIN, then the core with the same
-`client_ref`; a wrong PIN asks again and comes back to it), and Abandon, which only hides the sale.
-That card's next tap on this phone still finishes it, whatever sale is rung then (the owner's
-decision of 2026-11-10; ENG-854 is to make that tap's outcome name the sale it finished). After a
-restart, the home screen says "1 payment is waiting for its card: tap that card to finish it."
+`client_ref`; a wrong PIN asks again and comes back to it, and a PIN blocked since says so, with no
+Try again), and Abandon, which only hides the sale. That card's next tap on this phone still
+finishes it, whatever sale is rung then (the owner's decision of 2026-11-10; ENG-854 is to make
+that tap's outcome name the sale it finished). After a restart, the home screen says "1 payment is
+waiting for its card: tap that card to finish it."
 
 **Kit and sync.** Each status poll the till answers (every 5 s in the foreground, so on reconnect,
 on foreground and after every charge) runs on the core's thread: the kit is fetched when none is
@@ -219,9 +222,16 @@ kept for this pairing, when the kept one is 10 minutes old, after a sync that sy
 after a local `offline_kit_expired`, `offline_pool_exhausted` or `offline_cap_reached` (a failed
 fetch keeps the old kit and waits a minute); then the sync runs `drain(50)`,
 `POST /v1/offline/charges` and `mark_synced` on a 200 until nothing waits, and stops on an HTTP
-error or a round the till took none of, then waits a minute. "N payments waiting to sync" is the
-till's queue plus the phone's `waiting`, and charges a sync sent count until a status poll that
-started after it.
+error, a round the till took none of, or charges the till does not know, then waits a minute. A
+till answers `pool_entry_unknown`, `bad_note` or `bad_charge` for a charge taken with another
+till's kit (pool entries it never issued, notes of another federation). The till a charge was
+taken for never does within the charge's redeem window: the core checked the notes against that
+till's kit, and the pool entries stay that till's. So the phone does not take those answers as
+final: the charge keeps waiting, Settings says "N payments wait for the till they were taken
+for", and it syncs once the phone is paired with that till again. Any other refusal is as the
+till says: final, or sent again when it says `retry`. "N payments waiting to sync" is the till's
+queue plus the phone's `waiting`, and charges a sync sent count until a status poll that started
+after it.
 
 **Settings** shows whether offline payments are on (or why not), the kit's age, expiry and caps,
 what waits on the phone, held for its card and synced, the last kit or sync failure, and the
@@ -232,14 +242,20 @@ phone and sync only to the till they were taken for.
 **Limits.** Which sales were posted, and which the phone holds, are known only while the app
 runs: after a restart a held sale has no screen of its own (the home line above), and its card's
 next tap here finishes it with the new sale. An expired kit keeps a held sale from finishing until
-the till is reached again. The PIN reaches the core as a String, which cannot be wiped. Re-pairing,
-clearing the app's data, uninstalling or downgrading strands what waits on the phone.
+the till is reached again. The PIN reaches the core as a String, which cannot be wiped. Pairing
+another till leaves what waits on the phone for the till it was taken for: 50 or more of those at
+the head of the queue hold back the charges taken since with the new till's kit, and one its own
+till no longer knows (synced after its redeem window, once the till has dropped the entries)
+waits for good instead of being listed refused. Clearing the app's data, uninstalling or
+downgrading strands what waits on the phone.
 
 **The owner's Pixel pass** (the build touches no device): a sale in airplane mode ("Paid
 offline"), then reconnect and watch the count move to the till; pull the card mid-SIGN, then Try
 again with Wi-Fi on (it finishes on the phone; the till sees no `POST /v1/charge`); Abandon a held
 sale, then that card's next tap; the clock 8 days ahead (kit expired); unpair with payments
-waiting; and a boot with 16 KB pages (Android 15's developer option) that loads the core.
+waiting; with a second till at hand, pair it while payments wait (they keep waiting, "N payments
+wait for the till they were taken for"), then pair back (they sync); and a boot with 16 KB pages
+(Android 15's developer option) that loads the core.
 
 ## Risks
 
