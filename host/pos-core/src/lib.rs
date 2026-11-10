@@ -13,6 +13,8 @@ use tbs::{BlindedMessage, BlindingKey};
 uniffi::setup_scaffolding!();
 
 pub mod charge;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod files;
 pub mod kit;
 pub mod plan;
