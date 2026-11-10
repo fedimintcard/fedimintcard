@@ -17,6 +17,7 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -253,7 +254,7 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                     synchronized(writeLock) { Ws.writeFrame(out, op, p, ByteArray(4).also { rng.nextBytes(it) }) }
                 }
                 val session = LinkSession(card) { text -> try { writer(Ws.TEXT, text.toByteArray(Charsets.UTF_8)) } catch (_: IOException) {} }
-                var link: TillLink? = null
+                val link = AtomicReference<TillLink?>(null)
                 val reader = Thread({
                     try {
                         while (true) {
@@ -266,7 +267,11 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                         }
                     } catch (_: Exception) {
                     } finally {
-                        link?.close() ?: try { s.close() } catch (_: Exception) {}
+                        // The till ended the link (or the socket failed): answer its close and close
+                        // this side as close() does, even before open() has handed the link out.
+                        try { writer(Ws.CLOSE, ByteArray(0)) } catch (_: Exception) {}
+                        try { s.close() } catch (_: Exception) {}
+                        link.get()?.closed = true
                     }
                 }, "till-link")
                 reader.isDaemon = true
@@ -275,7 +280,7 @@ class TillLink private constructor(private val socket: Socket, val id: String, p
                     try { s.close() } catch (_: Exception) {}
                     throw IOException("no ready from the till")
                 }
-                return TillLink(s, id, session, writer).also { link = it; if (s.isClosed) it.closed = true }
+                return TillLink(s, id, session, writer).also { link.set(it); if (s.isClosed) it.closed = true }
             } catch (e: Exception) {
                 try { s.close() } catch (_: Exception) {}
                 throw e as? IOException ?: IOException(e.message, e)

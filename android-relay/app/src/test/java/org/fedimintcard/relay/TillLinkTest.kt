@@ -104,6 +104,34 @@ class TillLinkTest {
         server.close()
     }
 
+    /**
+     * A till that ends the link the moment it is ready (a job that fails at once) gets its close
+     * answered: the phone's side closes as close() does even before open() has returned the link.
+     */
+    @Test fun aTillThatClosesAtOnceGetsItsCloseAnswered() {
+        val server = ServerSocket(0)
+        val got = LinkedBlockingQueue<Any>()
+        val till = Thread {
+            server.accept().use { s ->
+                val input = s.getInputStream(); val out = s.getOutputStream()
+                val head = StringBuilder()
+                while (!head.endsWith("\r\n\r\n")) head.append(input.read().toChar())
+                val key = head.lines().first { it.startsWith("Sec-WebSocket-Key:") }.substringAfter(':').trim()
+                out.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${Ws.accept(key)}\r\n\r\n".toByteArray())
+                Ws.writeFrame(out, Ws.TEXT, """{"type":"ready","link":"00aa11bb22cc33dd"}""".toByteArray(), null)
+                Ws.writeFrame(out, Ws.CLOSE, ByteArray(0), null)
+                got.add(try { Ws.readMessage(input).opcode } catch (e: IOException) { e })
+            }
+        }.apply { start() }
+        val link = TillLink.open("http://127.0.0.1:${server.localPort}", null, CardLink { byteArrayOf(0x90.toByte(), 0) })
+        assertEquals(Ws.CLOSE, got.poll(5, TimeUnit.SECONDS))
+        till.join(5000)
+        val deadline = System.currentTimeMillis() + 5000
+        while (!link.closed && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertTrue(link.closed)
+        server.close()
+    }
+
     @Test fun aRefusedLinkThrows() {
         val server = ServerSocket(0)
         Thread {
