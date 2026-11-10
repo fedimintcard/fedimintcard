@@ -234,7 +234,17 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   IC type, fabrication date, serial, batch). The install tap is `apps/provisioner/src/installTap.ts`:
   probe → CPLC → keys from ops → install logged in with factory or own keys (one INITIALIZE UPDATE
   checked offline against both) → PUT KEY in place (version 01 kept) and a fresh login under the
-  new set → GEN_KEY ×8, SET_PIN, VERIFY_PIN. The card row carries `chip`. Deploy needs
+  new set → GEN_KEY ×8, SET_PIN, VERIFY_PIN. On a J3R452, which opens SCP03 and ships at key set
+  version FF, that rotation is cardkit's first contact (`tools/cardkit/README.md`): PUT KEY with
+  P1 `00` puts the card's own set at version 01 and the card drops the FF set, GET DATA `E0` must
+  then list the three AES keys at 01 and nothing at FF, and the fresh login proves them at 01. A
+  later tap whose rotation finds the card's own set already in place (a tap lifted after PUT KEY,
+  or the retap of a card stopped at that check) reads `E0` after its login too and stops at the
+  rotation on a key at FF, so no tap keys a card that kept its FF set and lists it. One kind of
+  card still ends the install tap off 01: if its first contact put its own set at another
+  version, ignoring PUT KEY's version byte, and dropped the FF set, the retap finds the set there
+  and keys the card at that version, which the reset refuses (`tools/cardkit/README.md`). Every
+  other card of either chip ends it at version 01. The card row carries `chip`. Deploy needs
   `wrangler secret put CARD_MANAGER_MASTER` on staging and production first.
   A tap lifted during GEN_KEY ×8, SET_PIN or VERIFY_PIN (found on silicon 2026-11-04: the card left
   on its own keys, keyed, with no PIN, and refused by every later tap) keeps the batch's place and
@@ -256,10 +266,12 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   see a load made around it; a blocked PIN needs ops to show the card empty plus a second operator
   confirmation. Then take the card back to factory, as cashucard's owned-card reset does: delete
   our package (only `F0464D43415244`, its applet and opener), PUT KEY the factory set back in place
-  at version 01 (what a factory J3R180 reports), and prove both with a full login under the factory
-  keys and a GET STATUS that lists none of ours. No reinstall, no new PIN, no new card row: the card
-  is blank, and goes through a new batch to be used again (the install tap gets the same per-card
-  keys back from ops). **Built 2026-11-04, not deployed, silicon pending**:
+  at version 01 (what a factory J3R180 reports, and where a J3R452 is after the install tap's first
+  contact; a card at any other version, FF included, stops before anything is written), and prove
+  both with a full login under the factory keys and a GET STATUS that lists none of ours. No
+  reinstall, no new PIN, no new card row: the card is blank, and goes through a new batch to be
+  used again (the install tap gets the same per-card keys back from ops). **Built 2026-11-04, not
+  deployed, silicon pending**:
   `apps/provisioner/src/reset.ts` and `screens/ResetScreen.tsx` over cardkit's `factoryReset`
   (`tools/cardkit/gp/reset.ts`), two taps (read slot 0 and the PIN's state without spending a try;
   then slot 0 again, ops' check again, `VERIFY_PIN`, CPLC, keys, one INITIALIZE UPDATE checked

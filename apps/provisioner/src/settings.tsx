@@ -81,7 +81,7 @@ export const BUILD = Object.freeze({
   /** The load file's size in bytes; 23 LOAD commands at 247 bytes. */
   loadSize: LOAD_FILE_SIZE,
   /** The engine version (`tools/cardkit/package.json`). */
-  cardkitVersion: '0.1.0',
+  cardkitVersion: '0.2.0',
 });
 
 /**

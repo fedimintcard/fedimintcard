@@ -41,6 +41,8 @@ import {
   type KeySet,
   type Transceiver,
 } from '../scp02';
+import {Scp03Session} from '../scp03';
+import {nodeAesEcb} from './node-aes';
 import {nodeCbc, nodeEcb, nodeFullMac, nodeRetailMac} from './node-des';
 
 function rnd(n: number): number[] {
@@ -411,7 +413,8 @@ describe('GP commands, byte for byte as GlobalPlatformPro v25.10.20 sends them',
 
   it('PUT KEY 80 D8 <KVN> 81: the new KVN, then each key 80 10 <3DES-ECB under S-DEK> 03 <KCV>, and Le 00', () => {
     const sDek = rnd(16);
-    const apdu = putKeys(SPIKE_KEYS, sDek, {p1: 0x01, newKvn: 0x01});
+    const session = new Session({enc: rnd(16), mac: rnd(16), dek: sDek});
+    const apdu = putKeys(SPIKE_KEYS, session, {p1: 0x01, newKvn: 0x01});
     const expected = concat(
       [0x80, 0xd8, 0x01, 0x81, 67, 0x01],
       ...[SPIKE_KEYS.enc, SPIKE_KEYS.mac, SPIKE_KEYS.dek].map(k =>
@@ -431,6 +434,52 @@ describe('GP commands, byte for byte as GlobalPlatformPro v25.10.20 sends them',
     );
   });
 
+  it('PUT KEY on an SCP03 channel: each key 88 11 10 <AES-ECB under the static DEK> 03 <AES KCV>, 70 bytes of data, Lc 4E once wrapped', () => {
+    const dek = rnd(16);
+    const session = new Scp03Session({enc: rnd(16), mac: rnd(16), dek});
+    const apdu = putKeys(FACTORY_KEYS, session, {p1: 0x01, newKvn: 0x01});
+    const entry = concat(
+      [0x88, 0x11, 0x10],
+      nodeAesEcb(dek, FACTORY_KEYS.enc),
+      [0x03],
+      fromHex('504A77'),
+    );
+    assert.equal(
+      toHex(apdu),
+      toHex(
+        concat([0x80, 0xd8, 0x01, 0x81, 70, 0x01], entry, entry, entry, [0x00]),
+      ),
+    );
+    // the key type follows the session, whatever keys are put
+    const spike = putKeys(SPIKE_KEYS, session, {p1: 0x01, newKvn: 0x02});
+    for (const [i, key] of [
+      SPIKE_KEYS.enc,
+      SPIKE_KEYS.mac,
+      SPIKE_KEYS.dek,
+    ].entries()) {
+      const at = 6 + i * 23;
+      assert.equal(
+        toHex(spike.slice(at, at + 23)),
+        toHex(
+          concat(
+            [0x88, 0x11, 0x10],
+            nodeAesEcb(dek, key),
+            [0x03],
+            nodeAesEcb(key, new Array(16).fill(1)).slice(0, 3),
+          ),
+        ),
+      );
+    }
+    const wrapped = session.wrap(apdu);
+    assert.deepEqual(wrapped.slice(0, 5), [0x84, 0xd8, 0x01, 0x81, 0x4e]);
+    assert.equal(wrapped.length, 5 + 0x4e + 1);
+    assert.throws(
+      () =>
+        putKeys({...FACTORY_KEYS, mac: rnd(24)}, session, {p1: 1, newKvn: 1}),
+      RangeError,
+    );
+  });
+
   it('ends every command that goes under the C-MAC in Le 00, as gp sends them all', () => {
     const wrapped: [string, number[]][] = [
       ['EXTERNAL AUTHENTICATE', externalAuthenticateCommand(rnd(8))],
@@ -442,7 +491,22 @@ describe('GP commands, byte for byte as GlobalPlatformPro v25.10.20 sends them',
         'INSTALL [for install and make selectable]',
         installAndSelectable(FEDIMINT_PACKAGE_AID, CARD_AID, CARD_AID),
       ],
-      ['PUT KEY', putKeys(SPIKE_KEYS, rnd(16), {p1: 0x01, newKvn: 0x01})],
+      [
+        'PUT KEY',
+        putKeys(
+          SPIKE_KEYS,
+          new Session({enc: rnd(16), mac: rnd(16), dek: rnd(16)}),
+          {p1: 0x01, newKvn: 0x01},
+        ),
+      ],
+      [
+        'PUT KEY (SCP03)',
+        putKeys(
+          SPIKE_KEYS,
+          new Scp03Session({enc: rnd(16), mac: rnd(16), dek: rnd(16)}),
+          {p1: 0x01, newKvn: 0x01},
+        ),
+      ],
       ...splitLoad(rnd(600)).map(
         (b, i) => ['LOAD ' + i, b] as [string, number[]],
       ),

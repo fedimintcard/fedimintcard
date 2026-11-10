@@ -1,9 +1,10 @@
 /**
- * cardkit: GlobalPlatform over an injected transceiver: SCP02, the card-manager
- * commands and a recovering install, for the phone-side provisioner
- * (docs/PROVISIONER-PLAN.md P1a). Environment-neutral core: no NFC, no HTTP,
- * no platform import. The transport is injected as `Transceiver`, so the phone
- * and Node run the same code, and gp/test runs it against a fake card.
+ * cardkit: GlobalPlatform over an injected transceiver: SCP02 (the J3R180) and
+ * SCP03 (the J3R452) behind one way in, the card-manager commands and a
+ * recovering install, for the phone-side provisioner (docs/PROVISIONER-PLAN.md
+ * P1a). Environment-neutral core: no NFC, no HTTP, no platform import. The
+ * transport is injected as `Transceiver`, so the phone and Node run the same
+ * code, and gp/test runs it against a fake card.
  */
 export * from './gp/aids';
 export {concat, equal, fromHex, swHex, toHex} from './gp/bytes';
@@ -18,6 +19,7 @@ export {
   tdesEcb,
 } from './gp/des';
 export * from './gp/scp02';
+export * from './gp/scp03';
 export * from './gp/identity';
 export * from './gp/provision';
 export * from './gp/reset';

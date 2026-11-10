@@ -3,7 +3,25 @@
  * side of SCP02 computed with node:crypto (gp/test/node-des.ts), sharing no
  * code with the host side under test, and the GlobalPlatform commands an
  * install uses, with what the chip is known or suspected to do when things go
- * wrong:
+ * wrong. With `scp: 3` it is a J3R452's card manager instead, the card side
+ * of SCP03 at level 01 by node:crypto as well (gp/test/node-aes.ts): the
+ * 32-byte INITIALIZE UPDATE reply with i=10 and the pseudo-random challenge
+ * for its own AID, a 3-byte counter that every INITIALIZE UPDATE advances
+ * (SCP02's moves at EXTERNAL AUTHENTICATE), C-MACs chained through the full
+ * CMAC, replies with no R-MAC, and PUT KEY of AES keys only, decrypted under
+ * the static DEK and refused (6A80) when a check value does not match, so a
+ * wrong DEK shows. Its PUT KEY replaces the set in place (P1 the current
+ * version) and takes P1 00 only on a card at version FF (`kvn: 0xff`, a
+ * J3R452 as it ships), for a new version from 01 to 7F: the new set then
+ * replaces the FF set, as the test card did at first contact (GET DATA E0
+ * afterwards listed version 01 alone). With `keepsShippedSet` it keeps the FF
+ * set beside the new one instead, which the test card did not do, so the
+ * guard against such a card has one to catch. GET DATA E0, plain or under the
+ * C-MAC, lists the keys of every set it holds (the key information template:
+ * C0 04, the key ID, the version, the type, 10), keys 01 to 03 of each,
+ * DES3 (80) under SCP02 and AES (88) under SCP03, the FF set a first contact
+ * kept first. INITIALIZE UPDATE that names a version the card does not hold
+ * answers 6A88. Under either protocol:
  *
  * - the opener rule: the INSTALL that is a package's first instantiation and
  *   runs a heavy constructor goes mute (the reader gives up) or answers 6F00,
@@ -17,8 +35,13 @@
  * - EXTERNAL AUTHENTICATE failures are counted, and lock the card manager at
  *   `failedAuthLimit`, as the chip does for good.
  *
+ * With `sellerApplets` it starts as the J3R452 test card came, with the
+ * seller's four applets (SELLER_APPLETS), its NDEF tag among them at
+ * D2760000850101. None of them is this card's, and the sweep's whitelist names
+ * none of them; a DELETE that named one would remove it, as on the chip.
+ *
  * The applet under this card is FedimintCardApplet, as it answers on the wire:
- * SELECT sends the two version bytes `02 01` and no FCI; GET_PUB (B0 11) on a
+ * SELECT sends the two version bytes `03 00` and no FCI; GET_PUB (B0 11) on a
  * slot with no key answers 6985; SIGN (B0 12) is refused before the PIN. The
  * fake dispatches on the **module** the selected instance was made from, not
  * on INS, because SELECT is global: the opener is a real instance of this
@@ -27,6 +50,7 @@
  * `reset()` is the power going: whatever was selected, the session, a pending
  * handshake (counted in `abandonedHandshakes`) and a pending load go with it.
  */
+import {nodeAesEcb, nodeCmac, nodeScp03Kdf} from './node-aes';
 import {nodeCbc, nodeEcb, nodeFullMac, nodeRetailMac} from './node-des';
 
 type Bytes = number[];
@@ -63,6 +87,13 @@ export interface CardAppletState {
 export interface FakeCardOptions {
   keys?: StaticKeys;
   kvn?: number;
+  /** The secure channel the card manager opens: 2 (the J3R180, the default) or 3 (the J3R452). */
+  scp?: 2 | 3;
+  /**
+   * The sequence counter. SCP02: its 2-byte value, which each EXTERNAL
+   * AUTHENTICATE advances (default 0009). SCP03: the 3-byte value before the
+   * first INITIALIZE UPDATE, each of which advances it (default 000000).
+   */
   seq?: number;
   /** How the card checks a C-MAC: over the modified header (gp's way) or the original. */
   macOverModifiedApdu?: boolean;
@@ -71,7 +102,40 @@ export interface FakeCardOptions {
   heavyModules?: string[];
   failedAuthLimit?: number;
   freeNonVolatile?: number;
+  /**
+   * Start with {@link SELLER_APPLETS} installed, as the J3R452 test card came
+   * (scp03-07): four instances, each from its own package, none of them this
+   * card's. Off by default, a blank card.
+   */
+  sellerApplets?: boolean;
+  /**
+   * What the test card did not do at first contact, for the guard that
+   * catches it: PUT KEY with P1 00 at version FF keeps the FF set beside the
+   * new one ({@link FakeCard.shipped}), so GET DATA E0 lists both sets,
+   * INITIALIZE UPDATE with P1 FF still opens under the FF set, and P1 00, the
+   * card's choice, then picks the new set (`'new'`) or the FF set
+   * (`'shipped'`). Unset, the new set replaces the FF set, as the test card's
+   * did.
+   */
+  keepsShippedSet?: 'new' | 'shipped';
 }
+
+/**
+ * The applets the J3R452 test card shipped with, as `gp --list` read them
+ * (gp/test/fixtures/scp03-07-list-default-keyver1.txt), in its order: each
+ * instance SELECTABLE, made from its own package, in the card manager's
+ * domain. The last is the seller's NDEF tag, at the NFC Forum's
+ * D2760000850101, made from D276000085.
+ */
+export const SELLER_APPLETS: readonly {
+  readonly instance: string;
+  readonly pkg: string;
+}[] = [
+  {instance: 'A0000008466D656D6F727901', pkg: 'A0000008466D656D6F7279'},
+  {instance: 'A0000005272101014150455801', pkg: 'A00000052721010141504558'},
+  {instance: 'A0000006472F000101', pkg: 'A0000006472F0001'},
+  {instance: 'D2760000850101', pkg: 'D276000085'},
+];
 
 interface Package {
   aid: string;
@@ -96,6 +160,7 @@ interface PendingLoad {
 interface Session {
   mac: Bytes;
   dek: Bytes;
+  /** The chaining value: SCP02's last C-MAC, SCP03's last full CMAC. */
   lastMac: Bytes;
 }
 
@@ -121,7 +186,10 @@ export class FakeCard {
   mute = false;
   keys: StaticKeys;
   kvn: number;
+  /** The FF set a first contact left beside the new one (`keepsShippedSet`); null when there is none. */
+  shipped: {keys: StaticKeys; kvn: number} | null = null;
   seq: number;
+  readonly scp: 2 | 3;
   free: number;
   override: Override | undefined;
   readonly packages = new Map<string, Package>();
@@ -140,15 +208,27 @@ export class FakeCard {
     dek: Bytes;
   } | null = null;
   private challengeCounter = 0;
+  private readonly keepsShippedSet: 'new' | 'shipped' | undefined;
   private readonly opts: Required<
-    Omit<FakeCardOptions, 'keys' | 'kvn' | 'seq' | 'freeNonVolatile'>
+    Omit<
+      FakeCardOptions,
+      | 'keys'
+      | 'kvn'
+      | 'scp'
+      | 'seq'
+      | 'freeNonVolatile'
+      | 'sellerApplets'
+      | 'keepsShippedSet'
+    >
   >;
 
   constructor(options: FakeCardOptions = {}) {
     this.keys = options.keys ?? {enc: K40, mac: K40, dek: K40};
     this.kvn = options.kvn ?? 0x01;
-    this.seq = options.seq ?? 0x0009;
+    this.scp = options.scp ?? 2;
+    this.seq = options.seq ?? (this.scp === 3 ? 0 : 0x0009);
     this.free = options.freeNonVolatile ?? 164176;
+    this.keepsShippedSet = options.keepsShippedSet;
     this.opts = {
       macOverModifiedApdu: options.macOverModifiedApdu ?? true,
       openerRule: options.openerRule ?? 'mute',
@@ -156,6 +236,20 @@ export class FakeCard {
       heavyModules: options.heavyModules ?? [CARD_MODULE],
       failedAuthLimit: options.failedAuthLimit ?? 10,
     };
+    for (const {instance, pkg} of options.sellerApplets ? SELLER_APPLETS : []) {
+      this.packages.set(pkg, {
+        aid: pkg,
+        modules: [instance],
+        size: 0,
+        instancesMade: 1,
+      });
+      this.instances.set(instance, {
+        aid: instance,
+        module: instance,
+        pkg,
+        state: freshState(),
+      });
+    }
   }
 
   /** The card in the field: one APDU in, data and SW out, or a rejection when it does not answer. */
@@ -330,6 +424,24 @@ export class FakeCard {
     return sw(0x9000, new Array(64).fill(0x11));
   }
 
+  /**
+   * The key set INITIALIZE UPDATE's P1 names, 00 being the card's choice, or
+   * null for a version the card does not hold (6A88). Only a first contact
+   * with `keepsShippedSet` leaves a second set.
+   */
+  private keySet(p1: number): {keys: StaticKeys; kvn: number} | null {
+    const shipped = this.shipped;
+    if (
+      shipped &&
+      (p1 === shipped.kvn || (p1 === 0 && this.keepsShippedSet === 'shipped'))
+    ) {
+      return shipped;
+    }
+    return p1 === 0 || p1 === this.kvn
+      ? {keys: this.keys, kvn: this.kvn}
+      : null;
+  }
+
   private deriveSession(seq: number) {
     const s = [seq >> 8, seq & 0xff];
     const d = (key: Bytes, c: number[]) =>
@@ -347,7 +459,8 @@ export class FakeCard {
       if (this.lockedOut) {
         return sw(0x6983);
       }
-      if (p1 !== 0 && p1 !== this.kvn) {
+      const set = this.keySet(p1);
+      if (!set) {
         return sw(0x6a88);
       }
       if (apdu[4] !== 8 || apdu.length < 13) {
@@ -355,6 +468,9 @@ export class FakeCard {
       }
       this.endSessions();
       const host = apdu.slice(5, 13);
+      if (this.scp === 3) {
+        return this.initializeUpdate03(host, set);
+      }
       this.challengeCounter++;
       const card = [
         0xc0,
@@ -382,6 +498,9 @@ export class FakeCard {
       this.handshake = null;
       if (!hs) {
         return sw(0x6985);
+      }
+      if (this.scp === 3) {
+        return this.externalAuthenticate03(hs, apdu);
       }
       const seq = [this.seq >> 8, this.seq & 0xff];
       const expectedHost = nodeFullMac(hs.enc, [
@@ -424,6 +543,24 @@ export class FakeCard {
       const data = apdu.slice(5, 5 + lc - 8);
       const mac = apdu.slice(5 + lc - 8, 5 + lc);
       const le = apdu.slice(5 + lc);
+      if (this.scp === 3) {
+        // the C-MAC over the chaining value and the header as sent, Le outside it
+        const full = nodeCmac(s.mac, [
+          ...s.lastMac,
+          cla,
+          ins,
+          p1,
+          apdu[3],
+          lc,
+          ...data,
+        ]);
+        if (hex(full.slice(0, 8)) !== hex(mac)) {
+          this.session = null;
+          return sw(0x6982);
+        }
+        s.lastMac = full;
+        return this.isdCommand(ins, p1, apdu[3], data, le);
+      }
       const original = cla & ~0x04;
       const header = this.opts.macOverModifiedApdu
         ? [cla, ins, p1, apdu[3], lc]
@@ -452,10 +589,28 @@ export class FakeCard {
         ),
       );
     }
+    if (cla === 0x80 && ins === 0xca && p1 === 0x00 && apdu[3] === 0xe0) {
+      return this.keyInformation();
+    }
     if (ins === 0xe4 || ins === 0xe6 || ins === 0xe8 || ins === 0xd8) {
       return sw(0x6982);
     }
     return sw(0x6d00);
+  }
+
+  /**
+   * GET DATA E0, the key information template: keys 01 to 03 of every set
+   * the card holds, C0 04 <ID> <version> <type> 10, the FF set a first
+   * contact kept ({@link FakeCard.shipped}) first, as both chips answer it
+   * (E0 12 and three entries for one set).
+   */
+  private keyInformation(): Bytes {
+    const type = this.scp === 3 ? 0x88 : 0x80;
+    const versions = [...(this.shipped ? [this.shipped.kvn] : []), this.kvn];
+    const entries = versions.flatMap(kvn =>
+      [1, 2, 3].flatMap(id => [0xc0, 0x04, id, kvn, type, 0x10]),
+    );
+    return sw(0x9000, [0xe0, entries.length, ...entries]);
   }
 
   private freeMemory(): Bytes {
@@ -493,6 +648,9 @@ export class FakeCard {
   ): Bytes {
     if (ins === 0xca && p1 === 0xff && p2 === 0x21) {
       return this.freeMemory();
+    }
+    if (ins === 0xca && p1 === 0x00 && p2 === 0xe0) {
+      return this.keyInformation();
     }
     if (ins === 0xe4) {
       return this.delete(data);
@@ -678,6 +836,9 @@ export class FakeCard {
 
   private putKey(p1: number, p2: number, data: Bytes): Bytes {
     const s = this.session!;
+    if (this.scp === 3) {
+      return this.putKey03(s, p1, p2, data);
+    }
     if (p1 !== this.kvn || p2 !== 0x81 || data.length !== 1 + 3 * 22) {
       return sw(0x6a80);
     }
@@ -699,6 +860,119 @@ export class FakeCard {
       }
       keys.push(key);
       kcvs.push(kcv);
+    }
+    this.keys = {enc: keys[0], mac: keys[1], dek: keys[2]};
+    this.kvn = data[0];
+    return sw(0x9000, [data[0], ...kcvs[0], ...kcvs[1], ...kcvs[2]]);
+  }
+
+  /** SCP03's INITIALIZE UPDATE under the set P1 named: the counter moves first, then the challenge for it and this card's AID, then the cryptogram. */
+  private initializeUpdate03(
+    host: Bytes,
+    set: {keys: StaticKeys; kvn: number},
+  ): Bytes {
+    this.seq = (this.seq + 1) & 0xffffff;
+    const seq = [
+      (this.seq >> 16) & 0xff,
+      (this.seq >> 8) & 0xff,
+      this.seq & 0xff,
+    ];
+    const card = nodeScp03Kdf(set.keys.enc, 0x02, 64, [
+      ...seq,
+      ...fromHex(ISD),
+    ]);
+    const context = [...host, ...card];
+    const enc = nodeScp03Kdf(set.keys.enc, 0x04, 128, context);
+    const mac = nodeScp03Kdf(set.keys.mac, 0x06, 128, context);
+    this.handshake = {host, card, enc, mac, dek: set.keys.dek};
+    return sw(0x9000, [
+      ...fromHex('0000936320C4A1B2C3D4'),
+      set.kvn,
+      0x03,
+      0x10,
+      ...card,
+      ...nodeScp03Kdf(mac, 0x00, 64, context),
+      ...seq,
+    ]);
+  }
+
+  /** SCP03's EXTERNAL AUTHENTICATE: P1 01 only, the host cryptogram, and its C-MAC from a zero chaining value. */
+  private externalAuthenticate03(
+    hs: {host: Bytes; card: Bytes; mac: Bytes; dek: Bytes},
+    apdu: Bytes,
+  ): Bytes {
+    const [, , p1, p2] = apdu;
+    const host = apdu.slice(5, 13);
+    const mac = apdu.slice(13, 21);
+    const expectedHost = nodeScp03Kdf(hs.mac, 0x01, 64, [
+      ...hs.host,
+      ...hs.card,
+    ]);
+    const full = nodeCmac(hs.mac, [
+      ...new Array(16).fill(0),
+      0x84,
+      0x82,
+      p1,
+      p2,
+      0x10,
+      ...host,
+    ]);
+    if (
+      apdu[4] !== 0x10 ||
+      p1 !== 0x01 ||
+      hex(host) !== hex(expectedHost) ||
+      hex(mac) !== hex(full.slice(0, 8))
+    ) {
+      this.failedAuths++;
+      if (this.failedAuths >= this.opts.failedAuthLimit) {
+        this.lockedOut = true;
+      }
+      return sw(0x6300);
+    }
+    this.session = {mac: hs.mac, dek: hs.dek, lastMac: full};
+    return sw(0x9000);
+  }
+
+  /**
+   * SCP03's PUT KEY: three 88 11 10 <key under the static DEK> 03 <AES KCV>
+   * entries, in place, or with P1 00 at version FF (first contact) to a new
+   * version from 01 to 7F, which then replaces the FF set, or with
+   * `keepsShippedSet` goes in beside it.
+   */
+  private putKey03(s: Session, p1: number, p2: number, data: Bytes): Bytes {
+    const firstContact =
+      p1 === 0x00 && this.kvn === 0xff && data[0] >= 0x01 && data[0] <= 0x7f;
+    if (
+      (p1 !== this.kvn && !firstContact) ||
+      p2 !== 0x81 ||
+      data.length !== 1 + 3 * 23
+    ) {
+      return sw(0x6a80);
+    }
+    const keys: Bytes[] = [];
+    const kcvs: Bytes[] = [];
+    for (let i = 0; i < 3; i++) {
+      const at = 1 + i * 23;
+      if (
+        data[at] !== 0x88 ||
+        data[at + 1] !== 0x11 ||
+        data[at + 2] !== 0x10 ||
+        data[at + 19] !== 0x03
+      ) {
+        return sw(0x6a80);
+      }
+      const key = nodeAesEcb(s.dek, data.slice(at + 3, at + 19), true);
+      const kcv = data.slice(at + 20, at + 23);
+      if (
+        hex(nodeAesEcb(key, new Array(16).fill(0x01)).slice(0, 3)) !== hex(kcv)
+      ) {
+        return sw(0x6a80);
+      }
+      keys.push(key);
+      kcvs.push(kcv);
+    }
+    if (firstContact && this.keepsShippedSet) {
+      this.shipped = {keys: this.keys, kvn: this.kvn};
     }
     this.keys = {enc: keys[0], mac: keys[1], dek: keys[2]};
     this.kvn = data[0];

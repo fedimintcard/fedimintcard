@@ -1,8 +1,8 @@
 {
   "name": "@fedimintcard/cardkit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "GlobalPlatform over an injected transceiver: SCP02, the card-manager commands and a recovering install, for the Fedimint card provisioner.",
+  "description": "GlobalPlatform over an injected transceiver: SCP02 and SCP03, the card-manager commands and a recovering install, for the Fedimint card provisioner.",
   "license": "MIT",
   "main": "dist/index.js",
   "scripts": {
@@ -13,6 +13,7 @@
     "prepack": "yarn build"
   },
   "dependencies": {
+    "@noble/ciphers": "1.3.0",
     "@noble/hashes": "1.8.0"
   },
   "devDependencies": {

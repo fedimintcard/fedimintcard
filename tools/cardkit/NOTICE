@@ -1,12 +1,23 @@
 tools/cardkit is ported from cashucard's tools/cardkit
-(https://github.com/cashucard/cashucard, package 0.2.0). The files below are
-copied as they are in that project's main branch:
+(https://github.com/cashucard/cashucard, package 0.2.0, main at 0229dc8).
+The files below are copied as they are at that commit:
 
+    gp/apdu.ts           copied verbatim
     gp/bytes.ts          copied verbatim
     gp/des.ts            copied verbatim
+    gp/scp03.ts          copied verbatim
+    gp/test/node-aes.ts  copied verbatim from testing/node-aes.ts
     gp/test/node-des.ts  copied verbatim from testing/node-des.ts
+    gp/test/transcript.ts
+                         copied verbatim
+    gp/test/fixtures/scp03-07-list-default-keyver1.txt,
+    gp/test/fixtures/scp03-08-list-default-auto.txt,
+    gp/test/fixtures/scp03-09-install-probe-default-key.txt,
+    gp/test/fixtures/scp03-10-delete-probe-default-key.txt
+                         copied verbatim: the owner's captures of the J3R452
+                         under the public default keys
 
-These differ only in the statements named, all of them about this card's AIDs:
+These differ only in the statements named:
 
     gp/scp02.ts          one line: a comment says this card's DELETE whitelist
                          holds three AIDs rather than Cashu's six
@@ -15,10 +26,41 @@ These differ only in the statements named, all of them about this card's AIDs:
                          verbatim against this repo's prettier settings so
                          the file stays diffable against upstream (it is
                          listed in .prettierignore for that reason)
+    gp/test/scp03.test.ts
+                         the import path of node-aes, and the comment that
+                         names it
+
+These are adapted:
 
     gp/test/scp02.test.ts
-                         adapted: this card's AIDs and byte-for-byte literals,
-                         and the whitelist test names three AIDs
+                         this card's AIDs and byte-for-byte literals, and the
+                         whitelist test names three AIDs
+    gp/provision.ts      rotateKeys, its options and RotateResult.firstContact,
+                         and the first-contact checks of the key information,
+                         as upstream has them without the sdAid run option,
+                         and with the key information read again by a run
+                         that finds the new set already in place under SCP03,
+                         at 01 or at another version, which upstream does
+                         not have; the install is this project's (below)
+    gp/test/rotate.test.ts
+                         the import path of the fake card, the comment that
+                         says where ROTATION_AT_01's hashes come from, and
+                         that read: the header, the reruns' APDUs, the retap
+                         of a card that kept its FF set, a pull before the
+                         read on such a card, the retap of a card whose first
+                         contact put the new set at another version, and the
+                         read's refusals there
+    gp/test/fake-card.ts upstream's SCP03 card side (scp, keySet,
+                         keepsShippedSet, sellerApplets and SELLER_APPLETS,
+                         GET DATA E0) merged into this project's fake of the
+                         Fedimint applet, without the isd and cplc options
+    gp/test/transcripts.test.ts
+                         the SCP03 section and the two readings of the key
+                         information template, as upstream has them; not the
+                         H0 section, whose J3R180 captures are not here; and
+                         one case of this project's own
+    gp/test/fixtures/README.md
+                         the J3R452 section and its four rows
 
 These are ported with changes of their own:
 
@@ -28,9 +70,13 @@ These are ported with changes of their own:
     gp/test/identity.test.ts
                          the same J3R180 CPLC capture, and the refusals
 
-Everything else in tools/cardkit is written for this project, and the upstream
-code it does not need (inspect, registry, reset, configuration,
-holderCommands, the NFC tag and hello applets) was not ported.
+Everything else in tools/cardkit is written for this project: the install's
+plan and key-set candidates in gp/provision.ts, gp/reset.ts (this card's
+factory reset, not cashucard's owned-card reset), gp/aids.ts,
+gp/load-file.ts and the rest of the tests. The upstream code it does not need
+(the registry, inspect, reset-preflight, settled-cleanup, configuration and
+holderCommands modules, the cleanup entry point, the install's handling of
+the seller's NDEF tag, and the NFC tag and hello applets) was not ported.
 
 Its licence follows verbatim.
 
