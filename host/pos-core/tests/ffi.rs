@@ -149,8 +149,8 @@ fn refused_charges_are_listed_until_dismissed() {
     assert!(matches!(pc.mark_synced("{".into()), Err(PosCoreError::Answer(_))));
 }
 
-/// A sale whose card left mid-SIGN is listed until that card's next tap here finishes it: the app
-/// retries it with `charge` only, never online.
+/// A sale whose card left mid-SIGN is answered `undecided` and listed until that card's next tap
+/// here finishes it: the app keeps its `client_ref` and retries it with `charge` only, never online.
 #[test]
 fn a_sale_left_signing_is_listed_until_its_card_finishes_it() {
     let fx = Fx::new(true);
@@ -159,7 +159,7 @@ fn a_sale_left_signing_is_listed_until_its_card_finishes_it() {
     let k = kit(&fx, &pc);
     // 90,000 msat takes two notes: the card leaves at the second SIGN.
     let r = pc.charge(Nfc::with(&card, Some(1), false), k.clone(), 90_000, "half".into(), "1234".into()).unwrap();
-    assert!(matches!(&r, ChargeOutcome::Refused { code, .. } if code == "no_card"), "{r:?}");
+    assert!(matches!(&r, ChargeOutcome::Refused { code, .. } if code == "undecided"), "{r:?}");
     assert_eq!(pc.signing_refs().unwrap(), vec!["half".to_string()]);
     assert_eq!(pc.stats().unwrap().signing, 1);
     let r = pc.charge(Nfc::new(&card), k, 90_000, "half".into(), "1234".into()).unwrap();

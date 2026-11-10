@@ -7,7 +7,8 @@
 //! Write order: the queue entry with every secret is saved (`signing`) before the card is told of
 //! change (`SET_CHANGE`) or signs, and the signed bytes (`queued`) before the caller is answered.
 //! Nothing the card signed is ever lost: an entry a pulled card left `signing` is finished at its
-//! next tap from the card's own answers (a SPENT slot repeats its signature for the same hash).
+//! next tap from the card's own answers (a SPENT slot repeats its signature for the same hash),
+//! and the tap that left it is answered `undecided`, never `no_card`, so the app keeps the sale.
 //!
 //! What differs between a till and a phone is in [`Env`]: the till makes its own outputs
 //! ([`TillOuts::Fresh`]) and knows from its copy of the card which KEYED slots once carried a note
@@ -129,13 +130,15 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 ///
 /// 1. the price, `client_ref` and PIN's shape;
 /// 2. a charge already queued under this `client_ref` is that charge (`conflict` for another price);
-/// 3. a phone's kit expiry, then the count cap;
+/// 3. a phone's kit expiry, then the count cap (not for a retap of a sale this device holds
+///    `signing`: finishing that charge adds none);
 /// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
 /// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
 ///    card for one is `undecided`; one that can never be finished is `abandoned` and frees its
 ///    `client_ref` and the notes the card never signed for it;
 /// 6. the card's notes, the plan, the value cap, the card's day, then `signing`, `SET_CHANGE` and
-///    `SIGN`, and `queued`.
+///    `SIGN`, and `queued`. A card taken away once it signed an input leaves the charge `signing`,
+///    and the tap is answered `undecided` (step 5 finishes it at the card's next tap), not `no_card`.
 pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client_ref: Option<&str>) -> Result<Taken> {
     check_request(price, client_ref, &env.pin)?;
     if let Some(r) = client_ref {
@@ -156,8 +159,11 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         }
     }
     {
-        let s = lock(queue).stats();
-        if s.queued + 1 > env.cfg.cap_count {
+        let q = lock(queue);
+        let s = q.stats();
+        // A retap of a sale this device holds `signing` adds no charge: it finishes that one
+        // (counted already), or abandons it and takes the sale again, the count as it was.
+        if !holds_signing(&q, client_ref) && s.queued + 1 > env.cfg.cap_count {
             bail!(cap_reached(&s, &env.cfg));
         }
     }
@@ -189,7 +195,10 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
 
     // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
     // stored signatures, never a second transaction. Another card for it waits for the first.
-    let resumed = resume_signing(card, queue, env, &short_id)?;
+    let resumed = match resume_signing(card, queue, env, &short_id) {
+        Ok(r) => r,
+        Err(e) => return Err(undecided_if_held(e, queue, client_ref)),
+    };
     if let Some(r) = client_ref {
         if let Some(c) = resumed.into_iter().find(|c| c.client_ref.as_deref() == Some(r)) {
             return Ok(Taken { charge: c, replayed: true });
@@ -307,6 +316,29 @@ fn usable_pool(q: &Queue, outs: &TillOuts) -> (Vec<PoolEntry>, Tiers) {
     let free: Vec<PoolEntry> = all.iter().filter(|e| !used.contains(e.blinded_hex.as_str())).cloned().collect();
     let tiers = free.iter().filter(|e| e.amount_msat.is_power_of_two()).fold(0, |t, e| t | e.amount_msat);
     (free, tiers)
+}
+
+/// Whether `q` holds a charge for `client_ref` that a card left `signing`.
+fn holds_signing(q: &Queue, client_ref: Option<&str>) -> bool {
+    client_ref.is_some_and(|r| q.file.charges.iter().any(|c| c.state == ChargeState::Signing && c.client_ref.as_deref() == Some(r)))
+}
+
+/// A failure that leaves this sale's charge `signing` here (the card left, or stopped answering,
+/// once it had signed an input) is `undecided`, not the failure itself: only that card's next tap
+/// on this device finishes the charge, so the app keeps the sale and its `client_ref` and asks for
+/// the same card. Answered as `no_card`, which says nothing was left behind, the apps rang the
+/// sale again under a new `client_ref`, and the retap paid it twice: the charge it finished and a
+/// new one (ENG-842's third review). Any other failure is itself.
+fn undecided_if_held(e: anyhow::Error, queue: &Mutex<Queue>, client_ref: Option<&str>) -> anyhow::Error {
+    let held = client_ref.and_then(|r| {
+        lock(queue).file.charges.iter().find(|c| c.state == ChargeState::Signing && c.client_ref.as_deref() == Some(r)).map(|c| c.short_id.clone())
+    });
+    match held {
+        Some(short_id) => anyhow::Error::new(OfflineError::Undecided(format!(
+            "card {short_id} was taken away while it signed this sale ({e:#}); only its next tap here can finish the sale, so tap that card again: nothing was charged twice"
+        ))),
+        None => e,
+    }
 }
 
 /// Step 6: plan from the card's notes and take the charge.
@@ -507,7 +539,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         Ok(s) => s,
         Err(e) => {
             settle_failed_signing(card, queue, &entry);
-            return Err(e);
+            return Err(undecided_if_held(e, queue, client_ref));
         }
     };
     tx.signatures = TransactionSignature::NaiveMultisig(sigs);

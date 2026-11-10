@@ -276,6 +276,29 @@ fn the_caps_are_kept() {
     assert_eq!(s.stats().waiting, 1);
 }
 
+/// At the count cap, the retap of a sale a card left signing still finishes it: that charge is
+/// the one counted, and finishing it adds none. (It was refused `offline_cap_reached`, and a phone
+/// with no network had no way out of it.) Another sale is over the cap, as before.
+#[test]
+fn at_the_count_cap_the_retap_of_a_sale_left_signing_still_finishes_it() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16]);
+    let mut kit = fx.kit(s.phone_id(), 40, now_ms(), DAY_MS);
+    kit.cap_count = 1;
+    let json = serde_json::to_string(&kit).unwrap();
+    // 90,000 msat takes two notes; the card leaves at the second SIGN, the sale undecided.
+    let r = s.charge(&mut CardClient::new(PullAtSign::new(&card, 1)), &json, 90_000, "held", b"1234");
+    assert_eq!(code(&r), "undecided");
+    assert_eq!((s.stats().waiting, s.stats().signing), (0, 1));
+    let t = take(&s, &card, &json, 90_000, "held").unwrap_or_else(|e| panic!("the retap at the cap: {e:#}"));
+    assert!(t.replayed);
+    assert_eq!((s.stats().waiting, s.stats().signing), (1, 0));
+    assert!(s.signing_refs().is_empty());
+    let (r, apdus) = take_counted(&s, &card, &json, 10_000, "two", b"1234");
+    assert_eq!((code(&r), apdus), ("offline_cap_reached", 0));
+}
+
 /// A kit out of the 32,768 msat tier: a price that needs one is refused with prices the pool
 /// still pays, and one of them pays.
 #[test]
@@ -414,6 +437,9 @@ fn a_card_pulled_at_any_apdu_then_tapped_again_pays_once() {
         // A sale left signing is listed for the app, which retries it only here.
         let signing = s.charges().iter().any(|c| c.state == ChargeState::Signing);
         assert_eq!(s.signing_refs(), if signing { vec!["pulled".to_string()] } else { vec![] }, "pulled at {at}");
+        // The sale is `undecided` while it waits for this card (the apps keep it and its
+        // `client_ref`), and `no_card` only when the card left nothing behind.
+        assert_eq!(code(&r), if signing { "undecided" } else { "no_card" }, "pulled at {at}");
         exactly_one_charge(&s, &card, &json, price, "pulled", &format!("pulled at {at}"));
         assert!(s.signing_refs().is_empty(), "pulled at {at}: finished");
     }
@@ -434,7 +460,7 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
         let json = fx.kit_json(s.phone_id());
         // 90,000 msat takes two notes; the card leaves at the second SIGN.
         let r = s.charge(&mut CardClient::new(PullAtSign::new(&card, 1)), &json, 90_000, "half", b"1234");
-        assert_eq!(code(&r), "no_card", "{what}");
+        assert_eq!(code(&r), "undecided", "{what}");
         let left = s.charges().remove(0);
         assert_eq!((left.state, left.inputs.len()), (ChargeState::Signing, 2), "{what}");
         let (signed, unsigned) = (left.inputs[0].slot, left.inputs[1].slot);
@@ -481,7 +507,7 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
     let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]);
     let json = fx.kit_json(s.phone_id());
     let r = s.charge(&mut CardClient::new(PullAtSign::new(&card, 1)), &json, 150_000, "three", b"1234");
-    assert_eq!(code(&r), "no_card");
+    assert_eq!(code(&r), "undecided");
     let left = s.charges().remove(0);
     assert_eq!((left.state, left.inputs.len()), (ChargeState::Signing, 3));
     let slots: Vec<u8> = left.inputs.iter().map(|i| i.slot).collect();

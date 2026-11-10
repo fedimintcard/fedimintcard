@@ -21,7 +21,7 @@ use crate::store::{self, Store};
 
 /// The phone's NFC session with the card: `transmit` sends one command APDU and answers the
 /// card's response, its data followed by the two status bytes. An error is the card leaving the
-/// field (the charge answers `no_card`).
+/// field (the charge answers `no_card`, or `undecided` once the card had signed an input).
 #[uniffi::export(with_foreign)]
 pub trait ApduTransport: Send + Sync {
     fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, TransportError>;
@@ -202,7 +202,7 @@ impl PosCore {
     /// (`kit_json`, the kit or the whole `{"ok":true,"kit":…}`), for the sale `client_ref` (1 to 128
     /// ASCII characters, the same on a retry) and the holder's `pin`. Blocks on the card, and on a
     /// charge already running on this store. A refusal is `Refused`; an error is the core failing
-    /// unexpectedly (`Internal`), the sale's outcome unknown as for `no_card`.
+    /// unexpectedly (`Internal`), the sale's outcome unknown as for `undecided`.
     pub fn charge(
         &self,
         transport: Arc<dyn ApduTransport>,

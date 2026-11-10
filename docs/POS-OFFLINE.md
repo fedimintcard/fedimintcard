@@ -54,9 +54,10 @@ unused entries of a kit past its grace, secrets and all.
 and never falls back (the double-charge guard). Order: try the till with the quick timeout; fall
 back when the link cannot open and the kit is valid and under its caps.
 
-**A sale the local charge answered `no_card` is retried locally only** (the core's `charge`, the
-same `client_ref`), never on the till's `POST /v1/charge`, while `PosCore.signing_refs()` lists
-its `client_ref`. The card may have signed part of a transaction that only its next local tap on
+**A sale the local charge answered `undecided` (its card was taken away while it signed) is
+retried locally only** (the core's `charge`, the same `client_ref`), never on the till's
+`POST /v1/charge`, while `PosCore.signing_refs()` lists its `client_ref`. The card may have signed
+part of a transaction that only its next local tap on
 this phone finishes; an online charge would take the sale a second time from the card's other
 notes, or spend the note that transaction still needs. The apps (ENG-843, ENG-844) check
 `signing_refs()` before they try the till, "Try again" included: the order above (the till
@@ -114,7 +115,8 @@ UniFFI, feature `ffi`: Swift module `FedimintCardPosCore`, Kotlin package
 `org.fedimintcard.poscore`.
 
 - `ApduTransport.transmit(apdu) -> data || SW`, implemented by the app over its NFC session
-  (`NFCISO7816Tag`, `IsoDep`). An error is the card leaving the field (`no_card`). The core
+  (`NFCISO7816Tag`, `IsoDep`). An error is the card leaving the field (`no_card`, or `undecided`
+  once the card had signed an input of this sale). The core
   selects the applet before its first command.
 - `PosCore.open(dir)`, `phone_id()`, `charge(transport, kit_json, price_msat, client_ref, pin)`
   returning `Paid { txid, price_msat, till_msat, overpay_msat, fees_msat, fee_margin_msat,
@@ -123,7 +125,7 @@ UniFFI, feature `ffi`: Swift module `FedimintCardPosCore`, Kotlin package
   `dismiss(txid)`.
 - Every method but `phone_id()` throws `PosCoreError` (`Store`, `Answer`, or `Internal` for a
   failure the core did not expect, a panic caught); a refusal is `Refused`, not an error. A
-  `charge` that throws has an unknown outcome, as `no_card`: retry it locally with the same
+  `charge` that throws has an unknown outcome, as `undecided`: retry it locally with the same
   `client_ref`.
 
 **Threading.** Every call blocks until it is done, and `charge` waits on the card (each SIGN is
@@ -153,7 +155,7 @@ is shown as its generic card error.
 |---|---|---|
 | `bad_request` | the price, `client_ref` or PIN's shape; nothing sent to the card | fix the input |
 | `conflict` | this `client_ref` was a sale of another price | use a new `client_ref` |
-| `undecided` | this `client_ref`'s first card was taken away while it signed | ask for that card again |
+| `undecided` | the card was taken away while it signed (its next tap here finishes the sale), or this `client_ref` waits for the card that was | tap that card again, same `client_ref` |
 | `offline_not_ready` | no kit yet, or one this phone cannot use | "Till service unreachable": no kit yet |
 | `offline_kit_expired` | the kit is past its expiry (phone's clock or card's) | kit expired: reach the till |
 | `offline_cap_reached` | the phone's caps on what waits to sync | caps reached: reach the till |
@@ -166,7 +168,7 @@ is shown as its generic card error.
 | `pin_blocked` | the PIN is blocked | the card cannot pay |
 | `card_limit` | the card's daily limit | decline |
 | `insufficient`, `no_exact_plan` | the card's notes do not make the price | decline |
-| `no_card` | the card left the field | tap again, same `client_ref` |
+| `no_card` | the card left the field before it signed anything | tap again, same `client_ref` |
 | `card_error`, `internal` | anything else | show `detail` |
 
 ## Risks

@@ -108,7 +108,9 @@ and `"suggest_above_msat"` (each `N` or null). The POS shows "This card can't ta
 offline. Try N sats" (or "Try another amount"), not "card needs a top up".
 
 **A card taken away mid-tap.** A card pulled after it signed some of an offline charge's inputs
-leaves the charge `signing` (the answer is `no_card`). Tapped again with the same `client_ref`,
+leaves the charge `signing`, and that tap is answered `undecided` (202): only the card's next tap
+can say whether it paid. (A card pulled before it signed anything leaves nothing behind, and the
+answer is `no_card`.) Tapped again with the same `client_ref`,
 the till finishes that charge from the card's stored signatures and answers it, as a repeat; it
 never signs a second transaction for the sale. Another card tapped with that `client_ref` while
 the first card's charge is still signing is answered `undecided` (202) with nothing signed: only
@@ -224,7 +226,8 @@ starts a second spend while the first may still count:
   and `txid`), without touching the card. The sale is in `sales.json` as soon as the federation has
   accepted it (`collection_pending` true until the till notes are in the wallet), so an app can
   also poll `/v1/sales` for its `client_ref`;
-* the earlier attempt is still unresolved, or still in flight (the service is busy with it):
+* the earlier attempt is still unresolved, or still in flight (the service is busy with it), or
+  its card was taken away while it signed an offline charge (that card's next tap finishes it):
   `undecided` 202, never `busy`, never a second spend. The service resolves it on the next job
   and records the sale;
 * the earlier attempt is proven to have left nothing behind (`insufficient`, `no_card`,
@@ -250,7 +253,7 @@ earlier attempt.
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: an earlier attempt with this `client_ref` waits for the card taken away while it signed, and this card was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |

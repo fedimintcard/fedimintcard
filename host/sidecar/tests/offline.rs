@@ -795,7 +795,7 @@ async fn a_retap_after_the_card_left_mid_sign_is_the_same_charge() -> anyhow::Re
     t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
-    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
     let first = t.off.queue.lock().unwrap().file.charges.clone();
     assert_eq!(first.len(), 1);
     assert_eq!((first[0].state, first[0].inputs.len()), (ChargeState::Signing, 2));
@@ -829,7 +829,7 @@ async fn another_card_for_a_sale_a_card_left_signing_is_refused_undecided() -> a
     t.load(&second, &[1 << 16, 1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge_pulled(&first, 1, 90_000, "two-cards").await;
-    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
 
     let (status, body) = t.charge(&second, 90_000, "two-cards").await;
     assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
@@ -861,7 +861,7 @@ async fn an_online_retap_of_a_sale_left_signing_offline_finishes_it() -> anyhow:
     t.load(&old, &[1 << 16, 1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
-    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
     let first = t.off.queue.lock().unwrap().file.charges.clone();
     assert_eq!((first.len(), first[0].state), (1, ChargeState::Signing));
 
