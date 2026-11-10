@@ -868,6 +868,9 @@ pub fn exact_prices_near_in(
             }
         }
     }
+    // With some tiers only, the whole-sat prices nearest the asked one whose till side can fit are
+    // candidates too: checked apart from the ones above, so neither list crowds out the other.
+    let mut scan: Vec<u64> = vec![];
     if tiers != ALL_TIERS {
         // A price is paid by a till side of `price..=price + MAX_TILL_OVERPAY`: it must fit.
         cands.retain(|p| fit_above(p.saturating_sub(1), tiers).is_some_and(|t| t <= p + MAX_TILL_OVERPAY));
@@ -876,7 +879,7 @@ pub fn exact_prices_near_in(
             let t = fit_below(down, tiers);
             let p = t / step * step;
             if p > 0 && p < price {
-                cands.push(p);
+                scan.push(p);
             }
             down = p.min(t);
             if down == 0 {
@@ -887,16 +890,25 @@ pub fn exact_prices_near_in(
             let Some(t) = fit_above(up, tiers) else { break };
             let p = t / step * step;
             if p > price {
-                cands.push(p);
+                scan.push(p);
             }
             up = t;
         }
     }
-    cands.sort_unstable();
-    cands.dedup();
     let pays = |p: u64| solve_in(notes, p, free_slots, fee, min_denom, tiers).is_ok();
-    let below = cands.iter().rev().filter(|c| **c < price).take(NEAR_TRIES).copied().find(|c| pays(*c));
-    let above = cands.iter().filter(|c| **c > price).take(NEAR_TRIES).copied().find(|c| pays(*c));
+    let mut below = None;
+    let mut above: Option<u64> = None;
+    for mut list in [cands, scan] {
+        list.sort_unstable();
+        list.dedup();
+        let b = list.iter().rev().filter(|c| **c < price).take(NEAR_TRIES).copied().find(|c| pays(*c));
+        let a = list.iter().filter(|c| **c > price).take(NEAR_TRIES).copied().find(|c| pays(*c));
+        below = below.max(b);
+        above = match (above, a) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        };
+    }
     (below, above)
 }
 
@@ -1296,6 +1308,19 @@ mod tests {
         assert_eq!(lowest_till_note(&ppm1000, min_econ(&ppm1000)), 1);
         // No fees: the smallest economical note is 1 msat.
         assert_eq!(lowest_till_note(&zero, min_econ(&zero)), 1);
+    }
+
+    /// With the kit's tiers and no room for change, the prices a card pays are its input sets'
+    /// (no change): the whole-sat scan near the asked price must not crowd them out.
+    #[test]
+    fn masked_suggestions_still_find_the_prices_paid_without_change() {
+        let notes = [65_536u64, 16_384];
+        let m = min_econ(&base100);
+        let kit = tiers_between(lowest_till_note(&base100, m), 1 << 26);
+        let all = exact_prices_near(&notes, 50_000, 0, &base100, m, 1_000);
+        assert!(all.0.is_some() || all.1.is_some(), "{all:?}");
+        let masked = exact_prices_near_in(&notes, 50_000, 0, &base100, m, 1_000, kit);
+        assert_eq!(masked, all, "the kit's tiers pay what every tier pays here");
     }
 
     /// A pool out of a tier: the prices suggested fit what is left, and pay.
