@@ -938,7 +938,8 @@ pub async fn charge_job(
 /// federation does not answer within 2 s, a 3.0 card is charged offline
 /// ([`crate::offline::charge`]); while both answer, charges taken offline for any card are reported
 /// first, so the registry knows which notes they spent. A sale whose offline charge a card left
-/// signing here is `undecided` online: only that card's next offline tap finishes it.
+/// signing here goes the offline way even while both answer ([`finish_left_signing`]): that
+/// card's tap finishes the charge it began, and another card is `undecided`.
 pub async fn charge_job_with(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -956,8 +957,8 @@ pub async fn charge_job_with(
         if reg != Some(true) || !fed {
             return offline_charge(cw, ops, off, price, client_ref, sales).await;
         }
-        if let Some(r) = left_signing(off, client_ref.as_deref()) {
-            return r;
+        if let Some(held) = left_signing(off, client_ref.as_deref()) {
+            return finish_left_signing(cw, ops, off, price, client_ref, sales, held).await;
         }
         let mut sent = crate::offline::Sent::default();
         crate::offline::report(off, ops, None, &mut sent).await;
@@ -979,10 +980,8 @@ pub async fn charge_job_with(
     r
 }
 
-/// `undecided` for a sale whose offline charge a card taken away mid-SIGN left `signing` in this
-/// till's queue. The card may have signed part of that transaction, which its next offline tap
-/// here finishes; an online charge would take the sale a second time from its other notes, or
-/// spend the note that transaction still needs.
+/// When this till's queue holds a sale's offline charge `signing` (its card was taken away
+/// mid-SIGN), the `undecided` answer for any card but that one.
 fn left_signing(off: &crate::offline::Offline, client_ref: Option<&str>) -> Option<Reply> {
     let r = client_ref?;
     let q = off.queue.lock().unwrap();
@@ -991,10 +990,32 @@ fn left_signing(off: &crate::offline::Offline, client_ref: Option<&str>) -> Opti
         202,
         "undecided",
         format!(
-            "an earlier attempt with this client_ref was taken offline and card {} left while it signed (transaction {}); only that card's next offline tap here finishes it, so nothing was charged online",
+            "an earlier attempt with this client_ref was taken offline and card {} left while it signed (transaction {}); only that card's next tap here finishes it, and this card was not charged",
             c.short_id, c.txid
         ),
     ))
+}
+
+/// A tap, while the registry and the federation answer, for a sale whose offline charge a card
+/// left `signing` here. The card may have signed part of that transaction, which its next offline
+/// tap would finish; an online charge would take the sale a second time from its other notes, or
+/// spend the note that transaction still needs. So the tap goes the offline way: that card
+/// finishes the charge it began, answered as the sale (`offline: true`, reported at the sender's
+/// next pass, every [`crate::offline::SEND_EVERY`]); another card is `undecided` (`held`) with
+/// nothing signed. A charge the card can never finish is abandoned by the core, freeing the sale's
+/// `client_ref`, and the tap takes the sale offline anew.
+async fn finish_left_signing(
+    cw: &mut CardWallet,
+    ops: &Ops,
+    off: &crate::offline::Offline,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+    held: Reply,
+) -> Reply {
+    let r = offline_charge(cw, ops, off, price, client_ref, sales).await;
+    // A 2.x card never took a charge offline, so it is not the card the sale waits for.
+    if r.body["error"] == "offline_unsupported_card" { held } else { r }
 }
 
 /// The offline path of a charge: take it, record the sale (`offline`), answer 200 with

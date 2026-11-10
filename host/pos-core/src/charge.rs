@@ -133,7 +133,7 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 /// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
 /// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
 ///    card for one is `undecided`; one that can never be finished is `abandoned` and frees its
-///    `client_ref`;
+///    `client_ref` and the notes the card never signed for it;
 /// 6. the card's notes, the plan, the value cap, the card's day, then `signing`, `SET_CHANGE` and
 ///    `SIGN`, and `queued`.
 pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client_ref: Option<&str>) -> Result<Taken> {
@@ -611,8 +611,9 @@ fn settle_failed_signing(card: &mut dyn Card, queue: &Mutex<Queue>, entry: &Offl
 /// signature for the same hash, so the transaction is completed and queued. An entry none of
 /// whose slots signed it is dropped. One that can never be finished, because an input slot is
 /// neither spent for it nor still holding its note (spent by another transaction since, or
-/// re-keyed), is [`ChargeState::Abandoned`] and the charge goes on. Needs the PIN session.
-/// Answers the entries finished.
+/// re-keyed), is [`ChargeState::Abandoned`] and the charge goes on; its inputs the card never
+/// signed still hold their notes, which leave the spent list and pay again. Needs the PIN
+/// session. Answers the entries finished.
 fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id: &str) -> Result<Vec<OfflineCharge>> {
     let left: Vec<OfflineCharge> =
         lock(queue).file.charges.iter().filter(|c| c.state == ChargeState::Signing && c.short_id == short_id).cloned().collect();
@@ -623,6 +624,8 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
         let mut keys = vec![];
         let mut spent = 0;
         let mut gone = None;
+        // The inputs not signed yet: their notes are still on the card.
+        let mut unsigned = vec![];
         // Every input slot is read before any is signed: a transaction that cannot be finished
         // must not spend another note.
         for i in &e.inputs {
@@ -633,7 +636,7 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
                 // Signed for this transaction: SIGN answers its stored signature again.
                 SlotState::Spent if ours && info.spent_hash == digest => spent += 1,
                 // Not signed yet: SIGN spends the note for this transaction.
-                SlotState::Note if ours && info.amount_msat == i.amount_msat => {}
+                SlotState::Note if ours && info.amount_msat == i.amount_msat => unsigned.push(i.nonce.clone()),
                 s => {
                     gone.get_or_insert_with(|| match (ours, s) {
                         (false, _) => format!("input slot {} was re-keyed", i.slot),
@@ -649,7 +652,7 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
             continue;
         }
         if let Some(why) = gone {
-            abandon(queue, &e, &why)?;
+            abandon(queue, &e, &why, &unsigned)?;
             continue;
         }
         let sigs = sign_inputs(card, &keys, digest)?;
@@ -676,8 +679,10 @@ fn input_key(i: &OfflineInput) -> Result<XOnlyPublicKey> {
 
 /// An entry left `signing` that can never be sent: kept for the operator as `abandoned`, its
 /// `client_ref` freed (a retap of the sale is a new charge: this one was never paid), its pool
-/// entries never taken again. The card's slots spent for it stay spent.
-fn abandon(queue: &Mutex<Queue>, e: &OfflineCharge, why: &str) -> Result<()> {
+/// entries never taken again. The card's slots spent for it stay spent; its `unsigned` inputs
+/// (nonces), whose notes the card still holds, leave the spent list in the same write, so they pay
+/// again here.
+fn abandon(queue: &Mutex<Queue>, e: &OfflineCharge, why: &str, unsigned: &[String]) -> Result<()> {
     let sale = e.client_ref.as_deref().map(|r| format!(" for client_ref {r:?}")).unwrap_or_default();
     let detail = format!(
         "{why} while this charge waited for the card's next tap, so it can never be sent; nothing was charged{sale}, and the notes the card signed for it stay spent on the card"
@@ -689,6 +694,7 @@ fn abandon(queue: &Mutex<Queue>, e: &OfflineCharge, why: &str) -> Result<()> {
             c.client_ref = None;
             c.detail = Some(detail);
             f.pool_used.extend(std::mem::take(&mut c.pool).into_iter().map(|p| p.blinded));
+            f.spent.retain(|n| !unsigned.contains(n));
         }
     })
 }

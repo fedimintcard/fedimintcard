@@ -422,7 +422,8 @@ fn a_card_pulled_at_any_apdu_then_tapped_again_pays_once() {
 /// A charge a card left signing whose other input slot has since paid another transaction (or
 /// been renewed and loaded again) can never be sent: the retap abandons it, frees its sale's
 /// `client_ref`, keeps its pool entries used, and takes the sale from the notes the card has. Once
-/// card_error on every later tap of the card, for good.
+/// card_error on every later tap of the card, for good. An input the card never signed for it
+/// still holds its note, and pays again: once skipped here for good, as taken offline already.
 #[test]
 fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays() {
     let fx = Fx::new(true);
@@ -473,6 +474,37 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
         assert!(s.signing_refs().is_empty(), "{what}");
         assert_eq!(s.drain(50).txids, vec![t.charge.txid.clone()], "{what}");
     }
+
+    // 150,000 msat takes three of four 65,536 msat notes, and the card leaves at the second SIGN;
+    // the second input then pays another transaction. The third was never signed: still a note.
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]);
+    let json = fx.kit_json(s.phone_id());
+    let r = s.charge(&mut CardClient::new(PullAtSign::new(&card, 1)), &json, 150_000, "three", b"1234");
+    assert_eq!(code(&r), "no_card");
+    let left = s.charges().remove(0);
+    assert_eq!((left.state, left.inputs.len()), (ChargeState::Signing, 3));
+    let slots: Vec<u8> = left.inputs.iter().map(|i| i.slot).collect();
+    {
+        let mut c = card.0.lock().unwrap();
+        open_pin_session_with(&mut *c, TEST_PIN).unwrap();
+        c.sign(slots[1], &[7; 32]).unwrap();
+    }
+    // The retap abandons it; the two notes the card has left do not make the sale.
+    let r = take(&s, &card, &json, 150_000, "three");
+    assert_eq!(code(&r), "insufficient", "{:?}", r.as_ref().err());
+    assert_eq!(s.charges().iter().find(|c| c.txid == left.txid).map(|c| c.state), Some(ChargeState::Abandoned));
+    let never_an_input = (0..4).find(|n| !slots.contains(n)).unwrap();
+    let mut live = vec![slots[2], never_an_input];
+    live.sort();
+    assert_eq!(slots_in(&card, SlotState::Note), live);
+    // They make a later 100,000 msat sale: both pay it, the one the abandoned charge took included.
+    let t = take(&s, &card, &json, 100_000, "after").unwrap_or_else(|e| panic!("the two live notes: {e:#}"));
+    let mut paid: Vec<u8> = t.charge.inputs.iter().map(|i| i.slot).collect();
+    paid.sort();
+    assert_eq!(paid, live);
+    assert!(slots_in(&card, SlotState::Note).is_empty());
+    assert_eq!(spent_hashes(&card).iter().filter(|(_, h)| *h == digest(&t.charge.txid)).count(), 2);
 }
 
 /// The first charge's transport: at its first GET_SLOT of slot `from` or later (a KEYED slot, for

@@ -139,7 +139,8 @@ pub enum ChargeState {
     /// Left `signing` by a card taken away, and never finishable: one of its input slots was
     /// since spent by another transaction or re-keyed. Nothing was charged for it, and it no
     /// longer answers for its `client_ref` (`detail` names it); the notes the card did sign for
-    /// it are stranded. Kept for the operator; its pool entries are never taken again.
+    /// it are stranded, and those it never signed left the spent list (they pay again). Kept for
+    /// the operator; its pool entries are never taken again.
     Abandoned,
 }
 

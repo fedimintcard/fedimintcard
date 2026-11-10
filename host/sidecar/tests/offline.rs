@@ -842,16 +842,23 @@ async fn another_card_for_a_sale_a_card_left_signing_is_refused_undecided() -> a
     Ok(())
 }
 
-/// A sale whose card left mid-SIGN offline, tapped again once the registry is back: the online
-/// path answers `undecided` and signs nothing (the card's other notes would pay the sale a second
-/// time, and the half-signed charge would still be finished at the card's next offline tap). The
-/// card's next offline tap finishes the charge it began.
+/// A sale whose card left mid-SIGN offline, tapped again once the registry is back: the tap goes
+/// the offline way, never the online charge (the card's other notes would pay the sale a second
+/// time, and the half-signed charge would still be finished at the card's next offline tap).
+/// Another card, 3.0 or 2.1, is `undecided` with nothing signed; the card that began the charge
+/// finishes it, answered as that charge, and the next send reports and settles it. Until
+/// ENG-842's review an online retap was `undecided` every time, and ringing the sale again
+/// charged the card twice.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_online_retap_of_a_sale_left_signing_offline_is_undecided() -> anyhow::Result<()> {
+async fn an_online_retap_of_a_sale_left_signing_offline_finishes_it() -> anyhow::Result<()> {
     let mut t = Till::new(OfflineConfig::default()).await?;
-    let card = v3_card();
+    let (card, other, old) = (v3_card(), v3_card(), Rc::new(RefCell::new(SoftCard::new())));
     provision(&t.reg, &card);
+    provision(&t.reg, &other);
+    provision(&t.reg, &old);
     t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    t.load(&other, &[1 << 16, 1 << 16]).await?;
+    t.load(&old, &[1 << 16, 1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
     assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
@@ -859,17 +866,31 @@ async fn an_online_retap_of_a_sale_left_signing_offline_is_undecided() -> anyhow
     assert_eq!((first.len(), first[0].state), (1, ChargeState::Signing));
 
     t.set_down(false);
-    let (status, body) = t.charge(&card, 90_000, "pulled").await;
-    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
-    assert_eq!(spent_slots(&card), 1, "nothing signed online");
+    for (which, c) in [("another 3.0 card", &other), ("a 2.1 card", &old)] {
+        let (status, body) = t.charge(c, 90_000, "pulled").await;
+        assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{which}: {body}");
+        assert_eq!(spent_slots(c), 0, "{which}: nothing signed");
+    }
     assert!(t.sales.lock().unwrap().find_ref("pulled").is_none(), "no sale");
     assert_eq!(t.off.queue.lock().unwrap().file.charges, first, "the offline charge still waits for its card");
 
-    t.set_down(true);
+    // Still online: the card that began the charge finishes it, and nothing is charged online.
     let (status, body) = t.charge(&card, 90_000, "pulled").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began: {body}");
-    assert_eq!((t.off.stats().queued, spent_slots(&card)), (1, 2));
+    assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began, not a second one: {body}");
+    assert_eq!(body["offline"], true, "{body}");
+    let q = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!(q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![(first[0].txid.as_str(), ChargeState::Queued)], "one charge for one sale");
+    assert_eq!(spent_slots(&card), 2, "two inputs, each signed once");
+    assert!(t.sale("pulled").offline);
+    let sent = t.send().await;
+    assert_eq!((&sent["reported"], &sent["settled"]), (&json!([first[0].txid]), &json!([first[0].txid])), "{sent}");
+    assert_eq!(t.off.stats().queued, 0);
+    assert!(!t.sale("pulled").collection_pending);
+    // A tap of the sale from now on is the sale.
+    let (status, again) = t.charge(&card, 90_000, "pulled").await;
+    assert_eq!((status, &again["txid"]), (200, &body["txid"]), "{again}");
+    assert_eq!(spent_slots(&card), 2);
     Ok(())
 }
 

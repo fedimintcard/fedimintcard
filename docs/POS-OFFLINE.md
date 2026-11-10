@@ -6,8 +6,9 @@ cannot pay twice with the same note. A cloned card, or a lost or rooted phone, c
 phone's caps, never the merchant's proceeds already queued.
 
 Online, the hosted till does the charge exactly as before (`docs/TILL-API.md`); nothing in the
-online path changes. This page is how the offline path is built (ENG-841; slice 1 is ENG-842:
-the shared core and the till's routes; the apps are ENG-843, iOS, and ENG-844, Android).
+online path changes but for a sale the till's own offline queue holds `signing` (below). This
+page is how the offline path is built (ENG-841; slice 1 is ENG-842: the shared core and the
+till's routes; the apps are ENG-843, iOS, and ENG-844, Android).
 
 ## Architecture
 
@@ -58,15 +59,20 @@ same `client_ref`), never on the till's `POST /v1/charge`, while `PosCore.signin
 its `client_ref`. The card may have signed part of a transaction that only its next local tap on
 this phone finishes; an online charge would take the sale a second time from the card's other
 notes, or spend the note that transaction still needs. The apps (ENG-843, ENG-844) check
-`signing_refs()` before they try the till. The till keeps the same rule for its own offline
-queue: a tap whose `client_ref` it holds `signing` is answered `undecided` online.
+`signing_refs()` before they try the till, "Try again" included: the order above (the till
+first) is not for such a sale. A `charge` that throws is retried locally too, with the same
+`client_ref`. The till keeps the same rule for its own offline queue: a tap whose `client_ref`
+it holds `signing` goes the offline way even while the registry and the federation answer: the
+card that began the charge finishes it (answered as the sale, `offline: true`; the sender's
+next pass, every 30 s, reports it), and another card is `undecided` with nothing signed.
 
 **Caps and the attacker.** The kit's caps are enforced by the core; an expired kit stops offline
 acceptance; the card's own daily limit applies as with any till. Double spends across phones and
 tills are found by the registry at report, as today, and counted.
 
-**What does not change.** Applet 3.0, the online charge path (but for the `undecided` above, for a
-sale the till's own offline queue holds `signing`), the registry API and the Setup app.
+**What does not change.** Applet 3.0, the online charge path (but for a sale the till's own
+offline queue holds `signing`, taken the offline way as above), the registry API and the Setup
+app.
 
 ## One charge
 
@@ -84,8 +90,9 @@ spends no PIN try:
 5. charges this card left `signing` are finished from its stored signatures: a repeat of one is
    that charge (`replayed`), and another card tapped for one is `undecided`. One that can never be
    finished (an input slot since spent by another transaction, or re-keyed) is set aside as
-   `abandoned`, nothing charged for it and its pool entries never taken again, and the tap goes
-   on as a new charge, for the same `client_ref` too;
+   `abandoned`, nothing charged for it and its pool entries never taken again (its inputs the
+   card never signed leave the spent list and pay again), and the tap goes on as a new charge,
+   for the same `client_ref` too;
 6. the card's notes (skipping those taken offline here already, and those that do not check),
    the plan, the value cap, the card's day (`card_limit`), then `signing`, `SET_CHANGE`, `SIGN` and
    `queued`.

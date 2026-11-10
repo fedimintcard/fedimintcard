@@ -112,12 +112,14 @@ leaves the charge `signing` (the answer is `no_card`). Tapped again with the sam
 the till finishes that charge from the card's stored signatures and answers it, as a repeat; it
 never signs a second transaction for the sale. Another card tapped with that `client_ref` while
 the first card's charge is still signing is answered `undecided` (202) with nothing signed: only
-the first card's next tap can say whether it paid. So is a tap with that `client_ref` once the
-till is online again: the online charge would take the sale a second time from the card's other
-notes, so the charge waits for that card's next offline tap here. A charge left signing that can
-never be finished (an input slot of it has since paid another transaction, or was re-keyed) is
-set aside at the card's next offline tap (`abandoned` in the queue, kept for the operator: the
-notes the card signed for it stay spent on the card); nothing was charged for it, and the tap
+the first card's next tap can say whether it paid. Once the till is online again, a tap with
+that `client_ref` still goes the offline way, never the online charge, which would take the sale
+a second time from the card's other notes: the first card finishes its charge (answered as the
+sale, `offline: true`; the sender's next pass, every 30 s, reports it), and another card is
+`undecided`. A charge left signing that can never be finished (an input slot of it has since
+paid another transaction, or was re-keyed) is set aside at the card's next tap on the offline
+path (`abandoned` in the queue, kept for the operator: the notes the card signed for it stay
+spent on the card, and those it never signed pay again); nothing was charged for it, and the tap
 goes on as a new charge, for the same `client_ref` too. Notes the till's checks refuse (no
 denomination of the federation's, or a federation signature that does not verify) are skipped;
 when the rest do not pay, the charge is `offline_note_invalid` (403), not `insufficient`.
@@ -248,7 +250,7 @@ earlier attempt.
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: an earlier attempt with this `client_ref` waits for the card taken away while it signed, and this card was not charged | show "pending", then poll /v1/sales; offline, ask for the first card again |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: an earlier attempt with this `client_ref` waits for the card taken away while it signed, and this card was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
