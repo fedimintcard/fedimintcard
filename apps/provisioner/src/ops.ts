@@ -52,7 +52,10 @@ export interface ResetCompletion {
   /** The old card's short id. */
   readonly short_id: string;
   readonly chip: string;
-  /** The key set version the factory login reported (01 on a J3R180). */
+  /**
+   * The key set version the factory login reported (01 on a J3R180 and on a
+   * J3R452 after first contact).
+   */
   readonly gp_key_version: number;
   readonly manager_keys: 'factory';
   readonly package: 'absent';

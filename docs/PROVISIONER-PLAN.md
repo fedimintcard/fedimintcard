@@ -311,7 +311,7 @@ Phases, in the operator's words:
 |---|---|---|
 | probe | `Checking the card` | SELECT applet → `9000` **with an empty body**; then `GET_PUB 0`: `6985` means an installed but unkeyed fedimint card, 32 bytes means a keyed one, `6D 00` means a foreign or unknown applet |
 | selectIsd | `Opening the card manager` | SELECT ISD `A000000151000000` |
-| auth | `Logging in` | SCP02 INITIALIZE UPDATE with factory keys; the host checks the card's cryptogram and stops `wrongKeys` if it does not match, sending nothing more |
+| auth | `Logging in` | SCP02 or SCP03 INITIALIZE UPDATE with factory keys (the card's reply names the protocol); the host checks the card's cryptogram and stops `wrongKeys` if it does not match, sending nothing more |
 | sweep | `Removing the old install` | DELETE applet, opener, package (never the ISD) |
 | installForLoad | `Preparing` | INSTALL [for load] |
 | load | `Writing n of N` | blocks of 247 bytes (5,513 B = 23 blocks, not 82) |

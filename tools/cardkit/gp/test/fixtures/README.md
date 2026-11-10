@@ -49,5 +49,5 @@ instances) collide with none of them, so the install's sweep and the reset
 never meet the seller's objects.
 
 No capture of first contact is here: the one the owner made was under the
-seller's key set. First contact (PUT KEY P1 00 at version FF, D182) rests on
-the fake card until ENG-839 traces it on silicon.
+seller's key set. First contact (PUT KEY P1 00 at version FF, cashucard's
+D182) rests on the fake card until it is traced on silicon.
