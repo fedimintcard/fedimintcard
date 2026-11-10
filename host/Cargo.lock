@@ -2499,6 +2499,7 @@ dependencies = [
  "fedimint-api-client",
  "fedimint-bip39",
  "fedimint-card-host-card",
+ "fedimint-card-pos-core",
  "fedimint-client",
  "fedimint-connectors",
  "fedimint-core",

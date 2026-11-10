@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fedimint-api-client = { workspace = true }
 fedimint-bip39 = { workspace = true }
 fedimint-card-host-card = { path = "../card" }
+fedimint-card-pos-core = { path = "../pos-core" }
 fedimint-client = { workspace = true }
 fedimint-connectors = { workspace = true }
 fedimint-core = { workspace = true }

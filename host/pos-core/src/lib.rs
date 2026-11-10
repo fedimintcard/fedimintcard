@@ -10,6 +10,8 @@ use fedimint_mint_common::{Nonce, Note};
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 
+pub mod plan;
+
 /// A scalar from a small integer: its consensus encoding is 32 bytes little-endian.
 fn scalar<T: Decodable>(n: u64) -> T {
     let mut bytes = [0u8; 32];
