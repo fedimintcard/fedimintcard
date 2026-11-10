@@ -515,6 +515,53 @@ describe('a J3R452 as it ships, at key set version FF', () => {
     }
   });
 
+  test('one that keeps its FF set beside its own at first contact is never keyed: guarded at the rotation, then at every retap, a tap lifted after PUT KEY included', async () => {
+    const GEN_KEY = 0x10;
+    const SET_PIN = 0x41;
+    for (const lifted of [false, true]) {
+      const label = lifted ? 'lifted after PUT KEY' : 'stopped at the reopen';
+      const card = new FakeGpCard({scp: 3, kvn: 0xff, cplc: J3R452_CPLC, keepsShippedSet: true});
+      if (lifted) {
+        card.pull(apdu => apdu[1] === PUT_KEY, 'after');
+      }
+      const r1 = await installTap(card.transceive, options().opts);
+      expect([label, r1.installed]).toEqual([
+        label,
+        expect.objectContaining({ok: false, kind: lifted ? 'pulled' : 'guarded', phase: 'rotate'}),
+      ]);
+      expect([label, card.kvn, card.shipped?.kvn]).toEqual([label, 0x01, 0xff]);
+      // the operator's retaps: the applet is there with no keys, so each goes straight to the
+      // rotation, which finds the card's own set at 01 and reads the key information after its login
+      for (const retap of [1, 2]) {
+        card.reset();
+        const from = card.log.length;
+        const r = await installTap(card.transceive, options().opts);
+        const where = `${label}, retap ${retap}`;
+        expect([where, r.installed]).toEqual([
+          where,
+          expect.objectContaining({
+            ok: false,
+            kind: 'guarded',
+            phase: 'rotate',
+            reason: expect.stringMatching(/still lists key version FF/),
+          }),
+        ]);
+        expect([where, r.setup]).toEqual([where, null]);
+        const sent = card.log.slice(from);
+        expect([where, sent.at(-1)]).toEqual([where, KEY_INFORMATION]);
+        expect([where, sent.filter(a => a[1] === PUT_KEY)]).toEqual([where, []]);
+        expect([where, sent.filter(a => a[0] === 0xb0 && (a[1] === GEN_KEY || a[1] === SET_PIN))]).toEqual([
+          where,
+          [],
+        ]);
+      }
+      expect([label, card.applet?.slots.every(s => s === null)]).toEqual([label, true]);
+      expect([label, card.applet?.pin]).toEqual([label, null]);
+      expect([label, card.putKeysTaken]).toEqual([label, 1]);
+      expect([label, card.failedAuths]).toEqual([label, 0]);
+    }
+  });
+
   test('on the seller’s own keys: one INITIALIZE UPDATE, no login, wrongKeys, and the card as it came', async () => {
     const seller = {
       enc: fromHex('a5'.repeat(16)),

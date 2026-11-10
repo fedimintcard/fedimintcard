@@ -774,11 +774,14 @@ function checkFirstContactKeys(reply: Reply): void {
  * contact: ours at 01 and nothing else, no key at FF among them. Then it must
  * prove `to` at 01. Any other answer to the first, or `to` at another
  * version, stops the run guarded, so a card that kept the FF set, or put ours
- * elsewhere, is not reported rotated by this run. A pull after the PUT KEY and
- * before those answers leaves the next run to find `to` at 01, as after any
- * lost reply, and that run does not read the key information: it cannot tell
- * the card from one rotated in place. Any other card has its set replaced in
- * place, with the APDUs this sent before. Each of these stops guarded with
+ * elsewhere, is not reported rotated by this run. Nor is it reported on `to`
+ * by a later one: a run that finds `to` already at 01 on an SCP03 card (after
+ * a pull between the PUT KEY and those answers, or on the retap of a card
+ * whose reopen stopped guarded) sends no PUT KEY, but after its login it
+ * selects the card manager again and reads the key information as the reopen
+ * does, the same answers stopping it guarded in the reopen phase. A rotation
+ * in place at 01 from `from` reads none. Any other card has its set replaced
+ * in place, with the APDUs this sent before. Each of these stops guarded with
  * nothing sent after INITIALIZE UPDATE: `to` proved at FF (only an in-place
  * rotation of a shipped card puts it there, and the reset refuses FF), FF
  * under SCP02 (never measured), a caller's `putKey` at first contact, and
@@ -815,6 +818,15 @@ export async function rotateKeys(
         );
       }
       await externalAuthenticate(run.timed, toKeys, hs, sessionOptions);
+      if (hs.reply.scp === 3 && kvn === FACTORY_KVN) {
+        // ours at 01 on an SCP03 card, perhaps from an earlier run's first
+        // contact whose answers were lost or whose reopen stopped guarded:
+        // read the key information as that reopen did, since a card that
+        // kept the FF set still lists it, and still opens to it
+        run.enter('reopen');
+        expectOk(await run.plain(selectAid(ISD_AID)), 0xa4);
+        checkFirstContactKeys(await run.plain(getKeyInformation()));
+      }
       run.enter('done');
       return {
         ...run.finish({ok: true}),

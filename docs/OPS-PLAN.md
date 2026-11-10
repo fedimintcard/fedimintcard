@@ -237,8 +237,11 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   new set → GEN_KEY ×8, SET_PIN, VERIFY_PIN. On a J3R452, which opens SCP03 and ships at key set
   version FF, that rotation is cardkit's first contact (`tools/cardkit/README.md`): PUT KEY with
   P1 `00` puts the card's own set at version 01 and the card drops the FF set, GET DATA `E0` must
-  then list the three AES keys at 01 and nothing at FF, and the fresh login proves them at 01.
-  Both chips end the install tap at version 01. The card row carries `chip`. Deploy needs
+  then list the three AES keys at 01 and nothing at FF, and the fresh login proves them at 01. A
+  later tap whose rotation finds the card's own set already at 01 (a tap lifted after PUT KEY, or
+  the retap of a card stopped at that check) reads `E0` the same way after its login, so no tap
+  keys a card that kept its FF set: each stops at the rotation. Both chips end the install tap at
+  version 01. The card row carries `chip`. Deploy needs
   `wrangler secret put CARD_MANAGER_MASTER` on staging and production first.
   A tap lifted during GEN_KEY ×8, SET_PIN or VERIFY_PIN (found on silicon 2026-11-04: the card left
   on its own keys, keyed, with no PIN, and refused by every later tap) keeps the batch's place and

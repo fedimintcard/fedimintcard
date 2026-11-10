@@ -3,8 +3,9 @@
 GlobalPlatform over an injected transport: SCP02 and SCP03 behind one way in,
 the card-manager commands, and an install that recovers from a pull at any APDU.
 This is the engine the phone provisioner runs to put the Fedimint card applet
-onto a blank J3R180, or onto a J3R452 once its first contact has moved it to the
-key set version a J3R180 starts at (below).
+onto a blank J3R180 or a J3R452; on a J3R452 the install's rotation is its first
+contact, which moves the card manager from FF to the version a J3R180 starts at
+(below).
 
 The core imports no NFC, no HTTP and no platform module. Callers pass a
 `Transceiver` — one APDU in, data and status bytes out — so the phone and the
@@ -98,6 +99,15 @@ rotation and the reset treat both chips alike. The Setup app's install tap
 (`apps/provisioner/src/installTap.ts`) rotates with `rotateKeys` already, so on
 a J3R452 its rotation is first contact with no change to the app.
 
+A run that finds the new set already at 01 on an SCP03 card sends no PUT KEY,
+but after its login it selects the card manager again and makes the same read,
+stopping `guarded` on the same answers. Such a run is the rerun after a pull
+between the PUT KEY and the read, or the retap of a card whose reopen the read
+stopped, which the Setup app sends straight to the rotation because its applet
+is installed with no keys: without the read either run would report the card
+on the new set, and the tap would go on to key it while a kept FF set still
+opened its card manager. A rotation in place at 01 reads no key information.
+
 `rotateKeys` now stops `guarded` before EXTERNAL AUTHENTICATE in four cases
 where it used to go on: the new set already proved at FF, a caller's `putKey`
 at first contact, FF under SCP02 (never measured), and P1 `00` on any card not
@@ -146,7 +156,12 @@ The shared files are aligned with cashucard's `tools/cardkit` at 0229dc8 (see
 - `gp/identity.ts` and `gp/load-file.ts`, and the fake card in `gp/test` (with
   the Fedimint applet behind it) rather than cashucard's `testing/` entry point;
 - no `sdAid` run option: the hub takes the security domain, and every run here
-  selects the ISD.
+  selects the ISD;
+- the key information read in a `rotateKeys` run that finds the new set
+  already at 01 under SCP03, until cashucard's copy takes the same change:
+  0229dc8 reads it only in first contact's reopen, so after a pull past the
+  PUT KEY (the residual D182 names) or on a retap it reports a card that kept
+  its FF set on the new set.
 
 Not ported, because this card does not need them: the registry, inspect,
 reset-preflight, settled-cleanup, configuration and holderCommands modules,

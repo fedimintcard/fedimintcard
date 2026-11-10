@@ -20,7 +20,9 @@
  * their check values. PUT KEY replaces the set in place, or with P1 00 on a
  * card at version FF (`kvn: 0xff`, a J3R452 as it ships) puts the new set at
  * its version and drops the FF set, as the test card did at first contact.
- * GET DATA E0, plain, lists the three keys of the set the card holds.
+ * GET DATA E0, plain, lists the three keys of each set the card holds: one,
+ * unless `keepsShippedSet` had first contact keep the FF set beside the new
+ * one, which the test card did not do.
  *
  * What it keeps that the demo's card does not: the card manager's keys and
  * their version (PUT KEY changes them), failed EXTERNAL AUTHENTICATEs (counted;
@@ -118,6 +120,9 @@ export class FakeGpCard {
   counter03 = 0;
   /** The secure channel the card manager opens: 2 (the J3R180) or 3 (the J3R452). */
   readonly scp: 2 | 3;
+  /** The FF set a first contact kept beside the new one (`keepsShippedSet`); null when there is none. */
+  shipped: {keys: {enc: number[]; mac: number[]; dek: number[]}; kvn: number} | null = null;
+  private readonly keepsShippedSet: boolean;
   /** PUT KEY commands the card took (answered 9000). */
   putKeysTaken = 0;
   failedAuths = 0;
@@ -159,11 +164,19 @@ export class FakeGpCard {
       scp?: 2 | 3;
       /** The key set version: 01 by default; FF is a J3R452 as it ships. */
       kvn?: number;
+      /**
+       * What the test card did not do at first contact: PUT KEY with P1 00 at
+       * FF keeps the FF set beside the new one (`shipped`), so GET DATA E0
+       * lists both, the FF set first. INITIALIZE UPDATE, which this card
+       * answers whatever its P1, opens the new set.
+       */
+      keepsShippedSet?: boolean;
     } = {},
   ) {
     this.appletSlots = options.appletSlots ?? 8;
     this.scp = options.scp ?? 2;
     this.kvn = options.kvn ?? 0x01;
+    this.keepsShippedSet = options.keepsShippedSet ?? false;
     const k = options.keys ?? FACTORY_KEYS;
     this.cplc = options.cplc ?? J3R180_CPLC;
     this.keys = {
@@ -347,9 +360,11 @@ export class FakeGpCard {
       return ok([0xff, 0x21, 0x06, 0x82, 0x04, 0x00, 0x02, 0x80, 0x50]);
     }
     if (cla === 0x80 && ins === 0xca && p1 === 0x00 && p2 === 0xe0) {
-      // the key information template: keys 01 to 03 of the set the card holds
+      // the key information template: keys 01 to 03 of each set the card holds, a kept FF set first
       const type = this.scp === 3 ? 0x88 : 0x80;
-      return ok([0xe0, 0x12, ...[1, 2, 3].flatMap(id => [0xc0, 0x04, id, this.kvn, type, 0x10])]);
+      const versions = [...(this.shipped ? [this.shipped.kvn] : []), this.kvn];
+      const entries = versions.flatMap(kvn => [1, 2, 3].flatMap(id => [0xc0, 0x04, id, kvn, type, 0x10]));
+      return ok([0xe0, entries.length, ...entries]);
     }
     if (cla === 0x80 && ins === 0x50) {
       if (this.locked) {
@@ -632,7 +647,7 @@ export class FakeGpCard {
    * SCP03's PUT KEY: three 88 11 10 <the key under the static DEK, AES-ECB> 03
    * <its AES check value> entries. In place (P1 the current version), or with
    * P1 00 on a card at FF to a version from 01 to 7F: first contact, after
-   * which the FF set is gone.
+   * which the FF set is gone, or with `keepsShippedSet` kept beside the new one.
    */
   private putKey03(dek: number[], p1: number, p2: number, data: number[]): number[] {
     const firstContact = p1 === 0x00 && this.kvn === 0xff && data[0] >= 0x01 && data[0] <= 0x7f;
@@ -650,6 +665,9 @@ export class FakeGpCard {
         return sw(0x6a80);
       }
       keys.push(key);
+    }
+    if (firstContact && this.keepsShippedSet) {
+      this.shipped = {keys: this.keys, kvn: this.kvn};
     }
     this.keys = {enc: keys[0], mac: keys[1], dek: keys[2]};
     this.kvn = data[0];
