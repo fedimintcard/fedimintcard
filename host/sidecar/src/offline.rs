@@ -95,17 +95,40 @@ impl Reach {
     }
 }
 
-/// Everything a till needs for offline charges.
+/// Everything a till needs for offline charges, its own and its phones'.
 pub struct Offline {
     pub cfg: OfflineConfig,
     pub reach: Reach,
     pub queue: Arc<Mutex<Queue>>,
     pub dir: PathBuf,
+    /// The phones' offline kits and their pool entries (`crate::pool`). Locked after `queue`,
+    /// never before it.
+    pub pool: Mutex<crate::pool::PoolLedger>,
+    pub kits: crate::pool::KitConfig,
 }
 
 impl Offline {
     pub fn open(data_dir: &Path, cfg: OfflineConfig) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { cfg, reach: Reach::default(), queue: Arc::new(Mutex::new(Queue::open(data_dir)?)), dir: data_dir.to_owned() }))
+        Self::open_with(data_dir, cfg, crate::pool::KitConfig::default())
+    }
+
+    /// [`Offline::open`] with the phones' kit lifetimes. A ledger a crash left behind the queue is
+    /// brought up to it.
+    pub fn open_with(data_dir: &Path, cfg: OfflineConfig, kits: crate::pool::KitConfig) -> Result<Arc<Self>> {
+        let queue = Queue::open(data_dir)?;
+        let mut pool = crate::pool::PoolLedger::open(data_dir)?;
+        if let Err(e) = crate::pool::reconcile(&queue, &mut pool) {
+            // Safe to run on: an entry a queued charge paid to is refused to any other charge.
+            tracing::warn!("offline pool: {e:#}");
+        }
+        Ok(Arc::new(Self {
+            cfg,
+            reach: Reach::default(),
+            queue: Arc::new(Mutex::new(queue)),
+            dir: data_dir.to_owned(),
+            pool: Mutex::new(pool),
+            kits,
+        }))
     }
 
     pub fn stats(&self) -> Stats {

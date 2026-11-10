@@ -71,10 +71,10 @@ impl IntoResponse for Reply {
 }
 
 impl Reply {
-    fn ok(body: Value) -> Self {
+    pub(crate) fn ok(body: Value) -> Self {
         Reply { status: 200, body }
     }
-    fn fail(status: u16, code: &str, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn fail(status: u16, code: &str, detail: impl std::fmt::Display) -> Self {
         Reply { status, body: json!({"ok": false, "error": code, "detail": detail.to_string()}) }
     }
 }
@@ -116,7 +116,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
     c(500, "internal")
 }
 
-fn error_reply(err: &anyhow::Error) -> Reply {
+pub(crate) fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
     let detail = match class.code {
         // Said plainly, for the holder, as a phone says it.
@@ -426,6 +426,8 @@ pub struct TillHandle {
     topups: Option<Arc<Topups>>,
     /// Offline charges ([`Self::with_offline`]); shared with the actor.
     offline: SharedOffline,
+    /// The newest block header, for the phones' offline kits ([`Self::with_headers`]).
+    headers: Option<Arc<crate::clock::Headers>>,
 }
 
 /// The till's offline charges, once [`TillHandle::with_offline`] set them.
@@ -437,6 +439,28 @@ impl TillHandle {
     pub fn with_offline(self, off: Arc<crate::offline::Offline>) -> Self {
         *self.offline.lock().unwrap() = Some(off);
         self
+    }
+
+    /// Give the phones' offline kits the newest block header this till keeps.
+    pub fn with_headers(mut self, headers: Arc<crate::clock::Headers>) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    pub(crate) fn wallet(&self) -> &Wallet {
+        &self.wallet
+    }
+
+    pub(crate) fn sales(&self) -> Arc<Mutex<SalesStore>> {
+        self.sales.clone()
+    }
+
+    pub(crate) fn offline_now(&self) -> Option<Arc<crate::offline::Offline>> {
+        self.offline.lock().unwrap().clone()
+    }
+
+    pub(crate) fn header(&self) -> Option<[u8; 80]> {
+        self.headers.as_ref().and_then(|h| h.latest())
     }
 
     /// Send the charges taken offline now, as the background sender does: one job, answered with
@@ -537,6 +561,7 @@ pub async fn new_with_conn(
         pos_auth: crate::pos::PosAuth::default(),
         topups: None,
         offline: offline.clone(),
+        headers: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn, offline))
 }
@@ -1413,6 +1438,11 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/topup/{topup_id}", get(topup_get))
         .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
+        .route("/v1/offline/kit", get(crate::pos::offline_kit))
+        .route(
+            "/v1/offline/charges",
+            post(crate::pos::offline_charges).layer(axum::extract::DefaultBodyLimit::max(crate::pos::MAX_CHARGES_BODY)),
+        )
         .with_state(h)
         .layer(axum::middleware::from_fn_with_state(auth, crate::pos::auth))
 }
@@ -1913,6 +1943,8 @@ pub struct ServeOptions {
     pub offline: crate::offline::OfflineConfig,
     /// The spare reserve an online tap keeps a 3.0 card at.
     pub spares: crate::ops::SpareConfig,
+    /// How long the phones' offline kits last, and their grace for redeeming.
+    pub kits: crate::pool::KitConfig,
 }
 
 /// [`serve_with`], with the offline options.
@@ -1987,10 +2019,10 @@ pub async fn serve_opts(
     // The card's clock: the newest block header, refreshed in the background.
     let headers = crate::clock::Headers::new(opts.esplora_url.clone(), &dir);
     let header_task = headers.spawn(crate::clock::REFRESH_EVERY);
-    cw.headers = Some(headers);
+    cw.headers = Some(headers.clone());
     cw.spares = opts.spares;
     let wallet = cw.wallet.clone();
-    let offline = crate::offline::Offline::open(&dir, opts.offline)?;
+    let offline = crate::offline::Offline::open_with(&dir, opts.offline, opts.kits)?;
     {
         let h = opts.offline.fee_headroom;
         let v = wallet.consensus_version;
@@ -2003,7 +2035,7 @@ pub async fn serve_opts(
         }
     }
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;
-    let handle = handle.with_offline(offline.clone());
+    let handle = handle.with_offline(offline.clone()).with_headers(headers);
     // The sender: while on ops, every so often, send what was taken offline (one job, never
     // while another is in flight).
     let sender = {

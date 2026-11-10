@@ -6,6 +6,7 @@ pub mod holder;
 pub mod link;
 pub mod offline;
 pub mod ops;
+pub mod pool;
 pub mod relay;
 pub mod pos;
 pub mod sales;
