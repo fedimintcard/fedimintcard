@@ -112,6 +112,11 @@ F0 and F1 are worth doing even if the rest waits: they harden what is in product
 3. **Reuse: port from cashucard with credit** in `NOTICE` (MIT, as `SchnorrHW` and cardkit already
    are).
 4. **Order: F0 to F6 straight through**, stopping only when stuck.
+5. **The POS phone as an offline till** (owner, 2026-11-09, final): a phone with no network of its
+   own takes a 3.0 card offline ("Paid offline") and the till settles it later; online, the hosted
+   till charges exactly as before. One Rust core (`host/pos-core`) for the till and both apps; the
+   phone holds an offline kit whose pool of till outputs keeps their secrets on the till; two till
+   routes take kits out and charges in. Slices ENG-842 to ENG-845; `docs/POS-OFFLINE.md`.
 
 Still open, defaults used until the owner says otherwise: the limits (a per-card daily offline
 limit set per batch in the Setup app, default none (owner, 2026-11-07: set one for village batches); a till's unsettled limit, default
