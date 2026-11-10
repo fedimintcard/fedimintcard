@@ -16,9 +16,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, open_pin_session};
+use fedimint_card_host_card::{BridgeError, Card, Certificate, SlotState, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::CardWallet;
-use fedimint_card_sidecar::offline::{Offline, OfflineConfig};
+use fedimint_card_sidecar::offline::{ChargeState, Offline, OfflineConfig};
 use fedimint_card_sidecar::ops::{MAX_KEY_PER_TAP, Ops, OpsConfig, SPARE_TARGET, SpareConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
@@ -713,6 +713,132 @@ async fn a_queued_charge_survives_a_restart_and_is_sent() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ------------------------------------------------------------------ a card taken away mid-SIGN
+
+/// The card, taken out of the field at its `at`th SIGN (from 0): that SIGN and every command
+/// after it fail as a phone's card link reports a lost card.
+struct PulledAt {
+    card: Shared,
+    at: usize,
+    signs: usize,
+    pulled: bool,
+}
+
+impl PulledAt {
+    fn new(card: &Rc<RefCell<SoftCard>>, at: usize) -> Self {
+        Self { card: Shared(card.clone()), at, signs: 0, pulled: false }
+    }
+
+    fn here(&self) -> anyhow::Result<()> {
+        if self.pulled {
+            anyhow::bail!(BridgeError::NoCard("POST /apdu: HTTP 503: the card left the field".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Card for PulledAt {
+    fn gen_key(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.here()?;
+        self.card.gen_key(slot)
+    }
+    fn gen_key_overwrite(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.here()?;
+        self.card.gen_key_overwrite(slot)
+    }
+    fn get_pub(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.here()?;
+        self.card.get_pub(slot)
+    }
+    fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> anyhow::Result<Signature> {
+        if self.signs == self.at {
+            self.pulled = true;
+        }
+        self.here()?;
+        self.signs += 1;
+        self.card.sign(slot, msg32)
+    }
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.here()?;
+        self.card.apdu(apdu)
+    }
+}
+
+impl Till {
+    /// An offline charge on a card that leaves the field at its `at`th SIGN.
+    async fn charge_pulled(&mut self, card: &Rc<RefCell<SoftCard>>, at: usize, price: u64, cref: &str) -> (u16, Value) {
+        self.cw.card = Box::new(PulledAt::new(card, at));
+        self.cw.pin = Some(b"1234".to_vec());
+        let r = charge_job_with(&mut self.cw, Some(&self.ops), Some(&self.off), price, Some(cref.into()), &self.sales).await;
+        self.cw.pin = None;
+        (r.status, r.body)
+    }
+}
+
+fn spent_slots(card: &Rc<RefCell<SoftCard>>) -> usize {
+    (0..32).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Spent)).count()
+}
+
+/// A card taken away while it signs leaves a `signing` charge; tapped again for the same sale (the
+/// same `client_ref`), the till finishes that charge from the card's stored signature and answers
+/// it. Before ENG-842 the retap went on to sign a second transaction for the same sale from the
+/// card's other notes: the holder paid twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retap_after_the_card_left_mid_sign_is_the_same_charge() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    // Four notes of 65,536 msat: a 90,000 msat charge takes two, and two are left for another.
+    t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    let first = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!(first.len(), 1);
+    assert_eq!((first[0].state, first[0].inputs.len()), (ChargeState::Signing, 2));
+    assert_eq!(spent_slots(&card), 1, "the card signed one input before it left");
+
+    let (status, body) = t.charge(&card, 90_000, "pulled").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began, not a second one: {body}");
+    assert_eq!(body["offline"], true, "{body}");
+    let q = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!(q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![(first[0].txid.as_str(), ChargeState::Queued)], "one charge for one sale");
+    assert_eq!(spent_slots(&card), 2, "two inputs, each signed once");
+    assert!(t.sale("pulled").offline);
+    // A third tap of the sale is the sale.
+    let (status, again) = t.charge(&card, 90_000, "pulled").await;
+    assert_eq!((status, &again["txid"]), (200, &body["txid"]), "{again}");
+    assert_eq!((t.off.stats().queued, spent_slots(&card)), (1, 2));
+    Ok(())
+}
+
+/// Another card tapped for a sale whose first card left while it signed is refused `undecided`:
+/// the first card may have paid already, and only its next tap can say. Nothing is signed on the
+/// second card; the first card's tap finishes the sale.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_card_for_a_sale_a_card_left_signing_is_refused_undecided() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (first, second) = (v3_card(), v3_card());
+    provision(&t.reg, &first);
+    provision(&t.reg, &second);
+    t.load(&first, &[1 << 16, 1 << 16]).await?;
+    t.load(&second, &[1 << 16, 1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge_pulled(&first, 1, 90_000, "two-cards").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+
+    let (status, body) = t.charge(&second, 90_000, "two-cards").await;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    assert_eq!(spent_slots(&second), 0, "nothing signed on the second card");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges.len(), 1);
+
+    let (status, body) = t.charge(&first, 90_000, "two-cards").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((t.off.stats().queued, spent_slots(&first), spent_slots(&second)), (1, 2, 0));
+    Ok(())
+}
+
 // ------------------------------------------------------------------ the queue file from 4301b0a
 
 /// A queue an earlier till (4301b0a) wrote, with a charge queued offline, loads unchanged: the
@@ -727,7 +853,7 @@ fn a_queue_from_4301b0a_loads() -> anyhow::Result<()> {
     let q = off.queue.lock().unwrap();
     assert_eq!(q.file.version, 1);
     let c = &q.file.charges[0];
-    assert_eq!((c.client_ref.as_deref(), c.state, c.price_msat, c.till_msat), (Some("golden-1"), fedimint_card_sidecar::offline::ChargeState::Queued, 50_000, 51_736));
+    assert_eq!((c.client_ref.as_deref(), c.state, c.price_msat, c.till_msat), (Some("golden-1"), ChargeState::Queued, 50_000, 51_736));
     assert_eq!((c.inputs.len(), c.change.len(), c.host.len()), (1, 3, 6));
     assert!(c.pool.is_empty() && !c.synced && q.file.pool_used.is_empty() && q.file.high_water_ms == 0);
     assert_eq!(q.file.spent, vec![c.inputs[0].nonce.clone()]);

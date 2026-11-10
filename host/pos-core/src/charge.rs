@@ -131,7 +131,8 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 /// 2. a charge already queued under this `client_ref` is that charge (`conflict` for another price);
 /// 3. a phone's kit expiry, then the count cap;
 /// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
-/// 5. charges this card left `signing` are finished;
+/// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
+///    card for one is `undecided`;
 /// 6. the card's notes, the plan, the value cap, the card's day, then `signing`, `SET_CHANGE` and
 ///    `SIGN`, and `queued`.
 pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client_ref: Option<&str>) -> Result<Taken> {
@@ -185,7 +186,20 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
     // The PIN, before anything on the card changes: a wrong one leaves the card as it was.
     open_pin(card, &env.pin)?;
 
-    resume_signing(card, queue, env, &short_id)?;
+    // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
+    // stored signatures, never a second transaction. Another card for it waits for the first.
+    let resumed = resume_signing(card, queue, env, &short_id)?;
+    if let Some(r) = client_ref {
+        if let Some(c) = resumed.into_iter().find(|c| c.client_ref.as_deref() == Some(r)) {
+            return Ok(Taken { charge: c, replayed: true });
+        }
+        if let Some(c) = lock(queue).file.charges.iter().find(|c| c.state == ChargeState::Signing && c.client_ref.as_deref() == Some(r)) {
+            bail!(OfflineError::Undecided(format!(
+                "an earlier attempt with client_ref {r:?} is waiting for card {} (it was taken away while it signed); tap that card again, nothing was charged again",
+                c.short_id
+            )));
+        }
+    }
     take(card, queue, env, price, client_ref, &short_id)
 }
 
