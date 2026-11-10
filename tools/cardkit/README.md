@@ -99,14 +99,32 @@ rotation and the reset treat both chips alike. The Setup app's install tap
 (`apps/provisioner/src/installTap.ts`) rotates with `rotateKeys` already, so on
 a J3R452 its rotation is first contact with no change to the app.
 
-A run that finds the new set already at 01 on an SCP03 card sends no PUT KEY,
-but after its login it selects the card manager again and makes the same read,
-stopping `guarded` on the same answers. Such a run is the rerun after a pull
-between the PUT KEY and the read, or the retap of a card whose reopen the read
-stopped, which the Setup app sends straight to the rotation because its applet
-is installed with no keys: without the read either run would report the card
-on the new set, and the tap would go on to key it while a kept FF set still
-opened its card manager. A rotation in place at 01 reads no key information.
+A run that finds the new set already in place on an SCP03 card sends no PUT
+KEY, but after its login it selects the card manager again and reads the key
+information. At 01 it makes the reopen's check and stops `guarded` on the same
+answers; at any other version it stops `guarded` on an error, a template that
+does not parse, or a key at FF. Such a run is the rerun after a pull between
+the PUT KEY and the read, or the retap of a card whose reopen the read stopped,
+which the Setup app sends straight to the rotation because its applet is
+installed with no keys: without the read either run would report the card on
+the new set, and the tap would go on to key it while a kept FF set still
+opened its card manager.
+
+Two gaps remain, each open only to a card that does what the test card did
+not:
+
+- A rotation in place reads no key information. Were `factoryReset` called
+  directly on a card that kept its FF set, it would put the public default back
+  at 01, and the next install would rotate that card in place, unread. The
+  Setup app cannot reach that state: the read stops every rotation of such a
+  card, so it is never keyed, and the app's reset refuses an applet that was
+  never keyed.
+- A card that ignores PUT KEY's version byte can come out of first contact
+  with the new set at a version other than 01. Its reopen stops `guarded`. If
+  it also dropped the FF set, the retap finds the new set at that version,
+  reads no key at FF, and reports the card on the new set there, so the Setup
+  app keys it at a version `factoryReset` refuses. Had it kept the FF set, the
+  read would stop that retap too.
 
 `rotateKeys` now stops `guarded` before EXTERNAL AUTHENTICATE in four cases
 where it used to go on: the new set already proved at FF, a caller's `putKey`
@@ -158,10 +176,10 @@ The shared files are aligned with cashucard's `tools/cardkit` at 0229dc8 (see
 - no `sdAid` run option: the hub takes the security domain, and every run here
   selects the ISD;
 - the key information read in a `rotateKeys` run that finds the new set
-  already at 01 under SCP03, until cashucard's copy takes the same change:
-  0229dc8 reads it only in first contact's reopen, so after a pull past the
-  PUT KEY (the residual D182 names) or on a retap it reports a card that kept
-  its FF set on the new set.
+  already in place under SCP03, at 01 or at another version, until
+  cashucard's copy takes the same change: 0229dc8 reads it only in first
+  contact's reopen, so after a pull past the PUT KEY (the residual D182 names)
+  or on a retap it reports a card that kept its FF set on the new set.
 
 Not ported, because this card does not need them: the registry, inspect,
 reset-preflight, settled-cleanup, configuration and holderCommands modules,

@@ -715,15 +715,19 @@ function describeKeys(keys: readonly KeyInformation[]): string {
 }
 
 /**
- * Throws Guard unless GET DATA E0's answer after first contact is what the
- * test card gave after its own (D182): 9000 and a key information template
- * that lists no key at SHIPPED_KVN and holds the three AES-128 keys PUT KEY
- * put at FACTORY_KVN, IDs 01 to 03, and nothing else.
+ * The keys GET DATA E0's answer lists. Throws Guard for an answer that leaves
+ * open whether the card still holds a key at SHIPPED_KVN: a status other than
+ * 9000, a template that does not parse, or a key at FF among those listed.
+ * `when` opens each reason, and `kvn` is the version our set is at.
  */
-function checkFirstContactKeys(reply: Reply): void {
+function keysWithoutShipped(
+  reply: Reply,
+  when: string,
+  kvn: number,
+): KeyInformation[] {
   if (reply.sw !== 0x9000) {
     throw new Guard(
-      `after first contact the card answered GET DATA E0 (its key information) with ${swHex(reply.sw)}, not 9000: whether it still holds the version-FF set is unknown`,
+      `${when} the card answered GET DATA E0 (its key information) with ${swHex(reply.sw)}, not 9000: whether it still holds the version-FF set is unknown`,
     );
   }
   let keys: KeyInformation[];
@@ -731,14 +735,25 @@ function checkFirstContactKeys(reply: Reply): void {
     keys = parseKeyInformation(reply.data);
   } catch {
     throw new Guard(
-      `after first contact the card's key information did not parse (${toHex(reply.data)}): whether it still holds the version-FF set is unknown`,
+      `${when} the card's key information did not parse (${toHex(reply.data)}): whether it still holds the version-FF set is unknown`,
     );
   }
   if (keys.some(k => k.kvn === SHIPPED_KVN)) {
     throw new Guard(
-      `after first contact the card still lists key version FF (${describeKeys(keys)}): its shipped set may still open it, beside ours at 01`,
+      `${when} the card still lists key version FF (${describeKeys(keys)}): its shipped set may still open it, beside ours at ${toHex([kvn])}`,
     );
   }
+  return keys;
+}
+
+/**
+ * Throws Guard unless GET DATA E0's answer after first contact is what the
+ * test card gave after its own (D182): 9000 and a key information template
+ * that lists no key at SHIPPED_KVN and holds the three AES-128 keys PUT KEY
+ * put at FACTORY_KVN, IDs 01 to 03, and nothing else.
+ */
+function checkFirstContactKeys(reply: Reply): void {
+  const keys = keysWithoutShipped(reply, 'after first contact', FACTORY_KVN);
   const expected = (k: KeyInformation) =>
     FIRST_CONTACT_KEYS.some(
       e =>
@@ -774,19 +789,24 @@ function checkFirstContactKeys(reply: Reply): void {
  * contact: ours at 01 and nothing else, no key at FF among them. Then it must
  * prove `to` at 01. Any other answer to the first, or `to` at another
  * version, stops the run guarded, so a card that kept the FF set, or put ours
- * elsewhere, is not reported rotated by this run. Nor is it reported on `to`
- * by a later one: a run that finds `to` already at 01 on an SCP03 card (after
- * a pull between the PUT KEY and those answers, or on the retap of a card
- * whose reopen stopped guarded) sends no PUT KEY, but after its login it
- * selects the card manager again and reads the key information as the reopen
- * does, the same answers stopping it guarded in the reopen phase. A rotation
- * in place at 01 from `from` reads none. Any other card has its set replaced
- * in place, with the APDUs this sent before. Each of these stops guarded with
- * nothing sent after INITIALIZE UPDATE: `to` proved at FF (only an in-place
- * rotation of a shipped card puts it there, and the reset refuses FF), FF
- * under SCP02 (never measured), a caller's `putKey` at first contact, and
- * P1 00 on any card but one at first contact (it would add a set beside the
- * one in place).
+ * elsewhere, is not reported rotated by this run. A later run that finds `to`
+ * already on an SCP03 card, at a version other than FF (after a pull between
+ * the PUT KEY and those answers, or on the retap of a card whose reopen
+ * stopped guarded), sends no PUT KEY, but after its login it selects the card
+ * manager again and reads the key information, stopping guarded in the
+ * reopen phase: at 01 on the answers the reopen stops on, at any other
+ * version on an error, a template that does not parse, or a key at FF. So a
+ * card that kept the FF set and lists it is not reported on `to` by a later
+ * run either. One that put ours at another version and dropped the FF set
+ * is: its retap finds `to` there, the key information lists nothing at FF,
+ * and the run reports the card on `to` at that version, which factoryReset
+ * refuses. A rotation in place from `from` reads none. Any other card has its
+ * set replaced in place, with the APDUs this sent before. Each of these stops
+ * guarded with nothing sent after INITIALIZE UPDATE: `to` proved at FF (only
+ * an in-place rotation of a shipped card puts it there, and the reset refuses
+ * FF), FF under SCP02 (never measured), a caller's `putKey` at first contact,
+ * and P1 00 on any card but one at first contact (it would add a set beside
+ * the one in place).
  */
 export async function rotateKeys(
   tx: Transceiver,
@@ -818,14 +838,26 @@ export async function rotateKeys(
         );
       }
       await externalAuthenticate(run.timed, toKeys, hs, sessionOptions);
-      if (hs.reply.scp === 3 && kvn === FACTORY_KVN) {
-        // ours at 01 on an SCP03 card, perhaps from an earlier run's first
-        // contact whose answers were lost or whose reopen stopped guarded:
-        // read the key information as that reopen did, since a card that
-        // kept the FF set still lists it, and still opens to it
+      if (hs.reply.scp === 3) {
+        // ours on an SCP03 card, perhaps from an earlier run's first contact
+        // whose answers were lost or whose reopen stopped guarded: read the
+        // key information, since a card that kept the FF set still lists it,
+        // and still opens to it. At 01 as that reopen reads it; at another
+        // version (where a first contact that ignored PUT KEY's version byte
+        // put ours) for the FF set alone: an error, a template that does not
+        // parse or a key at FF stops the run, and nothing else does
         run.enter('reopen');
         expectOk(await run.plain(selectAid(ISD_AID)), 0xa4);
-        checkFirstContactKeys(await run.plain(getKeyInformation()));
+        const info = await run.plain(getKeyInformation());
+        if (kvn === FACTORY_KVN) {
+          checkFirstContactKeys(info);
+        } else {
+          keysWithoutShipped(
+            info,
+            `with the new key set at version ${toHex([kvn])},`,
+            kvn,
+          );
+        }
       }
       run.enter('done');
       return {

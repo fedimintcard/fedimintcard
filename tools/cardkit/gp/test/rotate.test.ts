@@ -8,9 +8,12 @@
  * version 01 by PUT KEY P1 00, the reopen reading the key information (GET
  * DATA E0) before it proves ours at 01, with its guards, and the rotation at
  * version 01 held to the bytes it sent before first contact existed. A run
- * that finds ours already at 01 under SCP03 reads the key information too,
- * after its login, so neither a pull after the PUT KEY nor the operator's
- * retap of a card that kept its FF set ends with that card reported on ours.
+ * that finds ours already in place under SCP03, at 01 or at another version,
+ * reads the key information too, after its login, so neither a pull after the
+ * PUT KEY nor the operator's retap of a card that kept its FF set, and lists
+ * it, ends with that card reported on ours. A first contact that put ours at
+ * another version and dropped the FF set does: the retap reports the card on
+ * ours at that version, which factoryReset refuses.
  */
 import assert from 'node:assert/strict';
 import {createHash, randomBytes} from 'node:crypto';
@@ -270,15 +273,22 @@ for (const scp of [2, 3] as const) {
       assert.equal(result.ok, true, result.reason);
       assert.equal(result.keyVersion, 0x22);
       card.reset();
+      const at = card.log.length;
       const resumed = await rotateKeys(
         card.transceive,
         FACTORY_KEYS,
         SPIKE_KEYS,
         options(),
       );
-      assert.equal(resumed.ok, true);
+      assert.equal(resumed.ok, true, resumed.reason);
       assert.equal(resumed.rotated, false);
       assert.equal(resumed.keyVersion, 0x22);
+      // under SCP03 the login is followed by the key information read at 22,
+      // as at 01: the fake lists ours there and nothing at FF
+      assert.deepEqual(
+        card.insLog().slice(at),
+        scp === 3 ? [0xa4, 0x50, 0x82, 0xa4, 0xca] : [0xa4, 0x50, 0x82],
+      );
       assert.equal(card.failedAuths, 0);
     });
     it('confirmation authenticates only the assigned set and never sends PUT KEY', async () => {
@@ -323,6 +333,20 @@ function answeringKeyInformation(card: FakeCard, reply: string): Transceiver {
     }
     card.log.push(Array.from(apdu));
     return fromHex(reply);
+  };
+}
+
+/**
+ * The card, except that a PUT KEY it takes puts the new set at `kvn`, whatever
+ * version PUT KEY named: a card that ignores PUT KEY's version byte.
+ */
+function puttingOursAt(card: FakeCard, kvn: number): Transceiver {
+  return async apdu => {
+    const reply = await card.transceive(apdu);
+    if (apdu[1] === 0xd8 && toHex(reply.slice(-2)) === '9000') {
+      card.kvn = kvn;
+    }
+    return reply;
   };
 }
 
@@ -648,6 +672,150 @@ describe('first contact: an SCP03 card at key version FF, as a J3R452 ships (D18
         assert.equal(card.shipped?.kvn, SHIPPED_KVN, where);
       }
     }
+  });
+
+  it("after a first contact that put ours at a version other than 01, the operator's retap reads the key information there: a card that kept its FF set stops guarded, whichever set it picks for P1 00, and one that dropped it is reported on ours at that version", async () => {
+    // the first run stops at the reopen either way; what the retap does with
+    // the card decides whether the Setup app keys it
+    const elsewhere = 0x30;
+    for (const keep of [undefined, 'new', 'shipped'] as const) {
+      const where = keep ? `kept FF, picks ${keep}` : 'dropped FF';
+      const card = new FakeCard({
+        scp: 3,
+        kvn: SHIPPED_KVN,
+        keepsShippedSet: keep,
+      });
+      const tx = puttingOursAt(card, elsewhere);
+      const first = await rotateKeys(tx, FACTORY_KEYS, SPIKE_KEYS, options());
+      assert.equal(first.kind, 'guarded', `${where}: ${first.reason}`);
+      assert.equal(first.phase, 'reopen', where);
+      assert.match(
+        first.reason!,
+        keep ? /still lists key version FF/ : /lists key 01 at version 30/,
+        where,
+      );
+      assert.equal(card.kvn, elsewhere, where);
+      assert.equal(card.shipped?.kvn, keep ? SHIPPED_KVN : undefined, where);
+      // the operator's retap: the card is where first contact left it
+      card.reset();
+      const at = card.log.length;
+      const again = await rotateKeys(tx, FACTORY_KEYS, SPIKE_KEYS, options());
+      if (keep === 'shipped') {
+        // P1 00 opens the FF set again, so first contact again: this fake
+        // refuses its PUT KEY P1 00 (6A80), its own set being at 30, not FF
+        assert.equal(again.kind, 'refused', `${where}: ${again.reason}`);
+        assert.equal(again.phase, 'putKey', where);
+        assert.deepEqual(
+          card.insLog().slice(at),
+          [0xa4, 0x50, 0x82, 0xd8],
+          where,
+        );
+      } else {
+        // P1 00 opens ours at 30: no PUT KEY, and after the login a SELECT
+        // and the key information read
+        assert.deepEqual(
+          card.insLog().slice(at),
+          [0xa4, 0x50, 0x82, 0xa4, 0xca],
+          where,
+        );
+        assert.deepEqual(card.log.at(-1), KEY_INFORMATION, where);
+      }
+      if (keep === 'new') {
+        assert.equal(
+          again.ok,
+          false,
+          `${where}: the retap reported the card on ours`,
+        );
+        assert.equal(again.kind, 'guarded', `${where}: ${again.reason}`);
+        assert.equal(again.phase, 'reopen', where);
+        assert.match(
+          again.reason!,
+          /version 30, the card still lists key version FF .*beside ours at 30$/,
+          where,
+        );
+      }
+      if (keep === undefined) {
+        // the residual: the FF set is gone and the key information lists ours
+        // at 30 alone, so the retap reports the card on ours there, a version
+        // factoryReset refuses (reset.test.ts)
+        assert.equal(again.ok, true, `${where}: ${again.reason}`);
+        assert.equal(again.rotated, false, where);
+        assert.equal(again.keyVersion, elsewhere, where);
+      } else {
+        assert.equal(again.ok, false, where);
+        assert.equal(again.rotated, undefined, where);
+      }
+      assert.equal(card.kvn, elsewhere, where);
+      assert.deepEqual(keysOf(card), hexKeys(SPIKE_KEYS), where);
+      assert.equal(card.shipped?.kvn, keep ? SHIPPED_KVN : undefined, where);
+      assert.equal(card.failedAuths, 0, where);
+    }
+  });
+
+  it('reads the key information after a login that proves ours at a version other than 01 under SCP03, and stops guarded in the reopen phase on an error, a template that does not parse, or a key at FF', async () => {
+    const elsewhere = 0x30;
+    const entry = (id: number, kvn: number) =>
+      toHex([0xc0, 0x04, id, kvn, 0x88, 0x10]);
+    const template = (...entries: string[]) =>
+      `${toHex([0xe0, entries.join('').length / 2])}${entries.join('')}9000`;
+    const ours = [1, 2, 3].map(id => entry(id, elsewhere));
+    const cases: [string, string, RegExp][] = [
+      ['6A88', '6A88', /with 6A88, not 9000/],
+      ['6D00', '6D00', /with 6D00, not 9000/],
+      ['data that is no template', '6F009000', /did not parse/],
+      ['the extended form', 'E00AC0080101FF88001000009000', /did not parse/],
+      [
+        'the FF set beside ours',
+        template(...[1, 2, 3].map(id => entry(id, SHIPPED_KVN)), ...ours),
+        /still lists key version FF/,
+      ],
+      [
+        'one key at FF',
+        template(...ours, entry(1, SHIPPED_KVN)),
+        /still lists key version FF/,
+      ],
+    ];
+    for (const [where, reply, reason] of cases) {
+      const card = new FakeCard({
+        scp: 3,
+        kvn: elsewhere,
+        keys: holding(SPIKE_KEYS),
+      });
+      const r = await rotateKeys(
+        answeringKeyInformation(card, reply),
+        FACTORY_KEYS,
+        SPIKE_KEYS,
+        options(),
+      );
+      assert.equal(r.ok, false, where);
+      assert.equal(r.kind, 'guarded', `${where}: ${r.reason}`);
+      assert.equal(r.phase, 'reopen', where);
+      assert.match(r.reason!, reason, where);
+      assert.match(r.reason!, /^with the new key set at version 30, /, where);
+      assert.deepEqual(
+        card.insLog(),
+        [0xa4, 0x50, 0x82, 0xa4, 0xca],
+        `${where}: one login, no PUT KEY, then SELECT and GET DATA E0`,
+      );
+      assert.equal(card.failedAuths, 0, where);
+    }
+    // and ours at 30 with no key at FF, as the fake lists it, passes
+    const card = new FakeCard({
+      scp: 3,
+      kvn: elsewhere,
+      keys: holding(SPIKE_KEYS),
+    });
+    const r = await rotateKeys(
+      card.transceive,
+      FACTORY_KEYS,
+      SPIKE_KEYS,
+      options(),
+    );
+    assert.equal(r.ok, true, r.reason);
+    assert.equal(r.rotated, false);
+    assert.equal(r.keyVersion, elsewhere);
+    assert.deepEqual(card.insLog(), [0xa4, 0x50, 0x82, 0xa4, 0xca]);
+    assert.deepEqual(card.log.at(-1), KEY_INFORMATION);
   });
 
   it('stops guarded at the reopen, with no second login, when GET DATA E0 answers with an error', async () => {

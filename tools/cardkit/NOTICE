@@ -39,15 +39,17 @@ These are adapted:
                          and the first-contact checks of the key information,
                          as upstream has them without the sdAid run option,
                          and with the key information read again by a run
-                         that finds the new set already at 01 under SCP03,
-                         which upstream does not have; the install is this
-                         project's (below)
+                         that finds the new set already in place under SCP03,
+                         at 01 or at another version, which upstream does
+                         not have; the install is this project's (below)
     gp/test/rotate.test.ts
                          the import path of the fake card, the comment that
                          says where ROTATION_AT_01's hashes come from, and
                          that read: the header, the reruns' APDUs, the retap
-                         of a card that kept its FF set, and a pull before
-                         the read on such a card
+                         of a card that kept its FF set, a pull before the
+                         read on such a card, the retap of a card whose first
+                         contact put the new set at another version, and the
+                         read's refusals there
     gp/test/fake-card.ts upstream's SCP03 card side (scp, keySet,
                          keepsShippedSet, sellerApplets and SELLER_APPLETS,
                          GET DATA E0) merged into this project's fake of the
