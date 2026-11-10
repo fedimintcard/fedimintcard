@@ -30,6 +30,7 @@
 		A19D8686B3ABBF0A3734F4A5 /* TopUp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 668D284B6F2504B7F55524FF /* TopUp.swift */; };
 		BECEF796FCBBD9A859209C33 /* NFCCardReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = E518F954B819A02AAFC7253B /* NFCCardReader.swift */; };
 		CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9AEA85277653C319EC8C7B /* PairingTests.swift */; };
+		DEEA6BE858685A1C31034520 /* FedimintCardPosCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4FCC6785A5C25DEE674E7F49 /* FedimintCardPosCore */; };
 		EB7CB78117403AF777118344 /* PosController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86FE0870914BD0003EB671B /* PosController.swift */; };
 		ECC448B79524C5673C9452B0 /* TopUpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E62BA1ACE633798338DC8889 /* TopUpTests.swift */; };
 		F07D7EFDA9A00794775899A1 /* ErrorCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DDFC94C92C8812DAA33D897 /* ErrorCopy.swift */; };
@@ -71,12 +72,24 @@
 		CB46E83F11E1306121B63D09 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		D85F267DA8CD5CEF85E7A80B /* OFL-Figtree.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OFL-Figtree.txt"; sourceTree = "<group>"; };
 		DD8734CE2845FF73DCFA1BCA /* TillClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TillClient.swift; sourceTree = "<group>"; };
+		E1EDF39A4DF03C14A9F65E27 /* FedimintCardPosCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = FedimintCardPosCore; path = Packages/FedimintCardPosCore; sourceTree = SOURCE_ROOT; };
 		E518F954B819A02AAFC7253B /* NFCCardReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NFCCardReader.swift; sourceTree = "<group>"; };
 		E62BA1ACE633798338DC8889 /* TopUpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopUpTests.swift; sourceTree = "<group>"; };
 		E86FE0870914BD0003EB671B /* PosController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosController.swift; sourceTree = "<group>"; };
 		F7986F3432B14FF95BDD32A8 /* Pads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pads.swift; sourceTree = "<group>"; };
 		FC24BE04CC31D28A08266DDC /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A27F19462A7D44B5AD71DFAE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DEEA6BE858685A1C31034520 /* FedimintCardPosCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		0314F140A7FD1A196D2882E0 /* FedimintCardPOS */ = {
@@ -110,6 +123,7 @@
 			children = (
 				0314F140A7FD1A196D2882E0 /* FedimintCardPOS */,
 				30243F8E6AA66A7B7E45363B /* FedimintCardPOSTests */,
+				D2744027780CF31038F14EA0 /* Packages */,
 				9965F64903959D7D4625C42A /* Products */,
 			);
 			sourceTree = "<group>";
@@ -137,6 +151,14 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		D2744027780CF31038F14EA0 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				E1EDF39A4DF03C14A9F65E27 /* FedimintCardPosCore */,
+			);
+			path = Packages;
+			sourceTree = "<group>";
+		};
 		EF66FF253891CF83F657707D /* Resources */ = {
 			isa = PBXGroup;
 			children = (
@@ -156,6 +178,7 @@
 			buildPhases = (
 				E5499C1D19530B9D314B5569 /* Sources */,
 				EDACD320E030C7CA7304CCA4 /* Resources */,
+				A27F19462A7D44B5AD71DFAE /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -163,6 +186,7 @@
 			);
 			name = FedimintCardPOS;
 			packageProductDependencies = (
+				4FCC6785A5C25DEE674E7F49 /* FedimintCardPosCore */,
 			);
 			productName = FedimintCardPOS;
 			productReference = 30EC643D30FC5863225DE43A /* FedimintCardPOS.app */;
@@ -214,6 +238,9 @@
 			);
 			mainGroup = 1D7FE172E4E597CCFE27772D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				3F93BDC249A9C79F23B4C069 /* XCLocalSwiftPackageReference "Packages/FedimintCardPosCore" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9965F64903959D7D4625C42A /* Products */;
 			projectDirPath = "";
@@ -517,6 +544,20 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		3F93BDC249A9C79F23B4C069 /* XCLocalSwiftPackageReference "Packages/FedimintCardPosCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/FedimintCardPosCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		4FCC6785A5C25DEE674E7F49 /* FedimintCardPosCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = FedimintCardPosCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = C978A80AABC67111141095C9 /* Project object */;
 }

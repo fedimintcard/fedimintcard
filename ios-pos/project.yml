@@ -9,12 +9,19 @@ settings:
     SWIFT_VERSION: "5.0"
     DEVELOPMENT_TEAM: H7UAM79QQP
     CODE_SIGN_STYLE: Automatic
+packages:
+  # The POS core (host/pos-core): built by scripts/build-poscore.sh, not by Xcode. Resolving the
+  # package names the script when the core is not built.
+  FedimintCardPosCore:
+    path: Packages/FedimintCardPosCore
 targets:
   FedimintCardPOS:
     type: application
     platform: iOS
     sources:
       - path: FedimintCardPOS
+    dependencies:
+      - package: FedimintCardPosCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.fedimintcard.pos
