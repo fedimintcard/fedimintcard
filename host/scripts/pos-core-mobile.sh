@@ -66,11 +66,13 @@ ios() {
 }
 
 bindings() {
-	cargo rustc "${CARGO_FLAGS[@]}" --crate-type cdylib
+	# The bindings come from the library's UniFFI metadata symbols, which the stripped `mobile`
+	# profile drops on Linux: build the host library unstripped (the default dev profile).
+	cargo rustc -p "$PKG" --lib --features ffi --locked --crate-type cdylib
 	local lib
 	case "$(uname -s)" in
-		Darwin) lib="$TARGET/mobile/lib$LIB.dylib" ;;
-		*) lib="$TARGET/mobile/lib$LIB.so" ;;
+		Darwin) lib="$TARGET/debug/lib$LIB.dylib" ;;
+		*) lib="$TARGET/debug/lib$LIB.so" ;;
 	esac
 	for lang in ${1:-swift kotlin}; do
 		rm -rf "$OUT/bindings/$lang"
