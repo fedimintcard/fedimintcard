@@ -1,0 +1,43 @@
+[package]
+name = "fedimint-card-pos-core"
+description = "The offline charge a till and a POS phone share: the card's attestation, its notes checked offline, the plan, the card's signatures and the durable queue"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lib]
+name = "fedimint_card_pos_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# The UniFFI interface the POS apps call (docs/POS-OFFLINE.md). Mobile builds turn it on.
+ffi = ["dep:uniffi"]
+# The bindings generator (`src/bin/uniffi-bindgen.rs`), for a host build only.
+bindgen = ["ffi", "uniffi/cli", "uniffi/cargo-metadata"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+# No tokio code, fedimint-client, fedimint-api-client, rocksdb or registry client here: the core
+# runs on a phone with no network (`scripts/pos-core-mobile.sh check` proves the last four).
+[dependencies]
+anyhow = { workspace = true }
+fedimint-card-host-card = { path = "../card" }
+fedimint-core = { workspace = true }
+fedimint-mint-common = { workspace = true }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tbs = { workspace = true }
+tracing = { workspace = true }
+uniffi = { version = "0.32", optional = true, default-features = false }
+
+[dev-dependencies]
+fedimint-card-host-card = { path = "../card", features = ["softkit"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+tempfile = "3"

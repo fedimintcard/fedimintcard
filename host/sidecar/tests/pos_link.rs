@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
-use fedimint_card_host_card::{Card, SoftCard, StatusWord, open_pin_session};
+use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
@@ -93,27 +93,7 @@ async fn fx(notes: &[u64]) -> anyhow::Result<Fx> {
 
 /// The applet's APDU answers (`data || SW`), from a soft card.
 fn answer(card: &Mutex<SoftCard>, apdu: &[u8]) -> Vec<u8> {
-    let mut c = card.lock().unwrap();
-    let r: anyhow::Result<Vec<u8>> = match (apdu[0], apdu[1]) {
-        (0xB0, 0x10) if apdu[3] == 1 => c.gen_key_overwrite(apdu[2]).map(|k| k.serialize().to_vec()),
-        (0xB0, 0x10) => c.gen_key(apdu[2]).map(|k| k.serialize().to_vec()),
-        (0xB0, 0x11) => c.get_pub(apdu[2]).map(|k| k.serialize().to_vec()),
-        (0xB0, 0x12) => {
-            let m: [u8; 32] = apdu[5..37].try_into().unwrap();
-            c.sign(apdu[2], &m).map(|s| s.as_ref().to_vec())
-        }
-        _ => c.apdu(apdu),
-    };
-    match r {
-        Ok(mut d) => {
-            d.extend_from_slice(&[0x90, 0x00]);
-            d
-        }
-        Err(e) => {
-            let sw = e.downcast_ref::<StatusWord>().map_or(0x6F00, |s| s.0);
-            sw.to_be_bytes().to_vec()
-        }
-    }
+    fedimint_card_host_card::softkit::answer(&mut card.lock().unwrap(), apdu)
 }
 
 /// How the test phone ends: answer everything, or give up at the first APDU with this INS.

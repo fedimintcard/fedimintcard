@@ -1,0 +1,6 @@
+# Names the POS apps import (scripts/pos-core-mobile.sh bindings).
+[bindings.kotlin]
+package_name = "org.fedimintcard.poscore"
+
+[bindings.swift]
+module_name = "FedimintCardPosCore"

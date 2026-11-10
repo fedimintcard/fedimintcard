@@ -14,6 +14,8 @@ use secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
 pub mod bridge;
 #[cfg(feature = "pcsc")]
 pub mod pcsc_backend;
+#[cfg(feature = "softkit")]
+pub mod softkit;
 pub mod v3;
 
 pub use v3::{AppletVersion, CardStatus, Certificate, Opening, SlotInfo, SlotState};

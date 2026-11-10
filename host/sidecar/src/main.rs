@@ -129,6 +129,14 @@ enum TillCmd {
         /// Most slots one tap keys for that reserve (a key takes about 320 ms on the card).
         #[arg(long, env = "TILL_SPARE_KEYS_PER_TAP", default_value_t = fedimint_card_sidecar::ops::MAX_KEY_PER_TAP)]
         spare_keys_per_tap: usize,
+        /// How long a POS phone's offline kit lasts from the fetch that answered it, in hours
+        /// (`GET /v1/offline/kit`).
+        #[arg(long, env = "TILL_OFFLINE_KIT_TTL_HOURS", default_value_t = 168)]
+        offline_kit_ttl_hours: u64,
+        /// Days after a kit expires that the charges a phone took with it are still taken; then
+        /// its unused pool entries are dropped with their secrets.
+        #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
+        offline_kit_grace_days: u64,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -388,7 +396,22 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve { listen, relay, ops_url, ops_token, require_pos_token, esplora_url, offline_cap_msat, offline_cap_count, offline_fee_base_msat, offline_fee_headroom_ppm, spare_target, spare_keys_per_tap }) => {
+        Cmd::Till(TillCmd::Serve {
+            listen,
+            relay,
+            ops_url,
+            ops_token,
+            require_pos_token,
+            esplora_url,
+            offline_cap_msat,
+            offline_cap_count,
+            offline_fee_base_msat,
+            offline_fee_headroom_ppm,
+            spare_target,
+            spare_keys_per_tap,
+            offline_kit_ttl_hours,
+            offline_kit_grace_days,
+        }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
             let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
@@ -400,6 +423,10 @@ async fn main() -> Result<()> {
                     fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom { base_msat: *offline_fee_base_msat, ppm: *offline_fee_headroom_ppm },
                 },
                 spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
+                kits: fedimint_card_sidecar::pool::KitConfig {
+                    ttl_ms: offline_kit_ttl_hours.saturating_mul(3_600_000),
+                    grace_ms: offline_kit_grace_days.saturating_mul(86_400_000),
+                },
             };
             fedimint_card_sidecar::till::serve_opts(
                 cw,

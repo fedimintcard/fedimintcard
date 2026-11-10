@@ -34,7 +34,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use fedimint_card_host_card::{Card, SW_NO_SPACE, SlotState, status_word};
-use fedimint_core::secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -467,11 +466,8 @@ pub struct OpsLink {
     pub releases: Vec<RemoteRelease>,
 }
 
-/// A card's short id: the last 4 bytes of its slot-0 x-only key, lower-case hex.
-pub fn short_id_of(slot0: &XOnlyPublicKey) -> String {
-    let hex = slot0.to_string();
-    hex[hex.len() - 8..].to_owned()
-}
+// Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old path.
+pub use fedimint_card_pos_core::short_id_of;
 
 /// The till's side of ops: the client and where the per-card files live.
 #[derive(Clone)]
@@ -1059,6 +1055,7 @@ pub async fn report_federation(client: &OpsClient, report: &FederationReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fedimint_core::secp256k1::XOnlyPublicKey;
 
     fn note(nonce: &str, slot: u8, status: NoteStatus) -> NoteRec {
         NoteRec { slot, amount_msat: 1024, nonce: nonce.into(), signature: None, status, blinding_key: None, txid: None, out_idx: None }

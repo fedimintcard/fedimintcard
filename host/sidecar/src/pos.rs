@@ -1,5 +1,6 @@
 //! Pairing a POS phone with the till, and the bearer token that guards the till API off loopback
-//! (`docs/POS-LINK.md`, "Pairing and auth").
+//! (`docs/POS-LINK.md`, "Pairing and auth"); and what a paired phone asks of the till to charge
+//! offline (`docs/POS-OFFLINE.md`): its offline kit and the sync of the charges it took.
 //!
 //! The token is 32 random bytes, hex, in `<data_dir>/till-pos-token` (mode 0600). It is compared
 //! in constant time and never logged.
@@ -9,11 +10,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::{ConnectInfo, Request, State};
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::pool::{MAX_INGEST, TillKeys};
+use crate::till::{Reply, TillHandle, error_reply};
 
 pub const TOKEN_FILE: &str = "till-pos-token";
 pub const PAIR_SCHEME: &str = "fedimintcard-till:";
@@ -186,6 +193,77 @@ pub async fn auth(State(a): State<PosAuth>, req: Request, next: Next) -> Respons
         next.run(req).await
     } else {
         unauthorized()
+    }
+}
+
+// ------------------------------------------------------------------ phones charging offline
+
+/// Largest `POST /v1/offline/charges` body: 50 charges of a few kilobytes each.
+pub const MAX_CHARGES_BODY: usize = 1 << 20;
+
+/// A phone's id (its store's `phone-id`): 16 bytes, hex.
+fn phone_of(id: &str) -> Option<String> {
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_ascii_lowercase())
+}
+
+#[derive(Deserialize)]
+pub struct KitQuery {
+    phone: Option<String>,
+}
+
+/// `GET /v1/offline/kit?phone=<32 hex>`: the phone's offline kit (docs/TILL-API.md), never cached.
+pub async fn offline_kit(State(h): State<TillHandle>, Query(q): Query<KitQuery>) -> Response {
+    let Some(phone) = q.phone.as_deref().and_then(phone_of) else {
+        return Reply::fail(400, "bad_request", "phone must be the app's phone id, 32 hex characters").into_response();
+    };
+    let Some(off) = h.offline_now() else {
+        return Reply::fail(503, "offline_not_ready", "this till takes no offline charges").into_response();
+    };
+    let keys = TillKeys::of(h.wallet());
+    let header = h.header();
+    let r = tokio::task::spawn_blocking(move || {
+        let cert_key = crate::claim::read_cert_key(&off.dir)?;
+        crate::pool::issue_kit(&off.pool, &keys, &off.cfg, &off.kits, cert_key, header, &phone, crate::claim::now_ms())
+    })
+    .await;
+    match r {
+        Ok(Ok(kit)) => ([(CACHE_CONTROL, "no-store")], Reply::ok(json!({"ok": true, "kit": kit}))).into_response(),
+        Ok(Err(e)) => error_reply(&e).into_response(),
+        Err(e) => Reply::fail(500, "internal", format!("issuing the kit: {e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChargesReq {
+    phone_id: String,
+    charges: Vec<Value>,
+}
+
+/// `POST /v1/offline/charges {phone_id, charges}`: what a phone took offline, into the till's
+/// queue (docs/TILL-API.md). Each charge is answered `queued`, `already` or `refused`.
+pub async fn offline_charges(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    let req: ChargesReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"phone_id\":\"…\",\"charges\":[…]}}: {e}")),
+    };
+    let Some(phone) = phone_of(&req.phone_id) else {
+        return Reply::fail(400, "bad_request", "phone_id must be the app's phone id, 32 hex characters");
+    };
+    if req.charges.len() > MAX_INGEST {
+        return Reply::fail(400, "bad_request", format!("at most {MAX_INGEST} charges at a time"));
+    }
+    let Some(off) = h.offline_now() else {
+        return Reply::fail(503, "offline_not_ready", "this till takes no offline charges");
+    };
+    let keys = TillKeys::of(h.wallet());
+    let sales = h.sales();
+    let r = tokio::task::spawn_blocking(move || {
+        crate::pool::ingest(&off.queue, &off.pool, &keys, &sales, &phone, req.charges, crate::claim::now_ms())
+    })
+    .await;
+    match r {
+        Ok(results) => Reply::ok(json!({"ok": true, "results": results})),
+        Err(e) => Reply::fail(500, "internal", format!("taking the charges: {e}")),
     }
 }
 

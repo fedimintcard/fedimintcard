@@ -1,0 +1,78 @@
+name: Mobile
+# The POS apps' Rust core (host/pos-core, docs/POS-OFFLINE.md) for Android and iOS, with its
+# Kotlin and Swift bindings. Proves the cross-compile on every change under host/; the libraries,
+# the bindings and their sizes are uploaded for the apps.
+on:
+  push:
+    branches: ['**']
+    paths: ['host/**', '.github/workflows/mobile.yml']
+  pull_request:
+    paths: ['host/**', '.github/workflows/mobile.yml']
+permissions: { contents: read }
+# Block form, not a flow mapping: a `{ ... }` map containing `${{ }}` does not parse.
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev protobuf-compiler build-essential
+      - uses: dtolnay/rust-toolchain@1.91.1
+        with: { targets: 'aarch64-linux-android,x86_64-linux-android' }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "host -> target"
+          key: android
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      # The core runs on a phone with no network: no fedimint client, API client or rocksdb.
+      - name: the core's dependencies
+        working-directory: host
+        run: scripts/pos-core-mobile.sh check
+      - name: arm64-v8a and x86_64, API 26, 16 KB pages
+        working-directory: host
+        # The runner's newest NDK (ANDROID_NDK_HOME there is an older default).
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/pos-core-mobile.sh android
+      - name: Kotlin bindings
+        working-directory: host
+        run: scripts/pos-core-mobile.sh bindings kotlin
+      - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pos-core-android
+          path: |
+            host/target/pos-core-mobile/android
+            host/target/pos-core-mobile/bindings/kotlin
+            host/target/pos-core-mobile/sizes.txt
+  ios:
+    # macos-14 runners are retired; the newest image has the Xcode the targets need.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@1.91.1
+        with: { targets: 'aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios' }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "host -> target"
+          key: ios
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+        working-directory: host
+        run: scripts/pos-core-mobile.sh ios
+      - name: Swift bindings
+        working-directory: host
+        run: scripts/pos-core-mobile.sh bindings swift
+      - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pos-core-ios
+          path: |
+            host/target/pos-core-mobile/ios
+            host/target/pos-core-mobile/bindings/swift
+            host/target/pos-core-mobile/sizes.txt

@@ -10,9 +10,13 @@ version.workspace = true
 default = []
 # PC/SC backend (needs libpcsclite on Linux; the PC/SC framework ships with macOS).
 pcsc = ["dep:pcsc"]
+# Tests without a reader or a federation (`softkit`): a SoftCard behind a transport, a card pulled
+# at a chosen APDU, and a one-guardian mint whose notes load onto a 3.0 SoftCard.
+softkit = ["dep:fedimint-core", "dep:tbs"]
 
 [dependencies]
 anyhow = { workspace = true }
+fedimint-core = { workspace = true, optional = true }
 hex = "0.4"
 p256 = { version = "0.13", features = ["ecdsa"] }
 pcsc = { version = "2", optional = true }
@@ -20,4 +24,5 @@ rand = "0.8"
 secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
 serde_json = "1"
 sha2 = "0.10"
+tbs = { workspace = true, optional = true }
 ureq = { version = "2", default-features = false, features = ["json"] }

@@ -107,6 +107,36 @@ has, in whole sats: `"suggested_msat":N|null` (the nearer of the two), `"suggest
 and `"suggest_above_msat"` (each `N` or null). The POS shows "This card can't take change while
 offline. Try N sats" (or "Try another amount"), not "card needs a top up".
 
+**A card taken away mid-tap.** A card pulled after it signed some of an offline charge's inputs
+leaves the charge `signing`, and that tap is answered `undecided` (202): only the card's next tap
+can say whether it paid. (A card pulled before it signed anything leaves nothing behind, and the
+answer is `no_card`.) Tapped again with the same `client_ref`,
+the till finishes that charge from the card's stored signatures and answers it, as a repeat; it
+never signs a second transaction for the sale. Another card tapped with that `client_ref` while
+the first card's charge is still signing is answered `undecided` (202) with nothing signed: only
+the first card's next tap can say whether it paid. Once the till is online again, a tap with
+that `client_ref` still goes the offline way, never the online charge, which would take the sale
+a second time from the card's other notes: the first card finishes its charge (answered as the
+sale, `offline: true`; the sender's next pass, every 30 s, reports it), and another card is
+`undecided`. A charge left signing that can never be finished (an input slot of it has since
+paid another transaction, or was re-keyed) is set aside at the card's next tap on the offline
+path (`abandoned` in the queue, kept for the operator: the notes the card signed for it stay
+spent on the card, and those it never signed pay again); nothing was charged for it, and the tap
+goes on as a new charge, for the same `client_ref` too. Notes the till's checks refuse (no
+denomination of the federation's, or a federation signature that does not verify) are skipped;
+when the rest do not pay, the charge is `offline_note_invalid` (403), not `insufficient`.
+
+**POS phones offline.** A paired POS phone with no network takes a 3.0 card itself, with the
+same charge as the till's (`host/pos-core`, docs/POS-OFFLINE.md), and syncs what it took when it
+next reaches the till: it fetches an offline kit while online (`GET /v1/offline/kit`, below) and
+sends its charges with `POST /v1/offline/charges`, which puts each into this till's offline queue
+as `queued`; the sender above reports and settles it as the till's own, and its sale is in
+`sales.json` with `offline: true`. A kit lasts `--offline-kit-ttl-hours`
+(`TILL_OFFLINE_KIT_TTL_HOURS`, default 168, a week) from the fetch that answered it; the charges
+taken with it are taken for `--offline-kit-grace-days` (`TILL_OFFLINE_KIT_GRACE_DAYS`, default
+30) after that, then the kit's unused entries are dropped with their secrets. A phone's charges
+count toward this till's caps above; one is never refused for them (the money is already taken).
+
 ### Connecting by claim
 
 A till can ask for its own token instead (`docs/TILL-CLAIM.md`). `card-sidecar till claim
@@ -196,7 +226,8 @@ starts a second spend while the first may still count:
   and `txid`), without touching the card. The sale is in `sales.json` as soon as the federation has
   accepted it (`collection_pending` true until the till notes are in the wallet), so an app can
   also poll `/v1/sales` for its `client_ref`;
-* the earlier attempt is still unresolved, or still in flight (the service is busy with it):
+* the earlier attempt is still unresolved, or still in flight (the service is busy with it), or
+  its card was taken away while it signed an offline charge (that card's next tap finishes it):
   `undecided` 202, never `busy`, never a second spend. The service resolves it on the next job
   and records the sale;
 * the earlier attempt is proven to have left nothing behind (`insufficient`, `no_card`,
@@ -222,7 +253,7 @@ earlier attempt.
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now | show "pending", then poll /v1/sales |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
@@ -238,6 +269,9 @@ earlier attempt.
 | `card_not_genuine` | 403 | offline: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
 | `offline_no_change_room` | 409 | offline: the price needs change and the card has no fresh keyed slot (or too few) for it; an online till keys more. The body adds `suggested_msat`, `suggest_below_msat` and `suggest_above_msat`, prices in whole sats the card pays exactly now (each may be null); nothing moved | show "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_cap_reached` | 503 | offline: this till's unsettled offline total or count would pass its cap; nothing moved | decline, or retry once the till is online and has sent its queue |
+| `offline_note_invalid` | 403 | offline: some of the card's notes do not check against the federation's keys (no denomination of its, or a signature that does not verify) and the rest do not pay the price; nothing was signed | decline: the card cannot be checked offline; it pays online |
+| `offline_kit_expired` | 403 | a POS phone's offline charge only: its offline kit is past its expiry, by the phone's clock or the card's; nothing was asked of the card | take the card online, or fetch a new kit from the till |
+| `offline_pool_exhausted` | 409 | a POS phone's offline charge only: the price needs a till note of a tier the phone's offline kit has run out of; the answer has the prices the kit still pays (`suggested_msat`, `below_msat`, `above_msat`, as `offline_no_change_room`); nothing moved | show "Try N sats", and fetch a new kit when online |
 | `internal` | 500 | anything else | show detail |
 
 ## GET /v1/sales
@@ -245,6 +279,65 @@ earlier attempt.
 
 Oldest first. The sales file (`sales.json` in the data dir, mode 0600) is a convenience ledger;
 the money truth is the federation and `card_state.json`.
+
+## GET /v1/offline/kit
+
+`GET /v1/offline/kit?phone=<32 hex>`: the offline kit of the POS phone whose store id
+(`phone-id`, from the core's `PosCore.phone_id()`) is `phone`. Under the POS token like every
+`/v1/*` route; the answer is `Cache-Control: no-store`.
+
+`200 {"ok":true,"kit":{"version":1,"kit_id":"<32 hex>","phone_id":"<32 hex>","federation_id":"<hex>","mint_instance_id":N,"tbs_pks":{"<msat>":"<hex>",…},"fee_consensus":"<hex>","fee_headroom":{"base_msat":N,"ppm":N},"surplus_allowed":bool,"cert_key":"<130 hex>","cap_msat":N,"cap_count":N,"issued_at_ms":T,"expires_at_ms":T,"block_header":"<160 hex>"|absent,"pool":[{"amount_msat":N,"blinded":["<96 hex>",…]},…]}}`
+
+The kit carries the federation's note keys per tier and its mint fees, the till's fee headroom,
+the registry's certificate key, the phone's caps (the till's `--offline-cap-*`), its validity
+(`--offline-kit-ttl-hours`), the newest block header, and a pool of the till's outputs: per tier
+from the smallest note the planner gives the till (4 msat on fedimint's default fees) to the
+largest at or below `cap_msat`, 40 blinded nonces each (fewer when the kit would pass 128 KB; the
+till logs it). Their spend keys and blinding keys stay on the till, in `offline_pool.json` (0600),
+written before the kit is answered. Asked again within an hour, while every tier has 4 entries
+left, the phone gets the same kit (its entries still unused); else a new one, but never more than
+3 kits that have not expired: at the cap, the newest again, its tiers topped up to 40 under the
+same `kit_id` once one has fewer than 4 left. A kit given again is good for
+`--offline-kit-ttl-hours` from that fetch, and its charges are taken for the grace after that
+(both move at most once an hour). Each call drops the unused entries of kits past their grace,
+with their secrets; the entries charges used stay, so a charge sent again is still `already`.
+Pass the whole answer to the core's `charge`.
+
+`400 bad_request` for a missing or malformed `phone`; `503 offline_not_ready` when the till has no
+certificate key from the registry yet (it fetches one while online), or takes no offline charges.
+
+## POST /v1/offline/charges
+
+`{"phone_id":"<32 hex>","charges":[…]}`: what the phone took offline, at most 50 charges, the body
+of the core's `drain` as it is (each charge in the offline queue's format, with its signed bytes
+and its `pool` outputs). The body is at most 1 MiB (`413` past it).
+
+`200 {"ok":true,"results":[{"txid":"<hex>","status":"queued"|"already"|"refused","code":"<code>","detail":"…","retry":bool}]}`, one per charge, in order.
+
+Each charge is checked from its signed bytes alone, with no federation or registry call: the
+txid; every input a note of this federation's mint whose federation signature verifies, signed
+by the card over the txid, as declared; every output the declared change (its blinding key and
+the card's key) or a pool entry this till issued to this phone, unused, within its kit's redeem
+window, of the same amount. A charge that checks is put into the till's offline queue as
+`queued`, with the till's secrets for its pool outputs, then its pool entries are marked used,
+then its sale is recorded (a `client_ref` this ledger has under another transaction is dropped
+from the sale, with a warning); a request's charges are one write of the queue and one of the
+ledger. A txid the queue or the ledger already has is `already`: send it again freely. The sender
+reports and settles it like the till's own charges.
+
+| code | retry | meaning |
+|---|---|---|
+| `bad_charge` | false | the bytes do not decode, or are not the charge it declares |
+| `bad_note` | false | an input note's federation signature does not verify, or its amount is no denomination |
+| `bad_signature` | false | a card signature does not verify over the txid |
+| `pool_entry_unknown` | false | a pool output this till did not issue to this phone, or one of a kit past its redeem window whose unused entries are dropped |
+| `pool_entry_expired` | false | a pool output of a kit past its redeem window (its secrets are dropped at the next kit call) |
+| `pool_entry_reused` | false | a pool output another charge already paid to (a phone store restored from a backup) |
+| `internal` | true | the till could not write its queue: send it again later |
+
+The phone keeps a refused charge, with its code, to show (`retry: false`), and sends a `retry`
+one again. `400 bad_request` for a body that is not this shape, a malformed `phone_id` or more
+than 50 charges; `503 offline_not_ready` when the till takes no offline charges.
 
 ## POST /v1/card/balance
 Empty body. Reconciles the card's notes with the federation (shares the busy flag).

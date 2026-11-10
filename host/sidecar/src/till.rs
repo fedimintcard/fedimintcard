@@ -34,9 +34,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fedimint_card_host_card::{
-    BridgeError, BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, SW_PIN_BLOCKED, StatusWord, Transport, status_word,
-};
+use fedimint_card_host_card::{BridgeTransport, Card, CardClient, PIN_MAX, PIN_MIN, Transport, status_word};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -45,7 +43,6 @@ use crate::link::{Link, Links};
 use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
 use crate::claim::{Claim, Poll};
 use crate::ops::{FederationReport, Ops, OpsConfig, OpsError};
-use crate::plan::PlanError;
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
 use crate::topup::{TopupRec, TopupState, Topups};
@@ -74,10 +71,10 @@ impl IntoResponse for Reply {
 }
 
 impl Reply {
-    fn ok(body: Value) -> Self {
+    pub(crate) fn ok(body: Value) -> Self {
         Reply { status: 200, body }
     }
-    fn fail(status: u16, code: &str, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn fail(status: u16, code: &str, detail: impl std::fmt::Display) -> Self {
         Reply { status, body: json!({"ok": false, "error": code, "detail": detail.to_string()}) }
     }
 }
@@ -91,18 +88,13 @@ pub struct Class {
 }
 
 /// Map an error to its API code and HTTP status by looking for typed errors in its cause chain.
+/// The card's, the planner's and the offline charge's come from the core a phone shares
+/// ([`fedimint_card_pos_core::class_of`]): one vocabulary.
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
     for cause in err.chain() {
-        if let Some(o) = cause.downcast_ref::<crate::offline::OfflineError>() {
-            use crate::offline::OfflineError as E;
-            return match o {
-                E::Unsupported(_) => c(409, "offline_unsupported_card"),
-                E::NotReady(_) => c(503, "offline_not_ready"),
-                E::NotGenuine(_) => c(403, "card_not_genuine"),
-                E::Cap(_) => c(503, "offline_cap_reached"),
-                E::NoChangeRoom { .. } => c(409, "offline_no_change_room"),
-            };
+        if let Some((status, code)) = fedimint_card_pos_core::class_of(cause) {
+            return c(status, code);
         }
         if let Some(o) = cause.downcast_ref::<OpsError>() {
             return match o {
@@ -110,35 +102,6 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 OpsError::UnknownCard(_) => c(404, "unknown_card"),
                 OpsError::Unreachable(_) => c(502, "ops_unreachable"),
                 OpsError::Refused(..) => c(502, "ops_refused"),
-            };
-        }
-        if let Some(StatusWord(sw)) = cause.downcast_ref::<StatusWord>() {
-            match *sw {
-                0x63C0..=0x63CF => return c(403, "wrong_pin"),
-                SW_PIN_BLOCKED => return c(423, "pin_blocked"),
-                fedimint_card_host_card::v3::SW_OVER_LIMIT => return c(402, "card_limit"),
-                _ => {}
-            }
-        }
-        if let Some(b) = cause.downcast_ref::<BridgeError>() {
-            return match b {
-                BridgeError::NoCard(_) => c(409, "no_card"),
-                BridgeError::Unreachable(_) => c(502, "relay_unreachable"),
-                BridgeError::Http(..) => c(502, "card_error"),
-            };
-        }
-        if cause.downcast_ref::<StatusWord>().is_some() {
-            return c(502, "card_error");
-        }
-        if let Some(p) = cause.downcast_ref::<PlanError>() {
-            return match p {
-                PlanError::Insufficient { .. } => c(402, "insufficient"),
-                PlanError::NoExactPlan { .. }
-                | PlanError::TooManyNotes(_)
-                | PlanError::TooManyInputs { .. }
-                | PlanError::NoFreeSlots { .. } => {
-                    c(422, "no_exact_plan")
-                }
             };
         }
         if let Some(f) = cause.downcast_ref::<SpendFault>() {
@@ -153,16 +116,11 @@ pub fn classify(err: &anyhow::Error) -> Class {
     c(500, "internal")
 }
 
-fn error_reply(err: &anyhow::Error) -> Reply {
+pub(crate) fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
     let detail = match class.code {
-        // Said plainly, for the holder: the status word is the card's, the tries left are its low
-        // nibble (`63 CX`).
-        "wrong_pin" => {
-            let left = err.chain().find_map(|c| c.downcast_ref::<StatusWord>()).map_or(0, |s| s.0 & 0x0F);
-            format!("wrong PIN; {left} tries left before the card blocks")
-        }
-        "pin_blocked" => "the card's PIN is blocked after too many wrong tries; the card cannot pay".into(),
+        // Said plainly, for the holder, as a phone says it.
+        "wrong_pin" | "pin_blocked" => fedimint_card_pos_core::refusal(err).detail,
         _ => format!("{err:#}"),
     };
     Reply::fail(class.status, class.code, detail)
@@ -468,6 +426,8 @@ pub struct TillHandle {
     topups: Option<Arc<Topups>>,
     /// Offline charges ([`Self::with_offline`]); shared with the actor.
     offline: SharedOffline,
+    /// The newest block header, for the phones' offline kits ([`Self::with_headers`]).
+    headers: Option<Arc<crate::clock::Headers>>,
 }
 
 /// The till's offline charges, once [`TillHandle::with_offline`] set them.
@@ -479,6 +439,28 @@ impl TillHandle {
     pub fn with_offline(self, off: Arc<crate::offline::Offline>) -> Self {
         *self.offline.lock().unwrap() = Some(off);
         self
+    }
+
+    /// Give the phones' offline kits the newest block header this till keeps.
+    pub fn with_headers(mut self, headers: Arc<crate::clock::Headers>) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    pub(crate) fn wallet(&self) -> &Wallet {
+        &self.wallet
+    }
+
+    pub(crate) fn sales(&self) -> Arc<Mutex<SalesStore>> {
+        self.sales.clone()
+    }
+
+    pub(crate) fn offline_now(&self) -> Option<Arc<crate::offline::Offline>> {
+        self.offline.lock().unwrap().clone()
+    }
+
+    pub(crate) fn header(&self) -> Option<[u8; 80]> {
+        self.headers.as_ref().and_then(|h| h.latest())
     }
 
     /// Send the charges taken offline now, as the background sender does: one job, answered with
@@ -579,6 +561,7 @@ pub async fn new_with_conn(
         pos_auth: crate::pos::PosAuth::default(),
         topups: None,
         offline: offline.clone(),
+        headers: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn, offline))
 }
@@ -954,7 +937,9 @@ pub async fn charge_job(
 /// [`charge_job`] for a till that takes cards offline (`off`): when the registry or the
 /// federation does not answer within 2 s, a 3.0 card is charged offline
 /// ([`crate::offline::charge`]); while both answer, charges taken offline for any card are reported
-/// first, so the registry knows which notes they spent.
+/// first, so the registry knows which notes they spent. A sale whose offline charge a card left
+/// signing here goes the offline way even while both answer ([`finish_left_signing`]): that
+/// card's tap finishes the charge it began, and another card is `undecided`.
 pub async fn charge_job_with(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -971,6 +956,9 @@ pub async fn charge_job_with(
         let (reg, fed) = off.reach.probe(Some(ops), &cw.wallet, &off.dir).await;
         if reg != Some(true) || !fed {
             return offline_charge(cw, ops, off, price, client_ref, sales).await;
+        }
+        if let Some(held) = left_signing(off, client_ref.as_deref()) {
+            return finish_left_signing(cw, ops, off, price, client_ref, sales, held).await;
         }
         let mut sent = crate::offline::Sent::default();
         crate::offline::report(off, ops, None, &mut sent).await;
@@ -990,6 +978,44 @@ pub async fn charge_job_with(
     let r = charge_with(cw, price, client_ref, sales).await;
     Ops::finish(cw, base).await;
     r
+}
+
+/// When this till's queue holds a sale's offline charge `signing` (its card was taken away
+/// mid-SIGN), the `undecided` answer for any card but that one.
+fn left_signing(off: &crate::offline::Offline, client_ref: Option<&str>) -> Option<Reply> {
+    let r = client_ref?;
+    let q = off.queue.lock().unwrap();
+    let c = q.file.charges.iter().find(|c| c.state == crate::offline::ChargeState::Signing && c.client_ref.as_deref() == Some(r))?;
+    Some(Reply::fail(
+        202,
+        "undecided",
+        format!(
+            "an earlier attempt with this client_ref was taken offline and card {} left while it signed (transaction {}); only that card's next tap here finishes it, and this card was not charged",
+            c.short_id, c.txid
+        ),
+    ))
+}
+
+/// A tap, while the registry and the federation answer, for a sale whose offline charge a card
+/// left `signing` here. The card may have signed part of that transaction, which its next offline
+/// tap would finish; an online charge would take the sale a second time from its other notes, or
+/// spend the note that transaction still needs. So the tap goes the offline way: that card
+/// finishes the charge it began, answered as the sale (`offline: true`, reported at the sender's
+/// next pass, every [`crate::offline::SEND_EVERY`]); another card is `undecided` (`held`) with
+/// nothing signed. A charge the card can never finish is abandoned by the core, freeing the sale's
+/// `client_ref`, and the tap takes the sale offline anew.
+async fn finish_left_signing(
+    cw: &mut CardWallet,
+    ops: &Ops,
+    off: &crate::offline::Offline,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+    held: Reply,
+) -> Reply {
+    let r = offline_charge(cw, ops, off, price, client_ref, sales).await;
+    // A 2.x card never took a charge offline, so it is not the card the sale waits for.
+    if r.body["error"] == "offline_unsupported_card" { held } else { r }
 }
 
 /// The offline path of a charge: take it, record the sale (`offline`), answer 200 with
@@ -1013,16 +1039,19 @@ async fn offline_charge(
             tracing::warn!("offline charge of {price} msat refused: {e:#}");
             let mut r = error_reply(&e);
             // No room for change offline: the prices the card can pay instead.
-            if let Some(o @ crate::offline::OfflineError::NoChangeRoom { below_msat, above_msat, .. }) =
-                e.chain().find_map(|c| c.downcast_ref::<crate::offline::OfflineError>())
+            if let Some((suggested, below, above)) =
+                e.chain().find_map(|c| c.downcast_ref::<crate::offline::OfflineError>()).and_then(|o| o.suggestions())
             {
-                r.body["suggested_msat"] = json!(o.suggested_msat(price));
-                r.body["suggest_below_msat"] = json!(below_msat);
-                r.body["suggest_above_msat"] = json!(above_msat);
+                r.body["suggested_msat"] = json!(suggested);
+                r.body["suggest_below_msat"] = json!(below);
+                r.body["suggest_above_msat"] = json!(above);
             }
             return r;
         }
     };
+    // A charge the queue already had (a repeat whose sale was never recorded, or one a pulled card
+    // left signing that this tap finished) is recorded now, as a new one would be; `append` answers
+    // the sale already there.
     let mut rec = SaleRec {
         id: 0,
         ts_unix_ms: taken.ts_unix_ms,
@@ -1452,6 +1481,11 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/topup/{topup_id}", get(topup_get))
         .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
+        .route("/v1/offline/kit", get(crate::pos::offline_kit))
+        .route(
+            "/v1/offline/charges",
+            post(crate::pos::offline_charges).layer(axum::extract::DefaultBodyLimit::max(crate::pos::MAX_CHARGES_BODY)),
+        )
         .with_state(h)
         .layer(axum::middleware::from_fn_with_state(auth, crate::pos::auth))
 }
@@ -1952,6 +1986,8 @@ pub struct ServeOptions {
     pub offline: crate::offline::OfflineConfig,
     /// The spare reserve an online tap keeps a 3.0 card at.
     pub spares: crate::ops::SpareConfig,
+    /// How long the phones' offline kits last, and their grace for redeeming.
+    pub kits: crate::pool::KitConfig,
 }
 
 /// [`serve_with`], with the offline options.
@@ -2026,10 +2062,10 @@ pub async fn serve_opts(
     // The card's clock: the newest block header, refreshed in the background.
     let headers = crate::clock::Headers::new(opts.esplora_url.clone(), &dir);
     let header_task = headers.spawn(crate::clock::REFRESH_EVERY);
-    cw.headers = Some(headers);
+    cw.headers = Some(headers.clone());
     cw.spares = opts.spares;
     let wallet = cw.wallet.clone();
-    let offline = crate::offline::Offline::open(&dir, opts.offline)?;
+    let offline = crate::offline::Offline::open_with(&dir, opts.offline, opts.kits)?;
     {
         let h = opts.offline.fee_headroom;
         let v = wallet.consensus_version;
@@ -2042,7 +2078,7 @@ pub async fn serve_opts(
         }
     }
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;
-    let handle = handle.with_offline(offline.clone());
+    let handle = handle.with_offline(offline.clone()).with_headers(headers);
     // The sender: while on ops, every so often, send what was taken offline (one job, never
     // while another is in flight).
     let sender = {
