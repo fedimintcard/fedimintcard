@@ -394,8 +394,11 @@ fn sync_marks_what_the_till_took_and_keeps_what_it_refused() {
     let d = s.drain(50);
     assert_eq!(d.txids, vec![ids[2].clone()]);
     assert_eq!(d.refused.iter().map(|r| (r.txid.as_str(), r.code.as_str())).collect::<Vec<_>>(), vec![(ids[1].as_str(), "pool_entry_reused")]);
-    // A charge the till took is a replay, still; only a refused one is dismissed.
+    // A charge the till took is a replay, still; one it refused is not a sale to answer again.
     assert!(take(&s, &card, &json, 20_000, "a").unwrap().replayed);
+    let (r, apdus) = take_counted(&s, &card, &json, 20_000, "b", b"1234");
+    assert_eq!((code(&r), apdus), ("conflict", 0), "{:?}", r.err());
+    // Only a refused one is dismissed.
     assert!(!s.dismiss(&ids[0]).unwrap());
     assert!(s.dismiss(&ids[1]).unwrap());
     assert_eq!(s.stats().refused, 0);

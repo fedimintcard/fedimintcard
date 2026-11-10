@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::charge::{Env, Pin, Taken, TillOuts, charge};
 use crate::files::{create_private_dir, private_options};
 use crate::kit::Kit;
-use crate::queue::{ChargeState, OfflineCharge, Queue};
+use crate::queue::{ChargeState, OfflineCharge, OfflineError, Queue};
 
 pub const PHONE_ID_FILE: &str = "phone-id";
 pub const LOCK_FILE: &str = "store.lock";
@@ -134,8 +134,21 @@ impl Store {
     /// Take `price` from `card` offline with the kit `kit_json` (as the till answered it), the
     /// holder's `pin`, for the sale `client_ref`. The kit is checked before the card is asked
     /// anything; its expiry against the latest of the phone's clock, the kit's issue and the
-    /// latest time this store has seen, and again against the card's clock.
+    /// latest time this store has seen, and again against the card's clock. A repeat of a sale the
+    /// till refused at sync is `conflict`: that sale was not paid, and a new one needs a new
+    /// `client_ref`.
     pub fn charge(&self, card: &mut dyn Card, kit_json: &str, price: u64, client_ref: &str, pin: &[u8]) -> Result<Taken> {
+        let t = self.charge_inner(card, kit_json, price, client_ref, pin)?;
+        if t.replayed && t.charge.state == ChargeState::Refused {
+            bail!(OfflineError::Conflict(format!(
+                "the till refused sale {client_ref:?} at sync ({}); start it again with a new client_ref",
+                t.charge.detail.as_deref().unwrap_or("refused")
+            )));
+        }
+        Ok(t)
+    }
+
+    fn charge_inner(&self, card: &mut dyn Card, kit_json: &str, price: u64, client_ref: &str, pin: &[u8]) -> Result<Taken> {
         let kit = Kit::parse(kit_json)?;
         let keys = kit.decode(&self.phone_id)?;
         let now = now_ms().max(kit.issued_at_ms).max(self.q().file.high_water_ms);
