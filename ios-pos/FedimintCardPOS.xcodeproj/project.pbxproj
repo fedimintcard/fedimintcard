@@ -23,6 +23,7 @@
 		4A93A410EE7A943F1F8FD176 /* Screens.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32DF1049376C2E8D8027537 /* Screens.swift */; };
 		5223EC8F0E6EE1A74380EABA /* LinkSocketIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 109A74725E7081E73FA24600 /* LinkSocketIntegrationTests.swift */; };
 		5701E4515BEA0E0013031DE9 /* PosCoreFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08FA69CD082D57FFCD63E730 /* PosCoreFixture.swift */; };
+		5ADEB8030F266C137E5458C4 /* PosControllerOfflineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC2BFAC8505680F4D18ECD3D /* PosControllerOfflineTests.swift */; };
 		5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E997C08978966870EBE4456 /* PosFlowTests.swift */; };
 		64474BF43AFE8B19B3711F9C /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB46E83F11E1306121B63D09 /* App.swift */; };
 		66179A990AA24AA61D471757 /* OfflineFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC39083B8D2D27935CC5EE5F /* OfflineFlowTests.swift */; };
@@ -76,6 +77,7 @@
 		AC39083B8D2D27935CC5EE5F /* OfflineFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFlowTests.swift; sourceTree = "<group>"; };
 		B32DF1049376C2E8D8027537 /* Screens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Screens.swift; sourceTree = "<group>"; };
 		BB9AEA85277653C319EC8C7B /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
+		BC2BFAC8505680F4D18ECD3D /* PosControllerOfflineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosControllerOfflineTests.swift; sourceTree = "<group>"; };
 		C39AEE1B854A9883FB8CC268 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		CB46E83F11E1306121B63D09 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		D554A18E98750B4ACDF904AA /* PosCoreAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosCoreAdapterTests.swift; sourceTree = "<group>"; };
@@ -148,6 +150,7 @@
 				FE964C32564F10C57985D26D /* OfflineStoreTests.swift */,
 				915B237265E96624811EB5C1 /* PadTests.swift */,
 				BB9AEA85277653C319EC8C7B /* PairingTests.swift */,
+				BC2BFAC8505680F4D18ECD3D /* PosControllerOfflineTests.swift */,
 				D554A18E98750B4ACDF904AA /* PosCoreAdapterTests.swift */,
 				08FA69CD082D57FFCD63E730 /* PosCoreFixture.swift */,
 				0E997C08978966870EBE4456 /* PosFlowTests.swift */,
@@ -292,6 +295,7 @@
 				3D99ED25480377BB7B018B61 /* OfflineStoreTests.swift in Sources */,
 				98FBA4E1C15EE84244C8BA53 /* PadTests.swift in Sources */,
 				CC4A2D39EC4757A837210D5D /* PairingTests.swift in Sources */,
+				5ADEB8030F266C137E5458C4 /* PosControllerOfflineTests.swift in Sources */,
 				9B40247BE60AF8C7EBA47645 /* PosCoreAdapterTests.swift in Sources */,
 				5701E4515BEA0E0013031DE9 /* PosCoreFixture.swift in Sources */,
 				5CD9A215C51C30AAE469F7AB /* PosFlowTests.swift in Sources */,

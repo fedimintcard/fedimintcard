@@ -429,7 +429,7 @@ struct ErrorScreen: View {
             Button("Abandon", role: .destructive) { pos.send(.abandonPressed) }
             Button("Keep", role: .cancel) {}
         } message: {
-            Text(abandonCopy(info.kind))
+            Text(abandonCopy(held: pos.phone.localOnlyRefs.contains(info.clientRef)))
         }
     }
 }

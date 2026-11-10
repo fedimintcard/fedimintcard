@@ -10,9 +10,9 @@ final class PosController: ObservableObject {
     let flow = PosFlow()
     let store: PairingStore
     let offline: OfflinePhone
-    private let transport: HTTPTransport = URLSessionTransport()
+    private let transport: HTTPTransport
     private lazy var client = TillClient(pairing: { [weak self] in self?.pairing }, transport: transport)
-    private let reader = NFCCardReader()
+    private let reader: CardReader
 
     @Published private(set) var state: PosState = .entering
     @Published private(set) var amountDisplay = "0"
@@ -54,10 +54,14 @@ final class PosController: ObservableObject {
     private var cardChannel: CardChannel?
     private var localTransport: NFCApduTransport?
 
-    /// `offline`: the phone's offline side (nil: the app's own store).
-    init(store: PairingStore = KeychainPairingStore(), offline: OfflinePhone? = nil) {
+    /// `offline`: the phone's offline side (nil: the app's own store). `transport` carries every
+    /// request to the till and `reader` is the NFC session; tests give fakes of both.
+    init(store: PairingStore = KeychainPairingStore(), offline: OfflinePhone? = nil,
+         transport: HTTPTransport = URLSessionTransport(), reader: CardReader = NFCCardReader()) {
         self.store = store
         self.offline = offline ?? OfflinePhone()
+        self.transport = transport
+        self.reader = reader
         pairing = store.load()
         health = pairing == nil ? .notPaired : .ok
         self.offline.tillChanged(to: pairing?.baseURL)
@@ -410,15 +414,18 @@ final class PosController: ObservableObject {
         }
     }
 
-    private var pollInFlight = false
+    private(set) var pollInFlight = false
 
-    func pollNow() {
-        guard let till = pairing else { health = .notPaired; return }
-        if case .signing = state { return }
-        if case .topUpLoading = state { return }
-        guard !pollInFlight else { return }
+    /// A status poll, then the offline work it allows. The task is for a caller that waits for the
+    /// poll to end (tests); nil when none starts.
+    @discardableResult
+    func pollNow() -> Task<Void, Never>? {
+        guard let till = pairing else { health = .notPaired; return nil }
+        if case .signing = state { return nil }
+        if case .topUpLoading = state { return nil }
+        guard !pollInFlight else { return nil }
         pollInFlight = true
-        Task { [weak self] in
+        return Task { [weak self] in
             guard let self else { return }
             let r = await self.client.status()
             switch r {

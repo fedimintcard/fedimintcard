@@ -13,6 +13,7 @@ final class FakeCore: OfflineCore {
 
     var outcomes: [CoreOutcome] = []
     private(set) var charges: [Charge] = []
+    /// `stats()`, with `waiting` raised by the charges in `waiting`.
     var storeStats = OfflineStats()
     /// `signing_refs()`; `signingThrows` makes it fail.
     var signing: [String] = []
@@ -33,7 +34,11 @@ final class FakeCore: OfflineCore {
                      inputs: [Note(slot: 0, msat: priceMsat)], change: [], replayed: false)
     }
 
-    func stats() throws -> OfflineStats { storeStats }
+    func stats() throws -> OfflineStats {
+        var s = storeStats
+        s.waiting += waiting.count
+        return s
+    }
 
     func signingRefs() throws -> [String] {
         if signingThrows { throw CoreFailure(description: "the store is locked") }
@@ -79,10 +84,16 @@ final class FakeCore: OfflineCore {
 final class FakeTill: HTTPTransport {
     private let lock = NSLock()
     private var routes: [String: Result<RawResponse, TransportError>] = [:]
+    /// Answers for the next requests of a path only, in turn, before its route's.
+    private var once: [String: [Result<RawResponse, TransportError>]] = [:]
     private var log: [HTTPRequest] = []
 
     func answer(_ path: String, _ status: Int, _ body: String) { set(path, .success(RawResponse(status: status, body: Data(body.utf8)))) }
     func fail(_ path: String, _ e: TransportError) { set(path, .failure(e)) }
+    /// `path`'s next request (after any already set this way) gets this; then its route answers.
+    func answerOnce(_ path: String, _ status: Int, _ body: String) {
+        lock.lock(); once[path, default: []].append(.success(RawResponse(status: status, body: Data(body.utf8)))); lock.unlock()
+    }
     private func set(_ path: String, _ r: Result<RawResponse, TransportError>) { lock.lock(); routes[path] = r; lock.unlock() }
 
     var requests: [HTTPRequest] { lock.lock(); defer { lock.unlock() }; return log }
@@ -97,6 +108,10 @@ final class FakeTill: HTTPTransport {
         lock.lock()
         defer { lock.unlock() }
         log.append(req)
+        if let next = once[req.url.path]?.first {
+            once[req.url.path]?.removeFirst()
+            return next
+        }
         return routes[req.url.path]
     }
 }
@@ -313,6 +328,63 @@ final class OfflineFlowTests: XCTestCase {
         XCTAssertEqual(errorInfo(g)?.kind, .tillUnreachable)
     }
 
+    /// Answers to a first `POST /v1/charge` that leave nothing unresolved and yet do not prove that
+    /// nothing moved: a 500 (the till's worker dropped a job it had taken), a 5xx the app cannot
+    /// read (a proxy that gave up first), a code the app does not know, no answer at all. The till
+    /// may have taken the sale, and only its own `client_ref` guard stops a second charge, so the
+    /// retry's link failing never takes the card on the phone.
+    func testARetryOfASaleTheTillsChargeRouteHadIsNeverTakenOnThePhone() {
+        let answers: [ChargeResult] = [
+            .declined(code: .internal, detail: "the till service stopped before answering", httpStatus: 500),
+            .failed(.badResponse("bad json")),
+            .declined(code: .unknown, detail: "", httpStatus: 500),
+            .failed(.unreachable),
+        ]
+        for answer in answers {
+            let f = flow()
+            _ = toWaiting(f)
+            guard case .startCharge(let id, _, let ref, _)? = f.dispatch(.cardPresent).first else { return XCTFail("\(answer)") }
+            f.dispatch(.chargeDone(chargeId: id, result: answer))
+            guard let first = errorInfo(f) else { return XCTFail("\(answer): \(f.state)") }
+            XCTAssertNil(first.unresolvedRef, "\(answer): the online path's screen is as it was")
+            XCTAssertTrue(first.kind.retryable, "\(answer)")
+            f.dispatch(.retryPressed)
+            guard case .startCardSession(.charge)? = toWaiting(f).first else { return XCTFail("\(answer): the till is asked first") }
+            let fx = f.dispatch(.linkFailed(.unreachable))
+            guard case .failCardSession("Can't reach the till")? = fx.first, fx.count == 1 else { return XCTFail("\(answer): \(fx)") }
+            guard let e = errorInfo(f) else { return XCTFail("\(answer): \(f.state)") }
+            XCTAssertEqual(e.kind, .tillUnreachable, "\(answer)")
+            XCTAssertEqual(e.clientRef, ref, "\(answer)")
+            XCTAssertNil(e.unresolvedRef, "\(answer)")
+            XCTAssertEqual(errorCopy(e.kind, e.detail).1, tillUnreachableCopy.1, "\(answer)")
+            XCTAssertFalse(f.holdsPin, "\(answer)")
+            // Nor on any later retry.
+            f.dispatch(.retryPressed)
+            _ = toWaiting(f)
+            guard case .failCardSession? = f.dispatch(.linkFailed(.unreachable)).first else { return XCTFail("\(answer): \(f.state)") }
+        }
+    }
+
+    /// The till's definitive refusals prove nothing moved: the sale is free to go to the phone.
+    func testARetryAfterTheTillSaidNothingMovedStillFallsBack() {
+        let answers: [ChargeResult] = [
+            .declined(code: .noCard, detail: "", httpStatus: 409),
+            .declined(code: .insufficient, detail: "", httpStatus: 402),
+            .declined(code: .wrongPin, detail: "wrong PIN; 2 tries left before the card blocks", httpStatus: 403),
+        ]
+        for answer in answers {
+            let f = flow()
+            _ = toWaiting(f)
+            guard case .startCharge(let id, _, let ref, _)? = f.dispatch(.cardPresent).first else { return XCTFail("\(answer)") }
+            f.dispatch(.chargeDone(chargeId: id, result: answer))
+            if case .error = f.state { f.dispatch(.retryPressed) }
+            guard case .startCardSession(.charge)? = toWaiting(f).first else { return XCTFail("\(answer): \(f.state)") }
+            let fx = f.dispatch(.linkFailed(.unreachable))
+            guard case .startLocalCharge(_, 5000, let local, _)? = fx.first, fx.count == 1 else { return XCTFail("\(answer): \(fx)") }
+            XCTAssertEqual(local, ref, "\(answer)")
+        }
+    }
+
     func testNoKitExpiredKitAndCapsSayWhichAndTakeNothing() {
         let cases: [(OfflineSnapshot, ErrorKind, String)] = [
             (Offline.ready(nil), .offlineNoKit, "No offline kit yet. Reach the till once while online."),
@@ -372,7 +444,8 @@ final class OfflineFlowTests: XCTestCase {
         XCTAssertEqual(errorCopy(e.kind, e.detail, unresolved: true).0, "Payment not finished")
         XCTAssertEqual(errorCopy(e.kind, e.detail, unresolved: true).1,
                        "The card was taken away while it signed. Hold the same card to the phone and press Try again. It won't be charged twice.")
-        XCTAssertEqual(abandonCopy(e.kind), "The card already signed part of this payment. Its next tap on this phone still finishes it.")
+        XCTAssertEqual(abandonCopy(held: r.phone.snapshot.localOnlyRefs.contains(e.clientRef)),
+                       "The card already signed part of this payment. Its next tap on this phone still finishes it.")
         XCTAssertTrue(r.phone.snapshot.localOnlyRefs.contains("ref1"))
         await r.send(.backPressed)
         XCTAssertNotNil(r.error, "Back is not offered while the sale is held")
@@ -419,6 +492,98 @@ final class OfflineFlowTests: XCTestCase {
         r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, triesLeft: nil)]
         await r.send(.linkFailed(.unreachable))
         XCTAssertTrue(r.phone.snapshot.localOnlyRefs.contains("ref1"), "fails closed: the last set plus this sale")
+    }
+
+    /// A sale held on the phone, and the card left again, or a retap the core refuses at its card
+    /// checks: those come before it reaches the held charge, so `signing_refs()` still lists the
+    /// sale. It stays held: no Back, Try again stays on the phone, and Abandon's alert says the
+    /// card's next tap here still finishes it.
+    private func heldSale() async -> Runner {
+        let r = Runner()
+        await r.ready()
+        r.core.outcomes = [.refused(code: "undecided", detail: "the card was taken away while it signed", suggestedMsat: nil, triesLeft: nil)]
+        r.core.signing = ["ref1"]
+        await r.ring(5)
+        await r.send(.linkFailed(.unreachable))
+        XCTAssertEqual(r.error?.kind, .heldOnPhone)
+        return r
+    }
+
+    private let heldAbandon = "The card already signed part of this payment. Its next tap on this phone still finishes it."
+
+    func testAHeldSaleStaysHeldWhenTheCoreRefusesItsRetryAtTheCardChecks() async {
+        let r = await heldSale()
+        let refusals: [(String, ErrorKind)] = [
+            ("no_card", .noCard), ("card_error", .cardError), ("pin_blocked", .pinBlocked),
+            ("offline_unsupported_card", .offlineUnsupportedCard), ("card_not_genuine", .cardNotGenuine),
+        ]
+        for (code, kind) in refusals {
+            r.core.outcomes = [.refused(code: code, detail: "d", suggestedMsat: nil, triesLeft: nil)]
+            await r.send(.retryPressed)
+            await r.ring()
+            XCTAssertEqual(r.lastSession, .chargeLocal, code)
+            await r.send(.cardPresent)
+            guard let e = r.error else { return XCTFail("\(code): \(r.flow.state)") }
+            XCTAssertEqual(e.kind, kind, code)
+            XCTAssertEqual(e.unresolvedRef, "ref1", "\(code): still held")
+            await r.send(.backPressed)
+            XCTAssertEqual(r.error, e, "\(code): no Back while the sale is held")
+            XCTAssertEqual(abandonCopy(held: r.phone.snapshot.localOnlyRefs.contains(e.clientRef)), heldAbandon, code)
+        }
+        XCTAssertEqual(r.core.charges.map(\.ref), Array(repeating: "ref1", count: 1 + refusals.count))
+        XCTAssertFalse(r.till.paths.contains("/v1/charge"))
+        // The same card's next tap finishes it.
+        r.core.outcomes = []
+        r.core.signing = []
+        await r.send(.retryPressed)
+        await r.ring()
+        await r.send(.cardPresent)
+        guard case .receipt(let rc) = r.flow.state else { return XCTFail("\(r.flow.state)") }
+        XCTAssertTrue(rc.offline)
+    }
+
+    func testAWrongPinOnAHeldSaleGoesBackToTheHeldSale() async {
+        let r = await heldSale()
+        let held = PosErrorInfo(priceMsat: 5000, kind: .heldOnPhone, detail: "", clientRef: "ref1", unresolvedRef: "ref1")
+        r.core.outcomes = [.refused(code: "wrong_pin", detail: "d", suggestedMsat: nil, triesLeft: 2)]
+        await r.send(.retryPressed)
+        await r.ring()
+        await r.send(.cardPresent)
+        XCTAssertEqual(r.flow.state, .enteringPin(priceMsat: 5000, clientRef: "ref1", wrongPin: true, triesLeft: 2, returnTo: held))
+        XCTAssertEqual(r.flow.unresolvedRef, "ref1")
+        await r.send(.cancelPressed)
+        XCTAssertEqual(r.error, held, "Cancel goes back to the held sale, never to a new one")
+        await r.send(.backPressed)
+        XCTAssertEqual(r.error, held)
+        XCTAssertEqual(abandonCopy(held: r.phone.snapshot.localOnlyRefs.contains("ref1")), heldAbandon)
+        // The last try gone: the PIN is blocked, and the sale is still held.
+        r.core.outcomes = [.refused(code: "wrong_pin", detail: "d", suggestedMsat: nil, triesLeft: 0)]
+        await r.send(.retryPressed)
+        await r.ring()
+        await r.send(.cardPresent)
+        XCTAssertEqual(r.error, PosErrorInfo(priceMsat: 5000, kind: .pinBlocked, detail: "", clientRef: "ref1", unresolvedRef: "ref1"))
+        XCTAssertFalse(r.till.paths.contains("/v1/charge"))
+    }
+
+    /// A sale nothing holds on the phone keeps the online screens: Back, and the online alert.
+    func testASaleNothingHoldsReadsAsBefore() async {
+        let r = Runner()
+        await r.ready()
+        r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, triesLeft: nil)]
+        await r.ring(5)
+        await r.send(.linkFailed(.unreachable))
+        XCTAssertEqual(r.error, PosErrorInfo(priceMsat: 5000, kind: .noCard, detail: "gone", clientRef: "ref1", unresolvedRef: nil))
+        XCTAssertFalse(r.phone.snapshot.localOnlyRefs.contains("ref1"))
+        await r.send(.backPressed)
+        XCTAssertEqual(r.flow.state, .entering)
+        // An unresolved sale of the till's: its Abandon alert is the online one.
+        let f = flow()
+        _ = toWaiting(f)
+        guard case .startCharge(let id, _, _, _)? = f.dispatch(.cardPresent).first else { return XCTFail() }
+        f.dispatch(.chargeDone(chargeId: id, result: .failed(.timeout)))
+        guard let e = errorInfo(f) else { return XCTFail() }
+        XCTAssertEqual(abandonCopy(held: f.offline.localOnlyRefs.contains(e.clientRef)),
+                       "If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
     }
 
     func testEveryCoreAnswerMapsToItsScreen() async {

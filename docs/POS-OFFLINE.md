@@ -174,7 +174,13 @@ queue, where the NFC tag answers; an APDU the card does not answer in 15 s is lo
 
 **When the phone takes the card.** At `linkFailed` of a charge only, in the same NFC session, when
 the till is not serving (no connection, the link's quick timeout, a handshake that fails, a 5xx),
-no earlier attempt of the sale is unresolved, and the kit is there, unexpired and under its caps.
+no earlier attempt of the sale reached the till's charge route without an answer that proves
+nothing moved, and the kit is there, unexpired and under its caps. The answers that prove it are
+the definitive refusals (`insufficient`, `no_exact_plan`, `offline_no_change_room`, `declined`,
+`bad_request`, `no_card`, `card_error`, `wrong_pin`, `pin_blocked`). After any other answer to a
+`POST /v1/charge` (a 500, a 5xx the app cannot read, a code it does not know, no answer at all)
+the till may have taken the sale, and only the till's own `client_ref` guard stops a second
+charge, so a retry that cannot reach the till shows the unreachable screen and takes nothing.
 A 401 or 403 never falls back: the pairing is dead. An unresolved sale whose retry cannot reach the
 till stays on the unreachable screen with the lost reply's copy, and "Outcome unknown" is as it
 was. Otherwise the unreachable screen says which: no kit yet, the kit expired, or the caps reached.
@@ -187,9 +193,14 @@ threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatev
 health: "Try again" opens an NFC session with no card link, and the till never sees the sale
 ("Payment not finished": hold the same card to the phone, it won't be charged twice). The caps do
 not hold such a retry back, and it fetches a new kit first when its kit has expired and the till
-answers. Abandon only leaves the screen: the card's next tap on this phone still finishes the sale
-(the owner's decision, 2026-11-10; ENG-854 is the follow-up that names the finished sale). After a
-restart the home screen says how many sales wait for their cards (`stats().signing`).
+answers. The sale stays held whatever its retry answers: the core refuses a retap at its card
+checks (`no_card`, `card_error`, `wrong_pin`, `pin_blocked`, `offline_unsupported_card`,
+`card_not_genuine`) before it reaches the held charge, and `signing_refs()` still lists it. So
+there is no Back, Cancel on a wrong PIN goes back to the held sale, and Try again stays on the
+phone. Abandon only leaves the screen, and its alert says the card's next tap on this phone still
+finishes the sale (the owner's decision, 2026-11-10; ENG-854 is the follow-up that names the
+finished sale). After a restart the home screen says how many sales wait for their cards
+(`stats().signing`).
 
 **Kit and sync.** Off the status poll, while the till answers. The kit is fetched when none is
 kept, when the kept one is 10 minutes old, after a sync that synced a charge, and after a local

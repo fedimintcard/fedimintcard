@@ -70,10 +70,11 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     }
 }
 
-/// The Abandon alert's message: a sale held on this phone is still finished by its card's next
-/// tap here (the owner's decision, ENG-843); any other unresolved sale may have gone through.
-func abandonCopy(_ kind: ErrorKind) -> String {
-    kind == .heldOnPhone
+/// The Abandon alert's message. `held`: the sale is held on this phone (its `client_ref` is in the
+/// snapshot's `localOnlyRefs`), whatever its last tap answered, so its card's next tap here still
+/// finishes it (the owner's decision, ENG-843). Any other unresolved sale may have gone through.
+func abandonCopy(held: Bool) -> String {
+    held
         ? "The card already signed part of this payment. Its next tap on this phone still finishes it."
         : "If the payment did go through, the customer will have paid without a receipt. Check Sales first."
 }

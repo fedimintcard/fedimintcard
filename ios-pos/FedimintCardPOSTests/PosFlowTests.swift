@@ -304,10 +304,10 @@ final class OfflineCopyTests: XCTestCase {
     }
 
     func testTheAbandonAlertSaysAHeldSaleStillFinishes() {
-        XCTAssertEqual(abandonCopy(.heldOnPhone), "The card already signed part of this payment. Its next tap on this phone still finishes it.")
-        for k: ErrorKind in [.undecided, .timeoutUnknown, .tillUnreachable] {
-            XCTAssertEqual(abandonCopy(k), "If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
-        }
+        // Held: the sale's client_ref is in the phone's localOnlyRefs, whatever its screen's kind
+        // (OfflineFlowTests drive both from the flow).
+        XCTAssertEqual(abandonCopy(held: true), "The card already signed part of this payment. Its next tap on this phone still finishes it.")
+        XCTAssertEqual(abandonCopy(held: false), "If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
     }
 
     func testTheNewKindsHold() {
