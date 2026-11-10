@@ -26,6 +26,10 @@
 //! ```text
 //! sum(inputs) == sum(outputs) + sum(fee(input)) + sum(fee(output)) + surplus
 //! ```
+//!
+//! A till makes its own outputs, in any tier. A POS phone charging offline takes them from its
+//! offline kit's pool, which holds some tiers only: the `_in` functions take the tiers the till's
+//! notes may use ([`Tiers`]); the change, the card's own, may use any.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +53,61 @@ pub const MAX_CARD_NOTES: usize = 32;
 /// Most card notes one charge spends. Each input is one card signature (about 850 ms on a
 /// J3R180), and a tap has to stay short.
 pub const MAX_INPUTS: usize = 3;
+
+/// The note tiers the till's outputs may use: bit `i` set when a note of 2^`i` msat is there.
+pub type Tiers = u64;
+/// Every tier: a till's own outputs.
+pub const ALL_TIERS: Tiers = u64::MAX;
+
+/// Whether every note of `amount`'s binary decomposition (the till's side of a plan) is a tier
+/// in `tiers`.
+pub fn fits(amount: u64, tiers: Tiers) -> bool {
+    amount & !tiers == 0
+}
+
+/// The largest amount below `x` that [`fits`] `tiers` (0 when none does).
+fn fit_below(x: u64, tiers: Tiers) -> u64 {
+    let Some(x) = x.checked_sub(1) else { return 0 };
+    let mut y = 0;
+    for b in (0..64).rev() {
+        let bit = 1u64 << b;
+        if x & bit == 0 {
+            continue;
+        }
+        if tiers & bit == 0 {
+            // This bit cannot be had: every tier below it can.
+            return y | (tiers & (bit - 1));
+        }
+        y |= bit;
+    }
+    y
+}
+
+/// The smallest amount above `x` that [`fits`] `tiers`.
+fn fit_above(x: u64, tiers: Tiers) -> Option<u64> {
+    let x = x.checked_add(1)?;
+    if fits(x, tiers) {
+        return Some(x);
+    }
+    // Any larger one keeps `x`'s bits above some bit `b` that `x` lacks, sets `b`, and clears the
+    // rest; the smallest such is the answer.
+    (0..64)
+        .map(|b| 1u64 << b)
+        .filter(|bit| tiers & bit != 0 && x & bit == 0)
+        .map(|bit| (x & !((bit << 1).wrapping_sub(1)), bit))
+        .filter(|(high, _)| fits(*high, tiers))
+        .map(|(high, bit)| high | bit)
+        .min()
+}
+
+/// The smallest note the planner may give the till: 4 msat when every fee is a multiple of 4
+/// (fedimint's default schedule, where the descending floors stop at 4 msat), else 1 msat (the
+/// last-resort floor). An offline kit's pool covers the tiers from here up: with fees, the till's
+/// side absorbs what the fees leave (the dust notes of [`Plan::dust`]), and a pool without those
+/// tiers could pay no price on a card with no room for change.
+pub fn lowest_till_note(fee: FeeFn, min_denom: u64) -> u64 {
+    if min_denom >= 4 && (0..=MAX_EXP).all(|e| fee(1u64 << e) % 4 == 0) { 4 } else { 1 }
+}
 
 /// How far a plan leaves the card short of [`ROOM_AFTER_CHARGE`] free slots, assuming the spent
 /// inputs' slots are renewed after the charge (`glue.rs` renews until a slot is free).
@@ -297,12 +356,25 @@ pub fn solve(
     fee: FeeFn,
     min_denom: u64,
 ) -> Result<Plan, PlanError> {
-    solve_surplus(notes, price, free_slots, fee, min_denom, 0, 0)
+    solve_in(notes, price, free_slots, fee, min_denom, ALL_TIERS)
 }
 
-/// [`solve`] for a transaction whose inputs pay exactly `surplus` msat more than its outputs and
+/// [`solve`] with the till's notes in `tiers` only (the change may use any tier).
+pub fn solve_in(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    tiers: Tiers,
+) -> Result<Plan, PlanError> {
+    solve_surplus(notes, price, free_slots, fee, min_denom, 0, 0, tiers)
+}
+
+/// [`solve_in`] for a transaction whose inputs pay exactly `surplus` msat more than its outputs and
 /// their fees, overpaying the till by at least `min_overpay`. Only for a federation at core
 /// consensus 2.1 or later; the objective is [`solve`]'s.
+#[allow(clippy::too_many_arguments)]
 fn solve_surplus(
     notes: &[u64],
     price: u64,
@@ -311,6 +383,7 @@ fn solve_surplus(
     min_denom: u64,
     surplus: u64,
     min_overpay: u64,
+    tiers: Tiers,
 ) -> Result<Plan, PlanError> {
     // Every floor that balances is a candidate. Card slots are scarce (8 or 32), so the fewest change
     // notes wins, then the fewest output notes (each costs a fee), fewest inputs, smallest overpay. A high floor can force dozens of
@@ -326,7 +399,7 @@ fn solve_surplus(
         if floor == 1 && min_denom > 1 && best.is_some() {
             break; // 1 msat notes only when nothing larger balances
         }
-        match solve_with(notes, price, free_slots, fee, floor, surplus, min_overpay) {
+        match solve_with(notes, price, free_slots, fee, floor, surplus, min_overpay, tiers) {
             Ok(mut p) => {
                 p.dust = floor < min_denom;
                 let key = |p: &Plan| {
@@ -351,6 +424,7 @@ fn solve_surplus(
     best.ok_or_else(|| first_err.unwrap_or(PlanError::NoExactPlan { price, free_slots }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_with(
     notes: &[u64],
     price: u64,
@@ -359,6 +433,7 @@ fn solve_with(
     min_denom: u64,
     surplus: u64,
     min_overpay: u64,
+    tiers: Tiers,
 ) -> Result<Plan, PlanError> {
     if price == 0 {
         return Err(PlanError::NoExactPlan { price, free_slots });
@@ -380,12 +455,13 @@ fn solve_with(
         return Err(PlanError::TooManyInputs { price, max_inputs: MAX_INPUTS });
     }
 
-    // Till candidates: totals that are multiples of `min_denom`, price <= t <= price + MAX.
+    // Till candidates: totals that are multiples of `min_denom`, price <= t <= price + MAX, whose
+    // notes (`binary(t)`) are all in `tiers`.
     let first = price.div_ceil(min_denom) * min_denom;
     let till_cost: Vec<(u64, u64)> = (0..)
         .map(|i| first + i * min_denom)
         .take_while(|t| *t <= price + MAX_TILL_OVERPAY)
-        .filter(|t| t - price >= min_overpay)
+        .filter(|t| t - price >= min_overpay && fits(*t, tiers))
         .map(|t| (t - price, t + fee_sum(&binary(t), fee)))
         .collect();
     let Some(min_till) = till_cost.iter().map(|c| c.1).min() else {
@@ -657,7 +733,20 @@ pub fn solve_with_margin(
     min_denom: u64,
     headroom: FeeHeadroom,
 ) -> Result<Plan, PlanError> {
-    let exact = solve(notes, price, free_slots, fee, min_denom)?;
+    solve_with_margin_in(notes, price, free_slots, fee, min_denom, headroom, ALL_TIERS)
+}
+
+/// [`solve_with_margin`] with the till's notes in `tiers` only.
+pub fn solve_with_margin_in(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    headroom: FeeHeadroom,
+    tiers: Tiers,
+) -> Result<Plan, PlanError> {
+    let exact = solve_in(notes, price, free_slots, fee, min_denom, tiers)?;
     if headroom.is_off() {
         return Ok(exact);
     }
@@ -673,7 +762,7 @@ pub fn solve_with_margin(
         if margin == 0 {
             break;
         }
-        let Ok(p) = solve_surplus(notes, price, free_slots, fee, min_denom, margin, min_overpay) else { break };
+        let Ok(p) = solve_surplus(notes, price, free_slots, fee, min_denom, margin, min_overpay, tiers) else { break };
         if rank(&p) > rank(&exact) || p.inputs.len() > exact.inputs.len() {
             break;
         }
@@ -737,6 +826,21 @@ const NEAR_TRIES: usize = 8;
 /// to `step`), and the nearest of those on each side are checked with [`solve`], at most
 /// [`NEAR_TRIES`] per side. `None` on a side where none checks.
 pub fn exact_prices_near(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64, step: u64) -> (Option<u64>, Option<u64>) {
+    exact_prices_near_in(notes, price, free_slots, fee, min_denom, step, ALL_TIERS)
+}
+
+/// [`exact_prices_near`] with the till's notes in `tiers` only. A candidate whose till side cannot
+/// fit `tiers` is not checked; the whole-sat prices nearest the asked one whose till side can are
+/// added, so a pool short of a tier still gets a price it pays.
+pub fn exact_prices_near_in(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    step: u64,
+    tiers: Tiers,
+) -> (Option<u64>, Option<u64>) {
     let step = step.max(1);
     let n = notes.len().min(MAX_CARD_NOTES);
     let net = |a: u64| a.saturating_sub(fee(a));
@@ -764,9 +868,33 @@ pub fn exact_prices_near(notes: &[u64], price: u64, free_slots: usize, fee: FeeF
             }
         }
     }
+    if tiers != ALL_TIERS {
+        // A price is paid by a till side of `price..=price + MAX_TILL_OVERPAY`: it must fit.
+        cands.retain(|p| fit_above(p.saturating_sub(1), tiers).is_some_and(|t| t <= p + MAX_TILL_OVERPAY));
+        let (mut down, mut up) = (price, price);
+        for _ in 0..NEAR_TRIES {
+            let t = fit_below(down, tiers);
+            let p = t / step * step;
+            if p > 0 && p < price {
+                cands.push(p);
+            }
+            down = p.min(t);
+            if down == 0 {
+                break;
+            }
+        }
+        for _ in 0..NEAR_TRIES {
+            let Some(t) = fit_above(up, tiers) else { break };
+            let p = t / step * step;
+            if p > price {
+                cands.push(p);
+            }
+            up = t;
+        }
+    }
     cands.sort_unstable();
     cands.dedup();
-    let pays = |p: u64| solve(notes, p, free_slots, fee, min_denom).is_ok();
+    let pays = |p: u64| solve_in(notes, p, free_slots, fee, min_denom, tiers).is_ok();
     let below = cands.iter().rev().filter(|c| **c < price).take(NEAR_TRIES).copied().find(|c| pays(*c));
     let above = cands.iter().filter(|c| **c > price).take(NEAR_TRIES).copied().find(|c| pays(*c));
     (below, above)
@@ -1001,7 +1129,7 @@ mod tests {
         // The descending floors stop at 4 msat here: 100 msat fees balance on multiples of 4.
         assert!(p.till.iter().chain(&p.change).all(|a| *a >= 4), "{p:?}");
         // And the strict search alone finds nothing.
-        assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512, 0, 0), Err(PlanError::NoExactPlan { .. })));
+        assert!(matches!(solve_with(&notes, 100_000, 16, &base100, 512, 0, 0, ALL_TIERS), Err(PlanError::NoExactPlan { .. })));
     }
 
     #[test]
@@ -1065,6 +1193,132 @@ mod tests {
             }
         }
         assert!(planned >= 20, "only {planned} of 54 charges planned");
+    }
+
+    // ---- the till's tiers (an offline kit's pool)
+
+    /// Every tier from `lo` to `hi` msat (powers of two).
+    fn tiers_between(lo: u64, hi: u64) -> Tiers {
+        ((hi << 1) - 1) & !(lo - 1)
+    }
+
+    #[test]
+    fn fit_below_and_above_are_the_nearest_amounts_in_the_tiers() {
+        for tiers in [0b1011_0110u64, 0b0101_1001, 0b1111_0000, 0b0000_0001, 0b1000_0000] {
+            for x in 0..300u64 {
+                let below = (0..x).rev().find(|y| fits(*y, tiers)).unwrap_or(0);
+                assert_eq!(fit_below(x, tiers), below, "below {x} in {tiers:b}");
+                let above = (x + 1..1 << 12).find(|y| fits(*y, tiers));
+                assert_eq!(fit_above(x, tiers), above, "above {x} in {tiers:b}");
+            }
+        }
+        assert_eq!(fit_above(u64::MAX, ALL_TIERS), None);
+        assert_eq!(fit_above(1 << 62, 1 << 63), Some(1 << 63));
+    }
+
+    /// A mask holding every tier of the full plan's till side gives the same plan.
+    #[test]
+    fn a_mask_with_the_plans_tiers_changes_nothing() {
+        let mut s = 0x1F3D5B79A2C4E6F8u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut planned = 0;
+        for fee in [&zero as FeeFn, &base100, &ppm1000] {
+            for _ in 0..30 {
+                let n = 1 + (next() % 6) as usize;
+                let notes: Vec<u64> = (0..n).map(|_| 1u64 << (10 + next() % 12)).collect();
+                let total: u64 = notes.iter().sum();
+                let price = 1 + next() % (total / 2);
+                let free = (next() % 8) as usize;
+                let m = min_econ(fee);
+                let Ok(p) = solve(&notes, price, free, fee, m) else { continue };
+                let mask = p.till.iter().fold(0, |t, a| t | a);
+                assert_eq!(solve_in(&notes, price, free, fee, m, mask), Ok(p.clone()), "{notes:?} {price}");
+                assert_eq!(solve_in(&notes, price, free, fee, m, ALL_TIERS), Ok(p));
+                planned += 1;
+            }
+        }
+        assert!(planned > 30, "{planned}");
+    }
+
+    /// The till's notes stay in the mask, the change does not have to; a price that needs a
+    /// missing tier, with no other way to pay, has no plan.
+    #[test]
+    fn a_mask_keeps_the_till_to_its_tiers() {
+        let notes = [65_536u64, 16_384];
+        // No 32,768 msat note for the till: 50,000 msat needs one (any till side of
+        // 50,000..=52,048 msat does), so there is no plan however much room there is.
+        let mask = tiers_between(1, 1 << 26) & !(1 << 15);
+        for fee in [&zero as FeeFn, &base100] {
+            let m = min_econ(fee);
+            assert!(solve(&notes, 50_000, 6, fee, m).is_ok());
+            assert!(matches!(solve_in(&notes, 50_000, 6, fee, m, mask), Err(PlanError::NoExactPlan { .. })));
+            for price in [10_000u64, 20_000, 70_000] {
+                if let Ok(p) = solve_in(&notes, price, 6, fee, m, mask) {
+                    assert!(p.till.iter().all(|a| fits(*a, mask)) && p.balances(&notes, fee), "{p:?}");
+                }
+            }
+        }
+    }
+
+    /// Fedimint's default fees and a card with no room for change: the till's side has to take
+    /// what the fees leave, in notes down to 4 msat. The offline kit's pool covers those tiers
+    /// ([`lowest_till_note`]); a pool from `min_denom` (512 msat) up pays none of these prices.
+    #[test]
+    fn with_no_room_for_change_the_till_needs_its_small_tiers() {
+        let notes = [65_536u64, 16_384, 4_096];
+        let m = min_econ(&base100);
+        assert_eq!(lowest_till_note(&base100, m), 4);
+        let kit = tiers_between(lowest_till_note(&base100, m), 1 << 26);
+        let from_min_denom = tiers_between(m, 1 << 26);
+        let mut paid = 0;
+        for asked in [5_000u64, 15_000, 20_000, 60_000, 80_000] {
+            let (below, above) = exact_prices_near(&notes, asked, 0, &base100, m, 1_000);
+            for price in below.into_iter().chain(above) {
+                let p = solve(&notes, price, 0, &base100, m).expect("a suggestion pays");
+                assert!(p.till.iter().any(|a| *a < m), "the till takes notes under 512 msat: {p:?}");
+                assert_eq!(solve_in(&notes, price, 0, &base100, m, kit), Ok(p));
+                assert!(solve_in(&notes, price, 0, &base100, m, from_min_denom).is_err(), "{price}");
+                paid += 1;
+            }
+        }
+        assert!(paid >= 5, "{paid}");
+    }
+
+    #[test]
+    fn the_lowest_till_note_follows_the_fee_schedule() {
+        assert_eq!(lowest_till_note(&base100, min_econ(&base100)), 4);
+        // 0.1 % of a note is not a multiple of 4 msat for every tier: 1 msat notes may be needed.
+        assert_eq!(lowest_till_note(&ppm1000, min_econ(&ppm1000)), 1);
+        // No fees: the smallest economical note is 1 msat.
+        assert_eq!(lowest_till_note(&zero, min_econ(&zero)), 1);
+    }
+
+    /// A pool out of a tier: the prices suggested fit what is left, and pay.
+    #[test]
+    fn masked_suggestions_fit_the_tiers_left_and_pay() {
+        let notes = binary(30_000_000);
+        for fee in [&zero as FeeFn, &base100] {
+            let m = min_econ(fee);
+            let mask = tiers_between(lowest_till_note(fee, m), 1 << 26) & !(1 << 15);
+            for (price, free) in [(50_000u64, 6usize), (40_000, 6), (100_000, 2)] {
+                if solve_in(&notes, price, free, fee, m, mask).is_ok() {
+                    continue;
+                }
+                let (below, above) = exact_prices_near_in(&notes, price, free, fee, m, 1_000, mask);
+                assert!(below.is_some() || above.is_some(), "{price}: no suggestion");
+                for p in below.into_iter().chain(above) {
+                    assert_eq!(p % 1_000, 0);
+                    let plan = solve_in(&notes, p, free, fee, m, mask).expect("a suggestion pays");
+                    assert!(plan.till.iter().all(|a| fits(*a, mask)), "{plan:?}");
+                }
+                assert!(below.is_none_or(|b| b < price) && above.is_none_or(|a| a > price));
+            }
+        }
     }
 
     // ---- nearest_card_amount (docs/TOPUP.md)
