@@ -267,3 +267,111 @@ final class PosFlowTests: XCTestCase {
         guard case .enteringPin = f.state else { return XCTFail() }
     }
 }
+
+/// The copy for the phone as an offline till (ENG-843, one set for both apps).
+final class OfflineCopyTests: XCTestCase {
+    func testEveryNewKindHasItsTitle() {
+        let titles: [(ErrorKind, String)] = [
+            (.offlineNoKit, "Till service unreachable"), (.offlineKitExpired, "Till service unreachable"),
+            (.offlineCapReached, "Till service unreachable"), (.offlineNoteInvalid, "Till service unreachable"),
+            (.offlinePoolExhausted, "Amount not available offline"), (.offlineUnsupportedCard, "This card pays online only"),
+            (.cardNotGenuine, "Card declined"), (.cardLimit, "Card limit reached"), (.heldOnPhone, "Payment not finished"),
+        ]
+        for (k, title) in titles {
+            let (t, d) = errorCopy(k, "")
+            XCTAssertEqual(t, title, "\(k)")
+            XCTAssertFalse(d.isEmpty, "\(k)")
+        }
+        XCTAssertEqual(errorCopy(.offlineNoteInvalid, "").1, "This card can't be checked without the till. It pays online only.")
+        XCTAssertEqual(errorCopy(.offlineUnsupportedCard, "").1, "It can't be taken without the till.")
+        XCTAssertEqual(errorCopy(.cardNotGenuine, "").1, "This isn't a genuine Fedimint Card.")
+        XCTAssertEqual(errorCopy(.cardLimit, "").1, "This card has reached its daily limit.")
+    }
+
+    func testOneCopyForATillOutOfReach() {
+        XCTAssertEqual(errorCopy(.tillUnreachable, "").0, "Till service unreachable")
+        XCTAssertTrue(errorCopy(.tillUnreachable, "") == balanceErrorCopy(.tillUnreachable), "the sale and the balance say the same")
+        XCTAssertTrue(errorCopy(.tillUnreachable, "") == tillUnreachableCopy)
+        XCTAssertEqual(errorCopy(.tillUnreachable, "", unresolved: true).1,
+                       "The last reply was lost, so this sale can't be taken on the phone. Try again once the till answers.")
+        XCTAssertEqual(errorCopy(.tillUnreachable, "", unresolved: true).0, "Till service unreachable")
+    }
+
+    func testPoolExhaustedQuotesThePriceTheKitPays() {
+        XCTAssertEqual(errorCopy(.offlinePoolExhausted, "d", suggestedMsat: 12_000).1, "Try 12 sats, or reach the till for a new kit.")
+        XCTAssertEqual(errorCopy(.offlinePoolExhausted, "d").1, "Try another amount, or reach the till for a new kit.")
+        XCTAssertEqual(errorCopy(.offlinePoolExhausted, "d", suggestedMsat: 1_234_500).1, "Try 1,234.5 sats, or reach the till for a new kit.")
+    }
+
+    func testTheAbandonAlertSaysAHeldSaleStillFinishes() {
+        // Held: the sale's client_ref is in the phone's localOnlyRefs, whatever its screen's kind
+        // (OfflineFlowTests drive both from the flow).
+        XCTAssertEqual(abandonCopy(held: true), "The card already signed part of this payment. Its next tap on this phone still finishes it.")
+        XCTAssertEqual(abandonCopy(held: false), "If the payment did go through, the customer will have paid without a receipt. Check Sales first.")
+    }
+
+    func testTheNewKindsHold() {
+        XCTAssertTrue(ErrorKind.heldOnPhone.needsSalesCheck, "a held sale stays unresolved")
+        let new: [ErrorKind] = [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlineNoteInvalid, .offlinePoolExhausted,
+                                .offlineUnsupportedCard, .cardNotGenuine, .cardLimit, .heldOnPhone]
+        for k in new { XCTAssertFalse(k.definitive, "\(k) proves nothing about an earlier attempt") }
+        for k: ErrorKind in [.offlineUnsupportedCard, .cardNotGenuine, .cardLimit] { XCTAssertFalse(k.retryable, "\(k)") }
+        for k: ErrorKind in [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlineNoteInvalid, .offlinePoolExhausted, .heldOnPhone] {
+            XCTAssertTrue(k.retryable, "\(k)")
+            XCTAssertTrue(k.phoneOnly, "\(k)")
+        }
+        XCTAssertEqual(ErrorKind.from(ChargeErrorCode.offlineNotReady), .offlineNoKit)
+    }
+
+    func testTheWaitingCountAddsThePhonesToTheTills() {
+        let till = TillStatus(federationId: "f", federationName: nil, walletBalanceMsat: 0, cardRelayOk: true, busy: false, offlineQueued: 2)
+        XCTAssertEqual(waitingToSyncText(till: till, phone: OfflineStats(waiting: 3)), "5 payments waiting to sync")
+        XCTAssertEqual(waitingToSyncText(till: nil, phone: OfflineStats(waiting: 1)), "1 payment waiting to sync", "no till in reach")
+        XCTAssertEqual(waitingToSyncText(till: till, phone: OfflineStats()), "2 payments waiting to sync")
+        XCTAssertNil(waitingToSyncText(till: nil, phone: OfflineStats(signing: 1)), "a held sale is not waiting to sync")
+    }
+
+    func testTheHeldLine() {
+        XCTAssertNil(heldOnPhoneText(0))
+        XCTAssertEqual(heldOnPhoneText(1), "1 payment is waiting for its card: tap that card to finish it.")
+        XCTAssertEqual(heldOnPhoneText(3), "3 payments are waiting for their cards: tap those cards to finish them.")
+    }
+
+    func testSettingsLines() {
+        let t0: Int64 = 1_800_000_000_000
+        XCTAssertEqual(durationText(45_000), "45 s")
+        XCTAssertEqual(durationText(12 * 60_000), "12 min")
+        XCTAssertEqual(durationText(5 * 3_600_000), "5 h")
+        XCTAssertEqual(durationText(6 * 86_400_000), "6 days")
+        XCTAssertEqual(kitAgeText(fetchedAtMs: t0, expiresAtMs: t0 + 7 * 86_400_000, nowMs: t0 + 3 * 60_000),
+                       "Kit fetched 3 min ago · expires in 6 days")
+        XCTAssertEqual(kitAgeText(fetchedAtMs: t0, expiresAtMs: t0 + 1000, nowMs: t0 + 1000), "Kit fetched 1 s ago · expired")
+        XCTAssertEqual(refusedChargeText(priceMsat: 21_000, code: "pool_entry_unknown"),
+                       "21 sats · pool_entry_unknown: the till refused it after the card paid.")
+        XCTAssertEqual(unpairWarningText(2), "2 payments are waiting to sync with this till. They stay on this phone and can't be synced to another till.")
+        XCTAssertEqual(unpairWarningText(1), "1 payment is waiting to sync with this till. It stays on this phone and can't be synced to another till.")
+        let kit = KitInfo(kitId: "k", phoneId: "p", federationId: "f", capMsat: 100_000_000, capCount: 200, issuedAtMs: t0,
+                          expiresAtMs: t0 + 7 * 86_400_000, poolEntries: 40, fetchedAtMs: t0)
+        let on = OfflineSnapshot(enabled: true, disabledReason: nil, kit: kit, stats: OfflineStats(waiting: 2, waitingMsat: 7000, signing: 1, refused: 0, synced: 4))
+        XCTAssertEqual(offlinePanelLines(on, nowMs: t0 + 60_000), [
+            "Kit fetched 1 min ago · expires in 6 days",
+            "Caps: 200 payments or 100,000 sats waiting to sync",
+            "2 waiting to sync · 1 held for their cards · 4 synced",
+        ])
+        XCTAssertEqual(offlinePanelLines(OfflineSnapshot(enabled: true), nowMs: t0),
+                       ["No offline kit yet. Reach the till once while online.", "0 waiting to sync · 0 held for their cards · 0 synced"])
+        XCTAssertEqual(offlinePanelLines(.disabled, nowMs: t0), ["Offline payments are off on this phone."])
+    }
+
+    func testSettingsSaysWhyTheLastSyncStopped() {
+        var phone = OfflineSnapshot(enabled: true, stats: OfflineStats(waiting: 2))
+        phone.syncStopped = "2 payments wait for the till they were taken for"
+        XCTAssertEqual(offlinePanelLines(phone, nowMs: 0), [
+            "No offline kit yet. Reach the till once while online.",
+            "2 waiting to sync · 0 held for their cards · 0 synced",
+            "Sync stopped: 2 payments wait for the till they were taken for",
+        ])
+        phone.syncStopped = nil
+        XCTAssertFalse(offlinePanelLines(phone, nowMs: 0).contains { $0.hasPrefix("Sync stopped") })
+    }
+}

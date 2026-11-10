@@ -192,6 +192,38 @@ extension TillClient {
     }
 }
 
+/// The phone's offline routes (docs/TILL-API.md): here, beside `request` and `call`, which are
+/// this file's own.
+extension TillClient {
+    static let offlineTimeout: TimeInterval = 30
+
+    /// `GET /v1/offline/kit?phone=<id>`: the till's answer as it is, on 200 (the core takes it
+    /// whole); 401 and 403 are `unauthorized`, any other status `badResponse`.
+    func offlineKit(phoneId: String) async -> TillResult<Data> {
+        Self.raw(await call(request("GET", "/v1/offline/kit?phone=" + Self.pathSegment(phoneId), body: nil, timeout: Self.offlineTimeout)))
+    }
+
+    /// `POST /v1/offline/charges` with the body the core drained: the till's answer on 200.
+    func postOfflineCharges(_ body: String) async -> TillResult<Data> {
+        Self.raw(await offlineChargesReply(body))
+    }
+
+    /// The same request, the till's reply whatever its status: the sync names the status that
+    /// stopped it.
+    func offlineChargesReply(_ body: String) async -> Result<RawResponse, TillError> {
+        await call(request("POST", "/v1/offline/charges", body: Data(body.utf8), timeout: Self.offlineTimeout))
+    }
+
+    private static func raw(_ r: Result<RawResponse, TillError>) -> TillResult<Data> {
+        switch r {
+        case .failure(let e): return .err(e)
+        case .success(let r) where r.status == 200: return .ok(r.body)
+        case .success(let r) where r.status == 401 || r.status == 403: return .err(.unauthorized)
+        case .success(let r): return .err(.badResponse("HTTP \(r.status)"))
+        }
+    }
+}
+
 final class URLSessionTransport: HTTPTransport {
     func send(_ req: HTTPRequest) async throws -> RawResponse {
         var r = URLRequest(url: req.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: req.timeout)

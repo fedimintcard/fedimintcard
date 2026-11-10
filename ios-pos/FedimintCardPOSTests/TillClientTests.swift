@@ -200,3 +200,62 @@ final class ErrorMappingTests: XCTestCase {
         }
     }
 }
+
+/// The phone's offline routes (docs/TILL-API.md): the kit and the sync.
+final class OfflineRoutesTests: XCTestCase {
+    let pairing = TillPairing(baseURL: "http://10.0.0.2:9877", token: "deadbeef")
+
+    func testTheKitIsAskedForThisPhone() async throws {
+        let t = MockTransport()
+        t.reply = .success(RawResponse(status: 200, body: Data(#"{"ok":true,"kit":{}}"#.utf8)))
+        let c = TillClient(pairing: { self.pairing }, transport: t)
+        let r = await c.offlineKit(phoneId: "0123456789abcdef0123456789abcdef")
+        XCTAssertEqual(r, .ok(Data(#"{"ok":true,"kit":{}}"#.utf8)), "the answer as it is: the core takes it whole")
+        let req = try XCTUnwrap(t.requests.first)
+        XCTAssertEqual(req.method, "GET")
+        XCTAssertEqual(req.url.absoluteString, "http://10.0.0.2:9877/v1/offline/kit?phone=0123456789abcdef0123456789abcdef")
+        XCTAssertEqual(req.headers["Authorization"], "Bearer deadbeef")
+        XCTAssertNil(req.body)
+        XCTAssertEqual(req.timeout, 30)
+    }
+
+    func testTheSyncPostsTheDrainedBodyAsItIs() async throws {
+        let t = MockTransport()
+        t.reply = .success(RawResponse(status: 200, body: Data(#"{"ok":true,"results":[]}"#.utf8)))
+        let c = TillClient(pairing: { self.pairing }, transport: t)
+        let body = #"{"phone_id":"ab","charges":[{"txid":"t1"}]}"#
+        let r = await c.postOfflineCharges(body)
+        XCTAssertEqual(r, .ok(Data(#"{"ok":true,"results":[]}"#.utf8)))
+        let req = try XCTUnwrap(t.requests.first)
+        XCTAssertEqual(req.method, "POST")
+        XCTAssertEqual(req.url.path, "/v1/offline/charges")
+        XCTAssertEqual(req.headers["Content-Type"], "application/json")
+        XCTAssertEqual(req.headers["Authorization"], "Bearer deadbeef")
+        XCTAssertEqual(req.body, Data(body.utf8))
+        XCTAssertNil(req.headers["X-Card-Link"])
+    }
+
+    func testOnlyA200IsAnAnswer() async {
+        let t = MockTransport()
+        let c = TillClient(pairing: { self.pairing }, transport: t)
+        let cases: [(Result<RawResponse, TransportError>, TillResult<Data>)] = [
+            (.success(RawResponse(status: 401, body: Data())), .err(.unauthorized)),
+            (.success(RawResponse(status: 403, body: Data())), .err(.unauthorized)),
+            (.success(RawResponse(status: 503, body: Data(#"{"ok":false,"error":"offline_not_ready"}"#.utf8))), .err(.badResponse("HTTP 503"))),
+            (.success(RawResponse(status: 413, body: Data())), .err(.badResponse("HTTP 413"))),
+            (.success(RawResponse(status: 202, body: Data())), .err(.badResponse("HTTP 202"))),
+            (.failure(.unreachable), .err(.unreachable)),
+            (.failure(.timeout), .err(.timeout)),
+        ]
+        for (reply, want) in cases {
+            t.reply = reply
+            let kit = await c.offlineKit(phoneId: "ab")
+            XCTAssertEqual(kit, want, "\(reply)")
+            let sync = await c.postOfflineCharges("{}")
+            XCTAssertEqual(sync, want, "\(reply)")
+        }
+        let none = TillClient(pairing: { nil }, transport: t)
+        let r = await none.offlineKit(phoneId: "ab")
+        XCTAssertEqual(r, .err(.notPaired))
+    }
+}

@@ -19,6 +19,12 @@ enum LinkError: Error, Equatable {
     /// The first frame was not `{"type":"ready","link":"<id>"}`.
     case badHandshake
     case timeout
+
+    /// The link's HTTP answer when the WebSocket did not open: 401 and 403 are this phone refused
+    /// (the pairing is dead, no offline fallback); anything else is the till not serving.
+    static func forStatus(_ status: Int?) -> LinkError {
+        status == 401 || status == 403 ? .unauthorized : .unreachable
+    }
 }
 
 /// One card link: the till's APDUs go to the card one at a time, answers go back.
@@ -135,8 +141,7 @@ final class URLSessionLinkSocket: NSObject, LinkSocket {
             }
         } catch {
             if task.closeCode != .invalid { return nil }
-            if let r = task.response as? HTTPURLResponse, r.statusCode == 401 { throw LinkError.unauthorized }
-            throw LinkError.unreachable
+            throw LinkError.forStatus((task.response as? HTTPURLResponse)?.statusCode)
         }
     }
 

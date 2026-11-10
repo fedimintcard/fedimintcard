@@ -126,3 +126,13 @@ final class CardLinkTests: XCTestCase {
         XCTAssertTrue(s.sent.isEmpty)
     }
 }
+
+final class LinkStatusTests: XCTestCase {
+    /// The link's HTTP answer when the WebSocket did not open: 401 and 403 are this phone refused
+    /// (never taken on the phone); a 5xx or no answer is the till not serving.
+    func testRefusalsAndTheTillNotServing() {
+        XCTAssertEqual(LinkError.forStatus(401), .unauthorized)
+        XCTAssertEqual(LinkError.forStatus(403), .unauthorized)
+        for s: Int? in [nil, 500, 502, 503, 504, 404] { XCTAssertEqual(LinkError.forStatus(s), .unreachable, "\(String(describing: s))") }
+    }
+}

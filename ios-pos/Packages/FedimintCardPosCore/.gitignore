@@ -1,0 +1,6 @@
+# Built by ios-pos/scripts/build-poscore.sh, the library and its bindings in one run (UniFFI stops
+# the app when they come from different builds): only Package.swift is in git.
+/FedimintCardPosCoreFFI.xcframework/
+/Sources/FedimintCardPosCore/FedimintCardPosCore.swift
+/.build/
+/.swiftpm/

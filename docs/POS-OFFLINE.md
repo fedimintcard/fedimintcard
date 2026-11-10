@@ -145,6 +145,108 @@ phone's clock at a sync only decides which synced charges are old enough to leav
 store's latest-seen time (which an expired kit is judged by) moves only with a charge, and never
 past its kit's expiry.
 
+## The iOS app
+
+`ios-pos/` (ENG-843).
+
+**Build.** `ios-pos/scripts/build-poscore.sh` runs `host/scripts/pos-core-mobile.sh ios` and
+`bindings swift` in one run, joins the two simulator libraries (`lipo`), and writes the package
+`ios-pos/Packages/FedimintCardPosCore/`: `FedimintCardPosCoreFFI.xcframework` (the device library
+and the simulator one, each with the FFI header and its module map) and the generated
+`Sources/FedimintCardPosCore/FedimintCardPosCore.swift`. Both are gitignored; `Package.swift` is
+in git. Run the script before `xcodegen generate` and the first build, and again after any change
+under `host/pos-core` or `host/card`: a library and bindings from different builds stop the app
+(UniFFI's checksum `fatalError`) at its first call into the core, online too. With no core
+built, resolving the package stops the build and names the script. The package is its own Swift
+module, so the generated names (`TransportError`, `PhoneStats`) stay apart from the app's; only
+`OfflinePhone.swift` imports it, and the rest of the app and the tests see the core through the
+`OfflineCore` protocol. No CI job builds the app.
+
+**The store.** `Application Support/PosCore`, in the complete-protection file class and excluded
+from backups (`isExcludedFromBackup`). Both are read back at every launch before the store opens;
+offline stays off, and Settings says why, when either does not hold. The simulator has no data
+protection and reads back no class; a device must read back complete. The store opens once per
+process, off the main thread, and a failure is tried again at the next foreground. The kit is
+`kit.json` in the same directory (written atomically, complete protection), with the till it came
+from: pairing another till drops it; forgetting the till keeps it, for a held sale and for pairing
+that till again. Every call into the core runs on one serial queue of the app's, never on the main
+queue, where the NFC tag answers; an APDU the card does not answer in 15 s is lost.
+
+**When the phone takes the card.** At `linkFailed` of a charge only, in the same NFC session, when
+the till is not serving (no connection, the link's quick timeout, a handshake that fails, a 5xx),
+no earlier attempt of the sale was sent to the till's charge route at all, and the kit is there,
+unexpired and under its caps. A till on ops refuses from its card checks (`no_card`, `wrong_pin`)
+before it looks at an earlier attempt with that `client_ref`, so a refusal proves nothing about
+the attempt before it. Once a `POST /v1/charge` was sent for the sale, whatever it answered (a
+refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at all), only the
+till's own `client_ref` guard stops a second charge, so a retry that cannot reach the till shows
+the unreachable screen and takes nothing. A 401 or 403 never falls back: the pairing is dead. An
+unresolved sale whose retry cannot reach the till stays on the unreachable screen with the lost
+reply's copy, and "Outcome unknown" is as it was. Otherwise the unreachable screen says which: no
+kit yet, the kit expired, or the caps reached. Balance reads and top-ups never fall back. The
+till's own answers with the codes of its offline path (`offline_cap_reached`, `offline_not_ready`,
+`offline_note_invalid`) read as before, in the till's words: the phone's copy for them is about
+the phone's kit and queue.
+
+**Local only.** A sale in `signing_refs()`, or whose last local charge answered `undecided` or
+threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatever the till's
+health: "Try again" opens an NFC session with no card link, and the till never sees the sale
+("Payment not finished": hold the same card to the phone, it won't be charged twice). The caps do
+not hold such a retry back, and it fetches a new kit first when its kit has expired and the till
+answers. The sale stays held whatever its retry answers: the core refuses a retap at its card
+checks (`no_card`, `card_error`, `wrong_pin`, `pin_blocked`, `offline_unsupported_card`,
+`card_not_genuine`) before it reaches the held charge, and `signing_refs()` still lists it. So
+there is no Back, Cancel on a wrong PIN goes back to the held sale, and Try again stays on the
+phone. Abandon only leaves the screen, and its alert says the card's next tap on this phone still
+finishes the sale (the owner's decision, 2026-11-10; ENG-854 is the follow-up that names the
+finished sale). After a restart the home screen says how many sales wait for their cards
+(`stats().signing`).
+
+**Kit and sync.** Off the status poll, while the till answers. The kit is fetched when none is
+kept, when the kept one is 10 minutes old, after a sync that synced a charge, and after a local
+`offline_kit_expired`, `offline_pool_exhausted` or `offline_cap_reached`; a fetch that failed
+waits a minute before the next. A kit is kept only when it is `ok:true`, for this phone, and of
+the till's federation. The sync runs on reconnect, on foreground and after every charge, until a
+drain finds nothing waiting: up to 20 rounds of `drain(50)`, its body to
+`POST /v1/offline/charges`, the 200 answer to `mark_synced`. It stops on an HTTP error, a round
+the till took none of, or charges the till does not know, then waits a minute. A till answers
+`pool_entry_unknown`, `bad_note` or `bad_charge` for a charge taken with another till's kit (pool
+entries it never issued, notes of another federation). The till a charge was taken for never does
+within the charge's redeem window: the core checked the notes against that till's kit, and the
+pool entries stay that till's. So the phone does not take those answers as final: the charge
+keeps waiting, Settings says "N payments wait for the till they were taken for", and it syncs
+once the phone is paired with that till again. Any other refusal is as the till says: final, or
+sent again when it says `retry`. Both talk to the till the poll reached, whatever is paired by
+the time they ask. After a sync that synced, the till's status is read again, so the home
+screen's count (the till's queue plus the phone's) moves once.
+
+**Settings.** The kit's age, its expiry and the caps; the payments waiting to sync, held for their
+cards and synced, or why offline is off; why the last sync stopped short ("Sync stopped: the till
+did not answer"), until a sync finds nothing waiting; and each charge the till refused, with its
+code and Dismiss behind "Delete this record?". Pairing another till, or forgetting this one, with
+payments on the phone asks "Unpair anyway?" first; they stay on the phone, and sync only to the
+till they were taken for.
+
+**Limits.** 50 or more charges for another till at the head of the queue hold back the charges
+taken since with the new till's kit. A charge its own till no longer knows (synced after its
+redeem window) waits for good instead of being listed refused.
+
+**The owner's pass on the Max.**
+
+1. Paired online, Settings shows the kit and its caps.
+2. Airplane mode: a sale says "Paid offline · N sats", and the home screen counts it waiting.
+3. Back online: the count moves from the phone to the till in one step, and the till lists the
+   sale.
+4. The card pulled mid-SIGN: "Payment not finished". Wi-Fi on, Try again with the same card
+   finishes it on the phone; the till sees no `POST /v1/charge` for it.
+5. The clock set 8 days ahead, airplane mode: "The offline kit has expired", and nothing is asked
+   of the card.
+6. The phone locked mid-tap: the sale is held or not taken, never taken twice.
+7. The file class of the core's files (`offline_queue.json`, `phone-id`, `store.lock`) and of
+   `kit.json`: complete.
+8. With a second till at hand, pair it while payments wait (they keep waiting, "N payments wait
+   for the till they were taken for"), then pair back (they sync).
+
 ## Refusals
 
 The core answers the till API's codes (`docs/TILL-API.md`); the till's `classify` and the

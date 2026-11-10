@@ -18,8 +18,21 @@ final class ISO7816Channel: CardChannel {
     }
 }
 
+/// The NFC session as `PosController` drives it: `NFCCardReader` in the app, a fake in tests.
+protocol CardReader: AnyObject {
+    /// A card is connected; called once per session.
+    var onCard: ((CardChannel) -> Void)? { get set }
+    /// The session is over. `hadCard`: a card was connected during it.
+    var onEnd: ((_ hadCard: Bool) -> Void)? { get set }
+    func begin(alert: String)
+    func update(alert: String)
+    func finish(success message: String)
+    func finish(error message: String)
+    func cancel()
+}
+
 /// One `NFCTagReaderSession` per card job. Callbacks arrive on the main queue.
-final class NFCCardReader: NSObject, NFCTagReaderSessionDelegate {
+final class NFCCardReader: NSObject, NFCTagReaderSessionDelegate, CardReader {
     static var isAvailable: Bool { NFCTagReaderSession.readingAvailable }
 
     private var session: NFCTagReaderSession?

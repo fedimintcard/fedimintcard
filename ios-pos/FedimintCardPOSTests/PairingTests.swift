@@ -52,3 +52,15 @@ final class PairingTests: XCTestCase {
         s.clear(); XCTAssertNil(s.load())
     }
 }
+
+final class UnpairWarningTests: XCTestCase {
+    func testOnlyAnotherTillWithPaymentsOnThePhoneAsksFirst() {
+        let a = "http://10.0.0.2:9877", b = "http://10.0.0.9:9877"
+        XCTAssertTrue(strandsPayments(onPhone: 1, pairedURL: a, kitTillURL: a, newURL: b))
+        XCTAssertFalse(strandsPayments(onPhone: 1, pairedURL: a, kitTillURL: a, newURL: a), "the same till again")
+        XCTAssertFalse(strandsPayments(onPhone: 0, pairedURL: a, kitTillURL: a, newURL: b), "nothing on the phone")
+        XCTAssertTrue(strandsPayments(onPhone: 2, pairedURL: nil, kitTillURL: a, newURL: b), "a forgotten till's payments")
+        XCTAssertFalse(strandsPayments(onPhone: 2, pairedURL: nil, kitTillURL: a, newURL: a))
+        XCTAssertFalse(strandsPayments(onPhone: 2, pairedURL: nil, kitTillURL: nil, newURL: b))
+    }
+}
