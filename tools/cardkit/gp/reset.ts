@@ -18,11 +18,19 @@
  *   factory keys, ours present → stop, `guarded`: not a card this app moved to its own keys
  *
  * PUT KEY replaces the set in place: P1 the version the card reported, and
- * the new set's version `FACTORY_KEY_VERSION`, which is what a factory J3R180
- * reports (01). A card whose set is any other version stops before anything
- * is written. The proof is a fresh SELECT, INITIALIZE UPDATE that must prove
- * the factory set at version 01, EXTERNAL AUTHENTICATE, and GET STATUS that
- * lists none of ours.
+ * the new set's version `FACTORY_KEY_VERSION` (01): what a factory J3R180
+ * reports, and where a J3R452 sits once the install tap's rotation has made
+ * first contact (rotateKeys, D182). Its keys are DES3 under SCP02 and AES-128
+ * under SCP03, as the login opened (putKeys). A card at any other version
+ * stops guarded after INITIALIZE UPDATE, before EXTERNAL AUTHENTICATE, with
+ * nothing written: FF is a J3R452 as it ships, and only the install tap's
+ * first contact takes a card off FF (an in-place PUT KEY there would leave
+ * the public default at FF, a version the registry does not record); 00
+ * would make PUT KEY add a set beside the one in place rather than replace
+ * it; and 02 to 7F would be kept by an in-place PUT KEY, so the card would
+ * not end at the factory's version. The proof is a fresh SELECT, INITIALIZE
+ * UPDATE that must prove the factory set at version 01, EXTERNAL
+ * AUTHENTICATE, and GET STATUS that lists none of ours.
  *
  * `beforeWrite` runs once, just before the first DELETE or PUT KEY of the
  * run, so the caller can write its journal; whatever it throws ends the run
@@ -43,8 +51,10 @@ import {
 import {
   CardError,
   FACTORY_KEYS,
+  FACTORY_KVN,
   type KeySet,
   type Reply,
+  SHIPPED_KVN,
   type SecureSession,
   type Transceiver,
   WrongKeys,
@@ -57,12 +67,13 @@ import {
 } from './scp02';
 
 /**
- * The key set version a factory J3R180 carries, and the one a reset restores.
- * The owner's `gp -i -v` of a spare lists ENC/MAC/DEK as version 1 (0x01),
- * and `gp --unlock` back to the factory keys sends PUT KEY 84 D8 01 81 with
- * new version 01 (cashucard's gp-info.txt and gp-unlock-factory.txt).
+ * The key set version a factory J3R180 carries, the one a J3R452 is moved to
+ * at first contact, and the one a reset restores: scp02.ts's FACTORY_KVN. The
+ * owner's `gp -i -v` of a spare lists ENC/MAC/DEK as version 1 (0x01), and
+ * `gp --unlock` back to the factory keys sends PUT KEY 84 D8 01 81 with new
+ * version 01 (cashucard's gp-info.txt and gp-unlock-factory.txt).
  */
-export const FACTORY_KEY_VERSION = 0x01;
+export const FACTORY_KEY_VERSION = FACTORY_KVN;
 
 export type FactoryResetPhase =
   'selectIsd' | 'auth' | 'status' | 'erase' | 'restore' | 'prove' | 'done';
@@ -266,8 +277,16 @@ export async function factoryReset(
       );
     }
     const kvn = hs.reply.kvn;
+    if (kvn === SHIPPED_KVN) {
+      // A J3R452 as it ships. Only the install tap's first contact moves a card
+      // off FF (rotateKeys, D182); PUT KEY in place here would leave it at FF.
+      throw new Guard(
+        "the card's key set is version FF, where a J3R452 ships: only the install tap's first contact moves a card off FF, and nothing was written",
+      );
+    }
     if (kvn !== FACTORY_KEY_VERSION) {
-      // PUT KEY in place would keep this version, and the card would not be factory.
+      // PUT KEY in place would keep this version, and the card would not be
+      // factory; at 00, PUT KEY would add a set beside the one in place.
       throw new Guard(
         `the card's key set is version ${kvn}, not ${FACTORY_KEY_VERSION}: nothing was written`,
       );

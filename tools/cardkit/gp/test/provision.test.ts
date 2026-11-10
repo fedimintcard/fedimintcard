@@ -10,6 +10,12 @@
  * applet; `mayLeaveGuardedApplet` is false in every phase; and nothing on the
  * card side stops a sweep, so Replace is the only gate and these tests carry
  * it through a pull themselves.
+ *
+ * The install, the pull at every APDU and the per-card keys run twice: against
+ * the fake card as a J3R180 (SCP02) and as a J3R452 (`scp: 3`, SCP03), which
+ * must take the same commands in the same order. A J3R452 that came with the
+ * seller's applets keeps them: the sweep names only this card's AIDs, which
+ * that card answers 6A88 to.
  */
 import assert from 'node:assert/strict';
 import {randomBytes} from 'node:crypto';
@@ -41,7 +47,13 @@ import {
   type Transceiver,
 } from '../scp02';
 import {fedimintLoadFile} from './assets';
-import {FakeCard, CARD_MODULE, OPENER_MODULE, pullAt} from './fake-card';
+import {
+  FakeCard,
+  CARD_MODULE,
+  OPENER_MODULE,
+  SELLER_APPLETS,
+  pullAt,
+} from './fake-card';
 
 const LOAD_FILE = fedimintLoadFile();
 const PLAN = fedimintPlan(LOAD_FILE);
@@ -171,45 +183,47 @@ const INSTALL_ORDER = [
 ];
 
 describe('provision: the Fedimint card', () => {
-  it('installs on a clean card in the documented order, every card-manager command MACed', async () => {
-    const card = new FakeCard();
-    const r = await provision(card.transceive, PLAN, options());
-    assert.equal(r.ok, true, r.reason);
-    assert.equal(r.phase, 'done');
-    assertInstalled(card);
-    assert.deepEqual(card.insLog(), INSTALL_ORDER);
-    const sweep = card.log
-      .filter(a => a[1] === 0xe4)
-      .map(a => toHex(a.slice(7, 7 + a[6])));
-    // the applet first, then the opener, then the package that holds them
-    assert.deepEqual(sweep, [CARD, OPENER, PKG]);
-    assert.ok(
-      card.log
-        .filter(a => [0x82, 0xe4, 0xe6, 0xe8].includes(a[1]))
-        .every(a => a[0] === 0x84),
-    );
-    // as gp sends them: Le 00 after the MAC on every one (GPSession.transmit)
-    for (const a of card.log.filter(x => (x[0] & 0x04) !== 0)) {
-      assert.equal(
-        parseCommand(a).le,
-        0x00,
-        `INS ${toHex([a[1]])} ends in Le 00`,
+  for (const scp of [2, 3] as const) {
+    it(`installs on a clean card in the documented order, every card-manager command MACed (SCP0${scp})`, async () => {
+      const card = new FakeCard({scp});
+      const r = await provision(card.transceive, PLAN, options());
+      assert.equal(r.ok, true, r.reason);
+      assert.equal(r.phase, 'done');
+      assertInstalled(card);
+      assert.deepEqual(card.insLog(), INSTALL_ORDER);
+      const sweep = card.log
+        .filter(a => a[1] === 0xe4)
+        .map(a => toHex(a.slice(7, 7 + a[6])));
+      // the applet first, then the opener, then the package that holds them
+      assert.deepEqual(sweep, [CARD, OPENER, PKG]);
+      assert.ok(
+        card.log
+          .filter(a => [0x82, 0xe4, 0xe6, 0xe8].includes(a[1]))
+          .every(a => a[0] === 0x84),
       );
-    }
-    // probe (no guard) and installTag (no tag applet) are the two phases this
-    // plan never reaches; every other phase runs once, in order
-    assert.deepEqual(
-      r.timings.map(t => t.phase),
-      PHASES.filter(p => p !== 'probe' && p !== 'installTag'),
-    );
-    assert.equal(r.apdus.length, card.log.length);
-    assert.deepEqual(r.blocks, {at: BLOCKS, of: BLOCKS});
-    assert.ok(
-      r.freeBefore &&
-        r.freeAfter &&
-        r.freeAfter.nonVolatile < r.freeBefore.nonVolatile,
-    );
-  });
+      // as gp sends them: Le 00 after the MAC on every one (GPSession.transmit)
+      for (const a of card.log.filter(x => (x[0] & 0x04) !== 0)) {
+        assert.equal(
+          parseCommand(a).le,
+          0x00,
+          `INS ${toHex([a[1]])} ends in Le 00`,
+        );
+      }
+      // probe (no guard) and installTag (no tag applet) are the two phases this
+      // plan never reaches; every other phase runs once, in order
+      assert.deepEqual(
+        r.timings.map(t => t.phase),
+        PHASES.filter(p => p !== 'probe' && p !== 'installTag'),
+      );
+      assert.equal(r.apdus.length, card.log.length);
+      assert.deepEqual(r.blocks, {at: BLOCKS, of: BLOCKS});
+      assert.ok(
+        r.freeBefore &&
+          r.freeAfter &&
+          r.freeAfter.nonVolatile < r.freeBefore.nonVolatile,
+      );
+    });
+  }
 
   it('has no guard, so it sends no probe: a card applet already on the card is swept without asking', async () => {
     const card = new FakeCard();
@@ -268,33 +282,61 @@ describe('provision: the Fedimint card', () => {
     assert.ok(!/[0-9A-Fa-f]{16}/.test(text), 'no run of hex in the result');
   });
 
-  it('comes back from a pull at any APDU, before or after the card acts, with a run that sweeps and installs', async () => {
-    const total = INSTALL_ORDER.length;
-    for (const partialLoad of ['discard', 'keep'] as const) {
-      for (const when of ['before', 'after'] as const) {
-        for (let n = 0; n < total; n++) {
-          const card = new FakeCard({partialLoad});
-          const pull = pullAt(card, n, when);
-          const first = await provision(pull.tx, PLAN, options());
-          const where = `${partialLoad}/${when}/APDU ${n}`;
-          assert.equal(first.ok, false, where);
-          assert.equal(first.kind, 'pulled', where);
-          assert.equal(
-            pull.state.late,
-            0,
-            `${where}: nothing was sent after the pull`,
-          );
-          card.reset();
-          const again = await provision(card.transceive, PLAN, options());
-          assert.equal(
-            again.ok,
-            true,
-            `${where}: ${again.kind} ${again.reason}`,
-          );
-          assertInstalled(card);
+  for (const scp of [2, 3] as const) {
+    it(`comes back from a pull at any APDU, before or after the card acts, with a run that sweeps and installs (SCP0${scp})`, async () => {
+      const total = INSTALL_ORDER.length;
+      for (const partialLoad of ['discard', 'keep'] as const) {
+        for (const when of ['before', 'after'] as const) {
+          for (let n = 0; n < total; n++) {
+            const card = new FakeCard({scp, partialLoad});
+            const pull = pullAt(card, n, when);
+            const first = await provision(pull.tx, PLAN, options());
+            const where = `SCP0${scp}/${partialLoad}/${when}/APDU ${n}`;
+            assert.equal(first.ok, false, where);
+            assert.equal(first.kind, 'pulled', where);
+            assert.equal(
+              pull.state.late,
+              0,
+              `${where}: nothing was sent after the pull`,
+            );
+            card.reset();
+            const again = await provision(card.transceive, PLAN, options());
+            assert.equal(
+              again.ok,
+              true,
+              `${where}: ${again.kind} ${again.reason}`,
+            );
+            assertInstalled(card);
+          }
         }
       }
-    }
+    });
+  }
+
+  it("leaves a J3R452's own applets where they were: the sweep's DELETEs of this card's AIDs answer 6A88, and only this card's objects are added", async () => {
+    const card = new FakeCard({scp: 3, sellerApplets: true});
+    const seller = SELLER_APPLETS.map(a => a.instance);
+    const sellerPackages = SELLER_APPLETS.map(a => a.pkg);
+    assert.deepEqual(card.instanceAids(), seller);
+    const r = await provision(card.transceive, PLAN, options());
+    assert.equal(r.ok, true, r.reason);
+    assert.deepEqual(card.instanceAids(), [...seller, OPENER, CARD]);
+    assert.deepEqual([...card.packages.keys()], [...sellerPackages, PKG]);
+    // nothing of this card's was there: each DELETE of the sweep found nothing
+    assert.deepEqual(
+      r.apdus.filter(a => a.phase === 'sweep').map(a => [a.ins, a.sw]),
+      [
+        [0xe4, 0x6a88],
+        [0xe4, 0x6a88],
+        [0xe4, 0x6a88],
+      ],
+    );
+    // and named only this card's AIDs
+    const deleted = card.log
+      .filter(a => a[1] === 0xe4)
+      .map(a => toHex(a.slice(7, 7 + a[6])));
+    assert.deepEqual(deleted, [CARD, OPENER, PKG]);
+    assert.equal(card.failedAuths, 0);
   });
 
   it('never reports that a pull may leave a guarded applet: this plan guards nothing', async () => {
@@ -676,180 +718,183 @@ describe('fedimintPlan: shape', () => {
  * card decrypts PUT KEY with node:crypto, so the keys it ends on are checked
  * against an implementation that shares no code with scp02.ts.
  */
-describe('per-card manager keys', () => {
-  const OWN = {
-    enc: Array.from(SPIKE_KEYS.enc),
-    mac: Array.from(SPIKE_KEYS.mac),
-    dek: Array.from(SPIKE_KEYS.dek),
-  };
-  const FACTORY = {
-    enc: Array.from(FACTORY_KEYS.enc),
-    mac: Array.from(FACTORY_KEYS.mac),
-    dek: Array.from(FACTORY_KEYS.dek),
-  };
-  const sameKeys = (card: FakeCard, keys: typeof OWN) =>
-    toHex(card.keys.enc) === toHex(keys.enc) &&
-    toHex(card.keys.mac) === toHex(keys.mac) &&
-    toHex(card.keys.dek) === toHex(keys.dek);
+for (const scp of [2, 3] as const) {
+  describe(`per-card manager keys (SCP0${scp})`, () => {
+    const OWN = {
+      enc: Array.from(SPIKE_KEYS.enc),
+      mac: Array.from(SPIKE_KEYS.mac),
+      dek: Array.from(SPIKE_KEYS.dek),
+    };
+    const FACTORY = {
+      enc: Array.from(FACTORY_KEYS.enc),
+      mac: Array.from(FACTORY_KEYS.mac),
+      dek: Array.from(FACTORY_KEYS.dek),
+    };
+    const sameKeys = (card: FakeCard, keys: typeof OWN) =>
+      toHex(card.keys.enc) === toHex(keys.enc) &&
+      toHex(card.keys.mac) === toHex(keys.mac) &&
+      toHex(card.keys.dek) === toHex(keys.dek);
 
-  it('installs on whichever of the offered sets the card proves, with one INITIALIZE UPDATE', async () => {
-    for (const [keys, index] of [
-      [FACTORY, 1],
-      [OWN, 0],
-    ] as const) {
-      const card = new FakeCard({keys: {...keys}});
+    it('installs on whichever of the offered sets the card proves, with one INITIALIZE UPDATE', async () => {
+      for (const [keys, index] of [
+        [FACTORY, 1],
+        [OWN, 0],
+      ] as const) {
+        const card = new FakeCard({scp, keys: {...keys}});
+        const r = await provision(
+          card.transceive,
+          PLAN,
+          options({keys: [OWN, FACTORY_KEYS]}),
+        );
+        assert.equal(r.ok, true, r.reason);
+        assert.equal(r.keySet, index);
+        assert.equal(card.insLog().filter(i => i === 0x50).length, 1);
+        assert.equal(card.failedAuths, 0);
+        assertInstalled(card);
+      }
+    });
+
+    it('stops wrongKeys on a card that proves neither set, having sent nothing after INITIALIZE UPDATE', async () => {
+      const card = new FakeCard({
+        scp,
+        keys: {
+          enc: fromHex('55'.repeat(16)),
+          mac: fromHex('55'.repeat(16)),
+          dek: fromHex('55'.repeat(16)),
+        },
+      });
       const r = await provision(
         card.transceive,
         PLAN,
         options({keys: [OWN, FACTORY_KEYS]}),
       );
-      assert.equal(r.ok, true, r.reason);
-      assert.equal(r.keySet, index);
-      assert.equal(card.insLog().filter(i => i === 0x50).length, 1);
+      assert.equal(r.ok, false);
+      assert.equal(r.kind, 'wrongKeys');
+      assert.equal(r.keySet, undefined);
+      assert.equal(card.insLog().at(-1), 0x50);
       assert.equal(card.failedAuths, 0);
-      assertInstalled(card);
-    }
-  });
-
-  it('stops wrongKeys on a card that proves neither set, having sent nothing after INITIALIZE UPDATE', async () => {
-    const card = new FakeCard({
-      keys: {
-        enc: fromHex('55'.repeat(16)),
-        mac: fromHex('55'.repeat(16)),
-        dek: fromHex('55'.repeat(16)),
-      },
     });
-    const r = await provision(
-      card.transceive,
-      PLAN,
-      options({keys: [OWN, FACTORY_KEYS]}),
-    );
-    assert.equal(r.ok, false);
-    assert.equal(r.kind, 'wrongKeys');
-    assert.equal(r.keySet, undefined);
-    assert.equal(card.insLog().at(-1), 0x50);
-    assert.equal(card.failedAuths, 0);
-  });
 
-  it('rotates factory keys to the card’s own in place (version kept), and the card proves them after', async () => {
-    const card = new FakeCard();
-    const r = await rotateKeys(card.transceive, FACTORY_KEYS, OWN, options());
-    assert.equal(r.ok, true, r.reason);
-    assert.equal(r.rotated, true);
-    assert.equal(r.keyVersion, 0x01);
-    assert.ok(sameKeys(card, OWN));
-    assert.equal(card.kvn, 0x01);
-    const put = card.log.find(a => a[1] === 0xd8)!;
-    assert.deepEqual(put.slice(0, 4), [0x84, 0xd8, 0x01, 0x81]);
-    assert.equal(card.failedAuths, 0);
-  });
-
-  it('finds the card already on its own keys after a PUT KEY whose reply was lost, without a failed login', async () => {
-    const card = new FakeCard();
-    // the first run: SELECT, INITIALIZE UPDATE, EXTERNAL AUTHENTICATE, then PUT KEY (index 3), acted on and lost
-    const torn = pullAt(card, 3, 'after');
-    const first = await rotateKeys(torn.tx, FACTORY_KEYS, OWN, options());
-    assert.equal(first.ok, false);
-    assert.equal(first.kind, 'pulled');
-    assert.ok(
-      sameKeys(card, OWN),
-      'the card took the keys before the reply was lost',
-    );
-    card.reset();
-    const again = await rotateKeys(
-      card.transceive,
-      FACTORY_KEYS,
-      OWN,
-      options(),
-    );
-    assert.equal(again.ok, true, again.reason);
-    assert.equal(again.rotated, false);
-    assert.equal(
-      card.insLog().filter(i => i === 0xd8).length,
-      1,
-      'PUT KEY was not sent twice',
-    );
-    assert.equal(card.failedAuths, 0);
-  });
-
-  it('a pull before PUT KEY leaves the factory keys, which the next rotation still proves', async () => {
-    const card = new FakeCard();
-    const torn = pullAt(card, 3, 'before');
-    assert.equal(
-      (await rotateKeys(torn.tx, FACTORY_KEYS, OWN, options())).kind,
-      'pulled',
-    );
-    assert.ok(sameKeys(card, FACTORY));
-    card.reset();
-    const again = await rotateKeys(
-      card.transceive,
-      FACTORY_KEYS,
-      OWN,
-      options(),
-    );
-    assert.equal(again.rotated, true);
-    assert.ok(sameKeys(card, OWN));
-  });
-
-  it('a rotation against a card on neither set stops with no EXTERNAL AUTHENTICATE sent', async () => {
-    const other = {
-      enc: fromHex('66'.repeat(16)),
-      mac: fromHex('66'.repeat(16)),
-      dek: fromHex('66'.repeat(16)),
-    };
-    const card = new FakeCard({keys: other});
-    const r = await rotateKeys(card.transceive, FACTORY_KEYS, OWN, options());
-    assert.equal(r.kind, 'wrongKeys');
-    assert.ok(!card.insLog().includes(0x82));
-    assert.equal(card.failedAuths, 0);
-  });
-
-  it('the sweep deletes this card’s package and nothing else on the card', async () => {
-    const card = new FakeCard({keys: {...OWN}});
-    assert.equal(
-      (
-        await provision(
-          card.transceive,
-          PLAN,
-          options({keys: [OWN, FACTORY_KEYS]}),
-        )
-      ).ok,
-      true,
-    );
-    // a Cashu card's package and instance on the same chip
-    const cashuPkg = 'F043415348554341';
-    const cashuApp = 'F04341534855434101';
-    card.packages.set(cashuPkg, {
-      aid: cashuPkg,
-      modules: [cashuApp],
-      size: 4000,
-      instancesMade: 1,
+    it('rotates factory keys to the card’s own in place (version kept), and the card proves them after', async () => {
+      const card = new FakeCard({scp});
+      const r = await rotateKeys(card.transceive, FACTORY_KEYS, OWN, options());
+      assert.equal(r.ok, true, r.reason);
+      assert.equal(r.rotated, true);
+      assert.equal(r.keyVersion, 0x01);
+      assert.ok(sameKeys(card, OWN));
+      assert.equal(card.kvn, 0x01);
+      const put = card.log.find(a => a[1] === 0xd8)!;
+      assert.deepEqual(put.slice(0, 4), [0x84, 0xd8, 0x01, 0x81]);
+      assert.equal(card.failedAuths, 0);
     });
-    card.instances.set(cashuApp, {
-      aid: cashuApp,
-      module: cashuApp,
-      pkg: cashuPkg,
-      state: card.instances.get(CARD)!.state,
+
+    it('finds the card already on its own keys after a PUT KEY whose reply was lost, without a failed login', async () => {
+      const card = new FakeCard({scp});
+      // the first run: SELECT, INITIALIZE UPDATE, EXTERNAL AUTHENTICATE, then PUT KEY (index 3), acted on and lost
+      const torn = pullAt(card, 3, 'after');
+      const first = await rotateKeys(torn.tx, FACTORY_KEYS, OWN, options());
+      assert.equal(first.ok, false);
+      assert.equal(first.kind, 'pulled');
+      assert.ok(
+        sameKeys(card, OWN),
+        'the card took the keys before the reply was lost',
+      );
+      card.reset();
+      const again = await rotateKeys(
+        card.transceive,
+        FACTORY_KEYS,
+        OWN,
+        options(),
+      );
+      assert.equal(again.ok, true, again.reason);
+      assert.equal(again.rotated, false);
+      assert.equal(
+        card.insLog().filter(i => i === 0xd8).length,
+        1,
+        'PUT KEY was not sent twice',
+      );
+      assert.equal(card.failedAuths, 0);
     });
-    card.reset();
-    assert.equal(
-      (
-        await provision(
-          card.transceive,
-          PLAN,
-          options({keys: [OWN, FACTORY_KEYS]}),
-        )
-      ).ok,
-      true,
-    );
-    assert.ok(card.packages.has(cashuPkg));
-    assert.ok(card.instances.has(cashuApp));
-    const deleted = card.log
-      .filter(a => a[1] === 0xe4)
-      .map(a => toHex(a.slice(7, 7 + a[6])));
-    assert.ok(
-      deleted.every(aid => [CARD, OPENER, PKG].includes(aid)),
-      deleted.join(' '),
-    );
+
+    it('a pull before PUT KEY leaves the factory keys, which the next rotation still proves', async () => {
+      const card = new FakeCard({scp});
+      const torn = pullAt(card, 3, 'before');
+      assert.equal(
+        (await rotateKeys(torn.tx, FACTORY_KEYS, OWN, options())).kind,
+        'pulled',
+      );
+      assert.ok(sameKeys(card, FACTORY));
+      card.reset();
+      const again = await rotateKeys(
+        card.transceive,
+        FACTORY_KEYS,
+        OWN,
+        options(),
+      );
+      assert.equal(again.rotated, true);
+      assert.ok(sameKeys(card, OWN));
+    });
+
+    it('a rotation against a card on neither set stops with no EXTERNAL AUTHENTICATE sent', async () => {
+      const other = {
+        enc: fromHex('66'.repeat(16)),
+        mac: fromHex('66'.repeat(16)),
+        dek: fromHex('66'.repeat(16)),
+      };
+      const card = new FakeCard({scp, keys: other});
+      const r = await rotateKeys(card.transceive, FACTORY_KEYS, OWN, options());
+      assert.equal(r.kind, 'wrongKeys');
+      assert.ok(!card.insLog().includes(0x82));
+      assert.equal(card.failedAuths, 0);
+    });
+
+    it('the sweep deletes this card’s package and nothing else on the card', async () => {
+      const card = new FakeCard({scp, keys: {...OWN}});
+      assert.equal(
+        (
+          await provision(
+            card.transceive,
+            PLAN,
+            options({keys: [OWN, FACTORY_KEYS]}),
+          )
+        ).ok,
+        true,
+      );
+      // a Cashu card's package and instance on the same chip
+      const cashuPkg = 'F043415348554341';
+      const cashuApp = 'F04341534855434101';
+      card.packages.set(cashuPkg, {
+        aid: cashuPkg,
+        modules: [cashuApp],
+        size: 4000,
+        instancesMade: 1,
+      });
+      card.instances.set(cashuApp, {
+        aid: cashuApp,
+        module: cashuApp,
+        pkg: cashuPkg,
+        state: card.instances.get(CARD)!.state,
+      });
+      card.reset();
+      assert.equal(
+        (
+          await provision(
+            card.transceive,
+            PLAN,
+            options({keys: [OWN, FACTORY_KEYS]}),
+          )
+        ).ok,
+        true,
+      );
+      assert.ok(card.packages.has(cashuPkg));
+      assert.ok(card.instances.has(cashuApp));
+      const deleted = card.log
+        .filter(a => a[1] === 0xe4)
+        .map(a => toHex(a.slice(7, 7 + a[6])));
+      assert.ok(
+        deleted.every(aid => [CARD, OPENER, PKG].includes(aid)),
+        deleted.join(' '),
+      );
+    });
   });
-});
+}
