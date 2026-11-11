@@ -170,8 +170,8 @@ final class PosControllerOfflineTests: XCTestCase {
     func testSettingsCountsTheDoubleSpendsInTheTillsLastStatus() async {
         let r = ControllerRig()
         await r.open()
-        let line = "Double spends refused by the till: 2"
-        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Double spends") }, "no status read yet")
+        let line = "Offline payments lost to double spends: 2"
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Offline payments lost") }, "no status read yet")
         r.till.answer("/v1/status", 200, #"{"federation_id":"fed1","federation_name":"Island","wallet_balance_msat":1000,"card_relay_ok":true,"busy":false,"offline":{"queued":0,"queued_msat":0,"double_spent":2}}"#)
         await r.poll()
         XCTAssertEqual(r.pos.status?.offlineDoubleSpent, 2)
@@ -184,7 +184,35 @@ final class PosControllerOfflineTests: XCTestCase {
         XCTAssertTrue(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains(line))
         // Forgetting the till drops its status, and the line with it.
         r.pos.forgetTill()
-        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Double spends") })
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Offline payments lost") })
+    }
+
+    func testALateAnswerFromATillThePhoneLeftIsNotShown() async {
+        let r = ControllerRig()
+        await r.open()
+        let other = TillPairing(baseURL: "http://10.0.0.3:9877", token: "tok2")
+        // The till paired first answers the poll still out when the phone pairs another one, which
+        // never answers.
+        r.till.fail("/v1/status", .unreachable)
+        r.till.answerOnce("/v1/status", 200, #"{"federation_id":"fed1","federation_name":"Island","wallet_balance_msat":1000,"card_relay_ok":true,"busy":false,"offline":{"queued":0,"queued_msat":0,"double_spent":2}}"#)
+        guard let out = r.pos.pollNow() else { return XCTFail("no poll started") }
+        r.pos.pair(other)
+        await out.value
+        XCTAssertEqual(r.till.requests.first?.url.absoluteString, Offline.base + "/v1/status", "the poll asked the till paired when it started")
+        XCTAssertNil(r.pos.status, "that till's answer is not the paired till's status")
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Offline payments lost") })
+        XCTAssertEqual(r.kitFetches, 0, "nor is a kit fetched off it")
+        await r.poll()
+        XCTAssertEqual(r.till.requests.last?.url.absoluteString, other.baseURL + "/v1/status")
+        XCTAssertNil(r.pos.status, "the till paired now has not answered")
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Offline payments lost") })
+        // Forgetting the till while it answers: nothing of it comes back either.
+        r.till.answerOnce("/v1/status", 200, #"{"federation_id":"fed1","federation_name":"Island","wallet_balance_msat":1000,"card_relay_ok":true,"busy":false,"offline":{"double_spent":2}}"#)
+        guard let late = r.pos.pollNow() else { return XCTFail("no poll started") }
+        r.pos.forgetTill()
+        await late.value
+        XCTAssertNil(r.pos.status)
+        XCTAssertEqual(r.pos.health, .notPaired)
     }
 
     func testThePollFetchesTheKitOnItsScheduleNotEveryTime() async {

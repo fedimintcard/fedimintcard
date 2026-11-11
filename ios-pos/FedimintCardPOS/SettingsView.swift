@@ -114,8 +114,8 @@ struct SettingsView: View {
 }
 
 /// The phone's offline side: the kit's age, expiry and caps, what the store holds (or why offline
-/// is off), the double spends the till counts (when its status reports them), why the last sync
-/// stopped short, and the charges the till refused, each with Dismiss.
+/// is off), the offline payments the till lost to double spends (when its status reports them),
+/// why the last sync stopped short, and the charges the till refused, each with Dismiss.
 struct OfflinePanel: View {
     let phone: OfflineSnapshot
     /// The till's last status, for its `offline.double_spent` count; nil before one is read.

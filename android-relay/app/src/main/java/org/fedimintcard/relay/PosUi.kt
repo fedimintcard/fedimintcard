@@ -405,8 +405,8 @@ class PosUi(
 
     /**
      * Settings: the till URL, pairing (scan the till's QR code, or paste its text), offline payments
-     * (the kit, what is on this phone, the till's double spends once its status has been read,
-     * charges the till refused), and the relay. [paired] is the paired till's URL, or null.
+     * (the kit, what is on this phone, the offline payments the till lost to double spends, charges
+     * the till refused), and the relay. [paired] is the paired till's URL, or null.
      * [onPairText] returns false for text that is not a pairing code.
      * [onDismiss] deletes a refused charge's record and says, on the UI thread, whether it did.
      */
@@ -626,8 +626,10 @@ fun span(ms: Long): String {
 
 /**
  * Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone,
- * the double spends the till counts (`offline.double_spent`, from [till], the last status read;
- * shown once there is one), what failed last.
+ * the offline payments the till lost to double spends (`offline.double_spent` in [till], its last
+ * status, shown whenever that status carries the field), what failed last. Each double spend is a
+ * sale already answered as paid offline that the registry later found spent elsewhere: a loss the
+ * till keeps for the operator, so the line names it as one.
  */
 fun offlineLines(v: OfflineView, nowMs: Long, till: TillStatus? = null): List<String> {
     val lines = ArrayList<String>()
@@ -646,7 +648,7 @@ fun offlineLines(v: OfflineView, nowMs: Long, till: TillStatus? = null): List<St
         }
     }
     v.stats?.let { lines += "On this phone: ${it.waiting} waiting to sync, ${it.signing} waiting for their cards, ${it.synced} synced." }
-    till?.let { lines += "Double spends refused by the till: ${it.offlineDoubleSpent}" }
+    till?.offlineDoubleSpent?.let { lines += "Offline payments lost to double spends: $it" }
     v.kitError?.let { lines += "Last kit fetch failed: $it" }
     v.syncError?.let { lines += "Last sync stopped: $it" }
     return lines

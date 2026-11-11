@@ -423,8 +423,8 @@ final class PosController: ObservableObject {
 
     private(set) var pollInFlight = false
 
-    /// A status poll, then the offline work it allows. The task is for a caller that waits for the
-    /// poll to end (tests); nil when none starts.
+    /// A status poll of the till paired now, then the offline work it allows. The task is for a
+    /// caller that waits for the poll to end (tests); nil when none starts.
     @discardableResult
     func pollNow() -> Task<Void, Never>? {
         guard let till = pairing else { health = .notPaired; return nil }
@@ -434,7 +434,11 @@ final class PosController: ObservableObject {
         pollInFlight = true
         return Task { [weak self] in
             guard let self else { return }
-            let r = await self.client.status()
+            let r = await self.client(for: till).status()
+            // Paired with another till, or forgotten, while `till` answered: pair() and forgetTill()
+            // dropped what it said, and its late answer (failures included) is not shown either.
+            // The next poll asks the till paired now.
+            guard self.pairing == till else { self.pollInFlight = false; return }
             switch r {
             case .ok(let s):
                 // Back after the till was out of reach: sync what the phone took meanwhile.

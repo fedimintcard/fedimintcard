@@ -35,12 +35,18 @@ class TillClientTest {
             "offline":{"queued":3,"queued_msat":4500000,"double_spent":1,"cap_msat":100000000,"cap_count":20}}""") as TillResult.Ok
         assertEquals(3L, r.value.offlineQueued); assertEquals(4_500_000L, r.value.offlineQueuedMsat); assertEquals(1L, r.value.offlineDoubleSpent)
     }
-    @Test fun statusWithoutOrWithOddOfflineFieldsIsZero() {
+    /** Nothing queued, and no double-spend count (null, not 0: Settings then shows no line). */
+    @Test fun statusWithoutOrWithOddOfflineFieldsIsNothingQueued() {
         val base = """"federation_id":"ab","wallet_balance_msat":1,"card_relay_ok":true,"busy":false"""
-        for (extra in listOf("", ""","offline":null""", ""","offline":true""", ""","offline":{}""", ""","offline":{"queued":"many"}""")) {
+        for (extra in listOf("", ""","offline":null""", ""","offline":true""", ""","offline":{}""", ""","offline":{"queued":"many"}""",
+            ""","offline":{"double_spent":null}""", ""","offline":{"double_spent":"2"}""")) {
             val r = parseStatus("{$base$extra}") as TillResult.Ok
-            assertEquals(extra, 0L, r.value.offlineQueued); assertEquals(0L, r.value.offlineDoubleSpent)
+            assertEquals(extra, 0L, r.value.offlineQueued); assertNull(extra, r.value.offlineDoubleSpent)
         }
+    }
+    @Test fun statusReadsAReportedZeroDoubleSpends() {
+        val r = parseStatus("""{"federation_id":"ab","federation_name":null,"wallet_balance_msat":1,"card_relay_ok":true,"busy":false,"offline":{"double_spent":0}}""") as TillResult.Ok
+        assertEquals(0L, r.value.offlineDoubleSpent)
     }
     @Test fun chargeAnsweredOfflineIsMarked() {
         val s = parseCharge(200, """{"ok":true,"offline":true,"txid":"t","price_msat":5000,"received_msat":5000}""") as ChargeResult.Success

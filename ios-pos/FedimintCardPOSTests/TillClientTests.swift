@@ -97,7 +97,8 @@ final class TillClientTests: XCTestCase {
 
     func testStatusWithoutOrWithOddOfflineFieldsIsNothingQueued() {
         let base = #""federation_id":"ab","wallet_balance_msat":1,"card_relay_ok":true,"busy":false"#
-        for extra in ["", #","offline":null"#, #","offline":true"#, #","offline":{}"#, #","offline":{"queued":"many"}"#] {
+        for extra in ["", #","offline":null"#, #","offline":true"#, #","offline":{}"#, #","offline":{"queued":"many"}"#,
+                      #","offline":{"double_spent":null}"#, #","offline":{"double_spent":"2"}"#] {
             guard case .ok(let s) = TillParse.status(body("{" + base + extra + "}")) else { return XCTFail(extra) }
             XCTAssertEqual(s.offlineQueued, 0, extra); XCTAssertNil(s.offlineDoubleSpent, extra)
         }

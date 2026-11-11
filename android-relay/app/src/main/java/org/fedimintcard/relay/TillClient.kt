@@ -264,7 +264,7 @@ internal fun parseStatus(body: String): TillResult<TillStatus> = try {
             o.reqBool("busy"),
             offlineQueued = o.optJSONObject("offline")?.optLong("queued", 0) ?: 0,
             offlineQueuedMsat = o.optJSONObject("offline")?.optLong("queued_msat", 0) ?: 0,
-            offlineDoubleSpent = o.optJSONObject("offline")?.optLong("double_spent", 0) ?: 0,
+            offlineDoubleSpent = (o.optJSONObject("offline")?.opt("double_spent") as? Number)?.toLong(),
         )
     )
 } catch (e: JSONException) {
