@@ -69,7 +69,8 @@ next pass, every 30 s, reports it), and another card is `undecided` with nothing
 
 **Caps and the attacker.** The kit's caps are enforced by the core; an expired kit stops offline
 acceptance; the card's own daily limit applies as with any till. Double spends across phones and
-tills are found by the registry at report, as today, and counted.
+tills are found by the registry at report, as today, and counted: the till's count shows in
+Settings on both apps.
 
 **What does not change.** Applet 3.0, the online charge path (but for a sale the till's own
 offline queue holds `signing`, taken the offline way as above), the registry API and the Setup
@@ -221,11 +222,12 @@ the time they ask. After a sync that synced, the till's status is read again, so
 screen's count (the till's queue plus the phone's) moves once.
 
 **Settings.** The kit's age, its expiry and the caps; the payments waiting to sync, held for their
-cards and synced, or why offline is off; why the last sync stopped short ("Sync stopped: the till
-did not answer"), until a sync finds nothing waiting; and each charge the till refused, with its
-code and Dismiss behind "Delete this record?". Pairing another till, or forgetting this one, with
-payments on the phone asks "Unpair anyway?" first; they stay on the phone, and sync only to the
-till they were taken for.
+cards and synced, or why offline is off; "Double spends refused by the till: N", the till's
+`offline.double_spent`, whenever its last status carries the field (offline on or off); why the
+last sync stopped short ("Sync stopped: the till did not answer"), until a sync finds nothing
+waiting; and each charge the till refused, with its code and Dismiss behind "Delete this record?".
+Pairing another till, or forgetting this one, with payments on the phone asks "Unpair anyway?"
+first; they stay on the phone, and sync only to the till they were taken for.
 
 **Limits.** 50 or more charges for another till at the head of the queue hold back the charges
 taken since with the new till's kit. A charge its own till no longer knows (synced after its
@@ -336,10 +338,11 @@ queue plus the phone's `waiting`, and charges a sync sent count until a status p
 after it.
 
 **Settings** shows whether offline payments are on (or why not), the kit's age, expiry and caps,
-what waits on the phone, held for its card and synced, the last kit or sync failure, and the
-charges the till refused at sync, each with its code and a Dismiss behind "Delete this record?".
-Unpairing, or pairing another till, while payments wait on the phone asks first: they stay on the
-phone and sync only to the till they were taken for.
+what waits on the phone, held for its card and synced, "Double spends refused by the till: N" (the
+till's `offline.double_spent`, 0 for a status without the field) once a till status has been read,
+the last kit or sync failure, and the charges the till refused at sync, each with its code and a
+Dismiss behind "Delete this record?". Unpairing, or pairing another till, while payments wait on
+the phone asks first: they stay on the phone and sync only to the till they were taken for.
 
 **Limits.** Which sales were posted, and which the phone holds, are known only while the app
 runs: after a restart a held sale has no screen of its own (the home line above), and its card's
