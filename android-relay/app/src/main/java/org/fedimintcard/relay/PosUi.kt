@@ -405,8 +405,9 @@ class PosUi(
 
     /**
      * Settings: the till URL, pairing (scan the till's QR code, or paste its text), offline payments
-     * (the kit, what is on this phone, charges the till refused), and the relay. [paired] is the
-     * paired till's URL, or null. [onPairText] returns false for text that is not a pairing code.
+     * (the kit, what is on this phone, the till's double spends once its status has been read,
+     * charges the till refused), and the relay. [paired] is the paired till's URL, or null.
+     * [onPairText] returns false for text that is not a pairing code.
      * [onDismiss] deletes a refused charge's record and says, on the UI thread, whether it did.
      */
     fun settingsDialog(
@@ -441,7 +442,7 @@ class PosUi(
             setOnClickListener { onUnpair(); dialog?.dismiss() }
         }
         val offlineText = TextView(act).apply {
-            text = offlineLines(offline, System.currentTimeMillis()).joinToString("\n")
+            text = offlineLines(offline, System.currentTimeMillis(), tillStatus).joinToString("\n")
             setPadding(0, pad, 0, pad / 2)
         }
         val body = android.widget.LinearLayout(act).apply {
@@ -623,8 +624,12 @@ fun span(ms: Long): String {
     }
 }
 
-/** Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone, what failed last. */
-fun offlineLines(v: OfflineView, nowMs: Long): List<String> {
+/**
+ * Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone,
+ * the double spends the till counts (`offline.double_spent`, from [till], the last status read;
+ * shown once there is one), what failed last.
+ */
+fun offlineLines(v: OfflineView, nowMs: Long, till: TillStatus? = null): List<String> {
     val lines = ArrayList<String>()
     when {
         v.starting -> lines += "Offline payments: starting…"
@@ -641,6 +646,7 @@ fun offlineLines(v: OfflineView, nowMs: Long): List<String> {
         }
     }
     v.stats?.let { lines += "On this phone: ${it.waiting} waiting to sync, ${it.signing} waiting for their cards, ${it.synced} synced." }
+    till?.let { lines += "Double spends refused by the till: ${it.offlineDoubleSpent}" }
     v.kitError?.let { lines += "Last kit fetch failed: $it" }
     v.syncError?.let { lines += "Last sync stopped: $it" }
     return lines

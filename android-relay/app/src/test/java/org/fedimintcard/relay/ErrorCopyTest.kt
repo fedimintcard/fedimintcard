@@ -139,4 +139,24 @@ class ErrorCopyTest {
         assertEquals(listOf("0 s", "59 s", "1 min", "59 min", "1 h", "23 h", "1 day", "2 days"),
             listOf(0L, 59_000, 60_000, 3_599_000, 3_600_000, 86_399_000, day, 2 * day).map(::span))
     }
+
+    /** The till's `offline.double_spent` under what is on this phone, once a till status has been read. */
+    @Test
+    fun settingsCountsTheDoubleSpendsTheTillRefused() {
+        val now = 100 * 86_400_000L
+        fun till(offline: String) = (parseStatus(
+            """{"federation_id":"f","federation_name":null,"wallet_balance_msat":0,"card_relay_ok":true,"busy":false,"offline":$offline}""",
+        ) as TillResult.Ok).value
+        val view = OfflineView(null, false, true, null, CoreStats(waiting = 1), emptyList(), null, "the till did not answer")
+        val phone = listOf("Offline kit: none yet. Reach the till once while online.", "On this phone: 1 waiting to sync, 0 waiting for their cards, 0 synced.")
+        val stopped = "Last sync stopped: the till did not answer"
+        assertEquals(phone + "Double spends refused by the till: 2" + stopped, offlineLines(view, now, till("""{"queued":0,"queued_msat":0,"double_spent":2}""")))
+        assertEquals(phone + "Double spends refused by the till: 0" + stopped, offlineLines(view, now, till("""{"queued":0,"queued_msat":0,"double_spent":0}""")))
+        assertEquals("a status without the field reads as 0", phone + "Double spends refused by the till: 0" + stopped, offlineLines(view, now, till("null")))
+        assertEquals("no till status read yet", phone + stopped, offlineLines(view, now))
+        assertEquals(
+            listOf("Offline payments are off: UnsatisfiedLinkError: x", "Double spends refused by the till: 2"),
+            offlineLines(view.copy(off = "UnsatisfiedLinkError: x", stats = null, syncError = null), now, till("""{"double_spent":2}""")),
+        )
+    }
 }
