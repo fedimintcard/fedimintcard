@@ -3,7 +3,9 @@
 # ios-pos/scripts/release-ios.sh. Each case copies a script into a scratch tree and runs it with an
 # environment of its own (env -i), a scratch HOME and stand-ins for Gradle, xcodebuild, the core
 # build and the Keychain that record their calls. Nothing is built, signed or uploaded, and the real
-# Keychain is never read. The fixtures take this checkout's project files with test versions.
+# Keychain is never read. The fixtures take this checkout's project files with test versions. PATH
+# holds the stand-ins and the system directories only, so on macOS the scripts run under /bin/bash
+# 3.2 and the BSD tools, as they do on the release Mac.
 #
 #   scripts/test-release-scripts.sh
 set -euo pipefail
@@ -241,34 +243,46 @@ ios "${asc[@]}"
 expect "succeeds" is "$status" 0
 expect "builds the core first, from the repository root" \
   is "$(sed -n 1p "$c/log")" "build-poscore.sh (in $c/repo)"
-expect "archives with the version and build from project.yml" is "$(sed -n 2p "$c/log")" \
-  "xcodebuild -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS -configuration Release -destination generic/platform=iOS CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=H7UAM79QQP -allowProvisioningUpdates archive -archivePath dist/ios/FedimintCardPOS-9.8.7-65.xcarchive (in $c/repo)"
+expect "archives with the version and build from project.yml, signing with the API key" is "$(sed -n 2p "$c/log")" \
+  "xcodebuild -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS -configuration Release -destination generic/platform=iOS CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=H7UAM79QQP -allowProvisioningUpdates -authenticationKeyPath $c/keys/AuthKey_TEST.p8 -authenticationKeyID TESTKEYID -authenticationKeyIssuerID test-issuer-id archive -archivePath dist/ios/FedimintCardPOS-9.8.7-65.xcarchive (in $c/repo)"
 expect "exports and uploads with the API key (its relative path made absolute)" is "$(sed -n 3p "$c/log")" \
   "xcodebuild -exportArchive -archivePath dist/ios/FedimintCardPOS-9.8.7-65.xcarchive -exportOptionsPlist ios-pos/ExportOptions.plist -exportPath dist/ios/export-9.8.7-65 -allowProvisioningUpdates -authenticationKeyPath $c/keys/AuthKey_TEST.p8 -authenticationKeyID TESTKEYID -authenticationKeyIssuerID test-issuer-id (in $c/repo)"
 expect "runs nothing else" is "$(wc -l <"$c/log" | tr -d ' ')" 3
 expect "last line is the archive's path" \
   is "$(last_line "$c/out")" "$c/repo/dist/ios/FedimintCardPOS-9.8.7-65.xcarchive"
 
-new_case "ios: SKIP_POSCORE=1 skips the core build"
+# The core build has no switch to skip it: the core an earlier build left in ios-pos/Packages can
+# be from another commit, and git does not show it.
+new_case "ios: the core builds on every run, with one already in place and SKIP_POSCORE=1 set"
+pkg=$c/repo/ios-pos/Packages/FedimintCardPosCore
+mkdir -p "$pkg/FedimintCardPosCoreFFI.xcframework" "$pkg/Sources/FedimintCardPosCore"
+echo "// an earlier build's bindings" >"$pkg/Sources/FedimintCardPosCore/FedimintCardPosCore.swift"
 ios "${asc[@]}" SKIP_POSCORE=1
 expect "succeeds" is "$status" 0
-expect "builds no core" lacks "$c/log" "build-poscore.sh"
-expect "archives and uploads" is "$(grep -c '^xcodebuild ' "$c/log")" 2
+expect "builds the core before the archive" is "$(sed -n 1p "$c/log")" "build-poscore.sh (in $c/repo)"
+expect "then archives and uploads" is "$(grep -c '^xcodebuild ' "$c/log")" 2
 
 new_case "ios: a failed core build stops before xcodebuild"
 ios "${asc[@]}" FAKE_POSCORE_STATUS=3
 expect "fails" is "$status" 3
 expect "runs no xcodebuild" lacks "$c/log" "xcodebuild"
 
-new_case "ios: an Xcode project that disagrees with project.yml stops before building"
-pbx=$c/repo/ios-pos/FedimintCardPOS.xcodeproj/project.pbxproj
-awk '/CURRENT_PROJECT_VERSION = 65;/ && !done { sub(/65;/, "64;"); done = 1 } { print }' "$pbx" >"$pbx.new"
-mv "$pbx.new" "$pbx"
-expect "fixture: one configuration says 64" is "$(grep -c 'CURRENT_PROJECT_VERSION = 64;' "$pbx")" 1
-ios "${asc[@]}"
-expect "fails" is "$status" 1
-expect "says to regenerate the project" has "$c/err" "CURRENT_PROJECT_VERSION differs from ios-pos/project.yml (65): run xcodegen generate"
-expect "builds nothing" empty "$c/log"
+for mismatch in "CURRENT_PROJECT_VERSION 65 64" "MARKETING_VERSION 9.8.7 9.8.6"; do
+  read -r setting ours theirs <<<"$mismatch"
+  new_case "ios: an Xcode project whose $setting disagrees with project.yml stops before building"
+  pbx=$c/repo/ios-pos/FedimintCardPOS.xcodeproj/project.pbxproj
+  # One configuration keeps another value, as when project.yml changed and xcodegen did not run.
+  awk -v from="$setting = $ours;" -v to="$setting = $theirs;" \
+    '!done && (i = index($0, from)) { $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); done = 1 } { print }' \
+    "$pbx" >"$pbx.new"
+  mv "$pbx.new" "$pbx"
+  expect "fixture: one configuration says $theirs" is "$(grep -cF "$setting = $theirs;" "$pbx")" 1
+  ios "${asc[@]}"
+  expect "fails" is "$status" 1
+  expect "says to regenerate the project" \
+    has "$c/err" "$setting differs from ios-pos/project.yml ($ours): run xcodegen generate"
+  expect "builds nothing" empty "$c/log"
+done
 
 new_case "ios: a project.yml without MARKETING_VERSION stops before building"
 grep -v 'MARKETING_VERSION:' "$c/repo/ios-pos/project.yml" >"$c/project.yml"

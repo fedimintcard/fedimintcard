@@ -60,15 +60,22 @@ jobs:
       - run: npx vitest run
   # The POS release scripts (docs/RELEASING.md) against stand-ins for Gradle, xcodebuild, the core
   # build and the Keychain: their guards, the versions they read and the commands they run. Nothing
-  # is built, signed or uploaded.
+  # is built, signed or uploaded. The scripts run on the release Mac, under /bin/bash 3.2 and the
+  # BSD tools, so the suite runs on macOS as well as Linux, and under /bin/bash on both.
   release-scripts:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
-      - run: shellcheck scripts/release-android.sh scripts/test-release-scripts.sh ios-pos/scripts/release-ios.sh
-      - run: scripts/test-release-scripts.sh
+      # One lint is enough: shellcheck reads the same files on both, and the Linux image has it.
+      - if: runner.os == 'Linux'
+        run: shellcheck scripts/release-android.sh scripts/test-release-scripts.sh ios-pos/scripts/release-ios.sh
+      - run: /bin/bash scripts/test-release-scripts.sh
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 90

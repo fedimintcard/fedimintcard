@@ -27,12 +27,15 @@ ios-pos/scripts/release-ios.sh
 | `ASC_KEY_PATH` | the App Store Connect API key file (`.p8`) |
 | `ASC_KEY_ID` | that key's ID |
 | `ASC_ISSUER_ID` | the issuer ID of the key's team |
-| `SKIP_POSCORE` | `1` skips the core build, when `ios-pos/scripts/build-poscore.sh` already ran on this commit |
 
-The script refuses to start without the three `ASC_` variables or the key file. It builds the core,
-archives with automatic signing, then exports with `ios-pos/ExportOptions.plist` and uploads the
-build to App Store Connect itself. It needs Xcode and the Rust targets `aarch64-apple-ios`,
-`aarch64-apple-ios-sim` and `x86_64-apple-ios`.
+The script refuses to start without the three `ASC_` variables or the key file. It builds the core
+from the checkout on every run, because a core an earlier build left in `ios-pos/Packages` is
+gitignored and can come from another commit. It archives with automatic signing, then exports with
+`ios-pos/ExportOptions.plist` and uploads the build to App Store Connect itself. The API key
+authenticates both steps: with it, automatic signing fetches the archive's development profile, so
+no Apple ID has to be signed in to Xcode. The archive is signed with the team's Apple Development
+certificate from the login keychain. The script needs Xcode and the Rust targets
+`aarch64-apple-ios`, `aarch64-apple-ios-sim` and `x86_64-apple-ios`.
 
 Artifacts:
 
@@ -72,4 +75,6 @@ Play re-signs it with the app-signing key, and its review follows.
 ## Tests
 
 `scripts/test-release-scripts.sh` runs both scripts against stand-ins for Gradle, xcodebuild, the
-core build and the Keychain, so it builds, signs and uploads nothing. CI runs it with `shellcheck`.
+core build and the Keychain, so it builds, signs and uploads nothing. CI runs it on macOS, where the
+scripts get `/bin/bash` 3.2 and the BSD tools as on the release Mac, and on Linux after
+`shellcheck`.

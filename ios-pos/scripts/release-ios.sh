@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # Archive Fedimint Card POS for iOS and upload it to App Store Connect (TestFlight), in one run:
 #
-#   1. ios-pos/scripts/build-poscore.sh builds the core: the library and its bindings come from one
-#      build (UniFFI stops the app when they differ). SKIP_POSCORE=1 skips it when it already ran
-#      on this commit.
-#   2. xcodebuild archives dist/ios/FedimintCardPOS-<version>-<build>.xcarchive. The version and
-#      build are MARKETING_VERSION and CURRENT_PROJECT_VERSION in ios-pos/project.yml; the Xcode
-#      project must carry the same values (xcodegen generate), or the script stops first.
+#   1. ios-pos/scripts/build-poscore.sh builds the core from this checkout, on every run. The
+#      library and its bindings must come from one build (UniFFI stops the app when they differ),
+#      and the gitignored copies an earlier build left in ios-pos/Packages can come from another
+#      commit without git showing it. On a warm target directory it takes seconds.
+#   2. xcodebuild archives dist/ios/FedimintCardPOS-<version>-<build>.xcarchive with automatic
+#      signing. The version and build are MARKETING_VERSION and CURRENT_PROJECT_VERSION in
+#      ios-pos/project.yml; the Xcode project must carry the same values (xcodegen generate), or
+#      the script stops first.
 #   3. xcodebuild -exportArchive signs the archive for the App Store with ios-pos/ExportOptions.plist
-#      and uploads it, authenticated by an App Store Connect API key. Its summary and logs go to
-#      dist/ios/export-<version>-<build>.
+#      and uploads it. Its summary and logs go to dist/ios/export-<version>-<build>.
 #
-# Needs ASC_KEY_PATH (the API key's .p8 file), ASC_KEY_ID and ASC_ISSUER_ID; without all three, or
-# without the key file, it stops before building anything. Its own messages name the variables
-# without their values. Runs from the repository root wherever it is called from. The last line
-# printed is the archive's path. The whole release: docs/RELEASING.md.
+# Both xcodebuild runs authenticate with an App Store Connect API key: ASC_KEY_PATH (the key's .p8
+# file), ASC_KEY_ID and ASC_ISSUER_ID. With the key, automatic signing fetches the archive's
+# development profile itself, so Xcode needs no Apple ID signed in; the archive's certificate is the
+# team's Apple Development one in the login keychain. Without all three variables, or without the
+# key file, the script stops before building anything. Its own messages name the variables without
+# their values. Runs from the repository root wherever it is called from. The last line printed is
+# the archive's path. The whole release: docs/RELEASING.md.
 set -euo pipefail
 
 missing=()
@@ -56,16 +60,14 @@ for pair in "MARKETING_VERSION=$version" "CURRENT_PROJECT_VERSION=$build"; do
 	fi
 done
 
-if [[ ${SKIP_POSCORE:-} != 1 ]]; then
-	ios-pos/scripts/build-poscore.sh
-fi
+ios-pos/scripts/build-poscore.sh
 
+auth=(-authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
 archive=dist/ios/FedimintCardPOS-$version-$build.xcarchive
 mkdir -p dist/ios
 xcodebuild -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS -configuration Release \
 	-destination generic/platform=iOS CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=H7UAM79QQP \
-	-allowProvisioningUpdates archive -archivePath "$archive"
+	-allowProvisioningUpdates "${auth[@]}" archive -archivePath "$archive"
 xcodebuild -exportArchive -archivePath "$archive" -exportOptionsPlist ios-pos/ExportOptions.plist \
-	-exportPath "dist/ios/export-$version-$build" -allowProvisioningUpdates \
-	-authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+	-exportPath "dist/ios/export-$version-$build" -allowProvisioningUpdates "${auth[@]}"
 echo "$root/$archive"
