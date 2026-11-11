@@ -30,8 +30,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: FedimintCardPOS/FedimintCardPOS.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "0.2.0"
+        CURRENT_PROJECT_VERSION: "4"
         GENERATE_INFOPLIST_FILE: NO
   FedimintCardPOSTests:
     type: bundle.unit-test
