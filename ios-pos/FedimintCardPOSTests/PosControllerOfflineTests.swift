@@ -167,6 +167,26 @@ final class PosControllerOfflineTests: XCTestCase {
         XCTAssertEqual(r.kitFetches, 2, "a sync that synced asks for a new kit")
     }
 
+    func testSettingsCountsTheDoubleSpendsInTheTillsLastStatus() async {
+        let r = ControllerRig()
+        await r.open()
+        let line = "Double spends refused by the till: 2"
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Double spends") }, "no status read yet")
+        r.till.answer("/v1/status", 200, #"{"federation_id":"fed1","federation_name":"Island","wallet_balance_msat":1000,"card_relay_ok":true,"busy":false,"offline":{"queued":0,"queued_msat":0,"double_spent":2}}"#)
+        await r.poll()
+        XCTAssertEqual(r.pos.status?.offlineDoubleSpent, 2)
+        XCTAssertTrue(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains(line))
+        // The till out of reach: Settings keeps the count from the last status read.
+        r.till.fail("/v1/status", .unreachable)
+        await r.poll()
+        await r.poll()
+        XCTAssertEqual(r.pos.health, .offline)
+        XCTAssertTrue(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains(line))
+        // Forgetting the till drops its status, and the line with it.
+        r.pos.forgetTill()
+        XCTAssertFalse(offlinePanelLines(r.pos.phone, nowMs: r.now, till: r.pos.status).contains { $0.hasPrefix("Double spends") })
+    }
+
     func testThePollFetchesTheKitOnItsScheduleNotEveryTime() async {
         let r = ControllerRig()
         await r.open()

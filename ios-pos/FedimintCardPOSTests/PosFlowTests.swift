@@ -374,4 +374,27 @@ final class OfflineCopyTests: XCTestCase {
         phone.syncStopped = nil
         XCTAssertFalse(offlinePanelLines(phone, nowMs: 0).contains { $0.hasPrefix("Sync stopped") })
     }
+
+    func testSettingsCountsTheDoubleSpendsTheTillRefused() {
+        func till(_ offline: String) -> TillStatus? {
+            let body = #"{"federation_id":"f","federation_name":null,"wallet_balance_msat":0,"card_relay_ok":true,"busy":false,"offline":"# + offline + "}"
+            guard case .ok(let s) = TillParse.status(Data(body.utf8)) else { return nil }
+            return s
+        }
+        var phone = OfflineSnapshot(enabled: true, stats: OfflineStats(waiting: 1))
+        phone.syncStopped = "the till did not answer"
+        let kitAndCounts = ["No offline kit yet. Reach the till once while online.", "1 waiting to sync · 0 held for their cards · 0 synced"]
+        let stopped = "Sync stopped: the till did not answer"
+        XCTAssertEqual(offlinePanelLines(phone, nowMs: 0, till: till(#"{"queued":0,"queued_msat":0,"double_spent":2}"#)),
+                       kitAndCounts + ["Double spends refused by the till: 2", stopped])
+        XCTAssertEqual(offlinePanelLines(phone, nowMs: 0, till: till(#"{"queued":0,"queued_msat":0,"double_spent":0}"#)),
+                       kitAndCounts + ["Double spends refused by the till: 0", stopped], "a count of 0 the till reported")
+        for absent in ["null", #"{"queued":0,"queued_msat":0}"#] {
+            XCTAssertNotNil(till(absent), absent)
+            XCTAssertEqual(offlinePanelLines(phone, nowMs: 0, till: till(absent)), kitAndCounts + [stopped], "no double_spent in \(absent)")
+        }
+        XCTAssertEqual(offlinePanelLines(phone, nowMs: 0), kitAndCounts + [stopped], "no till status read yet")
+        XCTAssertEqual(offlinePanelLines(.disabled, nowMs: 0, till: till(#"{"double_spent":2}"#)),
+                       ["Offline payments are off on this phone.", "Double spends refused by the till: 2"])
+    }
 }
