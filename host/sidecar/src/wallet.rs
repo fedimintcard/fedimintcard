@@ -1,6 +1,10 @@
 //! The host's own Fedimint client: join by invite code, re-open, the stock mint v1 flows
 //! (`ecash import` / `ecash export`) and Lightning through the federation's gateways (top-up
 //! invoices, `ln pay`). Registered: mint v1, ln (lnv1), and lnv2 only on a federation without ln.
+//! [`pay`] is the same payment as a library call for the till's own use.
+
+pub mod pay;
+pub use pay::WalletPay;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,14 +17,14 @@ use fedimint_client::secret::RootSecretStrategy;
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::FederationId;
-use fedimint_core::core::ModuleInstanceId;
+use fedimint_core::core::{ModuleInstanceId, OperationId};
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::CoreConsensusVersion;
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_core::Amount;
 use fedimint_core::config::ClientConfig;
-use fedimint_ln_client::{InternalPayState, LnPayState, PayBolt11InvoiceError, PayType};
+use fedimint_ln_client::{InternalPayState, LnPayState, PayBolt11InvoiceError};
 use fedimint_ln_common::config::FeeToAmount as _;
 use fedimint_mint_client::{
     MintClientInit, MintClientModule, OOBNotes, ReissueExternalNotesState,
@@ -68,7 +72,7 @@ pub enum LnPayOutcome {
     /// The payment did not go through and the eCash came back to the wallet.
     Refunded { reason: String, operation_id: String },
     /// The client reported an error it could not settle; check the wallet balance.
-    Failed { reason: String, operation_id: Option<String> },
+    Failed { reason: String, operation_id: String },
     /// Not started: nothing left the wallet.
     Refused { reason: String, insufficient_funds: bool },
 }
@@ -282,31 +286,42 @@ impl Wallet {
     /// spent. Paying an invoice the wallet already paid answers that payment again (ln keeps a
     /// record per payment hash). Errors only for an invoice that does not parse or has no amount.
     pub async fn pay_bolt11(&self, bolt11: &str, max_fee_msat: Option<u64>) -> Result<LnPayOutcome> {
+        self.pay_bolt11_within(bolt11, max_fee_msat, LN_PAY_WAIT).await
+    }
+
+    /// `pay_bolt11`, following the payment for up to `wait` before it answers `Pending`.
+    async fn pay_bolt11_within(&self, bolt11: &str, max_fee_msat: Option<u64>, wait: Duration) -> Result<LnPayOutcome> {
         let invoice = parse_bolt11(bolt11)?;
         if self.lightning().is_ok() {
-            return Ok(self.pay_v1(invoice, max_fee_msat).await);
+            return Ok(self.pay_v1(invoice, max_fee_msat, wait).await);
         }
         if self.lightning_v2().is_ok() {
-            return Ok(self.pay_v2(invoice, max_fee_msat).await);
+            return Ok(self.pay_v2(invoice, max_fee_msat, wait).await);
         }
         Ok(LnPayOutcome::refused("this federation has no Lightning module the till can use"))
     }
 
-    async fn pay_v1(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>) -> LnPayOutcome {
+    async fn pay_v1(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>, wait: Duration) -> LnPayOutcome {
         let Ok(ln) = self.lightning() else { return LnPayOutcome::refused("no ln module") };
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
-        let gw = match lnv1_gateway(&ln, &invoice).await {
-            Ok(gw) => gw,
-            Err(reason) => return LnPayOutcome::refused(reason),
+        // Without a gateway only an invoice of this federation can be paid: the client pays it
+        // inside the federation with no gateway fee, and refuses any other invoice
+        // (`NoLnGatewayAvailable`) before anything is funded.
+        let (gw, no_gateway) = match lnv1_gateway(&ln, &invoice).await {
+            Ok(gw) => (Some(gw), None),
+            Err(reason) => (None, Some(reason)),
         };
-        let fee_msat = gw.fees.to_amount(&Amount::from_msats(amount_msat)).msats;
+        let fee_msat = gw.as_ref().map_or(0, |gw| gw.fees.to_amount(&Amount::from_msats(amount_msat)).msats);
         if let Some(r) = refuse_fee_or_balance(fee_msat, max_fee_msat, amount_msat, self.balance_msat().await.ok()) {
             return r;
         }
-        let out = match ln.pay_bolt11_invoice(Some(gw), invoice, ()).await {
+        let out = match ln.pay_bolt11_invoice(gw, invoice, ()).await {
             Ok(out) => out,
             Err(PayBolt11InvoiceError::PreviousPaymentAttemptStillInProgress { operation_id }) => {
-                return self.wait_pay_v1(PayType::Lightning(operation_id), 0).await;
+                return self.follow_v1(operation_id, wait).await.unwrap_or_else(|e| unsettled(operation_id, e));
+            }
+            Err(PayBolt11InvoiceError::NoLnGatewayAvailable) => {
+                return LnPayOutcome::refused(no_gateway.unwrap_or_else(|| "no Lightning gateway".into()));
             }
             Err(e) => {
                 let insufficient_funds = matches!(
@@ -316,71 +331,74 @@ impl Wallet {
                 return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds };
             }
         };
-        self.wait_pay_v1(out.payment_type, out.fee.msats).await
+        let op = out.payment_type.operation_id();
+        self.follow_v1(op, wait).await.unwrap_or_else(|e| unsettled(op, e))
     }
 
-    /// Follow an ln payment until it ends or `LN_PAY_WAIT` passes.
-    async fn wait_pay_v1(&self, pay: PayType, fee_msat: u64) -> LnPayOutcome {
-        let op = pay.operation_id();
+    /// Follow the ln payment `op` until it ends or `wait` passes. The fee and the kind of payment
+    /// (through a gateway, or inside the federation) come from the operation's own record, so a
+    /// payment picked up again (an earlier attempt, after a restart) answers what it was funded
+    /// with. Errors when `op` is not an ln payment of this wallet.
+    async fn follow_v1(&self, op: OperationId, wait: Duration) -> Result<LnPayOutcome> {
         let operation_id = hex::encode(op.0);
-        let Ok(ln) = self.lightning() else {
-            return LnPayOutcome::Failed { reason: "no ln module".into(), operation_id: Some(operation_id) };
-        };
-        let failed = |reason: String| LnPayOutcome::Failed { reason, operation_id: Some(operation_id.clone()) };
+        let ln = self.lightning()?;
+        let details = ln
+            .get_ln_pay_details_for(op)
+            .await
+            .map_err(|e| anyhow!("operation {operation_id} is not a Lightning payment of this wallet: {e}"))?;
+        let fee_msat = details.fee.msats;
+        let failed = |reason: String| LnPayOutcome::Failed { reason, operation_id: operation_id.clone() };
         let refunded = |reason: String| LnPayOutcome::Refunded { reason, operation_id: operation_id.clone() };
-        let wait = async {
-            match pay {
-                PayType::Lightning(op) => {
-                    let mut stream = match ln.subscribe_ln_pay(op).await {
-                        Ok(s) => s.into_stream(),
-                        Err(e) => return failed(e.to_string()),
-                    };
-                    while let Some(state) = stream.next().await {
-                        match state {
-                            LnPayState::Success { preimage } => {
-                                return LnPayOutcome::Paid { preimage, fee_msat, operation_id: operation_id.clone() };
-                            }
-                            LnPayState::Refunded { gateway_error } => return refunded(gateway_error.to_string()),
-                            LnPayState::Canceled => return refunded("canceled: the federation did not fund the payment".into()),
-                            LnPayState::UnexpectedError { error_message } => return failed(error_message),
-                            LnPayState::Created
-                            | LnPayState::Funded { .. }
-                            | LnPayState::WaitingForRefund { .. }
-                            | LnPayState::AwaitingChange => {}
+        let follow = async {
+            if !details.is_internal_payment {
+                let mut stream = match ln.subscribe_ln_pay(op).await {
+                    Ok(s) => s.into_stream(),
+                    Err(e) => return failed(e.to_string()),
+                };
+                while let Some(state) = stream.next().await {
+                    match state {
+                        LnPayState::Success { preimage } => {
+                            return LnPayOutcome::Paid { preimage, fee_msat, operation_id: operation_id.clone() };
                         }
+                        LnPayState::Refunded { gateway_error } => return refunded(gateway_error.to_string()),
+                        LnPayState::Canceled => return refunded("canceled: the federation did not fund the payment".into()),
+                        LnPayState::UnexpectedError { error_message } => return failed(error_message),
+                        LnPayState::Created
+                        | LnPayState::Funded { .. }
+                        | LnPayState::WaitingForRefund { .. }
+                        | LnPayState::AwaitingChange => {}
                     }
                 }
-                PayType::Internal(op) => {
-                    let mut stream = match ln.subscribe_internal_pay(op).await {
-                        Ok(s) => s.into_stream(),
-                        Err(e) => return failed(e.to_string()),
-                    };
-                    while let Some(state) = stream.next().await {
-                        match state {
-                            InternalPayState::Preimage(p) => {
-                                return LnPayOutcome::Paid { preimage: hex::encode(p.0), fee_msat, operation_id: operation_id.clone() };
-                            }
-                            InternalPayState::RefundSuccess { error, .. } => return refunded(format!("{error:?}")),
-                            InternalPayState::FundingFailed { error } => {
-                                return refunded(format!("the federation did not fund the payment: {error:?}"));
-                            }
-                            InternalPayState::RefundError { error_message, .. } | InternalPayState::UnexpectedError(error_message) => {
-                                return failed(error_message);
-                            }
-                            InternalPayState::Funding => {}
+            } else {
+                let mut stream = match ln.subscribe_internal_pay(op).await {
+                    Ok(s) => s.into_stream(),
+                    Err(e) => return failed(e.to_string()),
+                };
+                while let Some(state) = stream.next().await {
+                    match state {
+                        InternalPayState::Preimage(p) => {
+                            return LnPayOutcome::Paid { preimage: hex::encode(p.0), fee_msat, operation_id: operation_id.clone() };
                         }
+                        InternalPayState::RefundSuccess { error, .. } => return refunded(format!("{error:?}")),
+                        InternalPayState::FundingFailed { error } => {
+                            return refunded(format!("the federation did not fund the payment: {error:?}"));
+                        }
+                        InternalPayState::RefundError { error_message, .. } | InternalPayState::UnexpectedError(error_message) => {
+                            return failed(error_message);
+                        }
+                        InternalPayState::Funding => {}
                     }
                 }
             }
             failed("the payment ended without an outcome".into())
         };
-        tokio::time::timeout(LN_PAY_WAIT, wait)
+        Ok(tokio::time::timeout(wait, follow)
             .await
-            .unwrap_or_else(|_| LnPayOutcome::Pending { operation_id: hex::encode(op.0) })
+            .unwrap_or_else(|_| LnPayOutcome::Pending { operation_id: operation_id.clone() }))
     }
 
-    async fn pay_v2(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>) -> LnPayOutcome {
-        use fedimint_lnv2_client::{FinalSendOperationState, SendPaymentError, SendWithTermsError};
+    async fn pay_v2(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>, wait: Duration) -> LnPayOutcome {
+        use fedimint_lnv2_client::{SendPaymentError, SendWithTermsError};
         let Ok(ln) = self.lightning_v2() else { return LnPayOutcome::refused("no lnv2 module") };
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
         let (gateway, routing) = match ln.select_gateway(Some(invoice.clone())).await {
@@ -401,20 +419,35 @@ impl Wallet {
                 return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds };
             }
         };
+        self.follow_v2(op, wait).await.unwrap_or_else(|e| unsettled(op, e))
+    }
+
+    /// Follow the lnv2 payment `op` until it ends or `wait` passes, with the gateway fee its
+    /// contract was funded with. Errors when `op` is not an lnv2 payment of this wallet.
+    async fn follow_v2(&self, op: OperationId, wait: Duration) -> Result<LnPayOutcome> {
+        use fedimint_lnv2_client::{FinalSendOperationState, LightningOperationMeta};
         let operation_id = hex::encode(op.0);
-        match tokio::time::timeout(LN_PAY_WAIT, ln.await_final_send_operation_state(op)).await {
+        let ln = self.lightning_v2()?;
+        let meta = self.client.operation_log().get_operation(op).await.map(|e| e.try_meta::<LightningOperationMeta>());
+        let Some(Ok(LightningOperationMeta::Send(meta))) = meta else {
+            bail!("operation {operation_id} is not a Lightning payment of this wallet");
+        };
+        let fee_msat = meta.gateway_fee().msats;
+        Ok(match tokio::time::timeout(wait, ln.await_final_send_operation_state(op)).await {
             Err(_) => LnPayOutcome::Pending { operation_id },
-            Ok(Err(e)) => LnPayOutcome::Failed { reason: e.to_string(), operation_id: Some(operation_id) },
+            Ok(Err(e)) => LnPayOutcome::Failed { reason: e.to_string(), operation_id },
             Ok(Ok(FinalSendOperationState::Success(preimage))) => {
                 LnPayOutcome::Paid { preimage: hex::encode(preimage), fee_msat, operation_id }
             }
             Ok(Ok(FinalSendOperationState::Refunded)) => {
                 LnPayOutcome::Refunded { reason: "the gateway could not pay; refunded".into(), operation_id }
             }
+            // The refund was not accepted and no preimage turned up: where the value is, the
+            // client cannot say. Never a certain failure.
             Ok(Ok(FinalSendOperationState::Failure)) => {
-                LnPayOutcome::Failed { reason: "the federation reported a failed payment".into(), operation_id: Some(operation_id) }
+                LnPayOutcome::Failed { reason: "the federation reported a failed payment".into(), operation_id }
             }
-        }
+        })
     }
 
     pub fn mint(&self) -> Result<fedimint_client::module::ClientModuleInstance<'_, MintClientModule>> {
@@ -526,6 +559,12 @@ impl Wallet {
         }
         Ok(0)
     }
+}
+
+/// A payment the wallet funded (or found in flight) whose record could not be read back: its
+/// outcome cannot be settled from here, so it is never reported as refused.
+fn unsettled(op: OperationId, e: anyhow::Error) -> LnPayOutcome {
+    LnPayOutcome::Failed { reason: format!("{e:#}"), operation_id: hex::encode(op.0) }
 }
 
 /// The refusals checked before a payment is funded: a gateway fee over `max_fee_msat`, or a
