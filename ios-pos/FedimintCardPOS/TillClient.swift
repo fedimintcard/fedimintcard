@@ -289,7 +289,8 @@ enum TillParse {
     static func status(_ body: Data) -> TillResult<TillStatus> {
         do {
             let o = try obj(body)
-            // Absent on a till from before offline payments, or not an object: read as nothing queued.
+            // Absent on a till from before offline payments, or not an object: read as nothing queued
+            // and no double-spend count.
             let offline = o["offline"] as? [String: Any] ?? [:]
             return .ok(TillStatus(
                 federationId: try reqStr(o, "federation_id"),
@@ -299,7 +300,7 @@ enum TillParse {
                 busy: try reqBool(o, "busy"),
                 offlineQueued: optLong(offline, "queued"),
                 offlineQueuedMsat: optLong(offline, "queued_msat"),
-                offlineDoubleSpent: optLong(offline, "double_spent")))
+                offlineDoubleSpent: (offline["double_spent"] as? NSNumber)?.int64Value))
         } catch let e as Bad { return .err(.badResponse(e.msg)) } catch { return .err(.badResponse("bad json")) }
     }
 

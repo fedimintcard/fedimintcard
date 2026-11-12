@@ -139,4 +139,32 @@ class ErrorCopyTest {
         assertEquals(listOf("0 s", "59 s", "1 min", "59 min", "1 h", "23 h", "1 day", "2 days"),
             listOf(0L, 59_000, 60_000, 3_599_000, 3_600_000, 86_399_000, day, 2 * day).map(::span))
     }
+
+    /**
+     * The till's `offline.double_spent` under what is on this phone, whenever the till's last status
+     * carries the field. Each is a sale answered as paid that the registry found spent elsewhere:
+     * the line names the loss (the till refused nothing).
+     */
+    @Test
+    fun settingsCountsTheDoubleSpendsTheTillLost() {
+        val now = 100 * 86_400_000L
+        fun till(offline: String) = (parseStatus(
+            """{"federation_id":"f","federation_name":null,"wallet_balance_msat":0,"card_relay_ok":true,"busy":false,"offline":$offline}""",
+        ) as TillResult.Ok).value
+        val view = OfflineView(null, false, true, null, CoreStats(waiting = 1), emptyList(), null, "the till did not answer")
+        val phone = listOf("Offline kit: none yet. Reach the till once while online.", "On this phone: 1 waiting to sync, 0 waiting for their cards, 0 synced.")
+        val stopped = "Last sync stopped: the till did not answer"
+        assertEquals(phone + "Offline payments lost to double spends: 2" + stopped, offlineLines(view, now, till("""{"queued":0,"queued_msat":0,"double_spent":2}""")))
+        assertEquals("a count of 0 the till reported", phone + "Offline payments lost to double spends: 0" + stopped,
+            offlineLines(view, now, till("""{"queued":0,"queued_msat":0,"double_spent":0}""")))
+        // A till that takes no offline charges ("offline": null), or one from before the count: no line.
+        for (absent in listOf("null", """{"queued":0,"queued_msat":0}""")) {
+            assertEquals("no double_spent in $absent", phone + stopped, offlineLines(view, now, till(absent)))
+        }
+        assertEquals("no till status read yet", phone + stopped, offlineLines(view, now))
+        assertEquals(
+            listOf("Offline payments are off: UnsatisfiedLinkError: x", "Offline payments lost to double spends: 2"),
+            offlineLines(view.copy(off = "UnsatisfiedLinkError: x", stats = null, syncError = null), now, till("""{"double_spent":2}""")),
+        )
+    }
 }

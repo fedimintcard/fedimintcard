@@ -405,8 +405,9 @@ class PosUi(
 
     /**
      * Settings: the till URL, pairing (scan the till's QR code, or paste its text), offline payments
-     * (the kit, what is on this phone, charges the till refused), and the relay. [paired] is the
-     * paired till's URL, or null. [onPairText] returns false for text that is not a pairing code.
+     * (the kit, what is on this phone, the offline payments the till lost to double spends, charges
+     * the till refused), and the relay. [paired] is the paired till's URL, or null.
+     * [onPairText] returns false for text that is not a pairing code.
      * [onDismiss] deletes a refused charge's record and says, on the UI thread, whether it did.
      */
     fun settingsDialog(
@@ -441,7 +442,7 @@ class PosUi(
             setOnClickListener { onUnpair(); dialog?.dismiss() }
         }
         val offlineText = TextView(act).apply {
-            text = offlineLines(offline, System.currentTimeMillis()).joinToString("\n")
+            text = offlineLines(offline, System.currentTimeMillis(), tillStatus).joinToString("\n")
             setPadding(0, pad, 0, pad / 2)
         }
         val body = android.widget.LinearLayout(act).apply {
@@ -623,8 +624,14 @@ fun span(ms: Long): String {
     }
 }
 
-/** Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone, what failed last. */
-fun offlineLines(v: OfflineView, nowMs: Long): List<String> {
+/**
+ * Settings' lines on offline payments: whether they can be taken, the kit, what is on this phone,
+ * the offline payments the till lost to double spends (`offline.double_spent` in [till], its last
+ * status, shown whenever that status carries the field), what failed last. Each double spend is a
+ * sale already answered as paid offline that the registry later found spent elsewhere: a loss the
+ * till keeps for the operator, so the line names it as one.
+ */
+fun offlineLines(v: OfflineView, nowMs: Long, till: TillStatus? = null): List<String> {
     val lines = ArrayList<String>()
     when {
         v.starting -> lines += "Offline payments: starting…"
@@ -641,6 +648,7 @@ fun offlineLines(v: OfflineView, nowMs: Long): List<String> {
         }
     }
     v.stats?.let { lines += "On this phone: ${it.waiting} waiting to sync, ${it.signing} waiting for their cards, ${it.synced} synced." }
+    till?.offlineDoubleSpent?.let { lines += "Offline payments lost to double spends: $it" }
     v.kitError?.let { lines += "Last kit fetch failed: $it" }
     v.syncError?.let { lines += "Last sync stopped: $it" }
     return lines

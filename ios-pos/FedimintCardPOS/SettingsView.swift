@@ -34,7 +34,7 @@ struct SettingsView: View {
                         }
                         .padding(14).frame(maxWidth: .infinity, alignment: .leading).cardPanel()
 
-                        OfflinePanel(phone: pos.phone) { dismissing = $0 }
+                        OfflinePanel(phone: pos.phone, till: pos.status) { dismissing = $0 }
 
                         if scanning {
                             QRScannerView { code in
@@ -114,17 +114,22 @@ struct SettingsView: View {
 }
 
 /// The phone's offline side: the kit's age, expiry and caps, what the store holds (or why offline
-/// is off), why the last sync stopped short, and the charges the till refused, each with Dismiss.
+/// is off), the offline payments the till lost to double spends (when its status reports them),
+/// why the last sync stopped short, and the charges the till refused, each with Dismiss.
 struct OfflinePanel: View {
     let phone: OfflineSnapshot
+    /// The till's last status, for its `offline.double_spent` count; nil before one is read.
+    let till: TillStatus?
     let onDismiss: (RefusedOfflineCharge) -> Void
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { tl in
             VStack(alignment: .leading, spacing: 4) {
                 Text("OFFLINE").font(Fig.medium(11)).kerning(1.3).foregroundStyle(Palette.dim)
-                ForEach(offlinePanelLines(phone, nowMs: Int64(tl.date.timeIntervalSince1970 * 1000)), id: \.self) { line in
-                    Text(line).font(Fig.regular(14)).foregroundStyle(phone.enabled ? Palette.mist : Palette.bad)
+                let lines = offlinePanelLines(phone, nowMs: Int64(tl.date.timeIntervalSince1970 * 1000), till: till)
+                // Offline off: the first line (why) in the fault color, the till's count under it plain.
+                ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+                    Text(line).font(Fig.regular(14)).foregroundStyle(phone.enabled || i > 0 ? Palette.mist : Palette.bad)
                 }
                 ForEach(phone.refused) { r in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {

@@ -9,8 +9,11 @@ data class TillStatus(
     /** Offline charges queued on the till and not yet sent (`offline.queued`); 0 on a till without the field. */
     val offlineQueued: Long = 0,
     val offlineQueuedMsat: Long = 0,
-    /** Offline charges the registry refused as double spends (`offline.double_spent`). */
-    val offlineDoubleSpent: Long = 0,
+    /**
+     * Offline charges the registry refused as double spends (`offline.double_spent`); null when the
+     * status has no such field, so Settings shows the count only for a till that reports it.
+     */
+    val offlineDoubleSpent: Long? = null,
 )
 
 data class Note(val slot: Int, val msat: Long)

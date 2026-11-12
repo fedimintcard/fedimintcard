@@ -116,10 +116,14 @@ func unpairWarningText(_ count: Int) -> String {
 }
 
 /// Settings' offline lines: why offline is off, or the kit (its age and expiry, the phone's caps),
-/// what the store holds and why the last sync stopped short.
-func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64) -> [String] {
+/// what the store holds and why the last sync stopped short. When `till` (the till's last status)
+/// reports `offline.double_spent`, its count follows the phone's, offline on or off. Each one is a
+/// sale already answered as paid offline that the registry later found spent elsewhere: a loss the
+/// till keeps for the operator, so the line names it as one.
+func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64, till: TillStatus? = nil) -> [String] {
+    let doubleSpent = till?.offlineDoubleSpent.map { "Offline payments lost to double spends: \($0)" }
     guard phone.enabled else {
-        return ["Offline payments are off on this phone" + (phone.disabledReason.map { ": \($0)" } ?? ".")]
+        return ["Offline payments are off on this phone" + (phone.disabledReason.map { ": \($0)" } ?? "."), doubleSpent].compactMap { $0 }
     }
     var lines: [String] = []
     if let kit = phone.kit {
@@ -130,6 +134,7 @@ func offlinePanelLines(_ phone: OfflineSnapshot, nowMs: Int64) -> [String] {
     }
     let s = phone.stats
     lines.append("\(s.waiting) waiting to sync · \(s.signing) held for their cards · \(s.synced) synced")
+    if let doubleSpent { lines.append(doubleSpent) }
     if let why = phone.syncStopped { lines.append("Sync stopped: \(why)") }
     return lines
 }

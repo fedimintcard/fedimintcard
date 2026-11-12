@@ -190,13 +190,17 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
                     settings.baseUrl,
                     settings.pairing?.url,
                     view,
-                    { settings.baseUrl = it; failures = 0; pollNow() },
+                    {
+                        val changed = it != settings.baseUrl
+                        settings.baseUrl = it
+                        if (changed) tillChanged() else { failures = 0; pollNow() }
+                    },
                     { ui.showRelay() },
                     { startActivityForResult(Intent(this, ScanActivity::class.java), SCAN_REQUEST) },
                     { text -> pairWith(text) },
                     {
                         confirmPending(UNPAIR_TITLE, "Unpair") {
-                            settings.pairing = null; failures = 0; pollNow()
+                            settings.pairing = null; tillChanged()
                             Toast.makeText(this, "Unpaired: using USB", Toast.LENGTH_SHORT).show()
                         }
                     },
@@ -216,13 +220,24 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         val p = parsePairing(text) ?: return false
         val pair = {
             settings.pairing = p
-            failures = 0
-            pollNow()
+            tillChanged()
             Toast.makeText(this, "Paired with ${p.url}", Toast.LENGTH_SHORT).show()
         }
         val now = settings.pairing
         if (now == null || now == p) pair() else confirmPending(REPAIR_TITLE, "Pair", pair)
         return true
+    }
+
+    /**
+     * The phone left the till it was polling (another pairing, unpaired, or another URL saved): what
+     * that till said goes (its balance and federation on the home screen, its double-spend count in
+     * Settings), its failures with it, and the till set now is asked. Until it answers, nothing of a
+     * till shows (as on iOS).
+     */
+    private fun tillChanged() {
+        ui.setStatus(null)
+        failures = 0
+        pollNow()
     }
 
     /**
@@ -425,10 +440,14 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         if (flow.state is PosState.Signing || flow.state is PosState.TopUpLoading || pollInFlight) return
         pollInFlight = true
         val mark = offline.pollMark()
+        // The till this poll asks. An answer that lands after another URL was set (tillChanged) is
+        // that till's, not the one set now: dropped, failures included; the next poll asks again.
+        val url = settings.baseUrl
         Thread {
             val r = client.status()
             runOnUiThread {
                 pollInFlight = false
+                if (url != settings.baseUrl) return@runOnUiThread
                 if (r is TillResult.Ok) {
                     failures = 0
                     ui.setStatus(r.value)

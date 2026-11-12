@@ -9,8 +9,9 @@ struct TillStatus: Equatable {
     /// Offline charges queued on the till and not yet sent (`offline.queued`); 0 on a till without the field.
     var offlineQueued: Int64 = 0
     var offlineQueuedMsat: Int64 = 0
-    /// Offline charges the registry refused as double spends (`offline.double_spent`).
-    var offlineDoubleSpent: Int64 = 0
+    /// Offline charges the registry refused as double spends (`offline.double_spent`); nil when the
+    /// till's status has no such field, so Settings shows the count only for a till that reports it.
+    var offlineDoubleSpent: Int64? = nil
 }
 
 struct Note: Equatable { let slot: Int; let msat: Int64 }
