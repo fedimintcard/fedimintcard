@@ -23,6 +23,7 @@ fedimint-mint-common = { git = "https://github.com/fedimint/fedimint", tag = "v0
 fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-ln-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-ln-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
+fedimint-ln-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-lnv2-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }
 fedimint-mint-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0-beta.1" }

@@ -51,10 +51,13 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [dev-dependencies]
+# The lnv2 test gateway (tests/wallet_pay.rs) implements a fedimint trait declared with async-trait.
+async-trait = "0.1"
 fedimint-card-host-card = { path = "../card", features = ["softkit"] }
 fedimint-dummy-client = { workspace = true }
 fedimint-dummy-server = { workspace = true }
 fedimint-mint-server = { workspace = true }
+fedimint-ln-server = { workspace = true }
 fedimint-lnv2-server = { workspace = true }
 fedimint-testing = { workspace = true }
 p256 = { version = "0.13", features = ["ecdsa"] }
