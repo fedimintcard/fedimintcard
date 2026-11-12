@@ -80,6 +80,21 @@ impl Wallet {
         Ok(self.pay_bolt11_within(bolt11, Some(max_fee_msat), wait).await?.into())
     }
 
+    /// The currency of the invoices this wallet can pay: its Lightning module's network (ln, else
+    /// lnv2). `None` without a Lightning module.
+    pub async fn invoice_currency(&self) -> Option<lightning_invoice::Currency> {
+        let cfg = self.client.config().await;
+        if let Ok((_, c)) = cfg.get_first_module_by_kind::<fedimint_ln_common::config::LightningClientConfig>(fedimint_ln_common::KIND) {
+            return Some(c.network.0.into());
+        }
+        if let Ok((_, c)) =
+            cfg.get_first_module_by_kind::<fedimint_lnv2_client::common::config::LightningClientConfig>(fedimint_lnv2_client::common::KIND)
+        {
+            return Some(c.network.into());
+        }
+        None
+    }
+
     /// What became of the payment `operation_id` (hex, as [`WalletPay`] gives it), from the
     /// federation client's own record, following it for up to `wait` if it is still in flight.
     /// Errors when the id does not name a Lightning payment of this wallet.
