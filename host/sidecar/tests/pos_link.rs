@@ -13,11 +13,11 @@ use axum::extract::ConnectInfo;
 use axum::http::Request;
 use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::CardWallet;
+use fedimint_card_sidecar::pos;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, TillHandle};
 use fedimint_card_sidecar::wallet::Wallet;
-use fedimint_card_sidecar::pos;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
 use fedimint_core::Amount;
@@ -214,9 +214,8 @@ async fn a_charge_and_a_balance_over_a_link() -> anyhow::Result<()> {
         assert!(seen.contains(&ins), "INS {ins:02X} not seen: {seen:02X?}");
     }
     assert_eq!(bal.0, 200, "{:?}", bal.1);
-    let paid = charge.1["price_msat"].as_u64().unwrap()
-        + charge.1["overpaid_msat"].as_u64().unwrap()
-        + charge.1["fees_msat"].as_u64().unwrap();
+    let paid =
+        charge.1["price_msat"].as_u64().unwrap() + charge.1["overpaid_msat"].as_u64().unwrap() + charge.1["fees_msat"].as_u64().unwrap();
     assert_eq!(bal.1["live_msat"].as_u64().unwrap(), (1 << 16) + (1 << 14) - paid, "{:?}", bal.1);
     assert!(links.is_empty(), "every link is gone after its job");
     Ok(())

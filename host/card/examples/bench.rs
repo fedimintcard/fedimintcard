@@ -43,10 +43,7 @@ fn main() -> Result<()> {
         let t = Instant::now();
         let sig = card.sign(slot, &msg)?;
         times.push(t.elapsed());
-        if SECP256K1
-            .verify_schnorr(&sig, &Message::from_digest(msg), &pubkey)
-            .is_err()
-        {
+        if SECP256K1.verify_schnorr(&sig, &Message::from_digest(msg), &pubkey).is_err() {
             bail!("signature {i} did not verify");
         }
     }

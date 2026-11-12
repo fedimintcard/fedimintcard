@@ -189,11 +189,7 @@ pub fn authorized(token: Option<&str>, everywhere: bool, peer: Option<SocketAddr
 pub async fn auth(State(a): State<PosAuth>, req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
-    if authorized(a.token.as_deref(), a.everywhere, peer, header) {
-        next.run(req).await
-    } else {
-        unauthorized()
-    }
+    if authorized(a.token.as_deref(), a.everywhere, peer, header) { next.run(req).await } else { unauthorized() }
 }
 
 // ------------------------------------------------------------------ phones charging offline

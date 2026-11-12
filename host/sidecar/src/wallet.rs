@@ -16,20 +16,17 @@ use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::secret::RootSecretStrategy;
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::Amount;
+use fedimint_core::config::ClientConfig;
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{ModuleInstanceId, OperationId};
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::CoreConsensusVersion;
 use fedimint_core::secp256k1::rand::thread_rng;
-use fedimint_core::Amount;
-use fedimint_core::config::ClientConfig;
 use fedimint_ln_client::{InternalPayState, LnPayState, PayBolt11InvoiceError};
 use fedimint_ln_common::config::FeeToAmount as _;
-use fedimint_mint_client::{
-    MintClientInit, MintClientModule, OOBNotes, ReissueExternalNotesState,
-    ReissueExternalNotesError,
-};
+use fedimint_mint_client::{MintClientInit, MintClientModule, OOBNotes, ReissueExternalNotesError, ReissueExternalNotesState};
 use fedimint_mint_common::config::MintClientConfig;
 use futures::StreamExt as _;
 use lightning_invoice::Bolt11Invoice;
@@ -116,9 +113,9 @@ async fn lnv1_gateway(
     }
     let refresh_err = refresh.err().map(|e| format!("{e:?}")).unwrap_or_default();
     tracing::warn!("gateway refresh failed ({refresh_err}); asking the guardians one by one");
-    gateway_from_any_peer(&ln.api).await.ok_or_else(|| {
-        format!("reading the federation's gateways: {refresh_err}; no guardian listed a gateway on its own either")
-    })
+    gateway_from_any_peer(&ln.api)
+        .await
+        .ok_or_else(|| format!("reading the federation's gateways: {refresh_err}; no guardian listed a gateway on its own either"))
 }
 
 /// Ask each guardian for its gateway list on its own and pick a live gateway, vetted ones first.
@@ -186,9 +183,8 @@ impl Wallet {
     /// Wrap an already-built client (tests build theirs from the in-process federation).
     pub async fn from_client(client: ClientHandleArc) -> Result<Self> {
         let cfg = client.config().await;
-        let (mint_id, mint_cfg) = cfg
-            .get_first_module_by_kind::<MintClientConfig>(fedimint_mint_common::KIND)
-            .context("federation has no mint (v1) module")?;
+        let (mint_id, mint_cfg) =
+            cfg.get_first_module_by_kind::<MintClientConfig>(fedimint_mint_common::KIND).context("federation has no mint (v1) module")?;
         Ok(Self { client, mint_id, mint_cfg: mint_cfg.clone(), invite: None, consensus_version: cfg.global.consensus_version })
     }
 
@@ -213,10 +209,7 @@ impl Wallet {
                 .await
                 .context("downloading federation config from the invite code")?;
         }
-        let client = preview
-            .join(db, root_secret(&mnemonic))
-            .await
-            .context("joining the federation")?;
+        let client = preview.join(db, root_secret(&mnemonic)).await.context("joining the federation")?;
         std::fs::write(data_dir.join(INVITE_FILE), invite)?;
         // Joined with every module registered: the cached API versions already cover them.
         let _ = std::fs::write(data_dir.join(LN_VERSIONS_MARKER), b"ln module registered at join\n");
@@ -228,8 +221,8 @@ impl Wallet {
 
     /// Re-open a client joined earlier.
     pub async fn open(data_dir: &Path) -> Result<Self> {
-        let mnemonic = read_mnemonic(data_dir)
-            .with_context(|| format!("no wallet in {}: run `join <invite>` first", data_dir.display()))?;
+        let mnemonic =
+            read_mnemonic(data_dir).with_context(|| format!("no wallet in {}: run `join <invite>` first", data_dir.display()))?;
         let db = open_db(data_dir).await?;
         let lnv2 = Client::get_config_from_db(&db).await.is_some_and(|cfg| wants_lnv2(&cfg));
         // A wallet that joined before the ln module was registered has a cached API version set
@@ -249,10 +242,7 @@ impl Wallet {
         if lnv2 {
             builder = builder.with_lnv2();
         }
-        let client = builder
-            .open(connectors().await, db, root_secret(&mnemonic))
-            .await
-            .context("opening the client database")?;
+        let client = builder.open(connectors().await, db, root_secret(&mnemonic)).await.context("opening the client database")?;
         if !marker.exists() {
             let _ = std::fs::write(&marker, b"ln module registered; API versions refetched once\n");
         }
@@ -260,9 +250,7 @@ impl Wallet {
             let _ = std::fs::write(&marker_v2, b"lnv2 module registered; API versions refetched once\n");
         }
         let mut w = Self::from_client(Arc::new(client)).await?;
-        w.invite = std::fs::read_to_string(data_dir.join(INVITE_FILE))
-            .ok()
-            .and_then(|s| InviteCode::from_str(s.trim()).ok());
+        w.invite = std::fs::read_to_string(data_dir.join(INVITE_FILE)).ok().and_then(|s| InviteCode::from_str(s.trim()).ok());
         Ok(w)
     }
 
@@ -332,10 +320,8 @@ impl Wallet {
                 return LnPayOutcome::refused(no_gateway.unwrap_or_else(|| "no Lightning gateway".into()));
             }
             Err(e) => {
-                let insufficient_funds = matches!(
-                    e,
-                    PayBolt11InvoiceError::Transaction(fedimint_client::module::TransactionSubmitError::InsufficientFunds(_))
-                );
+                let insufficient_funds =
+                    matches!(e, PayBolt11InvoiceError::Transaction(fedimint_client::module::TransactionSubmitError::InsufficientFunds(_)));
                 return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds };
             }
         };
@@ -400,9 +386,7 @@ impl Wallet {
             }
             failed("the payment ended without an outcome".into())
         };
-        Ok(tokio::time::timeout(wait, follow)
-            .await
-            .unwrap_or_else(|_| LnPayOutcome::Pending { operation_id: operation_id.clone() }))
+        Ok(tokio::time::timeout(wait, follow).await.unwrap_or_else(|_| LnPayOutcome::Pending { operation_id: operation_id.clone() }))
     }
 
     async fn pay_v2(&self, invoice: Bolt11Invoice, max_fee_msat: Option<u64>, wait: Duration) -> LnPayOutcome {
@@ -511,14 +495,7 @@ impl Wallet {
             bail!("reissue stream ended early")
         };
         tokio::time::timeout(Duration::from_secs(120), wait).await.context("reissue timed out")??;
-        let fee_msat = self
-            .client
-            .get_operation_fees(op)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.get_bitcoin().msats)
-            .unwrap_or(0);
+        let fee_msat = self.client.get_operation_fees(op).await.ok().flatten().map(|a| a.get_bitcoin().msats).unwrap_or(0);
         Ok(Imported { face, fee_msat, already: false })
     }
 
@@ -620,11 +597,7 @@ async fn connectors() -> ConnectorRegistry {
 }
 
 async fn open_db(data_dir: &Path) -> Result<Database> {
-    Ok(fedimint_rocksdb::RocksDb::build(data_dir.join(DB_DIR))
-        .open()
-        .await
-        .context("opening RocksDB")?
-        .into())
+    Ok(fedimint_rocksdb::RocksDb::build(data_dir.join(DB_DIR)).open().await.context("opening RocksDB")?.into())
 }
 
 fn root_secret(mnemonic: &Mnemonic) -> RootSecret {
@@ -679,7 +652,8 @@ mod tests {
     fn fee_and_balance_are_checked_before_paying() {
         assert_eq!(refuse_fee_or_balance(1_000, Some(1_000), 10_000, Some(11_000)), None);
         assert_eq!(refuse_fee_or_balance(1_000, None, 10_000, None), None);
-        let Some(LnPayOutcome::Refused { reason, insufficient_funds: false }) = refuse_fee_or_balance(1_001, Some(1_000), 10_000, Some(1 << 30))
+        let Some(LnPayOutcome::Refused { reason, insufficient_funds: false }) =
+            refuse_fee_or_balance(1_001, Some(1_000), 10_000, Some(1 << 30))
         else {
             panic!("a fee over the cap is refused")
         };

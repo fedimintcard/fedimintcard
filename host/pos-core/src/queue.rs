@@ -410,7 +410,10 @@ mod tests {
         q.commit(|f| f.charges.push(charge("b", ChargeState::Queued, 2000))).unwrap();
         let e = q.set("a", |c| c.state = ChargeState::Reported).unwrap_err();
         assert!(format!("{e:#}").contains("injected"), "{e:#}");
-        assert_eq!(q.file.charges.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![("a", ChargeState::Queued), ("b", ChargeState::Queued)]);
+        assert_eq!(
+            q.file.charges.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(),
+            vec![("a", ChargeState::Queued), ("b", ChargeState::Queued)]
+        );
         // Once: the next write goes through, and the disk has what memory has.
         q.set("a", |c| c.state = ChargeState::Reported).unwrap();
         let on_disk = Queue::open(dir.path()).unwrap();

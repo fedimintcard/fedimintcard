@@ -42,11 +42,7 @@ mod imp {
 
     pub async fn serve(listen: SocketAddr, reader: Option<String>) -> Result<()> {
         let state = Arc::new(Relay { reader_name: reader, card: Mutex::new(None) });
-        let app = Router::new()
-            .route("/apdu", post(apdu))
-            .route("/reset", post(reset))
-            .route("/health", get(health))
-            .with_state(state);
+        let app = Router::new().route("/apdu", post(apdu)).route("/reset", post(reset)).route("/health", get(health)).with_state(state);
         let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
         eprintln!("relay: the USB reader's card at http://{listen}");
         axum::serve(listener, app).await?;

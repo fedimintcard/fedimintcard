@@ -16,8 +16,8 @@
 //! plan requires.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::future::Future;
+use std::rc::Rc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -65,8 +65,7 @@ async fn fx_with(card: Box<dyn Card>, funds: Amount) -> anyhow::Result<Fx> {
         "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend"
     );
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
-    let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).disable_mint_fees().build())
-        .await?;
+    let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).disable_mint_fees().build()).await?;
     let client = fed.new_client().await;
     fund(&client, funds).await?;
     let wallet = Wallet::from_client(client).await?;
@@ -89,11 +88,7 @@ impl Card for Shared {
     fn get_pub(&mut self, slot: u8) -> anyhow::Result<fedimint_core::secp256k1::XOnlyPublicKey> {
         self.0.borrow_mut().get_pub(slot)
     }
-    fn sign(
-        &mut self,
-        slot: u8,
-        msg32: &[u8; 32],
-    ) -> anyhow::Result<fedimint_core::secp256k1::schnorr::Signature> {
+    fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> anyhow::Result<fedimint_core::secp256k1::schnorr::Signature> {
         self.0.borrow_mut().sign(slot, msg32)
     }
     fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -104,28 +99,15 @@ impl Card for Shared {
 /// Build the till handle over `f`, and return it with the actor future the caller must poll.
 /// The router is built per call (`till::router` clones only the handle), so one actor can serve
 /// several requests in a test.
-async fn serve(
-    f: Fx,
-    card: Rc<RefCell<SoftCard>>,
-) -> (till::TillHandle, impl Future<Output = ()>) {
+async fn serve(f: Fx, card: Rc<RefCell<SoftCard>>) -> (till::TillHandle, impl Future<Output = ()>) {
     let sales = SalesStore::open(f._dir.path().join("sales.json")).unwrap();
     let opener_card = card;
-    till::new(
-        f.cw,
-        "http://127.0.0.1:1".into(),
-        sales,
-        Box::new(move || Ok(Box::new(Shared(opener_card.clone())) as Box<dyn Card>)),
-    )
-    .await
+    till::new(f.cw, "http://127.0.0.1:1".into(), sales, Box::new(move || Ok(Box::new(Shared(opener_card.clone())) as Box<dyn Card>))).await
 }
 
 async fn call(app: axum::Router, method: &str, path: &str, body: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_owned()))
-        .unwrap();
+    let req =
+        Request::builder().method(method).uri(path).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
@@ -269,10 +251,7 @@ async fn key_setup_refuses_a_foreign_card() -> anyhow::Result<()> {
     let (code, body) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
     assert_eq!(code, 502, "{body}");
     assert_eq!(body["error"], "card_error");
-    assert!(
-        body["detail"].as_str().unwrap().contains("did not produce"),
-        "the refusal must say why: {body}"
-    );
+    assert!(body["detail"].as_str().unwrap().contains("did not produce"), "the refusal must say why: {body}");
     Ok(())
 }
 
@@ -318,14 +297,10 @@ async fn issue_refuses_a_card_that_already_holds_notes() -> anyhow::Result<()> {
     let (h, actor) = serve(f, shared.clone()).await;
     let mut actor = Box::pin(actor);
 
-    let (code, body) =
-        call_with_actor!(&mut actor, h, "POST", "/v1/cards/issue", r#"{"amounts_msat":[1000],"client_ref":"second-tap"}"#);
+    let (code, body) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/issue", r#"{"amounts_msat":[1000],"client_ref":"second-tap"}"#);
     assert_eq!(code, 409, "{body}");
     assert_eq!(body["error"], "card_holds_notes");
-    assert!(
-        body["detail"].as_str().unwrap().contains("double its value"),
-        "the refusal must say the risk: {body}"
-    );
+    assert!(body["detail"].as_str().unwrap().contains("double its value"), "the refusal must say the risk: {body}");
     Ok(())
 }
 
@@ -345,13 +320,7 @@ async fn issue_onto_a_full_card_is_no_exact_plan_not_a_server_fault() -> anyhow:
     let (h, actor) = serve(f, shared.clone()).await;
     let mut actor = Box::pin(actor);
 
-    let (code, body) = call_with_actor!(
-        &mut actor,
-        h,
-        "POST",
-        "/v1/cards/issue",
-        r#"{"amounts_msat":[1000],"client_ref":"full-card"}"#
-    );
+    let (code, body) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/issue", r#"{"amounts_msat":[1000],"client_ref":"full-card"}"#);
     assert_eq!(code, 422, "{body}");
     assert_eq!(body["error"], "no_exact_plan");
     let detail = body["detail"].as_str().unwrap();

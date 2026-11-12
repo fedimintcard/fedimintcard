@@ -192,11 +192,7 @@ impl<'w> Loader<'w> {
         let short_id = short_id_of(&slot0);
         let mut free = self.ops.free_slots(&short_id).await.context("asking ops for the card's free slots")?;
         let ours = self.wallet.federation_id().to_string();
-        ensure!(
-            free.federation_id == ours,
-            "card {short_id} belongs to federation {}, and this wallet is in {ours}",
-            free.federation_id
-        );
+        ensure!(free.federation_id == ours, "card {short_id} belongs to federation {}, and this wallet is in {ours}", free.federation_id);
         if let Some(keyer) = &self.keyer {
             let n = crate::ops::slots_to_key(notes.len(), free.free.len(), free.unkeyed_slots.len());
             if n > 0 && free.free.len() + n >= notes.len() {
@@ -208,12 +204,7 @@ impl<'w> Loader<'w> {
             }
         }
         if free.free.len() < notes.len() {
-            return Err(anyhow!(CardFull {
-                short_id,
-                free: free.free.len(),
-                needed: notes.len(),
-                unkeyed: free.unkeyed_slots.len()
-            }));
+            return Err(anyhow!(CardFull { short_id, free: free.free.len(), needed: notes.len(), unkeyed: free.unkeyed_slots.len() }));
         }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
         let bal = self.wallet.balance_msat().await?;
@@ -306,10 +297,10 @@ impl<'w> Loader<'w> {
                         Some((n.slot, key, n.amount_msat, sig.clone()))
                     })
                     .collect();
-                if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once()) {
-                    if let Err(e) = crate::glue::write_notes(card, &notes) {
-                        tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
-                    }
+                if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once())
+                    && let Err(e) = crate::glue::write_notes(card, &notes)
+                {
+                    tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
                 }
                 let live = pending.notes.iter().map(|n| (n.slot, n.amount_msat)).collect();
                 Ok(LoadReport { short_id, txid: pending.txid, notes: live, resumed })
@@ -328,8 +319,7 @@ impl<'w> Loader<'w> {
     pub async fn resume_each(&self) -> Result<Vec<Finished>> {
         let mut done = vec![];
         for p in self.pending()? {
-            let live =
-                self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
+            let live = self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
             done.push(Finished { load: p, live });
         }
         Ok(done)
@@ -344,9 +334,7 @@ impl<'w> Loader<'w> {
     /// [`Self::finish`], answering each note's signature (hex) in the order of `p.notes`.
     async fn finish_signed(&self, p: &PendingLoad) -> Result<Option<Vec<String>>> {
         let client = &self.wallet.client;
-        let op = OperationId(
-            hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?,
-        );
+        let op = OperationId(hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?);
         let txid = TransactionId::from_str(&p.txid).map_err(|_| anyhow!("bad txid in the journal"))?;
         let outcome = if client.operation_log().get_operation(op).await.is_none() {
             // The build never committed: the federation never saw it.

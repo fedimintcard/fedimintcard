@@ -17,12 +17,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use fedimint_card_host_card::{BridgeError, Card, Certificate, SlotState, SoftCard, open_pin_session};
-use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_pos_core::kit::Kit;
 use fedimint_card_pos_core::store::Store;
+use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::offline::{ChargeState, Offline, OfflineCharge, OfflineConfig};
-use fedimint_card_sidecar::pool::{self, TillKeys};
 use fedimint_card_sidecar::ops::{MAX_KEY_PER_TAP, Ops, OpsConfig, SPARE_TARGET, SpareConfig, short_id_of};
+use fedimint_card_sidecar::pool::{self, TillKeys};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Conn, OpsState, card_balance_job, charge_job_with, send_offline_job};
@@ -265,7 +265,8 @@ async fn outcome(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> R
         // A release for every input's slot and every change slot (a load has none).
         let ins = inputs.as_array().unwrap();
         if !ins.is_empty() {
-            let mut slots: Vec<u8> = c.notes.iter().filter(|n| ins.contains(&n["nonce"])).map(|n| n["slot"].as_u64().unwrap() as u8).collect();
+            let mut slots: Vec<u8> =
+                c.notes.iter().filter(|n| ins.contains(&n["nonce"])).map(|n| n["slot"].as_u64().unwrap() as u8).collect();
             slots.extend(change.as_array().unwrap().iter().map(|ch| ch["slot"].as_u64().unwrap() as u8));
             slots.sort();
             slots.dedup();
@@ -545,7 +546,11 @@ async fn a_3_0_card_pays_online_and_holds_its_change() -> anyhow::Result<()> {
     assert!(body.get("offline").is_none(), "{body}");
     let change = slots_of(&body, "change");
     assert!(!change.is_empty(), "{body}");
-    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Note), "the change is on the card: {:?}", slot_states(&card, &change));
+    assert!(
+        slot_states(&card, &change).iter().all(|s| *s == SlotState::Note),
+        "the change is on the card: {:?}",
+        slot_states(&card, &change)
+    );
     for s in slots_of(&body, "inputs") {
         // Spent, then renewed in the same tap (GEN_KEY P2=1 on a SPENT slot).
         assert!(matches!(card.borrow().slot_state(s as u8).unwrap(), SlotState::Spent | SlotState::Keyed));
@@ -806,7 +811,11 @@ async fn a_retap_after_the_card_left_mid_sign_is_the_same_charge() -> anyhow::Re
     assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began, not a second one: {body}");
     assert_eq!(body["offline"], true, "{body}");
     let q = t.off.queue.lock().unwrap().file.charges.clone();
-    assert_eq!(q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![(first[0].txid.as_str(), ChargeState::Queued)], "one charge for one sale");
+    assert_eq!(
+        q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(),
+        vec![(first[0].txid.as_str(), ChargeState::Queued)],
+        "one charge for one sale"
+    );
     assert_eq!(spent_slots(&card), 2, "two inputs, each signed once");
     assert!(t.sale("pulled").offline);
     // A third tap of the sale is the sale.
@@ -880,7 +889,11 @@ async fn an_online_retap_of_a_sale_left_signing_offline_finishes_it() -> anyhow:
     assert_eq!(body["txid"], json!(first[0].txid), "the charge the card began, not a second one: {body}");
     assert_eq!(body["offline"], true, "{body}");
     let q = t.off.queue.lock().unwrap().file.charges.clone();
-    assert_eq!(q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(), vec![(first[0].txid.as_str(), ChargeState::Queued)], "one charge for one sale");
+    assert_eq!(
+        q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(),
+        vec![(first[0].txid.as_str(), ChargeState::Queued)],
+        "one charge for one sale"
+    );
     assert_eq!(spent_slots(&card), 2, "two inputs, each signed once");
     assert!(t.sale("pulled").offline);
     let sent = t.send().await;
@@ -1149,7 +1162,9 @@ async fn a_phone_charge_is_taken_once_and_a_pool_entry_never_twice() -> anyhow::
         let c = q.file.charges.iter().find(|c| c.txid == taken.txid).expect("queued");
         assert_eq!(c.state, ChargeState::Queued);
         assert_eq!(c.host.len(), c.pool.len());
-        assert!(c.host.iter().zip(&c.pool).all(|(h, p)| h.out_idx == Some(p.out_idx) && h.amount_msat == p.amount_msat && h.group == c.txid));
+        assert!(
+            c.host.iter().zip(&c.pool).all(|(h, p)| h.out_idx == Some(p.out_idx) && h.amount_msat == p.amount_msat && h.group == c.txid)
+        );
         assert_eq!((c.till_msat, c.unsigned_hex.clone()), (taken.till_msat, taken.unsigned_hex.clone()));
         assert!(taken.inputs.iter().all(|i| q.file.spent.contains(&i.nonce)), "the till never takes those notes offline itself");
     }
@@ -1160,7 +1175,14 @@ async fn a_phone_charge_is_taken_once_and_a_pool_entry_never_twice() -> anyhow::
     assert_eq!(t.off.stats().queued, 1);
     let used = t.ledger()["entries"].as_array().unwrap().iter().filter(|e| e["state"]["kind"] == "used").count();
     assert_eq!(used, taken.pool.len());
-    assert!(t.ledger()["entries"].as_array().unwrap().iter().filter(|e| e["state"]["kind"] == "used").all(|e| e["state"]["secret_key"].is_null()));
+    assert!(
+        t.ledger()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["state"]["kind"] == "used")
+            .all(|e| e["state"]["secret_key"].is_null())
+    );
 
     // The phone restored from a backup takes the same pool entries again: refused.
     let copy = phone.restored_copy();
@@ -1181,7 +1203,10 @@ async fn a_phone_charge_is_taken_once_and_a_pool_entry_never_twice() -> anyhow::
     // Past its kit's redeem window: refused.
     let late = phone.take(&card, &kit, 20_000, "p-late")?;
     let body: Vec<Value> = phone.drained().into_iter().filter(|c| c["txid"] == json!(late.txid)).collect();
-    assert_eq!(statuses(&t.ingest_at(&phone.id(), body.clone(), kit.expires_at_ms + 31 * DAY_MS)), vec![("refused", Some("pool_entry_expired"))]);
+    assert_eq!(
+        statuses(&t.ingest_at(&phone.id(), body.clone(), kit.expires_at_ms + 31 * DAY_MS)),
+        vec![("refused", Some("pool_entry_expired"))]
+    );
     assert_eq!(statuses(&t.ingest(&phone.id(), body)), vec![("queued", None)], "within it, taken");
     Ok(())
 }
@@ -1221,7 +1246,10 @@ async fn a_phone_charge_with_a_bad_signature_or_note_is_refused() -> anyhow::Res
     let mut lying = c.clone();
     lying["till_msat"] = json!(1);
     lying["pool"][0]["amount_msat"] = json!(1);
-    assert_eq!(statuses(&t.ingest(&phone.id(), vec![lying, json!({"txid": "x"})])), vec![("refused", Some("bad_charge")), ("refused", Some("bad_charge"))]);
+    assert_eq!(
+        statuses(&t.ingest(&phone.id(), vec![lying, json!({"txid": "x"})])),
+        vec![("refused", Some("bad_charge")), ("refused", Some("bad_charge"))]
+    );
     assert_eq!(t.off.stats().queued, 0, "nothing refused was queued");
     // The charge itself is fine.
     assert_eq!(statuses(&t.ingest(&phone.id(), vec![c])), vec![("queued", None)]);
@@ -1340,7 +1368,12 @@ async fn the_offline_routes_answer_through_the_tills_api() -> anyhow::Result<()>
     phone.take(&card, &kit, 20_000, "http")?;
     let header_time = fedimint_card_host_card::v3::header_time(&hex::decode(H900200)?.try_into().unwrap());
     assert_eq!(card.borrow_mut().get_state()?.now, header_time, "the card's clock moved to the kit's header");
-    let post = |body: String| axum::http::Request::post("/v1/offline/charges").header("content-type", "application/json").body(axum::body::Body::from(body)).unwrap();
+    let post = |body: String| {
+        axum::http::Request::post("/v1/offline/charges")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
     let (s, _, v) = call(post(phone.store.drain(50).body)).await;
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["results"][0]["status"], "queued", "{v}");
@@ -1506,7 +1539,11 @@ async fn a_double_spend_releases_the_change_slots_at_the_next_online_tap() -> an
 
     // The next online tap: CHANGE -> KEYED, and the slots take notes again.
     t.load(&card, &[1 << 15]).await?;
-    assert!(slot_states(&card, &change).iter().all(|s| matches!(s, SlotState::Keyed | SlotState::Note)), "{:?}", slot_states(&card, &change));
+    assert!(
+        slot_states(&card, &change).iter().all(|s| matches!(s, SlotState::Keyed | SlotState::Note)),
+        "{:?}",
+        slot_states(&card, &change)
+    );
     let input = slots_of(&body, "inputs")[0];
     assert_eq!(card.borrow().slot_state(input as u8), Some(SlotState::Spent), "the input was spent elsewhere: not released");
     // Free slots are taken lowest first, and the released ones are the lowest.
@@ -1560,7 +1597,10 @@ async fn a_charge_the_federation_rejects_releases_its_note_and_change_and_the_no
     let sent = t.send().await;
     assert_eq!(sent["rejected"].as_array().unwrap().len(), 1, "{sent}");
     let txid = body["txid"].as_str().unwrap();
-    assert!(t.reg.outcomes.lock().unwrap().iter().any(|o| o["txid"] == txid && o["accepted"] == false), "the rejection reached the registry");
+    assert!(
+        t.reg.outcomes.lock().unwrap().iter().any(|o| o["txid"] == txid && o["accepted"] == false),
+        "the rejection reached the registry"
+    );
     let detail = t.off.queue.lock().unwrap().file.charges[0].detail.clone().unwrap();
     assert!(detail.contains("released at its next online tap"), "{detail}");
     let mut want: Vec<u64> = inputs.iter().chain(&change).copied().collect();

@@ -119,13 +119,11 @@ async fn post(url: &str, body: &Value) -> Result<(u16, Value)> {
 pub async fn start(data_dir: &Path, ops_url: &str, name: &str, replace: bool) -> Result<Claim> {
     let name = check_name(name)?;
     let base = origin(ops_url)?;
-    if !replace {
-        if let Some(cfg) = read_ops(data_dir)? {
-            bail!(
-                "this till is already connected to {}; pass --replace to ask for a new token (the current one works until it is approved)",
-                cfg.url
-            );
-        }
+    if !replace && let Some(cfg) = read_ops(data_dir)? {
+        bail!(
+            "this till is already connected to {}; pass --replace to ask for a new token (the current one works until it is approved)",
+            cfg.url
+        );
     }
     let (status, v) = post(&format!("{base}/till-claims"), &json!({"name": name})).await?;
     if status != 200 {
@@ -152,9 +150,7 @@ pub fn read_claim(data_dir: &Path) -> Result<Option<Claim>> {
 /// The till token `serve` keeps (`till-ops.json`), if there is one.
 pub fn read_ops(data_dir: &Path) -> Result<Option<OpsConfig>> {
     // A file holding only the certificate key (a till given its token by flag) has no token.
-    Ok(read_json::<OpsFile>(&ops_path(data_dir))?
-        .filter(|f| !f.token.is_empty())
-        .map(|f| OpsConfig { url: f.url, token: f.token }))
+    Ok(read_json::<OpsFile>(&ops_path(data_dir))?.filter(|f| !f.token.is_empty()).map(|f| OpsConfig { url: f.url, token: f.token }))
 }
 
 pub fn write_ops(data_dir: &Path, cfg: &OpsConfig) -> Result<()> {
@@ -215,7 +211,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Poll {
     Pending,
-    Approved { till_id: u64, token: String },
+    Approved {
+        till_id: u64,
+        token: String,
+    },
     /// 404: unknown, expired, or never this secret's. It will not come back.
     Gone,
 }

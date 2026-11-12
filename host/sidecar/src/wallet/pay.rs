@@ -31,32 +31,19 @@ use super::{LnPayOutcome, Wallet, parse_bolt11};
 pub enum WalletPay {
     /// The invoice is paid. `fee_msat` is the gateway's fee: 0 for an invoice of this federation,
     /// paid inside it. The federation's own transaction fees are not included.
-    Paid {
-        preimage: String,
-        fee_msat: u64,
-        operation_id: String,
-    },
+    Paid { preimage: String, fee_msat: u64, operation_id: String },
     /// Certainly not paid, and the value is in the wallet. `operation_id` is set when a payment
     /// was funded and came back; `insufficient_funds` when the balance could not cover it.
-    Failed {
-        reason: String,
-        operation_id: Option<String>,
-        insufficient_funds: bool,
-    },
+    Failed { reason: String, operation_id: Option<String>, insufficient_funds: bool },
     /// Not settled: resolve it later with `operation_id`.
-    Unknown {
-        reason: String,
-        operation_id: String,
-    },
+    Unknown { reason: String, operation_id: String },
 }
 
 impl WalletPay {
     /// The payment's operation id, when one was funded.
     pub fn operation_id(&self) -> Option<&str> {
         match self {
-            Self::Paid { operation_id, .. } | Self::Unknown { operation_id, .. } => {
-                Some(operation_id)
-            }
+            Self::Paid { operation_id, .. } | Self::Unknown { operation_id, .. } => Some(operation_id),
             Self::Failed { operation_id, .. } => operation_id.as_deref(),
         }
     }
@@ -65,44 +52,15 @@ impl WalletPay {
 impl From<LnPayOutcome> for WalletPay {
     fn from(outcome: LnPayOutcome) -> Self {
         match outcome {
-            LnPayOutcome::Paid {
-                preimage,
-                fee_msat,
-                operation_id,
-            } => Self::Paid {
-                preimage,
-                fee_msat,
-                operation_id,
-            },
-            LnPayOutcome::Refused {
-                reason,
-                insufficient_funds,
-            } => Self::Failed {
-                reason,
-                operation_id: None,
-                insufficient_funds,
-            },
-            LnPayOutcome::Refunded {
-                reason,
-                operation_id,
-            } => Self::Failed {
-                reason,
-                operation_id: Some(operation_id),
-                insufficient_funds: false,
-            },
-            LnPayOutcome::Pending { operation_id } => Self::Unknown {
-                reason: "the payment is still in flight".into(),
-                operation_id,
-            },
+            LnPayOutcome::Paid { preimage, fee_msat, operation_id } => Self::Paid { preimage, fee_msat, operation_id },
+            LnPayOutcome::Refused { reason, insufficient_funds } => Self::Failed { reason, operation_id: None, insufficient_funds },
+            LnPayOutcome::Refunded { reason, operation_id } => {
+                Self::Failed { reason, operation_id: Some(operation_id), insufficient_funds: false }
+            }
+            LnPayOutcome::Pending { operation_id } => Self::Unknown { reason: "the payment is still in flight".into(), operation_id },
             // The client could not settle it: the value may be with the gateway or on its way
             // back, so this is not a failure anybody may refund.
-            LnPayOutcome::Failed {
-                reason,
-                operation_id,
-            } => Self::Unknown {
-                reason,
-                operation_id,
-            },
+            LnPayOutcome::Failed { reason, operation_id } => Self::Unknown { reason, operation_id },
         }
     }
 }
@@ -114,20 +72,12 @@ impl Wallet {
     /// funds a second one while one could still pay. Only after a certain failure does it start
     /// a new attempt. Errors for an invoice that does not parse or has no amount, and when the
     /// wallet's earlier payments of it cannot be read; nothing is funded then.
-    pub async fn pay_invoice(
-        &self,
-        bolt11: &str,
-        max_fee_msat: u64,
-        wait: Duration,
-    ) -> Result<WalletPay> {
+    pub async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64, wait: Duration) -> Result<WalletPay> {
         // The guard against a second attempt lives under `ln pay` (`pay_bolt11_within`), so the
         // operator's `ln pay` has it too: for ln `earlier_v1` answers an earlier attempt that is
         // paid or not settled; lnv2 never starts a second attempt at an invoice
         // (`DuplicatePaymentAttempt`, answered by following that attempt).
-        Ok(self
-            .pay_bolt11_within(bolt11, Some(max_fee_msat), wait)
-            .await?
-            .into())
+        Ok(self.pay_bolt11_within(bolt11, Some(max_fee_msat), wait).await?.into())
     }
 
     /// What became of the payment `operation_id` (hex, as [`WalletPay`] gives it), from the
@@ -135,12 +85,8 @@ impl Wallet {
     /// Errors when the id does not name a Lightning payment of this wallet.
     pub async fn resolve_pay(&self, operation_id: &str, wait: Duration) -> Result<WalletPay> {
         let op = parse_operation_id(operation_id)?;
-        let entry = self
-            .client
-            .operation_log()
-            .get_operation(op)
-            .await
-            .ok_or_else(|| anyhow!("this wallet has no operation {operation_id}"))?;
+        let entry =
+            self.client.operation_log().get_operation(op).await.ok_or_else(|| anyhow!("this wallet has no operation {operation_id}"))?;
         let kind = entry.operation_module_kind();
         let outcome = if kind == fedimint_ln_common::KIND.as_str() {
             self.follow_v1(op, wait).await?
@@ -170,24 +116,13 @@ impl Wallet {
     /// there is no earlier attempt or every one failed for certain (refunded). Fedimint's ln
     /// client starts a new attempt after any attempt that is neither paid nor running, including
     /// the unsettled ones, so this check runs before every ln payment.
-    pub(super) async fn earlier_v1(
-        &self,
-        invoice: &Bolt11Invoice,
-        wait: Duration,
-    ) -> Result<Option<LnPayOutcome>> {
+    pub(super) async fn earlier_v1(&self, invoice: &Bolt11Invoice, wait: Duration) -> Result<Option<LnPayOutcome>> {
         let mut found = Vec::new();
         for op in self.ln_pay_operations(invoice).await? {
             found.push(self.follow_v1(op, wait).await?);
         }
-        let paid = found
-            .iter()
-            .find(|o| matches!(o, LnPayOutcome::Paid { .. }));
-        let open = found.iter().find(|o| {
-            matches!(
-                o,
-                LnPayOutcome::Pending { .. } | LnPayOutcome::Failed { .. }
-            )
-        });
+        let paid = found.iter().find(|o| matches!(o, LnPayOutcome::Paid { .. }));
+        let open = found.iter().find(|o| matches!(o, LnPayOutcome::Pending { .. } | LnPayOutcome::Failed { .. }));
         Ok(paid.or(open).cloned())
     }
 
@@ -204,13 +139,7 @@ impl Wallet {
             };
             for index in 1..=last {
                 let op = ln_pay_operation_id(hash, index);
-                if self
-                    .client
-                    .operation_log()
-                    .get_operation(op)
-                    .await
-                    .is_some()
-                {
+                if self.client.operation_log().get_operation(op).await.is_some() {
                     ops.push(op);
                 }
             }
@@ -222,15 +151,9 @@ impl Wallet {
     async fn pay_operations(&self, invoice: &Bolt11Invoice) -> Result<Vec<OperationId>> {
         let mut ops = self.ln_pay_operations(invoice).await?;
         if let Ok(ln) = self.lightning_v2() {
-            match ln
-                .get_invoice_send_status(invoice)
-                .await
-                .context("reading the wallet's lnv2 payments")?
-            {
+            match ln.get_invoice_send_status(invoice).await.context("reading the wallet's lnv2 payments")? {
                 InvoiceSendStatus::NotAttempted => {}
-                InvoiceSendStatus::InFlight(op)
-                | InvoiceSendStatus::Succeeded(op)
-                | InvoiceSendStatus::Failed(op) => ops.push(op),
+                InvoiceSendStatus::InFlight(op) | InvoiceSendStatus::Succeeded(op) | InvoiceSendStatus::Failed(op) => ops.push(op),
             }
         }
         Ok(ops)
@@ -250,9 +173,7 @@ fn ln_pay_operation_id(payment_hash: &sha256::Hash, index: u16) -> OperationId {
 
 fn parse_operation_id(text: &str) -> Result<OperationId> {
     let bytes = hex::decode(text.trim()).map_err(|e| anyhow!("not an operation id: {e}"))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("not an operation id: it is 32 bytes of hex"))?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("not an operation id: it is 32 bytes of hex"))?;
     Ok(OperationId(bytes))
 }
 
@@ -270,76 +191,33 @@ mod tests {
     use super::*;
 
     fn paid(op: &str) -> WalletPay {
-        WalletPay::Paid {
-            preimage: "00".repeat(32),
-            fee_msat: 7,
-            operation_id: op.into(),
-        }
+        WalletPay::Paid { preimage: "00".repeat(32), fee_msat: 7, operation_id: op.into() }
     }
 
     fn unknown(op: &str) -> WalletPay {
-        WalletPay::Unknown {
-            reason: "in flight".into(),
-            operation_id: op.into(),
-        }
+        WalletPay::Unknown { reason: "in flight".into(), operation_id: op.into() }
     }
 
     fn failed(op: Option<&str>) -> WalletPay {
-        WalletPay::Failed {
-            reason: "refunded".into(),
-            operation_id: op.map(Into::into),
-            insufficient_funds: false,
-        }
+        WalletPay::Failed { reason: "refunded".into(), operation_id: op.map(Into::into), insufficient_funds: false }
     }
 
     #[test]
     fn only_a_refusal_or_a_refund_is_a_certain_failure() {
         let op = "ab".repeat(32);
-        let refused = LnPayOutcome::Refused {
-            reason: "fee".into(),
-            insufficient_funds: true,
-        };
-        assert_eq!(
-            WalletPay::from(refused),
-            WalletPay::Failed {
-                reason: "fee".into(),
-                operation_id: None,
-                insufficient_funds: true
-            }
-        );
-        let refunded = LnPayOutcome::Refunded {
-            reason: "gateway".into(),
-            operation_id: op.clone(),
-        };
+        let refused = LnPayOutcome::Refused { reason: "fee".into(), insufficient_funds: true };
+        assert_eq!(WalletPay::from(refused), WalletPay::Failed { reason: "fee".into(), operation_id: None, insufficient_funds: true });
+        let refunded = LnPayOutcome::Refunded { reason: "gateway".into(), operation_id: op.clone() };
         assert_eq!(
             WalletPay::from(refunded),
-            WalletPay::Failed {
-                reason: "gateway".into(),
-                operation_id: Some(op.clone()),
-                insufficient_funds: false
-            }
+            WalletPay::Failed { reason: "gateway".into(), operation_id: Some(op.clone()), insufficient_funds: false }
         );
         // In flight, and an error the client could not settle: both stay open, with their id.
-        let pending = WalletPay::from(LnPayOutcome::Pending {
-            operation_id: op.clone(),
-        });
+        let pending = WalletPay::from(LnPayOutcome::Pending { operation_id: op.clone() });
         assert!(matches!(&pending, WalletPay::Unknown { operation_id, .. } if *operation_id == op));
-        let unsettled = WalletPay::from(LnPayOutcome::Failed {
-            reason: "refund rejected".into(),
-            operation_id: op.clone(),
-        });
-        assert_eq!(
-            unsettled,
-            WalletPay::Unknown {
-                reason: "refund rejected".into(),
-                operation_id: op.clone()
-            }
-        );
-        let paid = WalletPay::from(LnPayOutcome::Paid {
-            preimage: "11".repeat(32),
-            fee_msat: 3,
-            operation_id: op.clone(),
-        });
+        let unsettled = WalletPay::from(LnPayOutcome::Failed { reason: "refund rejected".into(), operation_id: op.clone() });
+        assert_eq!(unsettled, WalletPay::Unknown { reason: "refund rejected".into(), operation_id: op.clone() });
+        let paid = WalletPay::from(LnPayOutcome::Paid { preimage: "11".repeat(32), fee_msat: 3, operation_id: op.clone() });
         assert_eq!(paid.operation_id(), Some(op.as_str()));
         assert_eq!(serde_json::to_value(&paid).unwrap()["status"], "paid");
         assert_eq!(serde_json::to_value(&pending).unwrap()["status"], "unknown");
@@ -348,28 +226,16 @@ mod tests {
     #[test]
     fn several_attempts_settle_paid_first_then_open_then_the_last_failure() {
         assert_eq!(settle(vec![]), None);
-        assert_eq!(
-            settle(vec![failed(Some("a")), paid("b"), unknown("c")]),
-            Some(paid("b"))
-        );
-        assert_eq!(
-            settle(vec![failed(Some("a")), unknown("c")]),
-            Some(unknown("c"))
-        );
-        assert_eq!(
-            settle(vec![failed(Some("a")), failed(Some("b"))]),
-            Some(failed(Some("b")))
-        );
+        assert_eq!(settle(vec![failed(Some("a")), paid("b"), unknown("c")]), Some(paid("b")));
+        assert_eq!(settle(vec![failed(Some("a")), unknown("c")]), Some(unknown("c")));
+        assert_eq!(settle(vec![failed(Some("a")), failed(Some("b"))]), Some(failed(Some("b"))));
     }
 
     #[test]
     fn operation_ids_parse_from_32_bytes_of_hex() {
         let op = OperationId([0xab; 32]);
         assert_eq!(parse_operation_id(&"ab".repeat(32)).unwrap(), op);
-        assert_eq!(
-            parse_operation_id(&format!(" {} ", "AB".repeat(32))).unwrap(),
-            op
-        );
+        assert_eq!(parse_operation_id(&format!(" {} ", "AB".repeat(32))).unwrap(), op);
         assert!(parse_operation_id("zz").is_err());
         assert!(parse_operation_id(&"ab".repeat(31)).is_err());
     }

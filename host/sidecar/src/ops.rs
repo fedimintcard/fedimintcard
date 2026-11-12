@@ -439,12 +439,7 @@ impl FederationReport {
     pub async fn of(wallet: &crate::wallet::Wallet) -> Self {
         use fedimint_core::encoding::Encodable as _;
         let name = wallet.client.config().await.global.meta.get("federation_name").cloned();
-        let tbs_pks = wallet
-            .mint_cfg
-            .tbs_pks
-            .iter()
-            .map(|(amount, pk)| (amount.msats.to_string(), pk.consensus_encode_to_hex()))
-            .collect();
+        let tbs_pks = wallet.mint_cfg.tbs_pks.iter().map(|(amount, pk)| (amount.msats.to_string(), pk.consensus_encode_to_hex())).collect();
         Self { federation_id: wallet.federation_id().to_string(), name, tbs_pks }
     }
 }
@@ -498,7 +493,13 @@ impl Ops {
         let written = cw.card_tick();
         match cw.card_spares(released, written).await {
             Ok(r) if !r.renewed.is_empty() || !r.keyed.is_empty() => {
-                tracing::info!("card {}: spare reserve from {} fresh slot(s): renewed {:?}, keyed {:?}", short_id_of(&pk), r.fresh, r.renewed, r.keyed);
+                tracing::info!(
+                    "card {}: spare reserve from {} fresh slot(s): renewed {:?}, keyed {:?}",
+                    short_id_of(&pk),
+                    r.fresh,
+                    r.renewed,
+                    r.keyed
+                );
             }
             Ok(_) => {}
             // The holder's PIN was refused: the charge would be refused the same way when it
@@ -516,7 +517,15 @@ impl Ops {
     pub async fn attach_id(&self, cw: &mut CardWallet, short_id: &str) -> Result<StateStore> {
         let card = StateStore::open(self.card_path(short_id))?;
         let base = std::mem::replace(&mut cw.store, card);
-        cw.ops = Some(OpsLink { client: self.client.clone(), short_id: short_id.to_owned(), version: 0, remote_slots: vec![], unkeyed: vec![], open: vec![], releases: vec![] });
+        cw.ops = Some(OpsLink {
+            client: self.client.clone(),
+            short_id: short_id.to_owned(),
+            version: 0,
+            remote_slots: vec![],
+            unkeyed: vec![],
+            open: vec![],
+            releases: vec![],
+        });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
             Err(e) => {
@@ -547,10 +556,7 @@ impl Ops {
 
     /// `client_ref`s of unresolved charges across every card this till has seen.
     pub fn pending_refs(&self) -> Vec<String> {
-        self.card_files()
-            .into_iter()
-            .flat_map(|(_, st)| st.pending_txs.into_iter().filter_map(|p| p.client_ref))
-            .collect()
+        self.card_files().into_iter().flat_map(|(_, st)| st.pending_txs.into_iter().filter_map(|p| p.client_ref)).collect()
     }
 
     fn card_files(&self) -> Vec<(String, CardState)> {
@@ -728,10 +734,8 @@ impl CardWallet {
                 }
             }
             OpsWrite::Load { txid, client_ref, notes } => {
-                let local: Vec<&NoteRec> = notes
-                    .iter()
-                    .filter_map(|l| self.store.state.notes.iter().find(|n| n.nonce == l.nonce))
-                    .collect();
+                let local: Vec<&NoteRec> =
+                    notes.iter().filter_map(|l| self.store.state.notes.iter().find(|n| n.nonce == l.nonce)).collect();
                 if local.len() != notes.len() || local.iter().any(|n| n.status == NoteStatus::Dead) {
                     return Ok(Sent::Dropped(format!("load {txid} never became money")));
                 }
@@ -755,10 +759,8 @@ impl CardWallet {
                     }
                     Err(e) => return Err(e),
                 }
-                let sigs: Vec<Value> = local
-                    .iter()
-                    .map(|n| json!({"nonce": n.nonce, "signature": n.signature.as_deref().unwrap_or_default()}))
-                    .collect();
+                let sigs: Vec<Value> =
+                    local.iter().map(|n| json!({"nonce": n.nonce, "signature": n.signature.as_deref().unwrap_or_default()})).collect();
                 link.client.outcome(id, &json!({"txid": txid, "accepted": true, "change": sigs})).await
             }
         };
@@ -770,10 +772,10 @@ impl CardWallet {
     /// Queue `w`, replacing an earlier entry for the same transaction or slot.
     pub(crate) fn ops_enqueue(&mut self, w: OpsWrite) {
         let Some(link) = &self.ops else { return };
-        if let OpsWrite::Outcome { txid, .. } = &w {
-            if !link.open.contains(txid) {
-                return;
-            }
+        if let OpsWrite::Outcome { txid, .. } = &w
+            && !link.open.contains(txid)
+        {
+            return;
         }
         let same = |a: &OpsWrite| match (a, &w) {
             (OpsWrite::Outcome { txid: x, .. }, OpsWrite::Outcome { txid: y, .. }) => x == y,
@@ -786,7 +788,14 @@ impl CardWallet {
 
     /// Record in ops, before the card signs, the charge `txid`: the unsigned transaction, the
     /// card notes it spends, and the card change notes with their blinding keys.
-    pub(crate) async fn ops_intent(&mut self, txid: &str, client_ref: Option<&str>, tx_hex: &str, inputs: &[String], change: Vec<Value>) -> Result<()> {
+    pub(crate) async fn ops_intent(
+        &mut self,
+        txid: &str,
+        client_ref: Option<&str>,
+        tx_hex: &str,
+        inputs: &[String],
+        change: Vec<Value>,
+    ) -> Result<()> {
         let Some(link) = self.ops.as_mut() else { return Ok(()) };
         // Open from here on as far as this till knows: if the answer is lost, the rejection that
         // follows still goes to ops.
@@ -828,10 +837,7 @@ impl CardWallet {
         if mine.clone().any(|n| n.status == NoteStatus::Pending) {
             return;
         }
-        let change = mine
-            .filter(|n| n.status == NoteStatus::Live)
-            .filter_map(|n| Some((n.nonce.clone(), n.signature.clone()?)))
-            .collect();
+        let change = mine.filter(|n| n.status == NoteStatus::Live).filter_map(|n| Some((n.nonce.clone(), n.signature.clone()?))).collect();
         self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: true, change });
     }
 
@@ -956,10 +962,10 @@ pub fn merge(st: &mut CardState, remote: &RemoteState) {
     st.slots = remote.slots.iter().map(|s| SlotRec { slot: s.slot, pubkey: s.pubkey.clone(), unknown: false }).collect();
     st.slots.sort_by_key(|s| s.slot);
     for w in &st.ops_outbox {
-        if let OpsWrite::Slot { slot, old_pubkey, pubkey } = w {
-            if let Some(s) = st.slots.iter_mut().find(|s| s.slot == *slot && s.pubkey == *old_pubkey) {
-                s.pubkey = pubkey.clone();
-            }
+        if let OpsWrite::Slot { slot, old_pubkey, pubkey } = w
+            && let Some(s) = st.slots.iter_mut().find(|s| s.slot == *slot && s.pubkey == *old_pubkey)
+        {
+            s.pubkey = pubkey.clone();
         }
     }
 
@@ -1093,9 +1099,10 @@ mod tests {
     fn unkeyed_slots_parse_and_default_to_none_from_an_older_registry() {
         let old: RemoteState = serde_json::from_value(json!({"version": 1, "slots": [], "notes": [], "open_txs": []})).unwrap();
         assert!(old.unkeyed_slots.is_empty());
-        let new: RemoteState =
-            serde_json::from_value(json!({"version": 1, "slot_count": 32, "slots": [], "unkeyed_slots": [8, 9], "notes": [], "open_txs": []}))
-                .unwrap();
+        let new: RemoteState = serde_json::from_value(
+            json!({"version": 1, "slot_count": 32, "slots": [], "unkeyed_slots": [8, 9], "notes": [], "open_txs": []}),
+        )
+        .unwrap();
         assert_eq!(new.unkeyed_slots, vec![8, 9]);
         let free: FreeSlots = serde_json::from_value(json!({"version": 1, "federation_id": "f", "free": []})).unwrap();
         assert!(free.unkeyed_slots.is_empty());
@@ -1131,7 +1138,13 @@ mod tests {
                 out_idx: None,
             }],
             vec![
-                RemoteTx { txid: "t1".into(), till_id: 2, client_ref: "r".into(), signed_hex: Some("ff".into()), inputs: vec!["02dd".into()] },
+                RemoteTx {
+                    txid: "t1".into(),
+                    till_id: 2,
+                    client_ref: "r".into(),
+                    signed_hex: Some("ff".into()),
+                    inputs: vec!["02dd".into()],
+                },
                 RemoteTx { txid: "t2".into(), till_id: 2, client_ref: "r".into(), signed_hex: None, inputs: vec!["02ee".into()] },
                 RemoteTx { txid: "load".into(), till_id: 2, client_ref: "r".into(), signed_hex: None, inputs: vec![] },
             ],
@@ -1151,7 +1164,19 @@ mod tests {
     fn signed_bytes_in_ops_make_a_local_charge_submitted() {
         let mut st = CardState::default();
         st.pending_txs.push(PendingTx { txid: "t".into(), client_ref: Some("mine".into()), ..Default::default() });
-        merge(&mut st, &remote(vec![], vec![RemoteTx { txid: "t".into(), till_id: 1, client_ref: "mine".into(), signed_hex: Some("aa".into()), inputs: vec!["02".into()] }]));
+        merge(
+            &mut st,
+            &remote(
+                vec![],
+                vec![RemoteTx {
+                    txid: "t".into(),
+                    till_id: 1,
+                    client_ref: "mine".into(),
+                    signed_hex: Some("aa".into()),
+                    inputs: vec!["02".into()],
+                }],
+            ),
+        );
         assert_eq!(st.pending_txs.len(), 1);
         assert!(st.pending_txs[0].submitted);
         assert_eq!(st.pending_txs[0].client_ref.as_deref(), Some("mine"), "this till's own sale stays its own");
@@ -1172,7 +1197,19 @@ mod tests {
     fn signed_bytes_in_ops_settle_an_unanswered_submitted() {
         let mut st = CardState::default();
         st.pending_txs.push(PendingTx { txid: "t".into(), tx_hex: Some("aa".into()), ops_unconfirmed: true, ..Default::default() });
-        merge(&mut st, &remote(vec![], vec![RemoteTx { txid: "t".into(), till_id: 1, client_ref: "r".into(), signed_hex: Some("aa".into()), inputs: vec!["02".into()] }]));
+        merge(
+            &mut st,
+            &remote(
+                vec![],
+                vec![RemoteTx {
+                    txid: "t".into(),
+                    till_id: 1,
+                    client_ref: "r".into(),
+                    signed_hex: Some("aa".into()),
+                    inputs: vec!["02".into()],
+                }],
+            ),
+        );
         assert!(st.pending_txs[0].submitted && !st.pending_txs[0].ops_unconfirmed);
     }
 

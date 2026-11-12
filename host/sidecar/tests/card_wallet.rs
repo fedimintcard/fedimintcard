@@ -14,6 +14,7 @@ use fedimint_card_sidecar::state::{HostKind, NoteStatus, StateStore};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
+use fedimint_core::Amount;
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::encoding::Decodable;
 use fedimint_core::module::registry::ModuleRegistry;
@@ -21,7 +22,6 @@ use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
 use fedimint_core::secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
 use fedimint_core::transaction::{Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome};
-use fedimint_core::Amount;
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_server::DummyInit;
 use fedimint_mint_client::{MintClientInit, OOBNotes};
@@ -211,10 +211,7 @@ async fn change_note_is_spendable() -> anyhow::Result<()> {
     // The first change notes that were used are now spent on the federation.
     for n in &f.cw.store.state.notes {
         if live_before.contains(&n.nonce) && r2.inputs.iter().any(|(s, a)| *s == n.slot && *a == n.amount_msat) {
-            assert!(f.cw.is_spent(fedimint_mint_common::Nonce(
-                fedimint_core::secp256k1::PublicKey::from_str(&n.nonce)?
-            ))
-            .await?);
+            assert!(f.cw.is_spent(fedimint_mint_common::Nonce(fedimint_core::secp256k1::PublicKey::from_str(&n.nonce)?)).await?);
         }
     }
     assert_eq!(f.cw.store.state.live_total_msat(), change1 - ins2 + change2);
@@ -327,10 +324,10 @@ async fn state_file_survives_a_restart() -> anyhow::Result<()> {
     let reopened = StateStore::open(&path)?;
     assert_eq!(reopened.state, state);
     // A pending overwrite left by a crash is resolved from the card's real state.
-    f.cw.store.state.pending_overwrites.push(fedimint_card_sidecar::state::PendingOverwrite {
-        slot: 5,
-        old_pubkey: f.cw.store.state.slot_pubkey(5).unwrap().to_owned(),
-    });
+    f.cw.store
+        .state
+        .pending_overwrites
+        .push(fedimint_card_sidecar::state::PendingOverwrite { slot: 5, old_pubkey: f.cw.store.state.slot_pubkey(5).unwrap().to_owned() });
     f.cw.store.save()?;
     f.cw.recover_overwrites()?; // card still has the old key: "never ran", record dropped
     assert!(f.cw.store.state.pending_overwrites.is_empty());
@@ -612,10 +609,7 @@ async fn an_eight_slot_card_behaves_as_before() -> anyhow::Result<()> {
 
     // 50,000 sats is twelve notes: more than the card can hold, so nothing is issued.
     let err = f.cw.topup(&[50_000_000]).await.expect_err("twelve notes on eight slots");
-    assert!(
-        matches!(err.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoFreeSlots { need: 12, free: 8 })),
-        "{err:#}"
-    );
+    assert!(matches!(err.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoFreeSlots { need: 12, free: 8 })), "{err:#}");
     assert_eq!(f.cw.store.state.live_total_msat(), 0);
 
     f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;

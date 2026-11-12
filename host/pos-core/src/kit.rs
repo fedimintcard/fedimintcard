@@ -125,7 +125,8 @@ impl Kit {
         let header = match &self.block_header {
             None => None,
             Some(h) => {
-                let b: [u8; HEADER_LEN] = hex::decode(h).ok().and_then(|b| b.try_into().ok()).context("its block header is not 80 bytes of hex")?;
+                let b: [u8; HEADER_LEN] =
+                    hex::decode(h).ok().and_then(|b| b.try_into().ok()).context("its block header is not 80 bytes of hex")?;
                 ensure!(header_has_work(&b), "its block header lacks the work it claims");
                 Some(b)
             }
@@ -134,7 +135,11 @@ impl Kit {
         let mut seen = HashSet::new();
         for tier in &self.pool {
             ensure!(tier.amount_msat.is_power_of_two(), "pool tier {} msat is not a power of two", tier.amount_msat);
-            ensure!(tbs_pks.get(Amount::from_msats(tier.amount_msat)).is_some(), "pool tier {} msat is not a note of the federation", tier.amount_msat);
+            ensure!(
+                tbs_pks.get(Amount::from_msats(tier.amount_msat)).is_some(),
+                "pool tier {} msat is not a note of the federation",
+                tier.amount_msat
+            );
             for b in &tier.blinded {
                 if !seen.insert(b.as_str()) {
                     bail!("pool entry {b} is there twice");

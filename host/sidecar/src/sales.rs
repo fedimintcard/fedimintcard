@@ -88,8 +88,7 @@ impl SalesStore {
         let path = path.into();
         let file = match std::fs::read(&path) {
             Ok(bytes) => {
-                let f: SalesFile =
-                    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+                let f: SalesFile = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
                 if f.version > SALES_VERSION {
                     bail!("{} has version {}, this build understands {SALES_VERSION}", path.display(), f.version);
                 }

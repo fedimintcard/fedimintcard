@@ -217,7 +217,13 @@ impl PosCore {
     pub fn stats(&self) -> Result<PhoneStats, PosCoreError> {
         guarded("stats", || {
             let s: store::PhoneStats = self.store.stats();
-            Ok(PhoneStats { waiting: s.waiting as u32, waiting_msat: s.waiting_msat, signing: s.signing as u32, refused: s.refused as u32, synced: s.synced as u32 })
+            Ok(PhoneStats {
+                waiting: s.waiting as u32,
+                waiting_msat: s.waiting_msat,
+                signing: s.signing as u32,
+                refused: s.refused as u32,
+                synced: s.synced as u32,
+            })
         })
     }
 

@@ -14,10 +14,10 @@ use fedimint_card_pos_core::charge::{Env, Pin, Taken, TillOuts, charge};
 use fedimint_card_pos_core::queue::{ChargeState, QUEUE_FILE, Queue};
 use fedimint_card_pos_core::refusal;
 use fedimint_card_pos_core::store::Store;
+use fedimint_core::TransactionId;
 use fedimint_core::encoding::Decodable;
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::{Message, SECP256K1, XOnlyPublicKey};
-use fedimint_core::TransactionId;
 use fedimint_core::transaction::{Transaction, TransactionSignature};
 use serde_json::{Value, json};
 
@@ -310,7 +310,7 @@ fn a_pool_out_of_a_tier_refuses_with_a_price_it_pays() {
     kit.pool.retain(|t| t.amount_msat != 1 << 15);
     let json = serde_json::to_string(&kit).unwrap();
     let r = take(&s, &card, &json, 50_000, "needs-32k");
-    let e = r.as_ref().err().expect("refused");
+    let e = r.as_ref().expect_err("refused");
     let f = refusal(e);
     assert_eq!((f.status, f.code), (409, "offline_pool_exhausted"), "{}", f.detail);
     let suggested = f.suggested_msat.expect("a price the pool pays");
@@ -548,12 +548,14 @@ struct Gate {
 
 impl Transport for Gate {
     fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if apdu.len() > 2 && apdu[..2] == [0xB0, 0x15] && apdu[2] >= self.from {
-            if let Some(tx) = self.entered.take() {
-                tx.send(()).unwrap();
-                let _ = self.release.recv_timeout(self.wait);
-                *self.other_then.lock().unwrap() = Some(self.other.load(Ordering::SeqCst));
-            }
+        if apdu.len() > 2
+            && apdu[..2] == [0xB0, 0x15]
+            && apdu[2] >= self.from
+            && let Some(tx) = self.entered.take()
+        {
+            tx.send(()).unwrap();
+            let _ = self.release.recv_timeout(self.wait);
+            *self.other_then.lock().unwrap() = Some(self.other.load(Ordering::SeqCst));
         }
         self.inner.transmit(apdu)
     }
@@ -570,10 +572,10 @@ struct Second {
 impl Transport for Second {
     fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.sent.fetch_add(1, Ordering::SeqCst);
-        if apdu.starts_with(&[0xB0, 0x12]) {
-            if let Some(tx) = self.release.take() {
-                let _ = tx.send(());
-            }
+        if apdu.starts_with(&[0xB0, 0x12])
+            && let Some(tx) = self.release.take()
+        {
+            let _ = tx.send(());
         }
         self.inner.transmit(apdu)
     }
@@ -610,7 +612,11 @@ fn two_charges_at_once_on_one_store_take_disjoint_pool_entries() {
         (first.join().unwrap(), second.join().unwrap())
     });
     let (first, second) = (first.unwrap().charge, second.unwrap().charge);
-    assert_eq!(*b_sent_then.lock().unwrap(), Some(0), "the second charge spoke to its card while the first was between its plan and its save");
+    assert_eq!(
+        *b_sent_then.lock().unwrap(),
+        Some(0),
+        "the second charge spoke to its card while the first was between its plan and its save"
+    );
     assert!(!first.pool.is_empty() && !second.pool.is_empty());
     let mine: Vec<&String> = first.pool.iter().map(|p| &p.blinded).collect();
     assert!(second.pool.iter().all(|p| !mine.contains(&&p.blinded)), "a pool entry taken twice");
@@ -693,7 +699,10 @@ fn sync_marks_what_the_till_took_and_keeps_what_it_refused() {
     assert_eq!((st.waiting, st.synced, st.refused), (1, 1, 1));
     let d = s.drain(50);
     assert_eq!(d.txids, vec![ids[2].clone()]);
-    assert_eq!(d.refused.iter().map(|r| (r.txid.as_str(), r.code.as_str())).collect::<Vec<_>>(), vec![(ids[1].as_str(), "pool_entry_reused")]);
+    assert_eq!(
+        d.refused.iter().map(|r| (r.txid.as_str(), r.code.as_str())).collect::<Vec<_>>(),
+        vec![(ids[1].as_str(), "pool_entry_reused")]
+    );
     // A charge the till took is a replay, still; one it refused is not a sale to answer again.
     assert!(take(&s, &card, &json, 20_000, "a").unwrap().replayed);
     let (r, apdus) = take_counted(&s, &card, &json, 20_000, "b", b"1234");
@@ -735,7 +744,8 @@ fn a_clock_set_ahead_at_a_sync_does_not_expire_the_kits() {
     let card = fx.card(32, &[1 << 16, 1 << 16]);
     let json = fx.kit_json(s.phone_id());
     let t = take(&s, &card, &json, 20_000, "before").unwrap();
-    let high_water = || serde_json::from_slice::<Value>(&std::fs::read(s.dir().join(QUEUE_FILE)).unwrap()).unwrap()["high_water_ms"].as_u64();
+    let high_water =
+        || serde_json::from_slice::<Value>(&std::fs::read(s.dir().join(QUEUE_FILE)).unwrap()).unwrap()["high_water_ms"].as_u64();
     let kept = high_water();
     assert!(kept.is_some_and(|h| h <= now_ms()), "a charge keeps the time it was taken: {kept:?}");
     let answer = json!({"ok": true, "results": [{"txid": t.charge.txid, "status": "queued"}]});

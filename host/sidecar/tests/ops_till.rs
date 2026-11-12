@@ -30,8 +30,8 @@ use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
 use fedimint_card_sidecar::holder::{LoadCrash, Loader, outcome_body};
 use fedimint_card_sidecar::ops::{FederationReport, Ops, OpsConfig, report_federation, short_id_of};
-use fedimint_card_sidecar::shares;
 use fedimint_card_sidecar::sales::SalesStore;
+use fedimint_card_sidecar::shares;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{card_balance_job, charge_job};
 use fedimint_card_sidecar::wallet::Wallet;
@@ -80,7 +80,10 @@ impl Registry {
         let operator = session["token"].as_str().expect("an operator token").to_owned();
         let mut r = Self { url, http, operator, batch_id: 0 };
         let b = r
-            .op_post("/registry/batches", json!({"federation_id": federation_id, "count": 10, "pin_policy": "batch", "load_sha256": "a".repeat(64)}))
+            .op_post(
+                "/registry/batches",
+                json!({"federation_id": federation_id, "count": 10, "pin_policy": "batch", "load_sha256": "a".repeat(64)}),
+            )
             .await?;
         r.batch_id = b["batch"]["batch_id"].as_u64().expect("a batch id");
         Ok(Some(r))
@@ -153,13 +156,7 @@ impl Registry {
 }
 
 fn live_msat(state: &Value) -> u64 {
-    state["notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|n| n["status"] == "live")
-        .map(|n| n["amount_msat"].as_u64().unwrap())
-        .sum()
+    state["notes"].as_array().unwrap().iter().filter(|n| n["status"] == "live").map(|n| n["amount_msat"].as_u64().unwrap()).sum()
 }
 
 fn open_txs(state: &Value) -> Vec<Value> {
@@ -531,7 +528,8 @@ async fn a_load_with_forged_signatures_is_refused_and_the_real_ones_finish_it() 
         let nonce = fedimint_mint_common::Nonce(n.nonce.parse()?);
         let key = tbs::BlindingKey::consensus_decode_hex(&n.blinding_key, &Default::default())?;
         let out = fedimint_core::OutPoint { txid, out_idx: n.out_idx };
-        let sig = shares::note_signature(&holder.wallet, out, Amount::from_msats(n.amount_msat), nonce, key, Duration::from_secs(60)).await?;
+        let sig =
+            shares::note_signature(&holder.wallet, out, Amount::from_msats(n.amount_msat), nonce, key, Duration::from_secs(60)).await?;
         real.push((n.nonce.clone(), sig.consensus_encode_to_hex()));
     }
     let post = |body: Value| {
@@ -657,10 +655,8 @@ async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -
     assert_eq!(unkeyed(&s), before[n..].to_vec(), "{s}");
 
     // The till's own load (a top-up from its wallet) keys the same way.
-    let free_n = reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?["free"]
-        .as_array()
-        .unwrap()
-        .len();
+    let free_n =
+        reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?["free"].as_array().unwrap().len();
     let before = unkeyed(&s);
     let notes = free_n + 2;
     let amounts: Vec<u64> = (0..notes as u32).map(|i| 1u64 << (12 + i)).collect();

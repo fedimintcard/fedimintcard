@@ -142,7 +142,10 @@ fn refused_charges_are_listed_until_dismissed() {
     assert_eq!(pc.mark_synced(answer.to_string()).unwrap().refused, 1);
     let d = pc.drain(50).unwrap();
     assert!(d.txids.is_empty());
-    assert_eq!(d.refused.iter().map(|r| (r.txid.as_str(), r.code.as_str())).collect::<Vec<_>>(), vec![(txid.as_str(), "pool_entry_reused")]);
+    assert_eq!(
+        d.refused.iter().map(|r| (r.txid.as_str(), r.code.as_str())).collect::<Vec<_>>(),
+        vec![(txid.as_str(), "pool_entry_reused")]
+    );
     assert_eq!(pc.stats().unwrap().refused, 1);
     assert!(pc.dismiss(txid.clone()).unwrap());
     assert!(!pc.dismiss(txid).unwrap());

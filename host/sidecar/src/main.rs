@@ -311,7 +311,8 @@ async fn main() -> Result<()> {
             };
             let gw = ln.select_available_gateway(want, None).await.map_err(|e| anyhow::anyhow!("no gateway: {e:?}"))?;
             eprintln!("gateway {} ({})", gw.gateway_id, gw.api);
-            let desc = lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
+            let desc =
+                lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
             let (op, invoice, _) = ln
                 .create_bolt11_invoice(fedimint_core::Amount::from_msats(*amount_msat), desc, Some(600), (), Some(gw))
                 .await
@@ -351,10 +352,7 @@ async fn main() -> Result<()> {
                 println!("module {id}: {} v{}.{}", m.kind, m.version.major, m.version.minor);
             }
             println!("wallet balance: {}", sats(w.balance_msat().await?));
-            println!(
-                "mint fee: {} msat for a 1,048,576 msat note (per input and per output)",
-                w.fee(1 << 20)
-            );
+            println!("mint fee: {} msat for a 1,048,576 msat note (per input and per output)", w.fee(1 << 20));
             let s = &st.state;
             println!(
                 "card state: {} slot(s) cached, {} live note(s) worth {}, {} free slot(s), {} pending overwrite(s), {} in-flight host output(s)",
@@ -420,7 +418,10 @@ async fn main() -> Result<()> {
                 offline: fedimint_card_sidecar::offline::OfflineConfig {
                     cap_msat: *offline_cap_msat,
                     cap_count: *offline_cap_count,
-                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom { base_msat: *offline_fee_base_msat, ppm: *offline_fee_headroom_ppm },
+                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom {
+                        base_msat: *offline_fee_base_msat,
+                        ppm: *offline_fee_headroom_ppm,
+                    },
                 },
                 spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
                 kits: fedimint_card_sidecar::pool::KitConfig {
@@ -463,11 +464,7 @@ async fn main() -> Result<()> {
                 Some(u) => pos::check_till_url(u)?,
                 None => format!("http://{}:9877", pos::lan_ipv4()?),
             };
-            let (token, made) = if *new_token {
-                (pos::rotate_token(&cli.data_dir)?, true)
-            } else {
-                pos::ensure_token(&cli.data_dir)?
-            };
+            let (token, made) = if *new_token { (pos::rotate_token(&cli.data_dir)?, true) } else { pos::ensure_token(&cli.data_dir)? };
             let text = pos::pair_text(&url, &token);
             if *text_only {
                 println!("{text}");
@@ -490,10 +487,10 @@ async fn main() -> Result<()> {
             let mut loader = fedimint_card_sidecar::holder::Loader::new(&w, ops_url, &cli.data_dir)?;
             // A till's own wallet loading a split-keyed card can key its unkeyed slots with the
             // token an approved claim left, when it is for this registry (`holder.rs`).
-            if let Some(cfg) = fedimint_card_sidecar::claim::read_ops(&cli.data_dir)? {
-                if cfg.url.trim_end_matches('/') == ops_url.trim_end_matches('/') {
-                    loader = loader.with_keyer(fedimint_card_sidecar::ops::OpsClient::new(&cfg)?);
-                }
+            if let Some(cfg) = fedimint_card_sidecar::claim::read_ops(&cli.data_dir)?
+                && cfg.url.trim_end_matches('/') == ops_url.trim_end_matches('/')
+            {
+                loader = loader.with_keyer(fedimint_card_sidecar::ops::OpsClient::new(&cfg)?);
             }
             let r = loader.load(card.as_mut(), amount_msat).await?;
             if r.resumed > 0 {
@@ -536,18 +533,18 @@ fn report_recovered(r: &Recovered) {
 async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
     match cmd {
         CardCmd::Setup { fresh } => {
-                        for (slot, pk) in cw.card_setup(*fresh)? {
+            for (slot, pk) in cw.card_setup(*fresh)? {
                 println!("slot {slot:2}  {pk}");
             }
         }
         CardCmd::Topup { amount_msat } => {
-                        for (slot, amount) in cw.topup(amount_msat).await? {
+            for (slot, amount) in cw.topup(amount_msat).await? {
                 println!("slot {slot:2}  +{}", sats(amount));
             }
         }
         CardCmd::Load { .. } => unreachable!("handled in main without a PIN session"),
         CardCmd::Balance => {
-                        let r = cw.balance().await?;
+            let r = cw.balance().await?;
             report_recovered(&r.recovered);
             for t in &r.unresolved {
                 println!("unresolved transaction {t} (run `card balance` again)");
@@ -565,11 +562,15 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
             println!("free slots: {:?}  to renew: {:?}", r.free_slots, r.overwritable_slots);
         }
         CardCmd::Spend { price } => {
-                        let r = cw.spend(*price).await?;
+            let r = cw.spend(*price).await?;
             println!("submitted, accepted by the federation: {}", r.txid);
             println!(
                 "inputs {:?}; till received {} (price {}, overpaid {} msat); fees {} msat",
-                r.inputs, sats(r.received.msats), sats(r.price_msat), r.overpay_msat, r.fees_msat
+                r.inputs,
+                sats(r.received.msats),
+                sats(r.price_msat),
+                r.overpay_msat,
+                r.fees_msat
             );
             println!("change notes {:?}; renewed slots {:?}", r.change, r.renewed_slots);
             if r.dust {
@@ -583,7 +584,7 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
             }
         }
         CardCmd::Cashout { slot, qr: want_qr } => {
-                        let r = cw.cashout(*slot).await?;
+            let r = cw.cashout(*slot).await?;
             println!("submitted, accepted by the federation: {}", r.txid);
             println!(
                 "slot {} ({} msat note): {} reached the wallet after fees{}",

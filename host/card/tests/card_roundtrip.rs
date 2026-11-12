@@ -32,15 +32,9 @@ fn roundtrip(card: &mut dyn Card, slot: u8) {
     assert_eq!(card.get_pub(slot).unwrap(), pk, "GET_PUB is stable");
     let msg = [0x5Au8; 32];
     let sig = card.sign(slot, &msg).expect("sign");
-    SECP256K1
-        .verify_schnorr(&sig, &Message::from_digest(msg), &pk)
-        .expect("signature verifies against the card's key");
+    SECP256K1.verify_schnorr(&sig, &Message::from_digest(msg), &pk).expect("signature verifies against the card's key");
     // A different message must not verify under the same signature.
-    assert!(
-        SECP256K1
-            .verify_schnorr(&sig, &Message::from_digest([0x5B; 32]), &pk)
-            .is_err()
-    );
+    assert!(SECP256K1.verify_schnorr(&sig, &Message::from_digest([0x5B; 32]), &pk).is_err());
 }
 
 #[test]

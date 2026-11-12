@@ -106,7 +106,7 @@ fn fit_above(x: u64, tiers: Tiers) -> Option<u64> {
 /// side absorbs what the fees leave (the dust notes of [`Plan::dust`]), and a pool without those
 /// tiers could pay no price on a card with no room for change.
 pub fn lowest_till_note(fee: FeeFn, min_denom: u64) -> u64 {
-    if min_denom >= 4 && (0..=MAX_EXP).all(|e| fee(1u64 << e) % 4 == 0) { 4 } else { 1 }
+    if min_denom >= 4 && (0..=MAX_EXP).all(|e| fee(1u64 << e).is_multiple_of(4)) { 4 } else { 1 }
 }
 
 /// How far a plan leaves the card short of [`ROOM_AFTER_CHARGE`] free slots, assuming the spent
@@ -257,6 +257,8 @@ fn split_to(mut notes: Vec<u64>, k: usize, min_denom: u64) -> Vec<u64> {
     notes
 }
 
+// A recursive search: each argument is per-call state, and a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn dfs(
     e: i32,
     floor: i32,
@@ -349,25 +351,12 @@ fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
 /// Objective, in order: leave [`ROOM_AFTER_CHARGE`] free slots if any plan can (else get as close
 /// as possible), fewest change notes, fewest output notes, fewest inputs (each costs one card
 /// signature, about a second on silicon; at most [`MAX_INPUTS`]), smallest overpay.
-pub fn solve(
-    notes: &[u64],
-    price: u64,
-    free_slots: usize,
-    fee: FeeFn,
-    min_denom: u64,
-) -> Result<Plan, PlanError> {
+pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64) -> Result<Plan, PlanError> {
     solve_in(notes, price, free_slots, fee, min_denom, ALL_TIERS)
 }
 
 /// [`solve`] with the till's notes in `tiers` only (the change may use any tier).
-pub fn solve_in(
-    notes: &[u64],
-    price: u64,
-    free_slots: usize,
-    fee: FeeFn,
-    min_denom: u64,
-    tiers: Tiers,
-) -> Result<Plan, PlanError> {
+pub fn solve_in(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64, tiers: Tiers) -> Result<Plan, PlanError> {
     solve_surplus(notes, price, free_slots, fee, min_denom, 0, 0, tiers)
 }
 
@@ -825,7 +814,14 @@ const NEAR_TRIES: usize = 8;
 /// pay with no change (its value after the input fees, less the till's output fees, rounded down
 /// to `step`), and the nearest of those on each side are checked with [`solve`], at most
 /// [`NEAR_TRIES`] per side. `None` on a side where none checks.
-pub fn exact_prices_near(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64, step: u64) -> (Option<u64>, Option<u64>) {
+pub fn exact_prices_near(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    min_denom: u64,
+    step: u64,
+) -> (Option<u64>, Option<u64>) {
     exact_prices_near_in(notes, price, free_slots, fee, min_denom, step, ALL_TIERS)
 }
 
@@ -1189,7 +1185,14 @@ mod tests {
             for (held, free) in [(32usize, 0usize), (30, 2), (24, 8)] {
                 let notes = &notes[..held];
                 // Prices a few inputs pay exactly, and arbitrary ones.
-                let prices = [notes[0] - 1_000, notes[1] + notes[5] - 3_000, notes[2] + notes[7] + notes[20] - 1_500, 777_000, 12_345_678, 29_999_000];
+                let prices = [
+                    notes[0] - 1_000,
+                    notes[1] + notes[5] - 3_000,
+                    notes[2] + notes[7] + notes[20] - 1_500,
+                    777_000,
+                    12_345_678,
+                    29_999_000,
+                ];
                 for price in prices {
                     let t = std::time::Instant::now();
                     let r = solve(notes, price, free, fee, min_econ(fee));
@@ -1378,7 +1381,10 @@ mod tests {
         // Notes the federation does not issue: only notes up to 2^20 here.
         let small = |n: u64| n <= 1 << 20;
         assert_eq!(nearest_card_amount((1 << 21) + 5, 3, 1, small), None);
-        assert_eq!(nearest_card_amount((1 << 20) + (1 << 19) + (1 << 18) + (1 << 17), 3, 1, small), Some((1 << 20) + (1 << 19) + (1 << 18)));
+        assert_eq!(
+            nearest_card_amount((1 << 20) + (1 << 19) + (1 << 18) + (1 << 17), 3, 1, small),
+            Some((1 << 20) + (1 << 19) + (1 << 18))
+        );
         // Never more than max_notes notes, never far off.
         for msat in [1_234_567u64, 999_999, 50_000, 5_000_000, 77_777_777] {
             let v = nearest_card_amount(msat, 3, 1, any).unwrap();

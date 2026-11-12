@@ -18,7 +18,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use fedimint_card_host_card::{Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, SlotState, StatusWord, past_last_slot, status_word};
+use fedimint_card_host_card::{
+    Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, SlotState, StatusWord, past_last_slot, status_word,
+};
 use fedimint_client::transaction::{ClientOutput, ClientOutputBundle, TransactionBuilder};
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -27,18 +29,16 @@ use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
 use fedimint_core::secp256k1::{Keypair, Message, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
-use fedimint_core::transaction::{
-    Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome,
-};
+use fedimint_core::transaction::{Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome};
 use fedimint_core::{Amount, OutPoint, TieredMulti, TransactionId};
 use fedimint_mint_client::api::MintFederationApi as _;
 use fedimint_mint_client::{OOBNotes, SpendableNote};
 use fedimint_mint_common::{BlindNonce, MintInput, MintOutput, Nonce, Note};
 use tbs::BlindingKey;
 
+use crate::ops::{OpsError, OpsLink};
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
-use crate::ops::{OpsError, OpsLink};
 use crate::state::{
     HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
 };
@@ -112,10 +112,7 @@ impl PromotedSale {
 pub type PromoteHook = Box<dyn Fn(&PromotedSale) -> Result<()>>;
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Run a blocking card call from inside a multi-thread tokio runtime.
@@ -135,10 +132,7 @@ fn dec<T: Decodable>(s: &str) -> Result<T> {
 /// Mint outputs for card notes, `(msat, blinded nonce)` each, with no state machine: the caller
 /// holds the blinding keys and collects the signatures itself. The stock client puts explicit
 /// outputs first, so output i of the transaction is note i.
-pub fn card_outputs(
-    wallet: &Wallet,
-    outs: impl Iterator<Item = (u64, tbs::BlindedMessage)>,
-) -> ClientOutputBundle {
+pub fn card_outputs(wallet: &Wallet, outs: impl Iterator<Item = (u64, tbs::BlindedMessage)>) -> ClientOutputBundle {
     ClientOutputBundle::new_no_sm(
         outs.map(|(amount, blinded)| ClientOutput {
             output: MintOutput::new_v0(Amount::from_msats(amount), BlindNonce(blinded)),
@@ -311,8 +305,7 @@ impl CardWallet {
             return on_card(|| self.card.verify_pin(pin)).context("verifying the holder's PIN");
         }
         let pin = fedimint_card_host_card::pin_from_env();
-        on_card(|| fedimint_card_host_card::open_pin_session_with(self.card.as_mut(), &pin))
-            .context("opening the PIN session")
+        on_card(|| fedimint_card_host_card::open_pin_session_with(self.card.as_mut(), &pin)).context("opening the PIN session")
     }
 
     fn fee_fn(&self) -> impl Fn(u64) -> u64 + use<> {
@@ -406,13 +399,13 @@ impl CardWallet {
                     Some(rec) if rec == hexpk => {}
                     Some(rec) => {
                         // The card holds a different key than we recorded.
-                        let busy = self
-                            .store
-                            .state
-                            .notes_on_current_key(slot)
-                            .any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending));
-                        ensure!(!busy, "slot {slot} holds a different key than recorded ({rec}) and has live notes; \
-                                        this is not the card the state file belongs to");
+                        let busy =
+                            self.store.state.notes_on_current_key(slot).any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending));
+                        ensure!(
+                            !busy,
+                            "slot {slot} holds a different key than recorded ({rec}) and has live notes; \
+                                        this is not the card the state file belongs to"
+                        );
                         self.store.state.set_unknown_slot(slot, hexpk);
                     }
                     None => self.store.state.set_unknown_slot(slot, hexpk),
@@ -554,10 +547,7 @@ impl CardWallet {
         let notes: Vec<u64> = amounts.iter().flat_map(|a| plan::binary(*a)).collect();
         ensure!(!notes.is_empty(), "nothing to top up");
         let m = self.wallet.min_denom();
-        ensure!(
-            notes.iter().all(|a| *a >= m),
-            "topup amounts must be multiples of {m} msat (the federation's smallest economical note)"
-        );
+        ensure!(notes.iter().all(|a| *a >= m), "topup amounts must be multiples of {m} msat (the federation's smallest economical note)");
         self.require_tiers(&notes)?;
         let mut free = self.store.state.free_slots();
         if free.len() < notes.len() {
@@ -622,32 +612,30 @@ impl CardWallet {
         let bundle = card_outputs(&self.wallet, outs.iter().map(|o| (o.amount, o.blinded)));
         let client = &self.wallet.client;
         let op = OperationId::new_random();
-        let range = match client
-            .finalize_and_submit_transaction(op, "card-topup", |_| (), TransactionBuilder::new().with_outputs(bundle))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Nothing was sent: forget the pending records and any ref pointing at them.
-                let nonces: Vec<String> = outs.iter().map(|o| nonce_hex(o.nonce)).collect();
-                self.store.state.notes.retain(|n| !(nonces.contains(&n.nonce) && n.status == NoteStatus::Pending));
-                if let Some(cref) = client_ref {
-                    self.store.state.issues.retain(|r| r.client_ref != cref);
+        let range =
+            match client.finalize_and_submit_transaction(op, "card-topup", |_| (), TransactionBuilder::new().with_outputs(bundle)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Nothing was sent: forget the pending records and any ref pointing at them.
+                    let nonces: Vec<String> = outs.iter().map(|o| nonce_hex(o.nonce)).collect();
+                    self.store.state.notes.retain(|n| !(nonces.contains(&n.nonce) && n.status == NoteStatus::Pending));
+                    if let Some(cref) = client_ref {
+                        self.store.state.issues.retain(|r| r.client_ref != cref);
+                    }
+                    self.store.save()?;
+                    return Err(anyhow!(e)).context("building the topup transaction");
                 }
-                self.store.save()?;
-                return Err(anyhow!(e)).context("building the topup transaction");
-            }
-        };
+            };
         let txid = range.txid();
         for n in self.store.state.notes.iter_mut().filter(|n| n.status == NoteStatus::Pending && n.txid.is_none()) {
             if outs.iter().any(|o| nonce_hex(o.nonce) == n.nonce) {
                 n.txid = Some(txid.to_string());
             }
         }
-        if let Some(cref) = client_ref {
-            if let Some(r) = self.store.state.issues.iter_mut().find(|r| r.client_ref == cref) {
-                r.txid = txid.to_string();
-            }
+        if let Some(cref) = client_ref
+            && let Some(r) = self.store.state.issues.iter_mut().find(|r| r.client_ref == cref)
+        {
+            r.txid = txid.to_string();
         }
         // On ops the notes are recorded once they are live (the stock client builds and sends in
         // one call, so there are no unsigned bytes to post first). The blinding keys are kept in
@@ -670,12 +658,9 @@ impl CardWallet {
         self.store.save()?;
 
         let client = &self.wallet.client;
-        let accepted = tokio::time::timeout(
-            SUBMIT_TIMEOUT,
-            client.transaction_updates(op).await.await_tx_accepted(txid),
-        )
-        .await
-        .context("topup transaction undecided after 90 s; run `card balance` later to reconcile")?;
+        let accepted = tokio::time::timeout(SUBMIT_TIMEOUT, client.transaction_updates(op).await.await_tx_accepted(txid))
+            .await
+            .context("topup transaction undecided after 90 s; run `card balance` later to reconcile")?;
         if let Err(e) = accepted {
             for n in self.store.state.notes.iter_mut().filter(|n| n.txid.as_deref() == Some(&txid.to_string())) {
                 n.status = NoteStatus::Dead;
@@ -739,8 +724,7 @@ impl CardWallet {
         self.abandoned.push(txid.to_owned());
         // On ops: the charge is recorded rejected, so its change notes die there too.
         self.ops_enqueue(OpsWrite::Outcome { txid: txid.to_owned(), accepted: false, change: vec![] });
-        let inputs: Vec<String> =
-            self.store.state.pending_txs.iter().filter(|p| p.txid == txid).flat_map(|p| p.inputs.clone()).collect();
+        let inputs: Vec<String> = self.store.state.pending_txs.iter().filter(|p| p.txid == txid).flat_map(|p| p.inputs.clone()).collect();
         for n in self
             .store
             .state
@@ -802,8 +786,7 @@ impl CardWallet {
             }
         }
         // Host notes: all of them or none, because they travel as one reissue.
-        let items: Vec<HostPending> =
-            self.store.state.host_pending.iter().filter(|h| h.group == txid).cloned().collect();
+        let items: Vec<HostPending> = self.store.state.host_pending.iter().filter(|h| h.group == txid).cloned().collect();
         if !items.is_empty() {
             let mut notes = TieredMulti::<SpendableNote>::default();
             let mut complete = true;
@@ -818,13 +801,9 @@ impl CardWallet {
                     break;
                 };
                 let got = async {
-                    let sig = shares::fetch_blind_signature(
-                        &self.wallet,
-                        op.txid,
-                        OutSpec { out_idx: op.out_idx, amount, blinded },
-                        timeout,
-                    )
-                    .await?;
+                    let sig =
+                        shares::fetch_blind_signature(&self.wallet, op.txid, OutSpec { out_idx: op.out_idx, amount, blinded }, timeout)
+                            .await?;
                     shares::finish_note(&self.wallet, amount, nonce, key, blinded, sig)
                 }
                 .await;
@@ -901,14 +880,8 @@ impl CardWallet {
             }
         }
         // Pending notes whose transaction id was never recorded (crash inside a topup).
-        let blind_only: Vec<NoteRec> = self
-            .store
-            .state
-            .notes
-            .iter()
-            .filter(|n| n.status == NoteStatus::Pending && n.txid.is_none())
-            .cloned()
-            .collect();
+        let blind_only: Vec<NoteRec> =
+            self.store.state.notes.iter().filter(|n| n.status == NoteStatus::Pending && n.txid.is_none()).cloned().collect();
         for n in blind_only {
             let (Some(bk), Ok(nonce)) = (n.blinding_key.as_deref(), nonce_from_hex(&n.nonce)) else { continue };
             let Ok(key) = dec::<BlindingKey>(bk) else { continue };
@@ -971,9 +944,8 @@ impl CardWallet {
             Ok(Ok(Err(rejection))) if !ptx.accepted => {
                 // A rejected resubmission does not mean the original failed: an older federation
                 // may refuse a transaction it already included. Ask for the confirmation first.
-                let included = tokio::time::timeout(Duration::from_secs(10), self.wallet.client.api().await_transaction(txid_parsed))
-                    .await
-                    .is_ok();
+                let included =
+                    tokio::time::timeout(Duration::from_secs(10), self.wallet.client.api().await_transaction(txid_parsed)).await.is_ok();
                 // Why abandoning below cannot hit a transaction the federation later accepts: the
                 // federation's verdict on a transaction is final and the same on every submission,
                 // so a rejection means it was never (and will never be) included. A transaction
@@ -1028,9 +1000,7 @@ impl CardWallet {
             // A record that carries a client_ref is never removed unless its sale is recorded:
             // either the hook succeeded, or (no hook, e.g. the CLI without a ledger) a tombstone
             // is written in the same save that removes the record.
-            if let Some(sale) =
-                PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false)
-            {
+            if let Some(sale) = PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false) {
                 match &self.on_promote {
                     Some(hook) => hook(&sale).context("recording the sale")?,
                     None => self.store.state.tombstones.push(Tombstone {
@@ -1063,13 +1033,7 @@ impl CardWallet {
 
     /// Sales the federation has accepted whose records are still waiting for their till notes.
     pub fn accepted_refs(&self) -> Vec<PromotedSale> {
-        self.store
-            .state
-            .pending_txs
-            .iter()
-            .filter(|p| p.accepted)
-            .filter_map(|p| PromotedSale::from_ptx(p, 0, true))
-            .collect()
+        self.store.state.pending_txs.iter().filter(|p| p.accepted).filter_map(|p| PromotedSale::from_ptx(p, 0, true)).collect()
     }
 
     /// Check that the card in the field is the one this wallet was set up with: the public key
@@ -1079,8 +1043,7 @@ impl CardWallet {
     /// its own error.
     pub fn verify_card(&mut self) -> Result<()> {
         let st = &self.store.state;
-        let Some(slot) = st.slots.iter().map(|s| s.slot).find(|s| !st.pending_overwrites.iter().any(|p| p.slot == *s))
-        else {
+        let Some(slot) = st.slots.iter().map(|s| s.slot).find(|s| !st.pending_overwrites.iter().any(|p| p.slot == *s)) else {
             return Ok(());
         };
         let want = st.slot_pubkey(slot).unwrap_or_default().to_owned();
@@ -1188,9 +1151,7 @@ impl CardWallet {
         for n in inputs {
             let nonce = nonce_from_hex(&n.nonce)?;
             let signature = dec(n.signature.as_deref().context("live note without signature")?)?;
-            tx_inputs.push(
-                MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce, signature }).into_dyn(mint_id),
-            );
+            tx_inputs.push(MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce, signature }).into_dyn(mint_id));
             keys.push((n.slot, XOnlyPublicKey::from(nonce.0)));
         }
         let mut tx = Transaction {
@@ -1364,10 +1325,10 @@ impl CardWallet {
                 Err(SpendFault::Declined(format!("federation rejected the spend: {e}")).into())
             }
             // Undecided: the records stay, recovery resubmits the stored bytes.
-            Err(e) => Err(SpendFault::Undecided(format!(
-                "transaction {group} is undecided and will be retried by the next command: {e:#}"
-            ))
-            .into()),
+            Err(e) => {
+                Err(SpendFault::Undecided(format!("transaction {group} is undecided and will be retried by the next command: {e:#}"))
+                    .into())
+            }
         }
     }
 
@@ -1386,11 +1347,7 @@ impl CardWallet {
                     }
                     OwnerKind::Host(kind) => {
                         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
-                        PlannedOut {
-                            amount: *a,
-                            blinded: blind(Nonce(kp.public_key()), key),
-                            owner: Owner::Host { kp, key, kind },
-                        }
+                        PlannedOut { amount: *a, blinded: blind(Nonce(kp.public_key()), key), owner: Owner::Host { kp, key, kind } }
                     }
                 })
             })
@@ -1546,10 +1503,7 @@ impl CardWallet {
             [] => bail!("slot {slot} holds no live note"),
             _ => bail!("slot {slot} holds several live notes; state file is inconsistent"),
         };
-        ensure!(
-            !self.is_spent(nonce_from_hex(&note.nonce)?).await?,
-            "the federation reports this note already spent; run `card balance`"
-        );
+        ensure!(!self.is_spent(nonce_from_hex(&note.nonce)?).await?, "the federation reports this note already spent; run `card balance`");
         let fee = self.fee_fn();
         let (amounts, dust) = plan::cashout(note.amount_msat, &fee, self.wallet.min_denom())
             .with_context(|| format!("a {} msat note cannot pay its own fee", note.amount_msat))?;
@@ -1582,7 +1536,10 @@ impl CardWallet {
             warnings,
         };
         if report.collection_pending {
-            report.warnings.push("the note is spent; its value reaches the wallet when `card balance` finishes the collection, then use `ecash export`".into());
+            report.warnings.push(
+                "the note is spent; its value reaches the wallet when `card balance` finishes the collection, then use `ecash export`"
+                    .into(),
+            );
             return Ok(report);
         }
         let gained = self.wallet.balance_msat().await?.saturating_sub(bal0);
@@ -1666,7 +1623,13 @@ impl CardWallet {
             }
             match info.state {
                 SlotState::Note => {
-                    ensure!(info.amount_msat == n.amount_msat, "slot {} holds a note of {} msat, not {}", n.slot, info.amount_msat, n.amount_msat);
+                    ensure!(
+                        info.amount_msat == n.amount_msat,
+                        "slot {} holds a note of {} msat, not {}",
+                        n.slot,
+                        info.amount_msat,
+                        n.amount_msat
+                    );
                     counted.push(n.amount_msat);
                 }
                 SlotState::Keyed | SlotState::Change => {

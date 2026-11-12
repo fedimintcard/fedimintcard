@@ -46,7 +46,6 @@ pub fn blind(nonce: Nonce, key: BlindingKey) -> BlindedMessage {
     tbs::blind_message(nonce.to_message(), key)
 }
 
-
 /// A scalar from a small integer: its consensus encoding is 32 bytes little-endian.
 fn scalar<T: Decodable>(n: u64) -> T {
     let mut bytes = [0u8; 32];
