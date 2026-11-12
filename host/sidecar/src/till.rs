@@ -51,7 +51,8 @@ use crate::wallet::{Wallet, sales_path};
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9877";
 /// Largest price accepted (2^40 msat, about 11 BTC).
 pub const MAX_PRICE_MSAT: u64 = 1 << 40;
-const MAX_CLIENT_REF: usize = 128;
+/// Longest `client_ref` a charge takes.
+pub const MAX_CLIENT_REF: usize = 128;
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A finished API answer: HTTP status plus JSON body.
@@ -192,7 +193,7 @@ impl Conn {
     }
 
     /// The refusal for a card job while a till that belongs on ops has no token.
-    fn refusal(&self) -> Option<Reply> {
+    pub(crate) fn refusal(&self) -> Option<Reply> {
         let detail = match &self.state {
             OpsState::Local | OpsState::Connected { .. } => return None,
             OpsState::Waiting { code, .. } => {
@@ -377,11 +378,14 @@ pub type CardOpener = Box<dyn Fn() -> Result<Box<dyn Card>>>;
 enum Job {
     /// `pin` is the holder's, typed at the till. Never logged, stored or sent to ops.
     /// `link`: the POS phone's card link (`X-Card-Link`), used instead of the opener.
+    /// `online_only`: never take it offline (a pay's charge: paying an invoice needs the
+    /// federation, `crate::pay`).
     Charge {
         price: u64,
         client_ref: Option<String>,
         pin: Option<Vec<u8>>,
         link: Option<Link>,
+        online_only: bool,
         reply: oneshot::Sender<Reply>,
     },
     Balance {
@@ -442,6 +446,8 @@ pub struct TillHandle {
     offline: SharedOffline,
     /// The newest block header, for the phones' offline kits ([`Self::with_headers`]).
     headers: Option<Arc<crate::clock::Headers>>,
+    /// Invoices paid with a card ([`Self::with_pays`]); without them the pay routes answer 503.
+    pays: Option<Arc<crate::pay::Pays>>,
 }
 
 /// The till's offline charges, once [`TillHandle::with_offline`] set them.
@@ -463,6 +469,38 @@ impl TillHandle {
 
     pub(crate) fn wallet(&self) -> &Wallet {
         &self.wallet
+    }
+
+    /// Pay invoices with a card (`POST /v1/pay`, [`crate::pay`]). Records a crash left open are
+    /// picked up by the sweeper ([`crate::pay::spawn_sweeper`]) or by [`crate::pay::sweep`].
+    pub fn with_pays(mut self, pays: Arc<crate::pay::Pays>) -> Self {
+        self.pays = Some(pays);
+        self
+    }
+
+    /// The pays, once [`Self::with_pays`] set them.
+    pub fn pays(&self) -> Option<Arc<crate::pay::Pays>> {
+        self.pays.clone()
+    }
+
+    /// Whether an unresolved charge in the card state carries `client_ref` (as of the last job).
+    pub(crate) fn has_pending_ref(&self, client_ref: &str) -> bool {
+        self.pending_refs.lock().unwrap().iter().any(|r| r == client_ref)
+    }
+
+    /// Charge the card in the field (or behind `link`) through the actor, exactly as
+    /// `POST /v1/charge` does once its request is checked; `online_only` refuses to take it offline.
+    pub(crate) async fn charge_card(
+        &self,
+        price: u64,
+        client_ref: String,
+        pin: Option<Vec<u8>>,
+        link: Option<Link>,
+        online_only: bool,
+    ) -> Reply {
+        let cref = client_ref.clone();
+        run_job(self, Some((&cref, price)), |reply| Job::Charge { price, client_ref: Some(client_ref), pin, link, online_only, reply })
+            .await
     }
 
     pub(crate) fn sales(&self) -> Arc<Mutex<SalesStore>> {
@@ -576,6 +614,7 @@ pub async fn new_with_conn(
         topups: None,
         offline: offline.clone(),
         headers: None,
+        pays: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn, offline))
 }
@@ -615,12 +654,13 @@ async fn actor(
                 };
                 (reply, r)
             }
-            Job::Charge { price, client_ref, pin, link, reply } => {
+            Job::Charge { price, client_ref, pin, link, online_only, reply } => {
                 let r = match on_card(|| open_for(&opener, link.as_ref())) {
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
-                        charge_job_with(&mut cw, ops.as_ref(), off.as_deref(), price, client_ref, &sales).await
+                        let off = if online_only { None } else { off.as_deref() };
+                        charge_job_with(&mut cw, ops.as_ref(), off, price, client_ref, &sales).await
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
@@ -1438,6 +1478,9 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/topup/{topup_id}", get(topup_get))
         .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
+        .route("/v1/pay", post(crate::pay::pay))
+        .route("/v1/pay/{pay_id}", get(crate::pay::pay_get))
+        .route("/v1/pays", get(crate::pay::pays_list))
         .route("/v1/offline/kit", get(crate::pos::offline_kit))
         .route(
             "/v1/offline/charges",
@@ -1457,7 +1500,7 @@ const LINK_HEADER: &str = "x-card-link";
 
 /// The link a job names in `X-Card-Link`: `Ok(None)` without the header, `Err(409)` for an id
 /// that is unknown or closed.
-fn link_of(h: &TillHandle, headers: &HeaderMap) -> Result<Option<Link>, Reply> {
+pub(crate) fn link_of(h: &TillHandle, headers: &HeaderMap) -> Result<Option<Link>, Reply> {
     let Some(v) = headers.get(LINK_HEADER) else { return Ok(None) };
     let id = v.to_str().unwrap_or_default().trim();
     match h.links.get(id) {
@@ -1588,7 +1631,15 @@ async fn charge_on(h: &TillHandle, link: Option<Link>, body: Bytes) -> Reply {
     }
     let cref = req.client_ref.clone();
     let pin = req.pin.map(String::into_bytes);
-    run_job(h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, pin, link, reply }).await
+    run_job(h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge {
+        price,
+        client_ref: req.client_ref,
+        pin,
+        link,
+        online_only: false,
+        reply,
+    })
+    .await
 }
 
 async fn card_balance(State(h): State<TillHandle>, headers: HeaderMap) -> Reply {
@@ -1935,6 +1986,8 @@ pub struct ServeOptions {
     pub spares: crate::ops::SpareConfig,
     /// How long the phones' offline kits last, and their grace for redeeming.
     pub kits: crate::pool::KitConfig,
+    /// Paying invoices with a card (`POST /v1/pay`, [`crate::pay`]); off by default.
+    pub pay: crate::pay::PayConfig,
 }
 
 /// [`serve_with`], with the offline options.
@@ -2063,13 +2116,25 @@ pub async fn serve_opts(
     let handle = match wallet.lightning() {
         Ok(_) => {
             let store = crate::topup::TopupStore::open(crate::topup::TopupStore::path_in(&dir))?;
-            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet })))
+            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet: wallet.clone() })))
         }
         Err(e) => {
             eprintln!("no Lightning top-ups: {e:#}");
             handle
         }
     };
+    // Invoices paid with a card, when the wallet can pay invoices. The records are resolved even
+    // with paying turned off, so a pay a restart left open is still settled.
+    let handle = match crate::pay::Pays::for_wallet(&dir, &wallet, opts.pay).await? {
+        Some(p) => {
+            if opts.pay.enabled {
+                eprintln!("paying invoices with a card: on (POST /v1/pay)");
+            }
+            handle.with_pays(p)
+        }
+        None => handle,
+    };
+    let sweeper = handle.pays().is_some().then(|| crate::pay::spawn_sweeper(handle.clone()));
     let (auth, handle) = match pos_token {
         Some(t) if require_pos_token => ("POS token required on every request", handle.with_pos_token_everywhere(t)),
         Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),
@@ -2101,6 +2166,9 @@ pub async fn serve_opts(
     let server = async {
         let r = server.await;
         sender.abort();
+        if let Some(s) = &sweeper {
+            s.abort();
+        }
         r
     };
     let (served, ()) = tokio::join!(server, actor);

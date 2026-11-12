@@ -137,6 +137,28 @@ enum TillCmd {
         /// its unused pool entries are dropped with their secrets.
         #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
         offline_kit_grace_days: u64,
+        /// Pay Lightning invoices with a card (`POST /v1/pay`): the till charges the card for the
+        /// invoice, its fee reserve and margin, then pays the invoice from its wallet. Off by default.
+        #[arg(long, env = "TILL_PAY_ENABLED", value_parser = clap::builder::BoolishValueParser::new())]
+        pay_enabled: bool,
+        /// Largest invoice paid with a card, in msat.
+        #[arg(long, env = "TILL_PAY_MAX_INVOICE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_INVOICE_MSAT)]
+        pay_max_invoice_msat: u64,
+        /// Cap on a pay's fee reserve, in msat: a larger `max_fee_msat` is lowered to it.
+        #[arg(long, env = "TILL_PAY_MAX_FEE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_FEE_MSAT)]
+        pay_max_fee_msat: u64,
+        /// The till's margin on each pay, in msat (added to --pay-margin-bps).
+        #[arg(long, env = "TILL_PAY_MARGIN_MSAT", default_value_t = 0)]
+        pay_margin_msat: u64,
+        /// The till's margin on each pay, in basis points of the invoice.
+        #[arg(long, env = "TILL_PAY_MARGIN_BPS", default_value_t = 0)]
+        pay_margin_bps: u64,
+        /// Most value, in msat, the till charges cards for pays in any 24 hours.
+        #[arg(long, env = "TILL_PAY_DAILY_CAP_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_DAILY_CAP_MSAT)]
+        pay_daily_cap_msat: u64,
+        /// Least time, in seconds, an invoice must have left before it expires.
+        #[arg(long, env = "TILL_PAY_MIN_EXPIRY_SECS", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MIN_EXPIRY_SECS)]
+        pay_min_expiry_secs: u64,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -409,6 +431,13 @@ async fn main() -> Result<()> {
             spare_keys_per_tap,
             offline_kit_ttl_hours,
             offline_kit_grace_days,
+            pay_enabled,
+            pay_max_invoice_msat,
+            pay_max_fee_msat,
+            pay_margin_msat,
+            pay_margin_bps,
+            pay_daily_cap_msat,
+            pay_min_expiry_secs,
         }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
@@ -427,6 +456,16 @@ async fn main() -> Result<()> {
                 kits: fedimint_card_sidecar::pool::KitConfig {
                     ttl_ms: offline_kit_ttl_hours.saturating_mul(3_600_000),
                     grace_ms: offline_kit_grace_days.saturating_mul(86_400_000),
+                },
+                pay: fedimint_card_sidecar::pay::PayConfig {
+                    enabled: *pay_enabled,
+                    max_invoice_msat: *pay_max_invoice_msat,
+                    max_fee_msat: *pay_max_fee_msat,
+                    margin_msat: *pay_margin_msat,
+                    margin_bps: *pay_margin_bps,
+                    daily_cap_msat: *pay_daily_cap_msat,
+                    min_expiry_secs: *pay_min_expiry_secs,
+                    ..Default::default()
                 },
             };
             fedimint_card_sidecar::till::serve_opts(
