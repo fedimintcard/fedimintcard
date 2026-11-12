@@ -110,14 +110,20 @@ impl From<LnPayOutcome> for WalletPay {
 impl Wallet {
     /// Pay `bolt11` from the wallet's balance, refusing (before anything is funded) a gateway
     /// that asks more than `max_fee_msat` for it, and follow the payment for up to `wait`.
-    /// Paying an invoice again answers the earlier payment, never a second one. Errors only for
-    /// an invoice that does not parse or has no amount.
+    /// Paying an invoice again answers an earlier payment that is paid or not settled and never
+    /// funds a second one while one could still pay. Only after a certain failure does it start
+    /// a new attempt. Errors for an invoice that does not parse or has no amount, and when the
+    /// wallet's earlier payments of it cannot be read; nothing is funded then.
     pub async fn pay_invoice(
         &self,
         bolt11: &str,
         max_fee_msat: u64,
         wait: Duration,
     ) -> Result<WalletPay> {
+        // The guard against a second attempt lives under `ln pay` (`pay_bolt11_within`), so the
+        // operator's `ln pay` has it too: for ln `earlier_v1` answers an earlier attempt that is
+        // paid or not settled; lnv2 never starts a second attempt at an invoice
+        // (`DuplicatePaymentAttempt`, answered by following that attempt).
         Ok(self
             .pay_bolt11_within(bolt11, Some(max_fee_msat), wait)
             .await?
@@ -158,8 +164,35 @@ impl Wallet {
         Ok(settle(found))
     }
 
-    /// The operations this wallet funded to pay `invoice`, oldest first.
-    async fn pay_operations(&self, invoice: &Bolt11Invoice) -> Result<Vec<OperationId>> {
+    /// This wallet's earlier ln attempt at `invoice` that a new attempt must not go around: a
+    /// paid one, else one that is not settled (in flight, or ended in an error the client could
+    /// not settle, which leaves the contract funded and claimable by the gateway). `None` when
+    /// there is no earlier attempt or every one failed for certain (refunded). Fedimint's ln
+    /// client starts a new attempt after any attempt that is neither paid nor running, including
+    /// the unsettled ones, so this check runs before every ln payment.
+    pub(super) async fn earlier_v1(
+        &self,
+        invoice: &Bolt11Invoice,
+        wait: Duration,
+    ) -> Result<Option<LnPayOutcome>> {
+        let mut found = Vec::new();
+        for op in self.ln_pay_operations(invoice).await? {
+            found.push(self.follow_v1(op, wait).await?);
+        }
+        let paid = found
+            .iter()
+            .find(|o| matches!(o, LnPayOutcome::Paid { .. }));
+        let open = found.iter().find(|o| {
+            matches!(
+                o,
+                LnPayOutcome::Pending { .. } | LnPayOutcome::Failed { .. }
+            )
+        });
+        Ok(paid.or(open).cloned())
+    }
+
+    /// The ln operations this wallet funded to pay `invoice`, oldest first; none without ln.
+    async fn ln_pay_operations(&self, invoice: &Bolt11Invoice) -> Result<Vec<OperationId>> {
         let mut ops = Vec::new();
         if let Ok(ln) = self.lightning() {
             // ln numbers the attempts at an invoice from 1 and keeps the last number; an attempt
@@ -182,6 +215,12 @@ impl Wallet {
                 }
             }
         }
+        Ok(ops)
+    }
+
+    /// The operations this wallet funded to pay `invoice`, oldest first.
+    async fn pay_operations(&self, invoice: &Bolt11Invoice) -> Result<Vec<OperationId>> {
+        let mut ops = self.ln_pay_operations(invoice).await?;
         if let Ok(ln) = self.lightning_v2() {
             match ln
                 .get_invoice_send_status(invoice)

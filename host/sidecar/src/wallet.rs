@@ -283,8 +283,10 @@ impl Wallet {
     /// `ln pay`: pay `bolt11` from the wallet's balance through a gateway of the federation's ln
     /// module, else of its lnv2 module, and follow it for up to `LN_PAY_WAIT`. With
     /// `max_fee_msat`, a gateway asking a larger fee for this invoice is refused before anything is
-    /// spent. Paying an invoice the wallet already paid answers that payment again (ln keeps a
-    /// record per payment hash). Errors only for an invoice that does not parse or has no amount.
+    /// spent. Paying an invoice again answers an earlier payment that is paid or not settled, and
+    /// never funds a second one while one could still pay; only after a certain failure (refunded)
+    /// does it start a new attempt. Errors for an invoice that does not parse or has no amount,
+    /// and when the wallet's earlier payments of it cannot be read.
     pub async fn pay_bolt11(&self, bolt11: &str, max_fee_msat: Option<u64>) -> Result<LnPayOutcome> {
         self.pay_bolt11_within(bolt11, max_fee_msat, LN_PAY_WAIT).await
     }
@@ -293,6 +295,12 @@ impl Wallet {
     async fn pay_bolt11_within(&self, bolt11: &str, max_fee_msat: Option<u64>, wait: Duration) -> Result<LnPayOutcome> {
         let invoice = parse_bolt11(bolt11)?;
         if self.lightning().is_ok() {
+            // ln refuses a new attempt only while the last one is paid or running; one that ended
+            // in an error it could not settle leaves a funded contract, and a second attempt would
+            // fund another for the same payment hash.
+            if let Some(earlier) = self.earlier_v1(&invoice, wait).await? {
+                return Ok(earlier);
+            }
             return Ok(self.pay_v1(invoice, max_fee_msat, wait).await);
         }
         if self.lightning_v2().is_ok() {

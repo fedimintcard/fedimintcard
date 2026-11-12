@@ -7,6 +7,10 @@
 //! - ln (v1) between two wallets of the same federation, which needs no gateway: paid, paid
 //!   again without paying twice, and resolved after the wallet is opened again. An invoice from
 //!   outside the federation is refused with nothing spent.
+//! - ln (v1) through a test gateway registered with the guardians, the path a till on a
+//!   federation with ln takes: paid with the gateway's fee, refused over the fee cap, an error the
+//!   client cannot settle that stays unknown and is never funded twice, and an unanswered
+//!   gateway that stays unknown until the contract times out and the refund comes back.
 //!
 //! Nothing here reaches a real federation, gateway or Lightning node.
 
@@ -408,5 +412,238 @@ async fn ln_pays_inside_the_federation_once_and_resolves_after_reopening() -> an
     assert_eq!(w.pay_status(&outside, WAIT).await?, None);
     assert_eq!(w.balance_msat().await?, after);
     close(w).await;
+    Ok(())
+}
+
+/// The fee the ln test gateway announces: 1 sat plus 0.1 %.
+const LN_GATEWAY_FEES: lightning_invoice::RoutingFees = lightning_invoice::RoutingFees {
+    base_msat: 1_000,
+    proportional_millionths: 1_000,
+};
+/// An invoice the ln test gateway answers with an error the client cannot settle.
+const BROKEN: [u8; 32] = [214; 32];
+
+fn ln_gateway_fee_msat() -> u64 {
+    use fedimint_ln_common::config::FeeToAmount as _;
+    LN_GATEWAY_FEES
+        .to_amount(&Amount::from_msats(INVOICE_MSAT))
+        .msats
+}
+
+/// An ln (v1) gateway that pays `PAYABLE` invoices, answers `BROKEN` ones with
+/// `OutgoingContractError` (the pay state machine ends in `Failure`, which the client reports as
+/// an unexpected error while the contract stays funded) and fails `UNANSWERED` ones with an
+/// internal error, which the client retries while the contract waits for its timelock.
+#[derive(Debug)]
+struct TestLnGateway;
+
+#[async_trait::async_trait]
+impl fedimint_ln_client::GatewayConnection for TestLnGateway {
+    async fn verify_gateway_availability(
+        &self,
+        _gateway: &fedimint_ln_common::LightningGateway,
+    ) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    async fn pay_invoice(
+        &self,
+        _gateway: fedimint_ln_common::LightningGateway,
+        payload: fedimint_ln_client::pay::PayInvoicePayload,
+    ) -> Result<String, fedimint_ln_client::pay::GatewayPayError> {
+        use fedimint_ln_client::pay::{GatewayPayError, PaymentData};
+        let secret = match &payload.payment_data {
+            PaymentData::Invoice(invoice) => invoice.payment_secret().0,
+            PaymentData::PrunedInvoice(pruned) => pruned.payment_secret,
+        };
+        match secret {
+            PAYABLE => Ok(hex::encode(PREIMAGE)),
+            BROKEN => Err(GatewayPayError::OutgoingContractError),
+            _ => Err(GatewayPayError::GatewayInternalError {
+                error_code: Some(500),
+                error_message: "the gateway is down".into(),
+            }),
+        }
+    }
+}
+
+/// A regtest invoice for `INVOICE_MSAT` that the ln test gateway treats by `secret`, with a
+/// payment hash of its own (ln keeps its attempts per payment hash).
+fn ln_invoice(secret: [u8; 32]) -> Bolt11Invoice {
+    let key = SecretKey::new(&mut OsRng);
+    InvoiceBuilder::new(Currency::Regtest)
+        .description(String::new())
+        .payment_hash(sha256::Hash::hash(&rand::random::<[u8; 32]>()))
+        .payment_secret(PaymentSecret(secret))
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(18)
+        .amount_milli_satoshis(INVOICE_MSAT)
+        .build_signed(|m| SECP256K1.sign_ecdsa_recoverable(m, &key))
+        .expect("valid invoice")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ln_through_a_gateway_pays_and_never_settles_an_unexpected_error_as_failed()
+-> anyhow::Result<()> {
+    use fedimint_ln_client::LightningClientModule;
+    use fedimint_ln_client::api::LnFederationApi as _;
+    use fedimint_ln_common::{LightningGateway, LightningGatewayAnnouncement};
+
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit)
+        .with_module(DummyClientInit, DummyInit)
+        .with_module(
+            fedimint_ln_client::LightningClientInit {
+                gateway_conn: Some(Arc::new(TestLnGateway)),
+            },
+            fedimint_ln_server::LightningInit,
+        );
+    let bitcoin = fixtures.bitcoin();
+    let fed = build(fixtures).await?;
+    let client = fed.new_client().await;
+    fund(&client, Amount::from_sats(50_000)).await?;
+
+    // Every guardian lists the test gateway, as a real gateway registers itself.
+    let key = SecretKey::from_slice(&[2; 32])?
+        .keypair(SECP256K1)
+        .public_key();
+    let announcement = LightningGatewayAnnouncement {
+        info: LightningGateway {
+            federation_index: 0,
+            gateway_redeem_key: key,
+            node_pub_key: key,
+            lightning_alias: "test-ln-gateway".into(),
+            api: gateway_url(),
+            route_hints: vec![],
+            fees: LN_GATEWAY_FEES,
+            gateway_id: key,
+            supports_private_payments: false,
+        },
+        vetted: true,
+        ttl: Duration::from_secs(3_600),
+        auth: None,
+    };
+    client
+        .get_first_module::<LightningClientModule>()?
+        .api
+        .register_gateway(&announcement)
+        .await?;
+    let w = Wallet::from_client(client).await?;
+    assert!(w.lightning().is_ok() && w.lightning_v2().is_err());
+    let fee = ln_gateway_fee_msat();
+    assert!(fee > 0);
+
+    // (1) Paid through the gateway, with the fee its contract was funded with; the client's
+    // record and the invoice alone give the same answer.
+    let payable = ln_invoice(PAYABLE).to_string();
+    let before = w.balance_msat().await?;
+    let paid = w.pay_invoice(&payable, fee, WAIT).await?;
+    let WalletPay::Paid {
+        preimage,
+        fee_msat,
+        operation_id,
+    } = &paid
+    else {
+        panic!("{paid:?}")
+    };
+    assert_eq!(*preimage, hex::encode(PREIMAGE));
+    assert_eq!(*fee_msat, fee);
+    let after = w.balance_msat().await?;
+    assert!(before - after >= INVOICE_MSAT + fee, "{before} -> {after}");
+    assert_eq!(w.resolve_pay(operation_id, WAIT).await?, paid);
+    assert_eq!(w.pay_status(&payable, WAIT).await?, Some(paid.clone()));
+    assert_eq!(w.pay_invoice(&payable, fee, WAIT).await?, paid);
+    assert_eq!(w.balance_msat().await?, after, "paid again: nothing spent");
+
+    // (4) A fee cap one below the gateway's fee: refused before anything is funded.
+    let capped = ln_invoice(PAYABLE).to_string();
+    let out = w.pay_invoice(&capped, fee - 1, WAIT).await?;
+    let WalletPay::Failed {
+        reason,
+        operation_id: None,
+        insufficient_funds: false,
+    } = &out
+    else {
+        panic!("{out:?}")
+    };
+    assert!(reason.contains("fee"), "{reason}");
+    assert_eq!(w.pay_status(&capped, WAIT).await?, None);
+    assert_eq!(w.balance_msat().await?, after);
+
+    // (2) The gateway answers an error the client cannot settle: the contract stays funded, so
+    // the answer is unknown, never failed, and paying again funds nothing.
+    let broken = ln_invoice(BROKEN).to_string();
+    let out = w.pay_invoice(&broken, fee, WAIT).await?;
+    let WalletPay::Unknown { operation_id, .. } = &out else {
+        panic!("{out:?}")
+    };
+    let funded = w.balance_msat().await?;
+    assert!(after - funded >= INVOICE_MSAT + fee, "{after} -> {funded}");
+    assert_eq!(w.pay_invoice(&broken, fee, WAIT).await?, out);
+    assert_eq!(
+        w.balance_msat().await?,
+        funded,
+        "an unsettled payment is never funded a second time"
+    );
+    assert_eq!(w.resolve_pay(operation_id, WAIT).await?, out);
+    assert_eq!(w.pay_status(&broken, WAIT).await?, Some(out.clone()));
+
+    // (3) The gateway never answers: funded and in flight, unknown with an id that the invoice
+    // alone finds again.
+    let unanswered = ln_invoice(UNANSWERED).to_string();
+    let out = w
+        .pay_invoice(&unanswered, fee, Duration::from_secs(3))
+        .await?;
+    let WalletPay::Unknown { operation_id, .. } = &out else {
+        panic!("{out:?}")
+    };
+    let op = operation_id.clone();
+    let short = Duration::from_millis(500);
+    assert!(matches!(
+        w.pay_status(&unanswered, short).await?,
+        Some(WalletPay::Unknown { operation_id: ref o, .. }) if *o == op
+    ));
+    assert!(matches!(
+        w.pay_invoice(&unanswered, fee, short).await?,
+        WalletPay::Unknown { operation_id: ref o, .. } if *o == op
+    ));
+    let in_flight = w.balance_msat().await?;
+    assert!(
+        funded - in_flight >= INVOICE_MSAT + fee,
+        "{funded} -> {in_flight}"
+    );
+
+    // Past the contract's timelock the client takes the refund: a certain failure, with the
+    // value back in the wallet.
+    bitcoin.mine_blocks(1_000).await;
+    let out = w.resolve_pay(&op, WAIT).await?;
+    let WalletPay::Failed {
+        operation_id: Some(ref o),
+        insufficient_funds: false,
+        ..
+    } = out
+    else {
+        panic!("{out:?}")
+    };
+    assert_eq!(*o, op);
+    let refunded = w.balance_msat().await?;
+    assert!(
+        refunded - in_flight > INVOICE_MSAT,
+        "{in_flight} -> {refunded}: the refund came back"
+    );
+    assert_eq!(w.pay_status(&unanswered, WAIT).await?, Some(out.clone()));
+
+    // Only after that certain failure does paying again start a new attempt.
+    let again = w
+        .pay_invoice(&unanswered, fee, Duration::from_secs(3))
+        .await?;
+    let WalletPay::Unknown {
+        operation_id: ref next,
+        ..
+    } = again
+    else {
+        panic!("{again:?}")
+    };
+    assert_ne!(*next, op);
+    assert_eq!(w.pay_status(&unanswered, short).await?, Some(again.clone()));
     Ok(())
 }
