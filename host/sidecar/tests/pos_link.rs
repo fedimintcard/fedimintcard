@@ -305,7 +305,9 @@ async fn the_bearer_is_required_off_loopback_only() -> anyhow::Result<()> {
 }
 
 /// A token with the pay scope (`till pair --scope pay`): the pay routes, health and the card link,
-/// from every peer; nothing else, loopback included. The POS token still opens everything.
+/// from every peer; nothing else, loopback included. Not `GET /v1/pays`: that lists every holder's
+/// pays, and the pay token lives in a phone app (it reads its own pay by `client_ref` only). The
+/// POS token still opens everything.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_pay_token_opens_the_pay_routes_and_nothing_else() -> anyhow::Result<()> {
     let f = fx(&[]).await?;
@@ -320,11 +322,15 @@ async fn the_pay_token_opens_the_pay_routes_and_nothing_else() -> anyhow::Result
     ] {
         for peer in ["127.0.0.1:5000", "192.168.1.50:40000"] {
             assert_eq!(call_from(app.clone(), peer, Some(&pay), "/v1/health").await.0, 200, "{peer}");
-            // A till without pays answers its pay routes 503, past the auth.
-            for path in ["/v1/pays", "/v1/pay/1"] {
-                let (s, v) = call_from(app.clone(), peer, Some(&pay), path).await;
-                assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{peer} {path}");
-            }
+            // A till without pays answers its pay route 503, past the auth.
+            let (s, v) = call_from(app.clone(), peer, Some(&pay), "/v1/pay/1").await;
+            assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{peer}");
+            // The list of every holder's pays is the POS token's: the pay token is refused before
+            // the handler, while the POS token gets past the auth to the same 503.
+            let (s, v) = call_from(app.clone(), peer, Some(&pay), "/v1/pays").await;
+            assert_eq!((s, v["error"].as_str()), (403, Some("forbidden")), "{peer}");
+            let (s, v) = call_from(app.clone(), peer, Some(&token), "/v1/pays").await;
+            assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{peer}");
             // The card link: past the auth (refused only as a request that is no upgrade).
             assert_ne!(call_from(app.clone(), peer, Some(&pay), "/v1/card/link").await.0, 403, "{peer}");
             assert_ne!(call_from(app.clone(), peer, Some(&pay), "/v1/card/link").await.0, 401, "{peer}");
