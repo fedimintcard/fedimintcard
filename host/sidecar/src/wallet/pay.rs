@@ -33,8 +33,10 @@ pub enum WalletPay {
     /// paid inside it. The federation's own transaction fees are not included.
     Paid { preimage: String, fee_msat: u64, operation_id: String },
     /// Certainly not paid, and the value is in the wallet. `operation_id` is set when a payment
-    /// was funded and came back; `insufficient_funds` when the balance could not cover it.
-    Failed { reason: String, operation_id: Option<String>, insufficient_funds: bool },
+    /// was funded and came back; `insufficient_funds` when the balance could not cover it;
+    /// `retryable` when nothing was funded only because no gateway answers now, so the same
+    /// payment may go through later.
+    Failed { reason: String, operation_id: Option<String>, insufficient_funds: bool, retryable: bool },
     /// Not settled: resolve it later with `operation_id`.
     Unknown { reason: String, operation_id: String },
 }
@@ -53,9 +55,11 @@ impl From<LnPayOutcome> for WalletPay {
     fn from(outcome: LnPayOutcome) -> Self {
         match outcome {
             LnPayOutcome::Paid { preimage, fee_msat, operation_id } => Self::Paid { preimage, fee_msat, operation_id },
-            LnPayOutcome::Refused { reason, insufficient_funds } => Self::Failed { reason, operation_id: None, insufficient_funds },
+            LnPayOutcome::Refused { reason, insufficient_funds, retryable } => {
+                Self::Failed { reason, operation_id: None, insufficient_funds, retryable }
+            }
             LnPayOutcome::Refunded { reason, operation_id } => {
-                Self::Failed { reason, operation_id: Some(operation_id), insufficient_funds: false }
+                Self::Failed { reason, operation_id: Some(operation_id), insufficient_funds: false, retryable: false }
             }
             LnPayOutcome::Pending { operation_id } => Self::Unknown { reason: "the payment is still in flight".into(), operation_id },
             // The client could not settle it: the value may be with the gateway or on its way
@@ -214,18 +218,27 @@ mod tests {
     }
 
     fn failed(op: Option<&str>) -> WalletPay {
-        WalletPay::Failed { reason: "refunded".into(), operation_id: op.map(Into::into), insufficient_funds: false }
+        WalletPay::Failed { reason: "refunded".into(), operation_id: op.map(Into::into), insufficient_funds: false, retryable: false }
     }
 
     #[test]
     fn only_a_refusal_or_a_refund_is_a_certain_failure() {
         let op = "ab".repeat(32);
-        let refused = LnPayOutcome::Refused { reason: "fee".into(), insufficient_funds: true };
-        assert_eq!(WalletPay::from(refused), WalletPay::Failed { reason: "fee".into(), operation_id: None, insufficient_funds: true });
+        let refused = LnPayOutcome::Refused { reason: "fee".into(), insufficient_funds: true, retryable: false };
+        assert_eq!(
+            WalletPay::from(refused),
+            WalletPay::Failed { reason: "fee".into(), operation_id: None, insufficient_funds: true, retryable: false }
+        );
+        // No gateway answers now: nothing funded, and the same payment may go through later.
+        let no_gateway = LnPayOutcome::Refused { reason: "no gateway".into(), insufficient_funds: false, retryable: true };
+        assert_eq!(
+            WalletPay::from(no_gateway),
+            WalletPay::Failed { reason: "no gateway".into(), operation_id: None, insufficient_funds: false, retryable: true }
+        );
         let refunded = LnPayOutcome::Refunded { reason: "gateway".into(), operation_id: op.clone() };
         assert_eq!(
             WalletPay::from(refunded),
-            WalletPay::Failed { reason: "gateway".into(), operation_id: Some(op.clone()), insufficient_funds: false }
+            WalletPay::Failed { reason: "gateway".into(), operation_id: Some(op.clone()), insufficient_funds: false, retryable: false }
         );
         // In flight, and an error the client could not settle: both stay open, with their id.
         let pending = WalletPay::from(LnPayOutcome::Pending { operation_id: op.clone() });

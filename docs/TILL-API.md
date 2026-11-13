@@ -169,11 +169,15 @@ pairing text, `--new-token` replaces the token first.
 **The pay scope.** `till pair --scope pay` makes a second token, in `<data_dir>/till-pay-token`
 (0600; the POS token is made too if there is none), and prints
 `fedimintcard-till-pay:<url>?t=<token>`. Its bearer opens `POST /v1/pay`, `GET /v1/pay/{pay_id}`,
-`POST /v1/pay/{pay_id}/refund`, `GET /v1/pays`, `GET /v1/health` and `GET /v1/card/link`, and
-nothing else, from every peer, loopback included: any other route answers
+`POST /v1/pay/{pay_id}/refund`, `GET /v1/health` and `GET /v1/card/link`, and nothing else, from
+every peer, loopback included: any other route (`GET /v1/pays`, every holder's pays, too) answers
 `403 {"ok":false,"error":"forbidden","detail":"…"}`. It is for an app that has a card pay its
 invoices (`docs/PAY.md`) without holding the till; paying still needs the card and, on ops, its
-PIN. `--scope pay --new-token` replaces it. `till serve` reads it at start (a running till keeps
+PIN. The token lives in a phone app, so it is held to its own card and its own pays: a
+`POST /v1/pay` or `POST /v1/pay/{pay_id}/refund` with it and no `X-Card-Link` answers
+`400 card_link_required` before anything runs (never the card on the till's own relay or reader),
+and `GET /v1/pay/{pay_id}` with it answers only with `?client_ref=<the pay's client_ref>`
+(`404 unknown_pay` otherwise, as for no pay at all). `--scope pay --new-token` replaces it. `till serve` reads it at start (a running till keeps
 the token it started with).
 
 `GET /v1/card/link` upgrades to a WebSocket over which the till sends the card's APDUs to the
@@ -416,28 +420,34 @@ from its own wallet with what it took. Off by default: `till serve --pay-enabled
 | `--pay-min-expiry-secs` | `TILL_PAY_MIN_EXPIRY_SECS` | 120 | least time an invoice must have left |
 
 The routes answer `503 lightning_unavailable` when the till's federation has no `ln` module the
-wallet can pay with.
+wallet can pay with; `POST /v1/pay` answers it too when no gateway can pay the invoice now.
 
 ### POST /v1/pay
 
 `{"bolt11":"<invoice>","max_fee_msat":N,"client_ref":"<1-124 bytes>","pin":"<optional, 4-8 digits>"}`,
-with `X-Card-Link` (or the relay's card). `max_fee_msat` is optional (the till's cap); `pin` as for
+with `X-Card-Link` (or, with the POS token only, the relay's card). `max_fee_msat` is optional (the till's cap); `pin` as for
 `/v1/charge` (required on ops; never logged, stored or echoed). Use a read timeout of at least
 120 s: the till charges the card, then follows the payment for up to 60 s.
 
 1. The invoice is checked before the card is touched: it decodes (`lightning:` prefix allowed),
    has an amount, is for this till's network, has at least `--pay-min-expiry-secs` left, and is at
    most `--pay-max-invoice-msat`. Then the price (invoice + fee reserve + margin, at most
-   2^40 msat as every charge), ops and the PIN, the daily cap, and that no other pay
-   holds the invoice and the wallet never paid it.
+   2^40 msat as every charge), ops and the PIN, the daily cap, that no other pay
+   holds the invoice and the wallet never paid it, and the gateway's quote: no gateway answering
+   for the invoice is `503 lightning_unavailable`, a gateway fee above the fee reserve is
+   `400 fee_reserve_too_low` (with `gateway_fee_msat`). Nothing is charged for any of these.
 2. `charging` is saved, and the card is charged the price with `client_ref` `pay:<client_ref>`
    through the charge path, never offline. The card's short id is read at that tap and kept.
 3. `charged`, then `paying` (saved before the payment starts), then `paid` with the preimage, or
-   `pay_failed`.
+   `pay_failed`. A payment refused with nothing funded only because the till's wallet does not
+   hold the amount yet, or no gateway answers for a moment, is not a failure: the pay stays
+   `charged` (`undecided` 202) and the sweeper pays it once it can, until the invoice expires.
 
-`200 {"ok":true,"pay_id":N,"client_ref":"…","state":"paid","payment_hash":"<hex>","invoice_msat":N,"fee_reserve_msat":N,"margin_msat":N,"price_msat":N,"sale_id":N,"txid":"<hex>","short_id":"<8 hex>","fee_paid_msat":N,"fee_refund_msat":N,"preimage":"<hex>","created_at_ms":T,"updated_at_ms":T,"invoice_expires_at_ms":T}`
+`200 {"ok":true,"pay_id":N,"client_ref":"…","state":"paid","payment_hash":"<hex>","invoice_msat":N,"fee_reserve_msat":N,"margin_msat":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"sale_id":N,"txid":"<hex>","short_id":"<8 hex>","fee_paid_msat":N,"fee_refund_msat":N,"preimage":"<hex>","created_at_ms":T,"updated_at_ms":T,"invoice_expires_at_ms":T}`
 
-`price_msat` is what the card paid. `fee_paid_msat` is the gateway's fee; `fee_refund_msat`, the
+`price_msat` is what the card was charged. `received_msat` (once `charged`) is what the card paid
+the till: the price, plus `overpaid_msat` when the card's notes could not make exact change (at
+most 2,048 msat, as for any charge). `fee_paid_msat` is the gateway's fee; `fee_refund_msat`, the
 unspent part of the reserve, stays in the till's wallet (it is not put back on the card). The
 preimage is the proof of payment: it is answered only here (and in a replay of this `POST`),
 never by `GET`. No answer carries the invoice or the wallet's operation id; the PIN, the invoice
@@ -448,8 +458,10 @@ and preimages are never logged.
 * a finished pay replays its answer (`paid`: the same 200 with the preimage; `pay_failed`: the
   same 502), whatever the invoice's time left, the settings, ops or a PIN say now;
 * a pay the card paid (or may have) that is not settled answers `undecided` 202 and the till
-  drives it on: a sweeper every 30 s (and at start) follows every open pay, asking the wallet what
-  it did with the invoice before it pays, so nothing is paid twice;
+  drives it on: a sweeper every 30 s (and at start) follows every open pay. A charge left
+  undecided is resolved without a card (accepted: the pay is `charged` and paid; never sent or
+  rejected: `not_charged`), and a repeat of the `POST` does the same. Before it pays, it asks the
+  wallet what it did with the invoice, so nothing is paid twice;
 * a pay whose card was not charged (`not_charged`: a wrong PIN, an `insufficient` card, a card
   error) is tapped again with the same `client_ref`;
 * the same `client_ref` with another invoice or another `max_fee_msat` is `conflict` 409.
@@ -461,6 +473,8 @@ and preimages are never logged.
 | error | HTTP | meaning | app action |
 |---|---|---|---|
 | `bad_request` | 400 | body, `client_ref` or `pin` malformed; nothing ran | fix input |
+| `card_link_required` | 400 | a pay token sent no `X-Card-Link`; nothing ran | open the card link and send its id |
+| `fee_reserve_too_low` | 400 | the gateway's quote (`gateway_fee_msat`) is above the fee reserve; nothing was charged | resend with `max_fee_msat` of at least `gateway_fee_msat` (when above the till's cap, decline) |
 | `bad_invoice` | 400 | the invoice does not decode, or has no amount | ask for an invoice with an amount |
 | `wrong_network` | 400 | the invoice is for another network than the till's federation | ask for an invoice on this network |
 | `invoice_expired` | 400 | the invoice has expired or has less than `--pay-min-expiry-secs` left | ask for a new invoice |
@@ -471,28 +485,29 @@ and preimages are never logged.
 | `conflict` | 409 | this `client_ref` was used for another invoice or fee reserve, or by a `/v1/charge` | use a new `client_ref` |
 | `not_charged` | 409 | an earlier attempt with this `client_ref` was refused by the card | tap again with the same `client_ref` |
 | `undecided` | 202 | the card paid (or may have) and the invoice is not settled yet; nothing is charged or paid again | poll `GET /v1/pay/{pay_id}`, or repeat the `POST` |
-| `pay_failed` | 502 | certain the invoice was not paid; the price stays in the till's wallet, owed to the holder (`state` `pay_failed`, `refunding` or `refunded`) | refund it to the card (below) |
+| `pay_failed` | 502 | certain the invoice was not paid; what the card paid (`received_msat`) stays in the till's wallet, owed to the holder (`state` `pay_failed`, `refunding` or `refunded`) | refund it to the card (below) |
 | `lightning_error` | 502 | the wallet could not be asked about the invoice; nothing was charged | retry |
 | `pay_disabled` | 503 | the till does not pay invoices (`--pay-enabled` is off) | none |
-| `lightning_unavailable` | 503 | the till's federation has no usable `ln` module | none |
+| `lightning_unavailable` | 503 | the till's federation has no usable `ln` module, or no gateway can pay the invoice now; nothing was charged | try again later |
 | card and ops errors | | as `/v1/charge` (`wrong_pin`, `pin_blocked`, `insufficient`, `no_card`, `card_link_gone`, `busy`, `ops_*`, `card_limit`, …), with `state: "not_charged"` when the card was refused | as `/v1/charge` |
 | `internal` | 500 | the pay could not be recorded, so the card was not charged; or anything else | show detail |
 
 ### GET /v1/pay/{pay_id}, GET /v1/pays
 
-`GET /v1/pay/{pay_id}` answers the record as above, without the preimage, and with the refund's
+`GET /v1/pay/{pay_id}` (with the pay token: `GET /v1/pay/{pay_id}?client_ref=<the pay's>`, else
+404) answers the record as above, without the preimage, and with the refund's
 fields: `refund_owed_msat` for a `pay_failed` pay (what the till still holds for the holder),
 `refund_msat` once a refund started (what is back on the card, or will be once the load in flight
 lands), `refund_txid` once a load landed, and `refund_dust_msat` for a `refunded` pay;
 `404 unknown_pay`.
-`GET /v1/pays` answers `{"count":N,"total_price_msat":N,"total_invoice_msat":N,"pays":[…]}`, the
+`GET /v1/pays` (POS token only) answers `{"count":N,"total_price_msat":N,"total_invoice_msat":N,"pays":[…]}`, the
 newest 200 oldest first, totals over `paid` pays. Records live in `<data_dir>/pays.json` (0600),
 each state saved before the step it guards.
 
 ### POST /v1/pay/{pay_id}/refund
 
-Empty body, with `X-Card-Link` (or the relay's card): loads a `pay_failed` pay's price back onto
-the card that paid, as a holder load (the top-up's load, `docs/TOPUP.md`; recorded in ops, so on
+Empty body, with `X-Card-Link` (or, with the POS token only, the relay's card): loads a
+`pay_failed` pay's value (`received_msat`: the price and any overpay) back onto the card that paid, as a holder load (the top-up's load, `docs/TOPUP.md`; recorded in ops, so on
 ops only). The card's short id must be the one read at the pay's charge (the till reads it before
 it charges the card, and keeps it on the charge's sale too). The till's wallet pays the load and
 the mint fees.
@@ -502,7 +517,7 @@ rounded **down** to whole notes, at most 7 and at most the card's free and unkey
 with room for all of it is refunded in one tap. A card with too few free slots takes part: the
 pay goes back to `pay_failed` with `refund_msat` (on the card so far) and `refund_owed_msat` (the
 rest), and the app asks the holder to free slots (spend from the card) and taps again; each tap
-loads more, never past the price. Once less than the smallest note the federation issues is
+loads more, never past what the card paid. Once less than the smallest note the federation issues is
 still owed, the pay is `refunded`, and that remainder (`refund_dust_msat`, under one note) stays
 with the till.
 

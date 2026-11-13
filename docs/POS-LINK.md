@@ -36,9 +36,11 @@ it. Whichever phone started a charge or a balance read supplies that job's card.
 - `till pair --scope pay` pairs an app that only pays invoices with a card (`docs/PAY.md`): a
   second token in `<data_dir>/till-pay-token` (0600, made like the POS token, which it also makes
   if missing), shown as `fedimintcard-till-pay:<url>?t=<token>` so a POS app never takes it for a
-  till's. Its bearer opens `/v1/pay`, `/v1/pay/{id}`, `/v1/pay/{id}/refund`, `/v1/pays`,
-  `/v1/health` and the card link only, from every peer, loopback included; anything else answers
-  `403 {"ok":false,"error":"forbidden"}`. `--scope pay --new-token` replaces it; a running till
+  till's. Its bearer opens `/v1/pay`, `/v1/pay/{id}`, `/v1/pay/{id}/refund`, `/v1/health` and
+  the card link only, from every peer, loopback included; anything else (`/v1/pays` too) answers
+  `403 {"ok":false,"error":"forbidden"}`. A pay or refund with it must name its card link
+  (`X-Card-Link`; `400 card_link_required` otherwise), and `GET /v1/pay/{id}` with it must name the
+  pay's `client_ref` (`?client_ref=`; `404 unknown_pay` otherwise). `--scope pay --new-token` replaces it; a running till
   reads it at start.
 
 ## The card link

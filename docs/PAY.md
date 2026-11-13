@@ -17,10 +17,13 @@ hand.
   `host/scripts/till-service.sh pair --scope pay`) and the app scans the QR, or takes the text:
   `fedimintcard-till-pay:<till url>?t=<token>`. Send `Authorization: Bearer <token>` on every
   request. The token opens only the pay routes, `/v1/health` and the card link, so the app cannot
-  charge cards for itself, read sales or load cards. Keep it in the platform's secret store.
+  charge cards for itself, read sales or other holders' pays, or load cards: a pay or refund with
+  it must name its own card link (`400 card_link_required` otherwise; never the card on the till's
+  reader), and `GET /v1/pay/{pay_id}` with it must carry `?client_ref=<your client_ref>` (404
+  otherwise). Keep it in the platform's secret store.
 - **The card in reach.** The phone the app runs on reads the card over NFC and lends it to the
   till through the card link (`docs/POS-LINK.md`: a WebSocket at `/v1/card/link` that forwards the
-  till's APDUs). Without a link the till uses the card behind its own relay (`CARD_BRIDGE_URL`).
+  till's APDUs). The pay token always needs the link.
 - **The holder's PIN** when the till is on a registry (`pin_required` otherwise). The app sends it
   in the body; the till never logs, stores or echoes it.
 
@@ -44,23 +47,30 @@ safe. The same `client_ref` never charges the card twice or pays the invoice twi
 ## When it does not answer 200
 
 - **`202 undecided`**: the card paid (or may have) and the invoice is not settled yet. Do not tap
-  again or make a new pay. Poll `GET /v1/pay/{pay_id}` (or repeat the same `POST`) until `state`
-  is `paid` or `pay_failed`; the till keeps driving the pay by itself.
+  again or make a new pay. Poll `GET /v1/pay/{pay_id}?client_ref=<your client_ref>` (or repeat the
+  same `POST`) until `state` is `paid`, `pay_failed` or `not_charged`; the till keeps driving the
+  pay by itself, the card's charge included (a charge left undecided is settled without the card:
+  `not_charged` when it never took the card's money, and then the holder may tap again with the
+  same `client_ref`).
 - **Before the card was touched** (`bad_invoice`, `wrong_network`, `invoice_expired`,
-  `over_limit`, `daily_cap`, `invoice_in_use`, `pay_disabled`, `pin_required`): nothing moved. Fix
-  the invoice or the input and try again with a new `client_ref`.
+  `over_limit`, `daily_cap`, `invoice_in_use`, `pay_disabled`, `pin_required`,
+  `card_link_required`, `lightning_unavailable`, `fee_reserve_too_low`): nothing moved. Fix
+  the invoice or the input (for `fee_reserve_too_low`, a `max_fee_msat` of at least
+  `gateway_fee_msat`; for `lightning_unavailable`, wait) and try again with a new `client_ref`.
 - **The card refused** (`wrong_pin`, `insufficient`, `no_card`, with `"state":"not_charged"`; or
   `card_link_gone`, before anything ran): nothing moved. Ask again (another PIN, the card held
   still, a new link) and resend the **same** `client_ref`.
-- **`502 pay_failed`**: the card paid, the invoice certainly was not (no route, the gateway asked
-  more than the fee reserve, the invoice expired while the till waited). The value stays in the
-  till's wallet, owed to the holder. Offer a refund to the card (below), with the card that paid
+- **`502 pay_failed`**: the card paid, the invoice certainly was not (no route, the gateway raised
+  its fee above the reserve after quoting it, the invoice expired while the till waited). What the
+  card paid (`received_msat`) stays in the till's wallet, owed to the holder. A gateway that is
+  only unreachable for a moment is not a failure: the pay waits (`202`) and the till pays it once
+  a gateway answers, before the invoice expires. Offer a refund to the card (below), with the card that paid
   (`short_id` in the answer).
 
 ## Refunding a failed pay
 
-`POST /v1/pay/{pay_id}/refund` with the card that paid behind `X-Card-Link` loads the price back
-onto it, rounded down to whole notes, never up: the till never loads more than it holds for the
+`POST /v1/pay/{pay_id}/refund` with the card that paid behind `X-Card-Link` loads what the card
+paid (`received_msat`) back onto it, rounded down to whole notes, never up: the till never loads more than it holds for the
 holder. It answers the pay with `"state":"refunded"`, `refund_msat` and `refund_txid`; less than
 one smallest note may stay with the till (`refund_dust_msat`). A card with too few free slots
 takes part of the refund: the answer is `200` with `"state":"pay_failed"`, `refund_msat` (on the
@@ -73,7 +83,10 @@ off its registry cannot refund (`ops_not_connected`).
 ## What the holder pays
 
 The card is charged the invoice, the fee reserve (the app's `max_fee_msat`, capped by the till)
-and the till's margin. The part of the fee reserve the gateway did not take (`fee_refund_msat`)
+and the till's margin: `price_msat`. When the card's notes cannot make exact change, the charge
+overpays the till by at most 2,048 msat, as any charge may; the answer's `received_msat` is what
+the card paid and `overpaid_msat` the part above the price. A refund gives all of
+`received_msat` back. The part of the fee reserve the gateway did not take (`fee_refund_msat`)
 stays with the till in this version; it is not put back on the card.
 
 ## Not in this version

@@ -13,8 +13,9 @@
 //! - `charged`: the card paid the till; no payment has started.
 //! - `paying`: saved before the payment starts; `operation_id` once the wallet named it.
 //! - `paid`: the preimage and the gateway's fee.
-//! - `pay_failed`: certain the invoice was not paid. The value stays in the till's wallet, owed to
-//!   the holder.
+//! - `pay_failed`: certain the invoice was not paid. The value the card paid the till
+//!   (`received_msat`: the price and any overpay of the charge) stays in the till's wallet, owed
+//!   to the holder.
 //! - `refunding`: saved before a refund load ([`refund_job`], `POST /v1/pay/{id}/refund`): the
 //!   value owed goes back onto the card that paid, as a holder load (docs/TOPUP.md). A card with
 //!   too few free slots takes part of it; the pay is `pay_failed` again, owed the rest
@@ -22,12 +23,18 @@
 //! - `refunded`: the value is back on the card (`refund_msat`, `refund_txid`), all but less than
 //!   the smallest note (`refund_dust_msat`), which stays with the till.
 //!
+//! Before the card is charged, the wallet quotes the gateway's fee for the invoice
+//! ([`PayLightning::quote`]): a pay no gateway can carry now (`lightning_unavailable`), or whose fee
+//! reserve is below the gateway's fee (`fee_reserve_too_low`), is refused with nothing charged.
+//!
 //! A record left `charging`, `charged` or `paying` (a crash, a payment still in flight, a till
-//! wallet not yet holding the amount) is driven on by the sweeper ([`sweep`]): a `charging` one is
-//! settled by what the charge left, a `charged` or `paying` one first asks the wallet what it did
-//! with the invoice ([`Wallet::pay_status`]) and pays only when it never funded a payment of it, and
-//! a `paying` one with an operation id is followed until the federation settles it. Nothing is ever
-//! paid twice, and nothing that could still be paid is called failed.
+//! wallet not yet holding the amount, no gateway answering for a moment) is driven on by the
+//! sweeper ([`sweep`]): a `charging` one is settled by what the charge left, resolving a charge
+//! still undecided without a card (`TillHandle::settle_charge`), a `charged` or `paying` one first
+//! asks the wallet what it did with the invoice ([`Wallet::pay_status`]) and pays only when it
+//! never funded a payment of it, and a `paying` one with an operation id is followed until the
+//! federation settles it. Nothing is ever paid twice, and nothing that could still be paid is
+//! called failed.
 //!
 //! A refund never loads more than the till holds for the holder, and each of its loads happens at
 //! most once. Every load is tagged `pay-refund:<pay_id>` in the loader's journal and kept there
@@ -51,8 +58,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::HeaderMap;
 use fedimint_card_host_card::{PIN_MAX, PIN_MIN};
 use futures::future::BoxFuture;
@@ -64,6 +72,7 @@ use crate::glue::on_card;
 use crate::holder::{CardFull, Loader};
 use crate::link::Link;
 use crate::ops::{OpsClient, short_id_of};
+use crate::pos::PayScope;
 use crate::state::write_private_json;
 use crate::till::{MAX_PRICE_MSAT, Reply, TillHandle, error_reply};
 use crate::topup::Topups;
@@ -247,12 +256,29 @@ pub struct PayRec {
     /// The refund's last load.
     #[serde(default)]
     pub refund_txid: Option<String>,
+    /// What the card paid the till, from the charge's sale: the price and any overpay the charge
+    /// could not avoid (up to `MAX_TILL_OVERPAY`). Set once the pay is `charged`; a record from
+    /// before it was kept counts the price.
+    #[serde(default)]
+    pub received_msat: Option<u64>,
+}
+
+/// What a charge's sale says the card paid the till: its price and overpay, or what the till
+/// collected when that is more.
+pub fn paid_to_till(price_msat: u64, overpaid_msat: u64, received_msat: u64) -> u64 {
+    received_msat.max(price_msat.saturating_add(overpaid_msat))
 }
 
 impl PayRec {
+    /// What the card paid the till for this pay: all of it is the holder's while the invoice is
+    /// not paid.
+    pub fn held_msat(&self) -> u64 {
+        self.received_msat.unwrap_or(self.price_msat)
+    }
+
     /// What the till still holds for the holder of a pay whose invoice was not paid.
     pub fn refund_owed_msat(&self) -> u64 {
-        self.price_msat.saturating_sub(self.refund_msat.unwrap_or(0))
+        self.held_msat().saturating_sub(self.refund_msat.unwrap_or(0))
     }
 
     /// What a refunded pay left with the till: less than the smallest note the card could take.
@@ -294,6 +320,11 @@ impl PayRec {
         }
         if let Some(c) = &self.short_id {
             v["short_id"] = json!(c);
+        }
+        // What the card paid the till, and the part of it above the price.
+        if let Some(r) = self.received_msat {
+            v["received_msat"] = json!(r);
+            v["overpaid_msat"] = json!(r.saturating_sub(self.price_msat));
         }
         if matches!(self.state, PayState::Refunding | PayState::Refunded) || self.refund_msat.is_some_and(|m| m > 0) {
             v["refund_msat"] = json!(self.refund_msat.unwrap_or(0));
@@ -418,6 +449,9 @@ pub trait PayLightning: Send + Sync {
     fn resolve(&self, operation_id: String, wait: Duration) -> BoxFuture<'_, Result<WalletPay>>;
     /// [`Wallet::pay_status`]: `None` when the wallet never funded a payment of the invoice.
     fn status(&self, bolt11: String, wait: Duration) -> BoxFuture<'_, Result<Option<WalletPay>>>;
+    /// [`Wallet::quote_invoice`]: the gateway's fee for the invoice now; an error when no gateway
+    /// can pay it now.
+    fn quote(&self, bolt11: String) -> BoxFuture<'_, Result<u64>>;
 }
 
 /// The till's own wallet.
@@ -436,6 +470,10 @@ impl PayLightning for WalletPayer {
 
     fn status(&self, bolt11: String, wait: Duration) -> BoxFuture<'_, Result<Option<WalletPay>>> {
         Box::pin(async move { self.wallet.pay_status(&bolt11, wait).await })
+    }
+
+    fn quote(&self, bolt11: String) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move { self.wallet.quote_invoice(&bolt11).await })
     }
 }
 
@@ -609,8 +647,9 @@ impl Pays {
 
 /// `pays.json`'s answer about whether the card paid for `rec`: from the sales and the card state.
 enum Charge {
-    /// The sale: id, transaction, and the card it charged when the sale recorded it.
-    Sold(u64, String, Option<String>),
+    /// The sale: id, transaction, the card it charged when the sale recorded it, and what the
+    /// card paid the till ([`paid_to_till`]).
+    Sold(u64, String, Option<String>, u64),
     /// A charge with this ref is unresolved.
     Pending,
     /// No charge with this ref, or one for another price (a `/v1/charge` that took the ref).
@@ -620,7 +659,11 @@ enum Charge {
 fn charge_of(h: &TillHandle, rec: &PayRec) -> Charge {
     let cref = charge_ref(&rec.client_ref);
     if let Some(s) = h.sales().lock().unwrap().find_ref(&cref) {
-        return if s.price_msat == rec.price_msat { Charge::Sold(s.id, s.txid.clone(), s.short_id.clone()) } else { Charge::None };
+        return if s.price_msat == rec.price_msat {
+            Charge::Sold(s.id, s.txid.clone(), s.short_id.clone(), paid_to_till(s.price_msat, s.overpaid_msat, s.received_msat))
+        } else {
+            Charge::None
+        };
     }
     if h.has_pending_ref(&cref) { Charge::Pending } else { Charge::None }
 }
@@ -640,6 +683,9 @@ fn about(mut r: Reply, rec: &PayRec) -> Reply {
         // The card a refund goes to, and what it is still owed.
         if let Some(c) = &rec.short_id {
             b.insert("short_id".into(), json!(c));
+        }
+        if let Some(r) = rec.received_msat {
+            b.insert("received_msat".into(), json!(r));
         }
         if rec.state == PayState::PayFailed {
             b.insert("refund_owed_msat".into(), json!(rec.refund_owed_msat()));
@@ -667,7 +713,7 @@ fn final_reply(rec: &PayRec) -> Reply {
                     "the invoice was not paid ({}); {} msat of the card's {} stay with the till, owed to the holder",
                     rec.detail.as_deref().unwrap_or("the payment failed"),
                     rec.refund_owed_msat(),
-                    rec.price_msat
+                    rec.held_msat()
                 ),
             ),
             rec,
@@ -700,7 +746,12 @@ fn final_reply(rec: &PayRec) -> Reply {
 /// Drive pay `id` as far as it goes now, and answer where it stands. `tap` is the card for a
 /// record still `charging`; without one (the sweeper) such a record is only settled by what an
 /// earlier charge left.
+///
+/// A charge still unresolved is settled here, once per call, without a card
+/// ([`TillHandle::settle_charge`]): the sweeper (and a repeat of the pay) is what drives an
+/// undecided charge to an end, whether a POS ever asks about it again or not.
 async fn advance(h: &TillHandle, pays: &Arc<Pays>, id: u64, mut tap: Option<Tap>, wait: Duration) -> Reply {
+    let mut settled = false;
     loop {
         let Some(mut rec) = pays.get(id) else { return unknown_pay() };
         match rec.state {
@@ -709,15 +760,24 @@ async fn advance(h: &TillHandle, pays: &Arc<Pays>, id: u64, mut tap: Option<Tap>
             }
             PayState::Charging => match tap.take() {
                 None => match charge_of(h, &rec) {
-                    Charge::Sold(sale_id, txid, card) => {
+                    Charge::Sold(sale_id, txid, card, received) => {
                         rec.state = PayState::Charged;
                         rec.sale_id = Some(sale_id);
                         rec.txid = Some(txid);
+                        rec.received_msat = Some(received);
                         // The card that paid, from its sale: a crash before the charge's answer
                         // was recorded loses no refund.
                         rec.short_id = rec.short_id.take().or(card);
                         rec.detail = None;
                         pays.record(&mut rec);
+                    }
+                    // Resolve it now, with no card and no new spend; then read what it left.
+                    Charge::Pending if !settled => {
+                        settled = true;
+                        let r = h.settle_charge(rec.price_msat, charge_ref(&rec.client_ref)).await;
+                        if r.status != 200 {
+                            tracing::info!("pay {id}: settling its charge: {} {}", r.status, r.body["error"]);
+                        }
                     }
                     Charge::Pending => {
                         return undecided(&rec, "the card's charge is still being resolved; nothing was charged again");
@@ -769,6 +829,11 @@ fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Rep
             r.body["sale_id"].as_u64().unwrap_or(0),
             r.body["txid"].as_str().unwrap_or_default().to_owned(),
             sale_card(h, &rec),
+            paid_to_till(
+                r.body["price_msat"].as_u64().unwrap_or(rec.price_msat),
+                r.body["overpaid_msat"].as_u64().unwrap_or(0),
+                r.body["received_msat"].as_u64().unwrap_or(0),
+            ),
         ),
         // Undecided: the charge layer resolves it; the pay waits for its sale.
         202 => Charge::Pending,
@@ -776,12 +841,13 @@ fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Rep
         _ => charge_of(h, &rec),
     };
     match sold {
-        Charge::Sold(sale_id, txid, card) => {
+        Charge::Sold(sale_id, txid, card, received) => {
             // A replay settled without the card answers no short id; its sale may have it.
             rec.short_id = rec.short_id.take().or(card);
             rec.state = PayState::Charged;
             rec.sale_id = Some(sale_id);
             rec.txid = Some(txid);
+            rec.received_msat = Some(received);
             rec.detail = None;
             pays.record(&mut rec);
             None
@@ -854,16 +920,28 @@ fn apply(pays: &Pays, mut rec: PayRec, outcome: WalletPay) -> Reply {
             final_reply(&rec)
         }
         // Nothing was funded: the till's wallet does not hold the amount yet (the charge's notes
-        // may still be being collected). Not a failure while the invoice can still be paid.
-        WalletPay::Failed { reason, operation_id: None, insufficient_funds: true } => {
+        // may still be being collected), or no gateway answers for a moment. Not a failure while
+        // the invoice can still be paid: the sweeper tries again until it expires.
+        WalletPay::Failed { reason, operation_id: None, insufficient_funds, retryable } if insufficient_funds || retryable => {
             if now_ms() >= rec.invoice_expires_at_ms {
-                return fail(pays, rec, None, format!("the invoice expired before the till's wallet could pay it ({reason})"));
+                return fail(pays, rec, None, format!("the invoice expired before the till could pay it ({reason})"));
             }
             rec.state = PayState::Charged;
             rec.operation_id = None;
-            rec.detail = Some(format!("the till's wallet cannot pay the invoice yet: {reason}"));
+            let (detail, answer) = if insufficient_funds {
+                (
+                    format!("the till's wallet cannot pay the invoice yet: {reason}"),
+                    "the till's wallet does not hold the amount yet; it pays the invoice once it does",
+                )
+            } else {
+                (
+                    format!("no Lightning gateway can pay the invoice now: {reason}"),
+                    "no Lightning gateway answers now; the till pays the invoice once one does, before it expires",
+                )
+            };
+            rec.detail = Some(detail);
             pays.record(&mut rec);
-            undecided(&rec, "the till's wallet does not hold the amount yet; it pays the invoice once it does")
+            undecided(&rec, answer)
         }
         WalletPay::Failed { reason, operation_id, .. } => fail(pays, rec, operation_id, reason),
         WalletPay::Unknown { reason, operation_id } => {
@@ -955,8 +1033,21 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// A pay-scope caller names its card (`X-Card-Link`): without one a pay or a refund would go to
+/// whatever card is on the till's own relay or reader, which is not the app's to charge.
+fn card_link_required() -> Reply {
+    Reply::fail(
+        400,
+        "card_link_required",
+        "a pay token pays only with the card behind its own card link (X-Card-Link); nothing was charged or loaded",
+    )
+}
+
 /// `POST /v1/pay`: charge the card for the invoice, then pay it.
-pub async fn pay(State(h): State<TillHandle>, headers: HeaderMap, body: Bytes) -> Reply {
+pub async fn pay(State(h): State<TillHandle>, scope: Option<Extension<PayScope>>, headers: HeaderMap, body: Bytes) -> Reply {
+    if scope.is_some() && !headers.contains_key(crate::till::LINK_HEADER) {
+        return card_link_required();
+    }
     let link = match crate::till::link_of(&h, &headers) {
         Ok(l) => l,
         Err(r) => return r,
@@ -1003,17 +1094,18 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
         && !pays.is_driven(rec.pay_id)
     {
         match charge_of(h, rec) {
-            Charge::Sold(sale_id, txid, card) => {
+            Charge::Sold(sale_id, txid, card, received) => {
                 rec.state = PayState::Charged;
                 rec.sale_id = Some(sale_id);
                 rec.txid = Some(txid);
+                rec.received_msat = Some(received);
                 rec.short_id = rec.short_id.take().or(card);
                 rec.detail = None;
                 pays.record(rec);
             }
             Charge::Pending => {
                 if rec.state == PayState::NotCharged {
-                    // The sweeper settles it from the charge, as any `charging` record.
+                    // Settled from the charge below ([`advance`]), as any `charging` record.
                     rec.state = PayState::Charging;
                     rec.detail = Some("the card's charge is still being resolved".into());
                     pays.record(rec);
@@ -1034,9 +1126,8 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
         }
         match rec.state {
             PayState::Paid | PayState::PayFailed | PayState::Refunding | PayState::Refunded => return final_reply(rec),
-            _ if charge_pending => {
-                return undecided(rec, "the card's charge is still being resolved; nothing was charged again");
-            }
+            // A charge still unresolved is driven below without the card: settled, then paid (it
+            // took the card's money) or `not_charged` (it left nothing).
             _ if pays.is_driven(rec.pay_id) => {
                 return undecided(rec, "an earlier attempt with this client_ref is in flight; nothing was charged or paid again");
             }
@@ -1063,7 +1154,9 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
                     return undecided(&rec, "an earlier attempt with this client_ref is in flight; nothing was charged or paid again");
                 }
                 if rec.state == PayState::NotCharged {
-                    if let Some(r) = refuse_new(h, &pays, &rec.client_ref, &inv, rec.price_msat, Some(rec.pay_id), now).await {
+                    if let Some(r) =
+                        refuse_new(h, &pays, &rec.client_ref, &inv, rec.fee_reserve_msat, rec.price_msat, Some(rec.pay_id), now).await
+                    {
                         return r;
                     }
                     let mut again = rec.clone();
@@ -1078,7 +1171,7 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
                 rec.pay_id
             }
             None => {
-                if let Some(r) = refuse_new(h, &pays, &client_ref, &inv, price_msat, None, now).await {
+                if let Some(r) = refuse_new(h, &pays, &client_ref, &inv, fee_reserve_msat, price_msat, None, now).await {
                     return r;
                 }
                 let rec = PayRec {
@@ -1103,6 +1196,7 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
                     short_id: None,
                     refund_msat: None,
                     refund_txid: None,
+                    received_msat: None,
                 };
                 match pays.store.lock().unwrap().insert(rec) {
                     Ok(r) => r.pay_id,
@@ -1171,12 +1265,15 @@ fn card_checks(
 
 /// Why a pay of `inv` for `client_ref` may not start (a new one, or `pay_id` again after its card
 /// was not charged): the invoice is another pay's or already paid by this wallet, the ref is taken
-/// by a charge, or the daily cap is reached.
+/// by a charge, the daily cap is reached, no gateway can pay the invoice now, or the gateway's
+/// fee is more than `fee_reserve_msat`. All of it is known before the card is charged.
+#[allow(clippy::too_many_arguments)]
 async fn refuse_new(
     h: &TillHandle,
     pays: &Pays,
     client_ref: &str,
     inv: &InvoiceFacts,
+    fee_reserve_msat: u64,
     price_msat: u64,
     pay_id: Option<u64>,
     now: u64,
@@ -1207,23 +1304,61 @@ async fn refuse_new(
     // An invoice this wallet already paid (or is paying) outside this pay: charging the card for it
     // would take the holder's money for nothing.
     match pays.ln.status(inv.bolt11.clone(), Duration::ZERO).await {
-        Ok(None) => None,
-        Ok(Some(_)) => Some(Reply::fail(409, "invoice_in_use", "this till's wallet already paid this invoice, or is paying it")),
-        Err(e) => Some(Reply::fail(502, "lightning_error", format!("reading the wallet's payments of the invoice: {e:#}"))),
+        Ok(None) => {}
+        Ok(Some(_)) => return Some(Reply::fail(409, "invoice_in_use", "this till's wallet already paid this invoice, or is paying it")),
+        Err(e) => return Some(Reply::fail(502, "lightning_error", format!("reading the wallet's payments of the invoice: {e:#}"))),
+    }
+    // The gateway's fee, asked now: a pay that could never start is refused before the card pays.
+    match pays.ln.quote(inv.bolt11.clone()).await {
+        Ok(fee) if fee > fee_reserve_msat => {
+            let ask = if fee <= pays.cfg.max_fee_msat {
+                format!("ask again with max_fee_msat of at least {fee}")
+            } else {
+                format!("this till's fee reserve is at most {} msat", pays.cfg.max_fee_msat)
+            };
+            let mut r = Reply::fail(
+                400,
+                "fee_reserve_too_low",
+                format!(
+                    "the gateway asks {fee} msat to pay this invoice, more than the fee reserve of {fee_reserve_msat} msat; {ask}; nothing was charged"
+                ),
+            );
+            r.body["gateway_fee_msat"] = json!(fee);
+            Some(r)
+        }
+        Ok(_) => None,
+        Err(e) => Some(Reply::fail(
+            503,
+            "lightning_unavailable",
+            format!("no Lightning gateway can pay this invoice now ({e:#}); nothing was charged, try again later"),
+        )),
     }
 }
 
-/// `GET /v1/pay/{pay_id}`: the record, without its preimage.
-pub async fn pay_get(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>) -> Reply {
+#[derive(Deserialize)]
+pub struct PayGetQuery {
+    client_ref: Option<String>,
+}
+
+/// `GET /v1/pay/{pay_id}`: the record, without its preimage. A pay-scope caller names the pay's
+/// `client_ref` too (`?client_ref=`), so it reads only the pays it made: any other is 404.
+pub async fn pay_get(
+    State(h): State<TillHandle>,
+    scope: Option<Extension<PayScope>>,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<PayGetQuery>,
+) -> Reply {
     let Some(pays) = h.pays() else { return unavailable() };
     match id.parse::<u64>().ok().and_then(|id| pays.get(id)) {
+        Some(rec) if scope.is_some() && q.client_ref.as_deref() != Some(rec.client_ref.as_str()) => unknown_pay(),
         // No preimage: it goes only to the caller, in the answer to its POST (and the POST's replay).
         Some(rec) => Reply::ok(rec.to_json(false)),
         None => unknown_pay(),
     }
 }
 
-/// `GET /v1/pays`: the newest [`LIST_MAX`] pays, oldest first; no preimages.
+/// `GET /v1/pays`: the newest [`LIST_MAX`] pays, oldest first; no preimages. The POS token only:
+/// it is every holder's pays, which a pay token does not open.
 pub async fn pays_list(State(h): State<TillHandle>) -> Reply {
     let Some(pays) = h.pays() else { return unavailable() };
     let s = pays.store.lock().unwrap();
@@ -1249,7 +1384,15 @@ fn not_refundable(rec: &PayRec) -> Reply {
 
 /// `POST /v1/pay/{pay_id}/refund`, with the card that paid in the field (`X-Card-Link`, or the
 /// relay): load a `pay_failed` pay's value back onto it.
-pub async fn pay_refund(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>, headers: HeaderMap) -> Reply {
+pub async fn pay_refund(
+    State(h): State<TillHandle>,
+    scope: Option<Extension<PayScope>>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Reply {
+    if scope.is_some() && !headers.contains_key(crate::till::LINK_HEADER) {
+        return card_link_required();
+    }
     let link = match crate::till::link_of(&h, &headers) {
         Ok(l) => l,
         Err(r) => return r,
@@ -1340,7 +1483,7 @@ fn settle_refund(pays: &Pays, id: u64, loads: &RefundLoads, min_denom: u64) {
     if loads.in_flight || !matches!(rec.state, PayState::Refunding | PayState::PayFailed) {
         return;
     }
-    let state = if rec.price_msat.saturating_sub(loads.msat) < min_denom { PayState::Refunded } else { PayState::PayFailed };
+    let state = if rec.held_msat().saturating_sub(loads.msat) < min_denom { PayState::Refunded } else { PayState::PayFailed };
     let refund_msat = (loads.msat > 0).then_some(loads.msat);
     if (rec.state, rec.refund_msat, rec.refund_txid.as_deref()) == (state, refund_msat, loads.txid.as_deref()) {
         return;
@@ -1454,7 +1597,7 @@ pub(crate) async fn refund_job(
             &rec,
         );
     }
-    let owed = rec.price_msat.saturating_sub(loads.msat);
+    let owed = rec.held_msat().saturating_sub(loads.msat);
     let cfg = &wallet.mint_cfg;
     let Some(amount) = crate::plan::card_amount_at_most(owed, room.min(REFUND_MAX_NOTES), min, |n| {
         cfg.tbs_pks.get(fedimint_core::Amount::from_msats(n)).is_some()
@@ -1563,6 +1706,7 @@ mod tests {
             short_id: None,
             refund_msat: None,
             refund_txid: None,
+            received_msat: None,
         }
     }
 
@@ -1678,6 +1822,9 @@ mod tests {
         fn status(&self, _: String, _: Duration) -> BoxFuture<'_, Result<Option<WalletPay>>> {
             Box::pin(async { bail!("not asked") })
         }
+        fn quote(&self, _: String) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async { bail!("not asked") })
+        }
     }
 
     #[test]
@@ -1781,6 +1928,40 @@ mod tests {
         pays.store.lock().unwrap().put(&r).unwrap();
         settle_refund(&pays, id, &loads(0, false), 512);
         assert_eq!(state(&pays), (PayState::PayFailed, None, (1 << 20) + (1 << 10) + 1));
+    }
+
+    #[test]
+    fn the_holder_is_owed_what_the_card_paid_the_till_overpay_included() {
+        // The sale's overpay counts; so does what the till collected when it is more.
+        assert_eq!(paid_to_till(11_150, 2_048, 0), 13_198);
+        assert_eq!(paid_to_till(11_150, 2_048, 13_198), 13_198);
+        assert_eq!(paid_to_till(11_150, 0, 0), 11_150);
+        assert_eq!(paid_to_till(11_150, 0, 11_200), 11_200);
+        let mut r = rec(4, PayState::PayFailed, 1, 11_150);
+        // A record from before the charge's amount was kept: the price.
+        assert_eq!((r.held_msat(), r.refund_owed_msat()), (11_150, 11_150));
+        assert!(r.to_json(false).get("received_msat").is_none());
+        r.received_msat = Some(13_198);
+        assert_eq!((r.held_msat(), r.refund_owed_msat()), (13_198, 13_198));
+        let v = r.to_json(false);
+        assert_eq!(
+            (v["received_msat"].as_u64(), v["overpaid_msat"].as_u64(), v["refund_owed_msat"].as_u64()),
+            (Some(13_198), Some(2_048), Some(13_198))
+        );
+        assert!(final_reply(&r).body["detail"].as_str().unwrap().contains("13198 msat of the card's 13198"), "{}", final_reply(&r).body);
+        // Part of it back on the card: owed the rest of what the card paid, not of the price.
+        r.refund_msat = Some(12_288);
+        assert_eq!(r.refund_owed_msat(), 910);
+        // A refund settles against what the card paid: 910 msat owed is not dust under a 512 note.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PayStore::open(PayStore::path_in(dir.path())).unwrap();
+        r.refund_msat = None;
+        let id = store.insert(r).unwrap().pay_id;
+        let pays = Pays::new(store, Arc::new(NoLn), PayConfig::default(), Currency::Regtest);
+        settle_refund(&pays, id, &RefundLoads { msat: 12_288, txid: Some("ab".repeat(32)), in_flight: false }, 512);
+        assert_eq!((pays.get(id).unwrap().state, pays.get(id).unwrap().refund_owed_msat()), (PayState::PayFailed, 910));
+        settle_refund(&pays, id, &RefundLoads { msat: 12_288 + 512, txid: Some("cd".repeat(32)), in_flight: false }, 512);
+        assert_eq!((pays.get(id).unwrap().state, pays.get(id).unwrap().refund_dust_msat()), (PayState::Refunded, 398));
     }
 
     #[test]

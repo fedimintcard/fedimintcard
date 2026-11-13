@@ -70,13 +70,19 @@ pub enum LnPayOutcome {
     Refunded { reason: String, operation_id: String },
     /// The client reported an error it could not settle; check the wallet balance.
     Failed { reason: String, operation_id: String },
-    /// Not started: nothing left the wallet.
-    Refused { reason: String, insufficient_funds: bool },
+    /// Not started: nothing left the wallet. `retryable` when nothing about the invoice or the
+    /// fee stops it, only that no gateway answers now: the same payment can go through later.
+    Refused { reason: String, insufficient_funds: bool, retryable: bool },
 }
 
 impl LnPayOutcome {
     fn refused(reason: impl Into<String>) -> Self {
-        Self::Refused { reason: reason.into(), insufficient_funds: false }
+        Self::Refused { reason: reason.into(), insufficient_funds: false, retryable: false }
+    }
+
+    /// Refused only because no gateway answers now.
+    fn no_gateway(reason: impl Into<String>) -> Self {
+        Self::Refused { reason: reason.into(), insufficient_funds: false, retryable: true }
     }
 }
 
@@ -317,12 +323,12 @@ impl Wallet {
                 return self.follow_v1(operation_id, wait).await.unwrap_or_else(|e| unsettled(operation_id, e));
             }
             Err(PayBolt11InvoiceError::NoLnGatewayAvailable) => {
-                return LnPayOutcome::refused(no_gateway.unwrap_or_else(|| "no Lightning gateway".into()));
+                return LnPayOutcome::no_gateway(no_gateway.unwrap_or_else(|| "no Lightning gateway".into()));
             }
             Err(e) => {
                 let insufficient_funds =
                     matches!(e, PayBolt11InvoiceError::Transaction(fedimint_client::module::TransactionSubmitError::InsufficientFunds(_)));
-                return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds };
+                return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds, retryable: false };
             }
         };
         let op = out.payment_type.operation_id();
@@ -395,7 +401,7 @@ impl Wallet {
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
         let (gateway, routing) = match ln.select_gateway(Some(invoice.clone())).await {
             Ok(g) => g,
-            Err(e) => return LnPayOutcome::refused(format!("no Lightning gateway answers: {e}")),
+            Err(e) => return LnPayOutcome::no_gateway(format!("no Lightning gateway answers: {e}")),
         };
         let (send_fee, expiration_delta) = routing.send_parameters(&invoice);
         let fee_msat = send_fee.fee(amount_msat).msats;
@@ -408,7 +414,7 @@ impl Wallet {
             Err(SendWithTermsError::Send(SendPaymentError::DuplicatePaymentAttempt(op))) => op,
             Err(e) => {
                 let insufficient_funds = matches!(e, SendWithTermsError::Send(SendPaymentError::InsufficientFunds(_)));
-                return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds };
+                return LnPayOutcome::Refused { reason: e.to_string(), insufficient_funds, retryable: false };
             }
         };
         self.follow_v2(op, wait).await.unwrap_or_else(|e| unsettled(op, e))
@@ -440,6 +446,36 @@ impl Wallet {
                 LnPayOutcome::Failed { reason: "the federation reported a failed payment".into(), operation_id }
             }
         })
+    }
+
+    /// What paying `bolt11` would cost in gateway fees now, asked before anything is funded or
+    /// charged: the fee [`Self::pay_bolt11`] checks against its cap, through the gateway it would
+    /// pick, and 0 for an invoice of this federation without a gateway (ln pays it inside the
+    /// federation). Errors when no gateway answers for the invoice now, or the federation has no
+    /// Lightning module the till can use: the invoice cannot be paid now. A gateway may still
+    /// change its fee before the payment, which the payment's own check refuses.
+    pub async fn quote_invoice(&self, bolt11: &str) -> Result<u64> {
+        let invoice = parse_bolt11(bolt11)?;
+        let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
+        if let Ok(ln) = self.lightning() {
+            return match lnv1_gateway(&ln, &invoice).await {
+                Ok(gw) => Ok(gw.fees.to_amount(&Amount::from_msats(amount_msat)).msats),
+                // As `pay_v1` without a gateway: only an invoice of this federation is paid.
+                Err(reason) => {
+                    let markers = self.client.get_internal_payment_markers().map_err(|e| anyhow!("{e}"))?;
+                    let last_hop =
+                        invoice.route_hints().first().and_then(|rh| rh.0.last()).map(|hop| (hop.src_node_id, hop.short_channel_id));
+                    let internal = last_hop == Some(markers)
+                        || ln.list_gateways().await.iter().any(|g| last_hop == Some((g.info.node_pub_key, g.info.federation_index)));
+                    if internal { Ok(0) } else { Err(anyhow!(reason)) }
+                }
+            };
+        }
+        if let Ok(ln) = self.lightning_v2() {
+            let (_, routing) = ln.select_gateway(Some(invoice.clone())).await.map_err(|e| anyhow!("no Lightning gateway answers: {e}"))?;
+            return Ok(routing.send_parameters(&invoice).0.fee(amount_msat).msats);
+        }
+        bail!("this federation has no Lightning module the till can use")
     }
 
     pub fn mint(&self) -> Result<fedimint_client::module::ClientModuleInstance<'_, MintClientModule>> {
@@ -566,6 +602,7 @@ fn refuse_fee_or_balance(fee_msat: u64, max_fee_msat: Option<u64>, amount_msat: 
         Some(b) if b < need => Some(LnPayOutcome::Refused {
             reason: format!("the wallet holds {b} msat; the invoice and the gateway's fee need {need} msat"),
             insufficient_funds: true,
+            retryable: false,
         }),
         _ => None,
     }
@@ -652,7 +689,7 @@ mod tests {
     fn fee_and_balance_are_checked_before_paying() {
         assert_eq!(refuse_fee_or_balance(1_000, Some(1_000), 10_000, Some(11_000)), None);
         assert_eq!(refuse_fee_or_balance(1_000, None, 10_000, None), None);
-        let Some(LnPayOutcome::Refused { reason, insufficient_funds: false }) =
+        let Some(LnPayOutcome::Refused { reason, insufficient_funds: false, retryable: false }) =
             refuse_fee_or_balance(1_001, Some(1_000), 10_000, Some(1 << 30))
         else {
             panic!("a fee over the cap is refused")

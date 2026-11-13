@@ -59,6 +59,8 @@ enum Mode {
     Refund,
     /// Funded and still in flight.
     InFlight,
+    /// Refused before funding: no gateway answers now (retryable).
+    NoGateway,
 }
 
 /// What a till wallet does with invoices, remembered as the federation client remembers it:
@@ -73,6 +75,8 @@ struct FakeLn {
     /// How long `pay` takes before it answers.
     delay: Mutex<Duration>,
     statuses: AtomicUsize,
+    /// The gateway's fee a quote answers; `None` when no gateway answers.
+    quote: Mutex<Option<u64>>,
 }
 
 const FEE_PAID: u64 = 300;
@@ -86,11 +90,16 @@ impl FakeLn {
             calls: Mutex::new(HashMap::new()),
             delay: Mutex::new(Duration::ZERO),
             statuses: AtomicUsize::new(0),
+            quote: Mutex::new(Some(FEE_PAID)),
         })
     }
 
     fn set(&self, m: Mode) {
         *self.mode.lock().unwrap() = m;
+    }
+
+    fn quote_with(&self, q: Option<u64>) {
+        *self.quote.lock().unwrap() = q;
     }
 
     fn delay(&self, d: Duration) {
@@ -111,7 +120,7 @@ impl FakeLn {
         let o = if paid {
             WalletPay::Paid { preimage: "77".repeat(32), fee_msat: FEE_PAID, operation_id: op.clone() }
         } else {
-            WalletPay::Failed { reason: "refunded".into(), operation_id: Some(op.clone()), insufficient_funds: false }
+            WalletPay::Failed { reason: "refunded".into(), operation_id: Some(op.clone()), insufficient_funds: false, retryable: false }
         };
         self.by_op.lock().unwrap().insert(op, o);
     }
@@ -150,12 +159,35 @@ impl PayLightning for FakeLn {
                     WalletPay::Paid { preimage: "99".repeat(32), fee_msat: FEE_PAID, operation_id: op.clone() }
                 }
                 Mode::Refuse => {
-                    return Ok(WalletPay::Failed { reason: "the gateway asks more".into(), operation_id: None, insufficient_funds: false });
+                    return Ok(WalletPay::Failed {
+                        reason: "the gateway asks more".into(),
+                        operation_id: None,
+                        insufficient_funds: false,
+                        retryable: false,
+                    });
                 }
                 Mode::Insufficient => {
-                    return Ok(WalletPay::Failed { reason: "insufficient funds".into(), operation_id: None, insufficient_funds: true });
+                    return Ok(WalletPay::Failed {
+                        reason: "insufficient funds".into(),
+                        operation_id: None,
+                        insufficient_funds: true,
+                        retryable: false,
+                    });
                 }
-                Mode::Refund => WalletPay::Failed { reason: "no route".into(), operation_id: Some(op.clone()), insufficient_funds: false },
+                Mode::NoGateway => {
+                    return Ok(WalletPay::Failed {
+                        reason: "no Lightning gateway answers".into(),
+                        operation_id: None,
+                        insufficient_funds: false,
+                        retryable: true,
+                    });
+                }
+                Mode::Refund => WalletPay::Failed {
+                    reason: "no route".into(),
+                    operation_id: Some(op.clone()),
+                    insufficient_funds: false,
+                    retryable: false,
+                },
                 Mode::InFlight => WalletPay::Unknown { reason: "in flight".into(), operation_id: op.clone() },
             };
             self.by_invoice.lock().unwrap().insert(bolt11, op.clone());
@@ -173,6 +205,10 @@ impl PayLightning for FakeLn {
             self.statuses.fetch_add(1, Ordering::SeqCst);
             Ok(self.status_of(&bolt11))
         })
+    }
+
+    fn quote(&self, _bolt11: String) -> BoxFuture<'_, anyhow::Result<u64>> {
+        Box::pin(async move { (*self.quote.lock().unwrap()).ok_or_else(|| anyhow::anyhow!("no Lightning gateway answers")) })
     }
 }
 
@@ -213,6 +249,8 @@ struct Fx {
     signs: Rc<Cell<u32>>,
     /// The card behind the opener.
     card: Rc<RefCell<SoftCard>>,
+    /// The till wallet (the federation client), for [`Fx::reopen`].
+    wallet: Wallet,
 }
 
 /// Give `client` ecash out of thin air through the dummy module.
@@ -247,8 +285,8 @@ async fn fx_with(cfg: PayConfig, crash: Option<CrashPoint>) -> anyhow::Result<Fx
     let (fed, client) = fixture(Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit)).await?;
     let wallet = Wallet::from_client(client).await?;
     let ln = FakeLn::new();
-    let (dir, handle, actor, opens, signs, card) = till_on(wallet, cfg, ln.clone(), crash).await?;
-    Ok(Fx { _fed: fed, dir, handle, actor, ln, opens, signs, card })
+    let (dir, handle, actor, opens, signs, card) = till_on(wallet.clone(), cfg, ln.clone(), crash).await?;
+    Ok(Fx { _fed: fed, dir, handle, actor, ln, opens, signs, card, wallet })
 }
 
 type Till = (tempfile::TempDir, TillHandle, Actor, Rc<Cell<u32>>, Rc<Cell<u32>>, Rc<RefCell<SoftCard>>);
@@ -310,6 +348,49 @@ impl Fx {
 
     async fn get(&self, uri: &str) -> (u16, Value) {
         call(&self.handle, "GET", uri, Value::Null).await
+    }
+
+    /// A request with headers (a bearer, a card link), polling the actor.
+    async fn call_with(&mut self, method: &'static str, uri: &str, body: Value, headers: &[(&'static str, &str)]) -> (u16, Value) {
+        let h = self.handle.clone();
+        let uri = uri.to_owned();
+        let headers: Vec<(&'static str, String)> = headers.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
+        with_actor(&mut self.actor, async move {
+            let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let req = req.body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
+            let resp = till::router(h).oneshot(req).await.unwrap();
+            let status = resp.status().as_u16();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        })
+        .await
+    }
+
+    /// One pass of the sweeper, polling the actor: settling a charge is a job of its own.
+    async fn sweep(&mut self) {
+        let h = self.handle.clone();
+        with_actor(&mut self.actor, async move { pay::sweep(&h).await }).await
+    }
+
+    /// A restart of the whole till: the card wallet, the sales and the pays read back from disk
+    /// (the federation, the card and the wallet side are the same), no crash point.
+    async fn reopen(&mut self, cfg: PayConfig) -> anyhow::Result<()> {
+        let store = StateStore::open(self.dir.path().join("card_state.json"))?;
+        let cw = CardWallet::new(self.wallet.clone(), store, Box::new(Shared(self.card.clone(), self.signs.clone())));
+        let sales = SalesStore::open(self.dir.path().join("sales.json"))?;
+        let (o, s, c) = (self.opens.clone(), self.signs.clone(), self.card.clone());
+        let opener = Box::new(move || {
+            o.set(o.get() + 1);
+            Ok(Box::new(Shared(c.clone(), s.clone())) as Box<dyn Card>)
+        });
+        let (handle, actor) = till::new(cw, closed_port_url(), sales, opener).await;
+        let pays = Pays::new(PayStore::open(PayStore::path_in(self.dir.path()))?, self.ln.clone(), cfg, Currency::Regtest);
+        self.handle = handle.with_pays(pays);
+        self.actor = Box::pin(actor);
+        Ok(())
     }
 
     fn sales_for(&self, client_ref: &str) -> usize {
@@ -586,6 +667,115 @@ async fn a_pay_records_the_card_that_paid_and_only_a_till_on_ops_refunds() -> an
     let (s, r) = with_actor(&mut f.actor, refund(3)).await;
     assert_eq!((s, r["error"].as_str()), (404, Some("unknown_pay")), "{r}");
     assert_eq!(f.state_of(2), PayState::Paid);
+
+    // What the holder is owed is what the card paid the till: the price and any overpay its
+    // charge could not avoid, as its sale recorded it.
+    let failed = f.handle.pays().unwrap().get(1).unwrap();
+    let sales = SalesStore::open(f.dir.path().join("sales.json"))?;
+    let sale = sales.find_ref(&pay::charge_ref("failed")).unwrap();
+    let paid = pay::paid_to_till(sale.price_msat, sale.overpaid_msat, sale.received_msat);
+    assert!(paid >= PRICE + sale.overpaid_msat, "{sale:?}");
+    assert_eq!((failed.received_msat, failed.refund_owed_msat()), (Some(paid), paid), "{failed:?}");
+    let (_, g) = f.get("/v1/pay/1").await;
+    assert_eq!(
+        (g["received_msat"].as_u64(), g["overpaid_msat"].as_u64(), g["refund_owed_msat"].as_u64()),
+        (Some(paid), Some(paid - PRICE), Some(paid)),
+        "{g}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pay_no_gateway_can_carry_is_refused_before_the_card_and_waits_after_it() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    let nothing = |f: &Fx| (f.opens.get(), f.signs.get(), f.ln.total_calls(), f.handle.pays().unwrap().store.lock().unwrap().all().len());
+
+    // No gateway answers for the invoice: refused before the card is touched, nothing recorded.
+    f.ln.quote_with(None);
+    let (s, b) = f.post(req(&hour_invoice(10_000), "down")).await;
+    assert_eq!((s, b["error"].as_str()), (503, Some("lightning_unavailable")), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("nothing was charged"), "{b}");
+    assert_eq!(nothing(&f), (0, 0, 0, 0));
+
+    // The gateway asks more than the fee reserve (the caller's max_fee_msat, here 1,000 and 0):
+    // refused before the card, with the fee to ask for.
+    f.ln.quote_with(Some(1_500));
+    let (s, b) = f.post(req(&hour_invoice(10_000), "fee")).await;
+    assert_eq!((s, b["error"].as_str(), b["gateway_fee_msat"].as_u64()), (400, Some("fee_reserve_too_low"), Some(1_500)), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("at least 1500"), "{b}");
+    let (s, b) = f.post(json!({"bolt11": hour_invoice(10_000), "max_fee_msat": 0, "client_ref": "zero"})).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("fee_reserve_too_low")), "{b}");
+    // More than the till's own cap (2,000): no max_fee_msat can carry it.
+    f.ln.quote_with(Some(5_000));
+    let (s, b) = f.post(json!({"bolt11": hour_invoice(10_000), "client_ref": "cap"})).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("fee_reserve_too_low")), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("at most 2000"), "{b}");
+    assert_eq!(nothing(&f), (0, 0, 0, 0));
+
+    // A fee within the reserve is charged and paid.
+    f.ln.quote_with(Some(FEE_PAID));
+    let (s, b) = f.post(req(&hour_invoice(10_000), "ok")).await;
+    assert_eq!((s, b["state"].as_str()), (200, Some("paid")), "{b}");
+
+    // The gateway goes away between the quote and the payment: nothing was funded, so not a
+    // failure. The pay waits `charged`, and the sweeper pays it once a gateway answers again.
+    f.ln.set(Mode::NoGateway);
+    let blip = hour_invoice(10_000);
+    let (s, b) = f.post(req(&blip, "blip")).await;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("charged")), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("gateway"), "{b}");
+    let id = b["pay_id"].as_u64().unwrap();
+    f.sweep().await;
+    assert_eq!((f.state_of(id), f.ln.calls(&blip)), (PayState::Charged, 2));
+    f.ln.set(Mode::Pay);
+    f.sweep().await;
+    assert_eq!((f.state_of(id), f.ln.calls(&blip), f.sales_for("blip")), (PayState::Paid, 3, 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pay_token_pays_only_with_its_own_card_link_and_reads_only_its_own_pays() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    f.handle = f.handle.clone().with_pay_token(Some("cd".into()));
+    let pay_token = ("authorization", "Bearer cd");
+
+    // No card link: refused before anything runs, so the card on the till's own reader is never
+    // charged (or its PIN tried) for the app.
+    let (s, b) = f.call_with("POST", "/v1/pay", req(&hour_invoice(10_000), "app"), &[pay_token]).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("card_link_required")), "{b}");
+    let (s, b) =
+        f.call_with("POST", "/v1/pay", json!({"bolt11": hour_invoice(10_000), "client_ref": "app", "pin": "1234"}), &[pay_token]).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("card_link_required")), "{b}");
+    // A link that is not open: refused too, no card.
+    let (s, b) = f.call_with("POST", "/v1/pay", req(&hour_invoice(10_000), "app"), &[pay_token, ("x-card-link", "nope")]).await;
+    assert_eq!((s, b["error"].as_str()), (409, Some("card_link_gone")), "{b}");
+    assert_eq!((f.opens.get(), f.signs.get(), f.ln.total_calls()), (0, 0, 0));
+    assert_eq!(f.handle.pays().unwrap().store.lock().unwrap().all().len(), 0, "nothing recorded");
+
+    // The POS (here: no token needed) pays with the card in the till's field.
+    let (s, b) = f.post(req(&hour_invoice(10_000), "mine")).await;
+    assert_eq!((s, b["state"].as_str(), b["pay_id"].as_u64()), (200, Some("paid"), Some(1)), "{b}");
+    let opens = f.opens.get();
+
+    // A refund without a link is refused the same way, before the card.
+    let (s, b) = f.call_with("POST", "/v1/pay/1/refund", json!({}), &[pay_token]).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("card_link_required")), "{b}");
+    assert_eq!(f.opens.get(), opens);
+
+    // Every holder's pays are not the pay token's to list.
+    let (s, b) = f.call_with("GET", "/v1/pays", Value::Null, &[pay_token]).await;
+    assert_eq!((s, b["error"].as_str()), (403, Some("forbidden")), "{b}");
+    assert_eq!(f.get("/v1/pays").await.0, 200);
+    // A pay reads only by its own client_ref: any other answer is the same 404 as no pay at all.
+    for uri in ["/v1/pay/1", "/v1/pay/1?client_ref=other", "/v1/pay/1?client_ref=", "/v1/pay/2?client_ref=mine"] {
+        let (s, b) = f.call_with("GET", uri, Value::Null, &[pay_token]).await;
+        assert_eq!((s, b["error"].as_str()), (404, Some("unknown_pay")), "{uri}: {b}");
+    }
+    let (s, b) = f.call_with("GET", "/v1/pay/1?client_ref=mine", Value::Null, &[pay_token]).await;
+    assert_eq!((s, b["state"].as_str(), b["client_ref"].as_str()), (200, Some("paid"), Some("mine")), "{b}");
+    assert!(b.get("preimage").is_none(), "{b}");
+    // The POS token reads any pay.
+    assert_eq!(f.get("/v1/pay/1").await.0, 200);
     Ok(())
 }
 
@@ -704,26 +894,81 @@ async fn a_charge_whose_answer_was_lost_pays_once_and_an_unresolved_one_never_pa
     assert_eq!((s, b["state"].as_str()), (200, Some("paid")), "{b}");
     assert_eq!((f.sales_for("lost"), f.ln.calls(&bolt11)), (1, 1));
 
-    // The charge is undecided (signed, never sent): the pay waits `charging` and never pays, and
-    // the sweeper leaves it as long as the charge is unresolved.
+    // The charge is undecided (signed, never sent): the pay answers `charging`, and nothing pays
+    // until the charge is settled. The sweeper settles it without the card: it never left the
+    // till, so the card was not charged. `not_charged`, nothing paid, nothing owed.
     let mut f = fx_with(cfg(), Some(CrashPoint::BeforeSubmit)).await?;
     let bolt11 = hour_invoice(10_000);
     let (s, b) = f.post(req(&bolt11, "unresolved")).await;
     assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("charging")), "{b}");
     let id = b["pay_id"].as_u64().unwrap();
-    pay::sweep(&f.handle).await;
+    assert!(f.handle.has_pending_ref(&pay::charge_ref("unresolved")), "the charge is unresolved");
+    let (opens, signed) = (f.opens.get(), f.signs.get());
+    f.sweep().await;
+    let settled = (PayState::NotCharged, 0, 0, 0);
+    assert_eq!((f.state_of(id), f.ln.calls(&bolt11), f.ln.total_calls(), f.sales_for("unresolved")), settled);
+    assert!(!f.handle.has_pending_ref(&pay::charge_ref("unresolved")), "the sweeper settled the charge");
+    assert_eq!((f.opens.get(), f.signs.get()), (opens, signed), "settled without the card");
+    // A restart and another pass change nothing.
     f.restart(cfg());
-    pay::sweep(&f.handle).await;
-    assert_eq!((f.state_of(id), f.ln.calls(&bolt11), f.ln.total_calls(), f.sales_for("unresolved")), (PayState::Charging, 0, 0, 0));
+    f.sweep().await;
+    assert_eq!((f.state_of(id), f.ln.calls(&bolt11), f.ln.total_calls(), f.sales_for("unresolved")), settled);
+    let (s, g) = f.get(&format!("/v1/pay/{id}")).await;
+    assert_eq!((s, g["state"].as_str()), (200, Some("not_charged")), "{g}");
 
     // Recorded not_charged, as a refusal read before the charge showed up would leave it: a
-    // repeat finds the charge unresolved, and neither charges again nor refuses the pay for it.
+    // repeat finds the charge unresolved and settles it without the card, never charging again.
+    let again = hour_invoice(10_000);
+    let (s, b) = f.post(req(&again, "repeat")).await;
+    assert_eq!((s, b["state"].as_str()), (202, Some("charging")), "{b}");
+    let id = b["pay_id"].as_u64().unwrap();
     f.edit_on_disk(id, |r| r.state = PayState::NotCharged);
     f.restart(cfg());
-    let signed = f.signs.get();
-    let (s, b) = f.post(req(&bolt11, "unresolved")).await;
-    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("charging")), "{b}");
-    assert_eq!((f.state_of(id), f.signs.get(), f.ln.total_calls(), f.sales_for("unresolved")), (PayState::Charging, signed, 0, 0));
+    let (opens, signed) = (f.opens.get(), f.signs.get());
+    let (s, b) = f.post(req(&again, "repeat")).await;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (409, Some("not_charged"), Some("not_charged")), "{b}");
+    assert_eq!(
+        (f.state_of(id), f.signs.get(), f.opens.get(), f.ln.total_calls(), f.sales_for("repeat")),
+        (PayState::NotCharged, signed, opens, 0, 0)
+    );
+    assert!(!f.handle.has_pending_ref(&pay::charge_ref("repeat")));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_the_federation_took_but_nobody_recorded_is_settled_by_the_sweeper_and_paid_once() -> anyhow::Result<()> {
+    // The federation accepted the charge; the till went down before the pay saw its answer and
+    // before the sale reached sales.json. The charge is left unresolved in the card state.
+    let mut f = fx_with(cfg(), Some(CrashPoint::AfterSubmit)).await?;
+    let bolt11 = hour_invoice(10_000);
+    *f.handle.pays().unwrap().crash.lock().unwrap() = Some(PayCrash::AfterCharge);
+    let (s, b) = f.post(req(&bolt11, "taken")).await;
+    assert_eq!(s, 500, "{b}");
+    let id = PayStore::open(PayStore::path_in(f.dir.path()))?.by_ref("taken").unwrap().pay_id;
+    let sales = f.dir.path().join("sales.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&sales)?)?;
+    let cref = pay::charge_ref("taken");
+    file["sales"].as_array_mut().unwrap().retain(|s| s["client_ref"] != cref.as_str());
+    std::fs::write(&sales, serde_json::to_vec(&file)?)?;
+    f.reopen(cfg()).await?;
+    assert_eq!((f.state_of(id), f.sales_for("taken")), (PayState::Charging, 0));
+    assert!(f.handle.has_pending_ref(&cref), "the accepted charge is unresolved in the card state");
+
+    // No POS asks about the charge again, and the app only polls: the sweeper alone resolves the
+    // charge (no card, no new spend), records its sale, and pays the invoice once.
+    let (opens, signed) = (f.opens.get(), f.signs.get());
+    let (s, g) = f.get(&format!("/v1/pay/{id}")).await;
+    assert_eq!((s, g["state"].as_str()), (200, Some("charging")), "{g}");
+    f.sweep().await;
+    let rec = f.handle.pays().unwrap().get(id).unwrap();
+    assert_eq!((rec.state, f.sales_for("taken"), f.ln.calls(&bolt11)), (PayState::Paid, 1, 1), "{rec:?}");
+    assert!(rec.sale_id.is_some() && rec.received_msat.is_some_and(|r| r >= rec.price_msat), "{rec:?}");
+    assert_eq!((f.opens.get(), f.signs.get()), (opens, signed), "settled without the card");
+    // Another pass, and the app's repeat, change nothing.
+    f.sweep().await;
+    let (s, b) = f.post(req(&bolt11, "taken")).await;
+    assert_eq!((s, b["state"].as_str()), (200, Some("paid")), "{b}");
+    assert_eq!((f.sales_for("taken"), f.ln.calls(&bolt11), f.signs.get()), (1, 1, signed));
     Ok(())
 }
 

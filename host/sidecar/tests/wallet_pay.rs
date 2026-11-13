@@ -207,8 +207,10 @@ async fn lnv2_pays_refuses_fails_for_certain_and_leaves_the_unanswered_open() ->
 
     // A fee cap below the gateway's fee: refused before anything is funded.
     let capped = invoice(PAYABLE).to_string();
+    // The quote asked before a card is charged names the fee the payment checks.
+    assert_eq!(w.quote_invoice(&capped).await?, gateway_fee_msat());
     let out = w.pay_invoice(&capped, gateway_fee_msat() - 1, WAIT).await?;
-    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false } = &out else { panic!("{out:?}") };
+    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false, retryable: false } = &out else { panic!("{out:?}") };
     assert!(reason.contains("fees"), "{reason}");
     assert_eq!(w.pay_status(&capped, WAIT).await?, None);
     assert_eq!(w.balance_msat().await?, after);
@@ -284,6 +286,7 @@ async fn ln_pays_inside_the_federation_once_and_resolves_after_reopening() -> an
 
     // No gateway, and none needed: paid inside the federation, with no gateway fee.
     assert_eq!(w.pay_status(&bolt11, WAIT).await?, None);
+    assert_eq!(w.quote_invoice(&bolt11).await?, 0);
     let before = w.balance_msat().await?;
     let paid = w.pay_invoice(&bolt11, 0, WAIT).await?;
     let WalletPay::Paid { fee_msat: 0, operation_id, .. } = &paid else { panic!("{paid:?}") };
@@ -312,8 +315,11 @@ async fn ln_pays_inside_the_federation_once_and_resolves_after_reopening() -> an
         .amount_milli_satoshis(10_000)
         .build_signed(|m| SECP256K1.sign_ecdsa_recoverable(m, &key))?
         .to_string();
+    // No gateway answers for it: the quote says so before a card is charged, and a payment is
+    // refused with nothing funded, retryable once a gateway answers.
+    assert!(w.quote_invoice(&outside).await.unwrap_err().to_string().contains("gateway"));
     let out = w.pay_invoice(&outside, 1_000, WAIT).await?;
-    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false } = &out else { panic!("{out:?}") };
+    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false, retryable: true } = &out else { panic!("{out:?}") };
     assert!(reason.contains("gateway"), "{reason}");
     assert_eq!(w.pay_status(&outside, WAIT).await?, None);
     assert_eq!(w.balance_msat().await?, after);
@@ -433,8 +439,9 @@ async fn ln_through_a_gateway_pays_and_never_settles_an_unexpected_error_as_fail
 
     // (4) A fee cap one below the gateway's fee: refused before anything is funded.
     let capped = ln_invoice(PAYABLE).to_string();
+    assert_eq!(w.quote_invoice(&capped).await?, fee);
     let out = w.pay_invoice(&capped, fee - 1, WAIT).await?;
-    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false } = &out else { panic!("{out:?}") };
+    let WalletPay::Failed { reason, operation_id: None, insufficient_funds: false, retryable: false } = &out else { panic!("{out:?}") };
     assert!(reason.contains("fee"), "{reason}");
     assert_eq!(w.pay_status(&capped, WAIT).await?, None);
     assert_eq!(w.balance_msat().await?, after);

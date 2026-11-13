@@ -123,6 +123,9 @@ impl PayLightning for NoLn {
     fn status(&self, _: String, _: Duration) -> BoxFuture<'_, anyhow::Result<Option<WalletPay>>> {
         Box::pin(async { anyhow::bail!("not asked") })
     }
+    fn quote(&self, _: String) -> BoxFuture<'_, anyhow::Result<u64>> {
+        Box::pin(async { anyhow::bail!("not asked") })
+    }
 }
 
 async fn fund(client: &ClientHandleArc, amount: Amount) -> anyhow::Result<()> {
@@ -223,6 +226,7 @@ fn put_pay(pays: &Pays, client_ref: &str, state: PayState, price_msat: u64, shor
         short_id: short_id.map(str::to_owned),
         refund_msat: None,
         refund_txid: None,
+        received_msat: None,
     };
     pays.store.lock().unwrap().insert(rec).unwrap().pay_id
 }
@@ -372,6 +376,36 @@ async fn a_pay_failed_pay_goes_back_onto_its_card_once() -> anyhow::Result<()> {
         // A refund is not a payment: the pay still answers that its invoice was not paid.
         let (s, l) = call(addr, "GET", "/v1/pays", None).await;
         assert_eq!((s, l["total_price_msat"].as_u64(), l["pays"][0]["state"].as_str()), (200, Some(0), Some("refunded")), "{l}");
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_gives_back_what_the_card_paid_overpay_included() -> anyhow::Result<()> {
+    let (f, actor) = start(true).await?;
+    // The charge overpaid the till by the most a charge may (pos-core's MAX_TILL_OVERPAY): the
+    // card paid the price and 2,048 msat more, all of it the holder's.
+    let paid = PRICE + 2_048;
+    let id = put_pay(&f.pays, "over", PayState::PayFailed, PRICE, Some(&f.short_id));
+    let mut rec = f.pays.get(id).unwrap();
+    rec.received_msat = Some(paid);
+    f.pays.store.lock().unwrap().put(&rec).unwrap();
+    assert_eq!(rec.refund_owed_msat(), paid);
+    let want = refund_for(&f.wallet, paid);
+    assert!(paid - want < f.wallet.min_denom() && want > PRICE, "{want}");
+    let (addr, registry, card) = (f.addr, f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        let (s, g) = call(addr, "GET", &format!("/v1/pay/{id}"), None).await;
+        assert_eq!(
+            (s, g["received_msat"].as_u64(), g["overpaid_msat"].as_u64(), g["refund_owed_msat"].as_u64()),
+            (200, Some(paid), Some(2_048), Some(paid)),
+            "{g}"
+        );
+        let (s, v) = refund(addr, id, Some(card)).await;
+        assert_eq!((s, v["state"].as_str(), v["refund_msat"].as_u64()), (200, Some("refunded"), Some(want)), "{v}");
+        assert_eq!(v["refund_dust_msat"].as_u64(), Some(paid - want), "{v}");
+        assert_eq!(loaded(&registry), vec![want]);
     })
     .await;
     Ok(())

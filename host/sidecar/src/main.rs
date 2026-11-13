@@ -196,7 +196,7 @@ enum TillCmd {
         #[arg(long)]
         new_token: bool,
         /// What the token opens: `pos`, the whole till API (the POS app), or `pay`, only paying
-        /// invoices with a card (`/v1/pay…`, `/v1/pays`, `/v1/health`, the card link).
+        /// invoices with a card (`/v1/pay`, `/v1/pay/{id}…`, `/v1/health`, the card link).
         #[arg(long, value_enum, default_value_t = PairScope::Pos)]
         scope: PairScope,
     },
@@ -533,7 +533,7 @@ async fn main() -> Result<()> {
             qr(&text)?;
             println!("{text}");
             eprintln!(
-                "scan it in the app that pays invoices with a card. It opens only /v1/pay…, /v1/pays, /v1/health and the card link. Restart the till to take it."
+                "scan it in the app that pays invoices with a card. It opens only /v1/pay, /v1/pay/{{id}}…, /v1/health and the card link. Restart the till to take it."
             );
         }
         Cmd::Till(TillCmd::Pair { url, text: text_only, new_token, scope: PairScope::Pos }) => {

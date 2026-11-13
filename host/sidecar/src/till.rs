@@ -417,6 +417,13 @@ enum Job {
         topups: Arc<Topups>,
         reply: oneshot::Sender<Reply>,
     },
+    /// Settle the charge carrying `client_ref` from what it left, with no card and no new spend
+    /// ([`settle_without_card`]): a pay's charge left undecided, which no POS may ask about again.
+    SettleCharge {
+        price: u64,
+        client_ref: String,
+        reply: oneshot::Sender<Reply>,
+    },
     /// Load a `pay_failed` pay's value back onto the card that paid (`crate::pay::refund_job`).
     PayRefund {
         pay_id: u64,
@@ -493,7 +500,7 @@ impl TillHandle {
     }
 
     /// Whether an unresolved charge in the card state carries `client_ref` (as of the last job).
-    pub(crate) fn has_pending_ref(&self, client_ref: &str) -> bool {
+    pub fn has_pending_ref(&self, client_ref: &str) -> bool {
         self.pending_refs.lock().unwrap().iter().any(|r| r == client_ref)
     }
 
@@ -510,6 +517,15 @@ impl TillHandle {
         let cref = client_ref.clone();
         run_job(self, Some((&cref, price)), |reply| Job::Charge { price, client_ref: Some(client_ref), pin, link, online_only, reply })
             .await
+    }
+
+    /// Settle the charge carrying `client_ref` through the actor without opening a card: an
+    /// unresolved one is resolved from the federation (accepted: its sale is recorded; never sent
+    /// or rejected: it is gone), never spent anew. Answers the charge's reply when it settled to
+    /// a sale or is still undecided, 404 `no_charge` when nothing carries the ref (any more).
+    pub(crate) async fn settle_charge(&self, price: u64, client_ref: String) -> Reply {
+        let cref = client_ref.clone();
+        run_job(self, Some((&cref, price)), |reply| Job::SettleCharge { price, client_ref, reply }).await
     }
 
     /// Refund pay `pay_id` onto the card in the field (or behind `link`) through the actor.
@@ -554,8 +570,8 @@ impl TillHandle {
         self
     }
 
-    /// Take `token` as a bearer with the pay scope only (`till pair --scope pay`): `/v1/pay…`,
-    /// `/v1/pays`, `/v1/health` and the card link, from every peer ([`crate::pos::access`]).
+    /// Take `token` as a bearer with the pay scope only (`till pair --scope pay`): `/v1/pay`,
+    /// `/v1/pay/{id}…`, `/v1/health` and the card link, from every peer ([`crate::pos::access`]).
     pub fn with_pay_token(mut self, token: Option<String>) -> Self {
         self.pos_auth.pay_token = token.map(Arc::from);
         self
@@ -777,6 +793,14 @@ async fn actor(
             Job::TopupLoad { topup_id, amount_msat, ops_url, link, topups, reply } => {
                 let keyer = ops.as_ref().map(|o| o.client.clone());
                 let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url, keyer).await;
+                (reply, r)
+            }
+            Job::SettleCharge { price, client_ref, reply } => {
+                // Never opens a card: the job is answered from the card state and the federation.
+                cw.card = Box::new(NoCard);
+                let r = settle_without_card(&mut cw, ops.as_ref(), &client_ref, price, &sales)
+                    .await
+                    .unwrap_or_else(|| Reply::fail(404, "no_charge", "no charge carries this client_ref; nothing was charged"));
                 (reply, r)
             }
             Job::PayRefund { pay_id, ops_url, link, pays, topups, reply } => {
@@ -1576,7 +1600,7 @@ async fn card_link(State(h): State<TillHandle>, ws: WebSocketUpgrade) -> Respons
     ws.on_upgrade(move |socket| crate::link::run(socket, links))
 }
 
-const LINK_HEADER: &str = "x-card-link";
+pub(crate) const LINK_HEADER: &str = "x-card-link";
 
 /// The link a job names in `X-Card-Link`: `Ok(None)` without the header, `Err(409)` for an id
 /// that is unknown or closed.

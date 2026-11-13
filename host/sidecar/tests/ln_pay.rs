@@ -77,8 +77,10 @@ async fn mint_only_federation_refuses_ln_pay_and_the_wallet_reopens() -> anyhow:
     let err = w.pay_bolt11("lnbc1garbage", None).await.unwrap_err().to_string();
     assert!(err.contains("not a BOLT11 invoice"), "{err}");
     let out = w.pay_bolt11(&invoice(Some(10_000)).to_string(), None).await?;
-    let LnPayOutcome::Refused { reason, insufficient_funds: false } = &out else { panic!("{out:?}") };
+    let LnPayOutcome::Refused { reason, insufficient_funds: false, retryable: false } = &out else { panic!("{out:?}") };
     assert!(reason.contains("no Lightning module"), "{reason}");
+    let quote = w.quote_invoice(&invoice(Some(10_000)).to_string()).await.unwrap_err().to_string();
+    assert!(quote.contains("no Lightning module"), "{quote}");
     assert_eq!(serde_json::to_value(&out)?["status"], "refused");
     close(w).await;
 
@@ -106,8 +108,12 @@ async fn lnv2_only_federation_registers_lnv2_and_refuses_without_a_gateway() -> 
     assert!(w.lightning_v2().is_ok(), "a federation without ln gets the lnv2 client");
 
     let out = w.pay_bolt11(&invoice(Some(10_000)).to_string(), Some(5_000)).await?;
-    let LnPayOutcome::Refused { reason, insufficient_funds: false } = &out else { panic!("{out:?}") };
+    // No gateway answers now: refused with nothing funded, and it may go through later.
+    let LnPayOutcome::Refused { reason, insufficient_funds: false, retryable: true } = &out else { panic!("{out:?}") };
     assert!(reason.contains("no Lightning gateway"), "{reason}");
+    // The quote asked before a card is charged says so too.
+    let quote = w.quote_invoice(&invoice(Some(10_000)).to_string()).await.unwrap_err().to_string();
+    assert!(quote.contains("no Lightning gateway"), "{quote}");
     close(w).await;
 
     // A wallet that joined this federation before lnv2 was registered: its cached API versions

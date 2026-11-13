@@ -6,9 +6,10 @@
 //! in constant time and never logged.
 //!
 //! The pay token (`<data_dir>/till-pay-token`, made the same way by `till pair --scope pay`) has
-//! the `pay` scope: it opens `/v1/pay…`, `/v1/pays`, `/v1/health` and the card link, and nothing
-//! else, from any peer, loopback included ([`pay_scope_allows`]). An app paired with it can have a
-//! card pay its invoices without holding the till.
+//! the `pay` scope: it opens `/v1/pay` and `/v1/pay/{id}…`, `/v1/health` and the card link, and
+//! nothing else, from any peer, loopback included ([`pay_scope_allows`]). An app paired with it can
+//! have a card pay its invoices without holding the till: only the card behind its own card link,
+//! and it reads only the pays it names by `client_ref` ([`PayScope`]).
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -216,7 +217,7 @@ fn forbidden() -> Response {
         axum::Json(json!({
             "ok": false,
             "error": "forbidden",
-            "detail": "this token has the pay scope: it opens /v1/pay, /v1/pay/{id}, /v1/pay/{id}/refund, /v1/pays, /v1/health and /v1/card/link only",
+            "detail": "this token has the pay scope: it opens /v1/pay, /v1/pay/{id}, /v1/pay/{id}/refund, /v1/health and /v1/card/link only",
         })),
     )
         .into_response()
@@ -245,18 +246,27 @@ pub enum Access {
 }
 
 /// The routes the pay scope opens: paying invoices with a card (`/v1/pay`, `/v1/pay/{id}`,
-/// `/v1/pay/{id}/refund`, `/v1/pays`), `/v1/health`, and the card link a pay's card goes through.
+/// `/v1/pay/{id}/refund`), `/v1/health`, and the card link a pay's card goes through. Not
+/// `/v1/pays`: that lists every holder's pays, and the pay token lives in a phone app.
 pub fn pay_scope_allows(path: &str) -> bool {
-    matches!(path, "/v1/health" | "/v1/card/link" | "/v1/pay" | "/v1/pays") || path.starts_with("/v1/pay/")
+    matches!(path, "/v1/health" | "/v1/card/link" | "/v1/pay") || path.starts_with("/v1/pay/")
+}
+
+/// Set on a request the pay token let in ([`auth`]): the pay handlers hold such a caller to its
+/// own card link and its own pays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayScope;
+
+/// Whether `authorization` carries the pay token.
+pub fn pay_bearer(auth: &PosAuth, authorization: Option<&str>) -> bool {
+    let given = authorization.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
+    matches!((auth.pay_token.as_deref(), given), (Some(pay), Some(given)) if token_eq(given.as_bytes(), pay.as_bytes()))
 }
 
 /// [`authorized`], with the pay token: its bearer is held to [`pay_scope_allows`] from every peer,
 /// loopback included, so a pay token never opens more than its scope.
 pub fn access(auth: &PosAuth, path: &str, peer: Option<SocketAddr>, authorization: Option<&str>) -> Access {
-    let given = authorization.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
-    if let (Some(pay), Some(given)) = (auth.pay_token.as_deref(), given)
-        && token_eq(given.as_bytes(), pay.as_bytes())
-    {
+    if pay_bearer(auth, authorization) {
         return if pay_scope_allows(path) { Access::Allowed } else { Access::Forbidden };
     }
     if authorized(auth.token.as_deref(), auth.everywhere, peer, authorization) { Access::Allowed } else { Access::Unauthorized }
@@ -274,12 +284,19 @@ pub fn authorized(token: Option<&str>, everywhere: bool, peer: Option<SocketAddr
     token_eq(given.trim().as_bytes(), token.as_bytes())
 }
 
-/// Middleware over `/v1/*`: [`authorized`] with the handle's token and the peer's address.
-pub async fn auth(State(a): State<PosAuth>, req: Request, next: Next) -> Response {
+/// Middleware over `/v1/*`: [`access`] with the handle's tokens and the peer's address. A request
+/// the pay token let in carries [`PayScope`].
+pub async fn auth(State(a): State<PosAuth>, mut req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
+    let pay = pay_bearer(&a, header);
     match access(&a, req.uri().path(), peer, header) {
-        Access::Allowed => next.run(req).await,
+        Access::Allowed => {
+            if pay {
+                req.extensions_mut().insert(PayScope);
+            }
+            next.run(req).await
+        }
         Access::Unauthorized => unauthorized(),
         Access::Forbidden => forbidden(),
     }
@@ -392,8 +409,10 @@ mod tests {
     fn the_pay_token_opens_the_pay_routes_only_from_every_peer() {
         let lan: SocketAddr = "192.168.1.20:5000".parse().unwrap();
         let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let open = ["/v1/health", "/v1/card/link", "/v1/pay", "/v1/pay/1", "/v1/pay/1/refund", "/v1/pays"];
+        let open = ["/v1/health", "/v1/card/link", "/v1/pay", "/v1/pay/1", "/v1/pay/1/refund"];
         let closed = [
+            // Every holder's pays: the POS token's, not the pay token's.
+            "/v1/pays",
             "/v1/charge",
             "/v1/status",
             "/v1/sales",
@@ -431,6 +450,11 @@ mod tests {
         // Without a pay token, its value is just a wrong token.
         let a = PosAuth { token: Some("ab".into()), everywhere: false, pay_token: None };
         assert_eq!(access(&a, "/v1/pay", Some(lan), Some("Bearer cd")), Access::Unauthorized);
+        assert!(!pay_bearer(&a, Some("Bearer cd")));
+        // Only the pay token's bearer is the pay scope.
+        let a = PosAuth { token: Some("ab".into()), everywhere: false, pay_token: Some("cd".into()) };
+        assert!(pay_bearer(&a, Some("Bearer cd")) && pay_bearer(&a, Some("Bearer  cd ")));
+        assert!(!pay_bearer(&a, Some("Bearer ab")) && !pay_bearer(&a, Some("cd")) && !pay_bearer(&a, None));
         assert_eq!(pay_pair_text("https://till.example.com/", "ff"), "fedimintcard-till-pay:https://till.example.com?t=ff");
     }
 
