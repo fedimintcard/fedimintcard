@@ -116,7 +116,8 @@ F0 and F1 are worth doing even if the rest waits: they harden what is in product
    own takes a 3.0 card offline ("Paid offline") and the till settles it later; online, the hosted
    till charges exactly as before. One Rust core (`host/pos-core`) for the till and both apps; the
    phone holds an offline kit whose pool of till outputs keeps their secrets on the till; two till
-   routes take kits out and charges in. Slices ENG-842 to ENG-845; `docs/POS-OFFLINE.md`.
+   routes take kits out and charges in. Slices ENG-842 to ENG-845; `docs/POS-OFFLINE.md`. Drilled
+   on production on 2026-11-13 (§ 10, third e2e run).
 
 Still open, defaults used until the owner says otherwise: the limits (a per-card daily offline
 limit set per batch in the Setup app, default none (owner, 2026-11-07: set one for village batches); a till's unsettled limit, default
@@ -179,9 +180,9 @@ tests.
   a live fee change.
 - **Spare slots offline.** A fresh card ran out of keyed spare slots after two charges with change.
   Online tills should key more ahead; an offline till may re-key the slots its own queued charges
-  spent. *Built (online half):* every online tap keeps a 3.0 card at 6 fresh keyed slots, at most 2
-  keys a tap, settled SPENT slots renewed before new slots are keyed (`docs/TILL-API.md`, "Spare
-  slots for offline change"). Re-keying offline is still open.
+  spent. *Built (online half):* every online tap keeps a 3.0 card at 12 fresh keyed slots (by
+  default), at most 2 keys a tap, settled SPENT slots renewed before new slots are keyed
+  (`docs/TILL-API.md`, "Spare slots for offline change"). Re-keying offline is still open.
 - **Messages.** The POS says "card needs a top up" for "no slot for change"; the Setup app says
   "the card left the phone" for a registry refusal. *Built (POS half):* the till refuses with
   `offline_no_change_room` and a price the card can pay; both POS apps show "This card can't take
@@ -191,7 +192,8 @@ tests.
 - **A note pending under another till's unresolved online charge** makes an offline report a
   `double_spend` even if that charge later fails.
 - **Production**: registry v11 needs its own `CERT_SIGNING_KEY` (set by the owner), then the
-  registry, the zion till package and the apps.
+  registry, the zion till package and the apps. *Done:* `ROLLOUT-OFFLINE.md`, which reached step 6
+  on 2026-11-07.
 
 ### Second e2e run (2026-11-07, staging)
 
@@ -202,3 +204,29 @@ and 7 sat, all "Paid offline" (10 sat had been refused in the first drill). Back
 of 3 settled with no double spend or rejection, the till's wallet rose by exactly the 49.152 sat it
 was owed, and a balance tap finished both change slots. Found: every fee margin was 0 (fixed, as
 above).
+
+### Third e2e run (2026-11-13, prod on zion)
+
+The POS phones as offline tills (§ 8, decision 5), on production: zion's till `0.1.0:4` (built
+from `a630a22`; caps of 200 payments and 100,000 sat), the owner's card `a5c816c9` (1,933,312 msat
+live), the Max (iOS POS 0.1.0 (3)) and the Pixel (Android POS 0.3.0 (2), then 0.4.0 (3) from the
+PR #26 branch). The staging rig was ready but both staging cards were empty, so the owner moved the
+drills to zion. Sales of 16 sat, or 8 where 16 was refused:
+
+- (a) One sale per phone in airplane mode. Back online, each synced, the Max within seconds and the
+  Pixel in about a minute, and the registry recorded both, the Max's under its receipt's txid.
+- (b) Both phones offline on one card: two sales, two txids, no double spend; the till's balance
+  rose by the 24,576 msat the card's live total fell by.
+- (c) Refused offline with nothing signed: 16 sat with too few fresh slots for its change ("Try 8
+  sats"), 100,001 sat over the value cap, and 8 sat with the phone's clock 8 days ahead (kit
+  expired). The kit renewed online.
+- (d) Three offline sales (48 sat) on the Pixel, then its data cleared: the till and the registry
+  never saw them. The merchant lost the 48 sat. The three notes they spent on the card (65,536 msat)
+  stay live on the registry: the card's balance counts them, and an online sale that picks them
+  fails.
+
+The count cap (200) and a double spend were not staged. Found: no Android phone could open its
+offline store (fixed, PR #26); ENG-864, offline runs of 5 to 10 sales on one card (fresh keyed
+slots, change waiting for an online tap, the note mix); ENG-865, the copy for a price over the cap;
+ENG-866, the card's id in the apps, and the Pixel's slower sync; ENG-867, notes stranded by a wiped
+phone. Details: `POS-OFFLINE.md` § Drill log.
