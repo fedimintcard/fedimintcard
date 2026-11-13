@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
 use fedimint_card_sidecar::sales::SalesStore;
@@ -137,6 +137,28 @@ enum TillCmd {
         /// its unused pool entries are dropped with their secrets.
         #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
         offline_kit_grace_days: u64,
+        /// Pay Lightning invoices with a card (`POST /v1/pay`): the till charges the card for the
+        /// invoice, its fee reserve and margin, then pays the invoice from its wallet. Off by default.
+        #[arg(long, env = "TILL_PAY_ENABLED", value_parser = clap::builder::BoolishValueParser::new())]
+        pay_enabled: bool,
+        /// Largest invoice paid with a card, in msat.
+        #[arg(long, env = "TILL_PAY_MAX_INVOICE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_INVOICE_MSAT)]
+        pay_max_invoice_msat: u64,
+        /// Cap on a pay's fee reserve, in msat: a larger `max_fee_msat` is lowered to it.
+        #[arg(long, env = "TILL_PAY_MAX_FEE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_FEE_MSAT)]
+        pay_max_fee_msat: u64,
+        /// The till's margin on each pay, in msat (added to --pay-margin-bps).
+        #[arg(long, env = "TILL_PAY_MARGIN_MSAT", default_value_t = 0)]
+        pay_margin_msat: u64,
+        /// The till's margin on each pay, in basis points of the invoice.
+        #[arg(long, env = "TILL_PAY_MARGIN_BPS", default_value_t = 0)]
+        pay_margin_bps: u64,
+        /// Most value, in msat, the till charges cards for pays in any 24 hours.
+        #[arg(long, env = "TILL_PAY_DAILY_CAP_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_DAILY_CAP_MSAT)]
+        pay_daily_cap_msat: u64,
+        /// Least time, in seconds, an invoice must have left before it expires.
+        #[arg(long, env = "TILL_PAY_MIN_EXPIRY_SECS", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MIN_EXPIRY_SECS)]
+        pay_min_expiry_secs: u64,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -158,7 +180,8 @@ enum TillCmd {
         replace: bool,
     },
     /// Pair a POS phone: make the POS token if there is none, and print it as a QR code to scan
-    /// in the POS app's settings (docs/POS-LINK.md).
+    /// in the POS app's settings (docs/POS-LINK.md). With `--scope pay`, pair an app that only
+    /// pays invoices with a card (docs/PAY.md).
     Pair {
         /// The till's URL as the phone reaches it: http:// or https:// (behind a proxy that
         /// terminates TLS; the phone then uses wss:// for the card link), host and port only.
@@ -169,10 +192,20 @@ enum TillCmd {
         #[arg(long)]
         text: bool,
         /// Replace the POS token first. Every paired phone must pair again, and a running till
-        /// keeps the old token until it restarts.
+        /// keeps the old token until it restarts. With `--scope pay`, the pay token.
         #[arg(long)]
         new_token: bool,
+        /// What the token opens: `pos`, the whole till API (the POS app), or `pay`, only paying
+        /// invoices with a card (`/v1/pay`, `/v1/pay/{id}…`, `/v1/health`, the card link).
+        #[arg(long, value_enum, default_value_t = PairScope::Pos)]
+        scope: PairScope,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PairScope {
+    Pos,
+    Pay,
 }
 
 #[derive(Subcommand)]
@@ -311,7 +344,8 @@ async fn main() -> Result<()> {
             };
             let gw = ln.select_available_gateway(want, None).await.map_err(|e| anyhow::anyhow!("no gateway: {e:?}"))?;
             eprintln!("gateway {} ({})", gw.gateway_id, gw.api);
-            let desc = lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
+            let desc =
+                lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
             let (op, invoice, _) = ln
                 .create_bolt11_invoice(fedimint_core::Amount::from_msats(*amount_msat), desc, Some(600), (), Some(gw))
                 .await
@@ -351,10 +385,7 @@ async fn main() -> Result<()> {
                 println!("module {id}: {} v{}.{}", m.kind, m.version.major, m.version.minor);
             }
             println!("wallet balance: {}", sats(w.balance_msat().await?));
-            println!(
-                "mint fee: {} msat for a 1,048,576 msat note (per input and per output)",
-                w.fee(1 << 20)
-            );
+            println!("mint fee: {} msat for a 1,048,576 msat note (per input and per output)", w.fee(1 << 20));
             let s = &st.state;
             println!(
                 "card state: {} slot(s) cached, {} live note(s) worth {}, {} free slot(s), {} pending overwrite(s), {} in-flight host output(s)",
@@ -411,6 +442,13 @@ async fn main() -> Result<()> {
             spare_keys_per_tap,
             offline_kit_ttl_hours,
             offline_kit_grace_days,
+            pay_enabled,
+            pay_max_invoice_msat,
+            pay_max_fee_msat,
+            pay_margin_msat,
+            pay_margin_bps,
+            pay_daily_cap_msat,
+            pay_min_expiry_secs,
         }) => {
             let wallet = Wallet::open(&cli.data_dir).await?;
             let store = StateStore::open(state_path(&cli.data_dir))?;
@@ -420,12 +458,25 @@ async fn main() -> Result<()> {
                 offline: fedimint_card_sidecar::offline::OfflineConfig {
                     cap_msat: *offline_cap_msat,
                     cap_count: *offline_cap_count,
-                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom { base_msat: *offline_fee_base_msat, ppm: *offline_fee_headroom_ppm },
+                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom {
+                        base_msat: *offline_fee_base_msat,
+                        ppm: *offline_fee_headroom_ppm,
+                    },
                 },
                 spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
                 kits: fedimint_card_sidecar::pool::KitConfig {
                     ttl_ms: offline_kit_ttl_hours.saturating_mul(3_600_000),
                     grace_ms: offline_kit_grace_days.saturating_mul(86_400_000),
+                },
+                pay: fedimint_card_sidecar::pay::PayConfig {
+                    enabled: *pay_enabled,
+                    max_invoice_msat: *pay_max_invoice_msat,
+                    max_fee_msat: *pay_max_fee_msat,
+                    margin_msat: *pay_margin_msat,
+                    margin_bps: *pay_margin_bps,
+                    daily_cap_msat: *pay_daily_cap_msat,
+                    min_expiry_secs: *pay_min_expiry_secs,
+                    ..Default::default()
                 },
             };
             fedimint_card_sidecar::till::serve_opts(
@@ -456,18 +507,43 @@ async fn main() -> Result<()> {
                 c.expires_at.saturating_sub(claim::now_ms()) / 60_000
             );
         }
-        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token }) => {
+        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token, scope: PairScope::Pay }) => {
+            use fedimint_card_sidecar::pos;
+            let url = match url {
+                Some(u) => pos::check_till_url(u)?,
+                None => format!("http://{}:9877", pos::lan_ipv4()?),
+            };
+            // The POS token guards everything else on the LAN: a till listens there only with it.
+            let (_, made_pos) = pos::ensure_token(&cli.data_dir)?;
+            let (token, made) =
+                if *new_token { (pos::rotate_pay_token(&cli.data_dir)?, true) } else { pos::ensure_pay_token(&cli.data_dir)? };
+            let text = pos::pay_pair_text(&url, &token);
+            if *text_only {
+                println!("{text}");
+                return Ok(());
+            }
+            if made_pos {
+                eprintln!("made a POS token in {}", pos::token_path(&cli.data_dir).display());
+            }
+            if *new_token {
+                eprintln!("replaced the pay token in {}: every paying app must pair again", pos::pay_token_path(&cli.data_dir).display());
+            } else if made {
+                eprintln!("made a pay token in {}", pos::pay_token_path(&cli.data_dir).display());
+            }
+            qr(&text)?;
+            println!("{text}");
+            eprintln!(
+                "scan it in the app that pays invoices with a card. It opens only /v1/pay, /v1/pay/{{id}}…, /v1/health and the card link. Restart the till to take it."
+            );
+        }
+        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token, scope: PairScope::Pos }) => {
             use fedimint_card_sidecar::pos;
             // Check the URL before touching the token, so a typo changes nothing.
             let url = match url {
                 Some(u) => pos::check_till_url(u)?,
                 None => format!("http://{}:9877", pos::lan_ipv4()?),
             };
-            let (token, made) = if *new_token {
-                (pos::rotate_token(&cli.data_dir)?, true)
-            } else {
-                pos::ensure_token(&cli.data_dir)?
-            };
+            let (token, made) = if *new_token { (pos::rotate_token(&cli.data_dir)?, true) } else { pos::ensure_token(&cli.data_dir)? };
             let text = pos::pair_text(&url, &token);
             if *text_only {
                 println!("{text}");
@@ -490,10 +566,10 @@ async fn main() -> Result<()> {
             let mut loader = fedimint_card_sidecar::holder::Loader::new(&w, ops_url, &cli.data_dir)?;
             // A till's own wallet loading a split-keyed card can key its unkeyed slots with the
             // token an approved claim left, when it is for this registry (`holder.rs`).
-            if let Some(cfg) = fedimint_card_sidecar::claim::read_ops(&cli.data_dir)? {
-                if cfg.url.trim_end_matches('/') == ops_url.trim_end_matches('/') {
-                    loader = loader.with_keyer(fedimint_card_sidecar::ops::OpsClient::new(&cfg)?);
-                }
+            if let Some(cfg) = fedimint_card_sidecar::claim::read_ops(&cli.data_dir)?
+                && cfg.url.trim_end_matches('/') == ops_url.trim_end_matches('/')
+            {
+                loader = loader.with_keyer(fedimint_card_sidecar::ops::OpsClient::new(&cfg)?);
             }
             let r = loader.load(card.as_mut(), amount_msat).await?;
             if r.resumed > 0 {
@@ -536,18 +612,18 @@ fn report_recovered(r: &Recovered) {
 async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
     match cmd {
         CardCmd::Setup { fresh } => {
-                        for (slot, pk) in cw.card_setup(*fresh)? {
+            for (slot, pk) in cw.card_setup(*fresh)? {
                 println!("slot {slot:2}  {pk}");
             }
         }
         CardCmd::Topup { amount_msat } => {
-                        for (slot, amount) in cw.topup(amount_msat).await? {
+            for (slot, amount) in cw.topup(amount_msat).await? {
                 println!("slot {slot:2}  +{}", sats(amount));
             }
         }
         CardCmd::Load { .. } => unreachable!("handled in main without a PIN session"),
         CardCmd::Balance => {
-                        let r = cw.balance().await?;
+            let r = cw.balance().await?;
             report_recovered(&r.recovered);
             for t in &r.unresolved {
                 println!("unresolved transaction {t} (run `card balance` again)");
@@ -565,11 +641,15 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
             println!("free slots: {:?}  to renew: {:?}", r.free_slots, r.overwritable_slots);
         }
         CardCmd::Spend { price } => {
-                        let r = cw.spend(*price).await?;
+            let r = cw.spend(*price).await?;
             println!("submitted, accepted by the federation: {}", r.txid);
             println!(
                 "inputs {:?}; till received {} (price {}, overpaid {} msat); fees {} msat",
-                r.inputs, sats(r.received.msats), sats(r.price_msat), r.overpay_msat, r.fees_msat
+                r.inputs,
+                sats(r.received.msats),
+                sats(r.price_msat),
+                r.overpay_msat,
+                r.fees_msat
             );
             println!("change notes {:?}; renewed slots {:?}", r.change, r.renewed_slots);
             if r.dust {
@@ -583,7 +663,7 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
             }
         }
         CardCmd::Cashout { slot, qr: want_qr } => {
-                        let r = cw.cashout(*slot).await?;
+            let r = cw.cashout(*slot).await?;
             println!("submitted, accepted by the federation: {}", r.txid);
             println!(
                 "slot {} ({} msat note): {} reached the wallet after fees{}",

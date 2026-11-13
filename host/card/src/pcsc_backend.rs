@@ -20,9 +20,7 @@ impl PcscTransport {
         let Some(chosen) = chosen else {
             bail!("no matching PC/SC reader (found {readers:?})");
         };
-        let card = ctx
-            .connect(chosen, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
-            .context("connecting to card")?;
+        let card = ctx.connect(chosen, pcsc::ShareMode::Shared, pcsc::Protocols::ANY).context("connecting to card")?;
         Ok(Self { card })
     }
 }

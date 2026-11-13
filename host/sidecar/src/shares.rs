@@ -35,12 +35,7 @@ pub struct OutSpec {
 }
 
 /// Fetch a threshold of valid shares for one output and aggregate them into a blind signature.
-pub async fn fetch_blind_signature(
-    w: &Wallet,
-    txid: TransactionId,
-    spec: OutSpec,
-    timeout: Duration,
-) -> Result<BlindedSignature> {
+pub async fn fetch_blind_signature(w: &Wallet, txid: TransactionId, spec: OutSpec, timeout: Duration) -> Result<BlindedSignature> {
     // `await_output_outcome` is a federation-wide endpoint, not a mint module one.
     let api = w.client.api();
     let decoder = w.client.decoders().get_expect(w.mint_id).clone();
@@ -53,7 +48,7 @@ pub async fn fetch_blind_signature(
                 move |peer, outcome: SerdeOutputOutcome| {
                     ready(
                         verify_blind_share(peer, &outcome, amount, blinded, &decoder, &peer_pks)
-                            .map_err(|e| ServerError::InvalidResponse(e.to_string().into())),
+                            .map_err(|e| ServerError::InvalidResponse(e.to_string())),
                     )
                 },
                 api.all_peers().to_num_peers(),
@@ -65,9 +60,7 @@ pub async fn fetch_blind_signature(
     )
     .await
     .with_context(|| format!("timed out waiting for signature shares of output {out_idx}"))?;
-    Ok(tbs::aggregate_signature_shares(
-        &shares.into_iter().map(|(p, s)| (p.to_usize() as u64, s)).collect(),
-    ))
+    Ok(tbs::aggregate_signature_shares(&shares.into_iter().map(|(p, s)| (p.to_usize() as u64, s)).collect()))
 }
 
 /// Unblind `sig` and check the resulting note against the federation's key for `amount`.

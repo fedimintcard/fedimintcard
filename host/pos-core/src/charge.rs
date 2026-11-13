@@ -150,13 +150,13 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
             return Ok(Taken { charge: c.clone(), replayed: true });
         }
     }
-    if let Some(exp) = env.expires_at_ms {
-        if env.now_ms >= exp {
-            bail!(OfflineError::KitExpired(format!(
-                "the offline kit expired at {exp} (now {}); the phone needs a new one from the till",
-                env.now_ms
-            )));
-        }
+    if let Some(exp) = env.expires_at_ms
+        && env.now_ms >= exp
+    {
+        bail!(OfflineError::KitExpired(format!(
+            "the offline kit expired at {exp} (now {}); the phone needs a new one from the till",
+            env.now_ms
+        )));
     }
     {
         let q = lock(queue);
@@ -183,12 +183,12 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
     let short_id = short_id_of(&slot0);
     // The clock first: a header a day later starts the card's new day.
     let card_now = if env.header.is_some() || env.expires_at_ms.is_some() { sync_clock(card, env.header) } else { None };
-    if let (Some(exp), Some(now)) = (env.expires_at_ms, card_now) {
-        if u64::from(now).saturating_mul(1_000) >= exp {
-            bail!(OfflineError::KitExpired(format!(
-                "the offline kit expired at {exp}, and the card's clock says {now} s; the phone needs a new kit from the till"
-            )));
-        }
+    if let (Some(exp), Some(now)) = (env.expires_at_ms, card_now)
+        && u64::from(now).saturating_mul(1_000) >= exp
+    {
+        bail!(OfflineError::KitExpired(format!(
+            "the offline kit expired at {exp}, and the card's clock says {now} s; the phone needs a new kit from the till"
+        )));
     }
     // The PIN, before anything on the card changes: a wrong one leaves the card as it was.
     open_pin(card, &env.pin)?;
@@ -331,7 +331,12 @@ fn holds_signing(q: &Queue, client_ref: Option<&str>) -> bool {
 /// new one (ENG-842's third review). Any other failure is itself.
 fn undecided_if_held(e: anyhow::Error, queue: &Mutex<Queue>, client_ref: Option<&str>) -> anyhow::Error {
     let held = client_ref.and_then(|r| {
-        lock(queue).file.charges.iter().find(|c| c.state == ChargeState::Signing && c.client_ref.as_deref() == Some(r)).map(|c| c.short_id.clone())
+        lock(queue)
+            .file
+            .charges
+            .iter()
+            .find(|c| c.state == ChargeState::Signing && c.client_ref.as_deref() == Some(r))
+            .map(|c| c.short_id.clone())
     });
     match held {
         Some(short_id) => anyhow::Error::new(OfflineError::Undecided(format!(
@@ -412,7 +417,8 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
     }
     let input_amounts: Vec<u64> = inputs.iter().map(|n| n.amount_msat).collect();
     if !st.limit_allows(&input_amounts) {
-        return Err(anyhow::Error::new(StatusWord(SW_OVER_LIMIT)).context("the card's daily offline limit does not take this charge; nothing was signed"));
+        return Err(anyhow::Error::new(StatusWord(SW_OVER_LIMIT))
+            .context("the card's daily offline limit does not take this charge; nothing was signed"));
     }
 
     // Outputs, blinded as the online flow blinds them: the till's first, then the change.
@@ -452,7 +458,8 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         inputs: inputs
             .iter()
             .map(|n| -> Result<_> {
-                Ok(MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce: nonce_for(n.key), signature: sig_of(&n.sig48)? }).into_dyn(env.mint_id))
+                Ok(MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce: nonce_for(n.key), signature: sig_of(&n.sig48)? })
+                    .into_dyn(env.mint_id))
             })
             .collect::<Result<_>>()?,
         outputs: outs.iter().map(|(a, b)| MintOutput::new_v0(Amount::from_msats(*a), BlindNonce(*b)).into_dyn(env.mint_id)).collect(),
@@ -461,7 +468,8 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
     };
     let txid = tx.tx_hash();
     let n_till = plan.till.len();
-    let fees_msat = inputs.iter().map(|n| fee(n.amount_msat)).sum::<u64>() + plan::fee_sum(&plan.till, &fee) + plan::fee_sum(&plan.change, &fee);
+    let fees_msat =
+        inputs.iter().map(|n| fee(n.amount_msat)).sum::<u64>() + plan::fee_sum(&plan.till, &fee) + plan::fee_sum(&plan.change, &fee);
     // What the card signs pays the outputs, their fees and the margin, to the msat.
     ensure!(
         input_amounts.iter().sum::<u64>() == till_msat + plan.change.iter().sum::<u64>() + fees_msat + plan.surplus,
@@ -558,11 +566,20 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
 /// Why there is no plan, in the vocabulary of the till API: a pool short of a tier, a card short
 /// of room for change (each with prices it pays), notes that do not check, or the planner's own.
 #[allow(clippy::too_many_arguments)]
-fn no_plan(e: PlanError, amounts: &[u64], price: u64, free: usize, fee: plan::FeeFn, min_denom: u64, tiers: Tiers, invalid: usize) -> anyhow::Error {
+fn no_plan(
+    e: PlanError,
+    amounts: &[u64],
+    price: u64,
+    free: usize,
+    fee: plan::FeeFn,
+    min_denom: u64,
+    tiers: Tiers,
+    invalid: usize,
+) -> anyhow::Error {
     let pays = |free: usize, tiers: Tiers| plan::solve_in(amounts, price, free, fee, min_denom, tiers).is_ok();
     if invalid == 0 && matches!(e, PlanError::NoExactPlan { .. }) && pays(MAX_CARD_NOTES, ALL_TIERS) {
         let (below, above) = plan::exact_prices_near_in(amounts, price, free, fee, min_denom, 1_000, tiers);
-        let sats = |m: u64| if m % 1_000 == 0 { format!("{} sats", m / 1_000) } else { format!("{:.3} sats", m as f64 / 1_000.0) };
+        let sats = |m: u64| if m.is_multiple_of(1_000) { format!("{} sats", m / 1_000) } else { format!("{:.3} sats", m as f64 / 1_000.0) };
         let tip = match (below, above) {
             (None, None) => "try another amount".to_owned(),
             (b, a) => format!("it can pay {} exactly", [b, a].into_iter().flatten().map(sats).collect::<Vec<_>>().join(" or ")),
@@ -598,7 +615,11 @@ fn no_plan(e: PlanError, amounts: &[u64], price: u64, free: usize, fee: plan::Fe
 }
 
 /// SIGN each `(slot, key)` over `digest` and check each signature here.
-fn sign_inputs(card: &mut dyn Card, keys: &[(u8, XOnlyPublicKey)], digest: [u8; 32]) -> Result<Vec<fedimint_core::secp256k1::schnorr::Signature>> {
+fn sign_inputs(
+    card: &mut dyn Card,
+    keys: &[(u8, XOnlyPublicKey)],
+    digest: [u8; 32],
+) -> Result<Vec<fedimint_core::secp256k1::schnorr::Signature>> {
     let msg = Message::from_digest(digest);
     let mut sigs = vec![];
     for (slot, key) in keys {
@@ -688,7 +709,8 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
             continue;
         }
         let sigs = sign_inputs(card, &keys, digest)?;
-        let mut tx = Transaction::consensus_decode_hex(&e.unsigned_hex, env.decoders).map_err(|x| anyhow!("decoding a queued transaction: {x}"))?;
+        let mut tx =
+            Transaction::consensus_decode_hex(&e.unsigned_hex, env.decoders).map_err(|x| anyhow!("decoding a queued transaction: {x}"))?;
         tx.signatures = TransactionSignature::NaiveMultisig(sigs);
         let hex_tx = tx.consensus_encode_to_hex();
         let c = lock(queue).commit(|f| {

@@ -23,7 +23,7 @@ async fn federation_starts_and_client_is_funded() -> anyhow::Result<()> {
     let range = client
         .finalize_and_submit_transaction(
             op,
-            "Issue".into(),
+            "Issue",
             |_| (),
             TransactionBuilder::new().with_inputs(dummy.create_input(Amount::from_sats(10_000))),
         )
@@ -51,7 +51,10 @@ async fn note_issued_to_card_key_verifies() -> anyhow::Result<()> {
     assert!(verify_note(note, pk));
 
     // The check can fail: wrong denomination key, different nonce, or another note's signature.
-    assert!(!verify_note(fedimint_mintv2_common::Note { denomination: Denomination(19), ..note }, env.mint_cfg.tbs_agg_pks[&Denomination(19)]));
+    assert!(!verify_note(
+        fedimint_mintv2_common::Note { denomination: Denomination(19), ..note },
+        env.mint_cfg.tbs_agg_pks[&Denomination(19)]
+    ));
     let other = on_card(|| card.get_or_gen(1))?;
     assert!(!verify_note(fedimint_mintv2_common::Note { nonce: nonce_for(other), ..note }, pk));
     Ok(())

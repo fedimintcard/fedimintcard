@@ -83,12 +83,25 @@ jobs:
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
       - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev protobuf-compiler build-essential
-      # host/rust-toolchain.toml pins the compiler (fedimint's dependency tree needs >= 1.91).
+      # host/rust-toolchain.toml pins the compiler (fedimint's dependency tree needs >= 1.91) and
+      # lists rustfmt and clippy, which the two checks below need.
       - uses: dtolnay/rust-toolchain@1.91.1
+        with: { components: 'rustfmt, clippy' }
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "host -> target"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The workspace is formatted (host/rustfmt.toml) and clippy-clean; a change that drifts
+      # fails here instead of leaving the next branch a reformat.
+      - name: cargo fmt
+        working-directory: host
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        working-directory: host
+        run: cargo clippy --locked --workspace --all-targets --profile ci -- -D warnings
+      - name: cargo clippy (pos-core with ffi)
+        working-directory: host
+        run: cargo clippy --locked -p fedimint-card-pos-core --features ffi --all-targets --profile ci -- -D warnings
       - name: cargo test
         working-directory: host
         run: cargo test --locked --workspace --profile ci -- --test-threads=2

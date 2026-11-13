@@ -40,9 +40,7 @@ impl BridgeTransport {
     pub fn new(base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_owned(),
-            agent: ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(10))
-                .build(),
+            agent: ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build(),
         }
     }
 
@@ -101,10 +99,8 @@ mod tests {
             data.extend_from_slice(&buf[..n]);
             if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
-                let want = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
-                    .unwrap_or(0);
+                let want =
+                    head.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
                 if data.len() >= end + 4 + want {
                     return;
                 }

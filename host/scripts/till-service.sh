@@ -5,7 +5,8 @@
 #   till-service.sh restart    copy the binary again (after a rebuild) and restart
 #   till-service.sh stop       unload; start with `install` again
 #   till-service.sh status     launchd's view, /v1/status, the log's tail
-#   till-service.sh pair       make the POS token if needed and print the pairing QR (POS-LINK.md)
+#   till-service.sh pair       make the POS token if needed and print the pairing QR (POS-LINK.md);
+#                              --scope pay pairs an app that only pays invoices with a card (PAY.md)
 #   till-service.sh claim NAME ask the registry for a till token; approve it in the provisioner app
 #   till-service.sh run        what launchd runs; not for a terminal
 #

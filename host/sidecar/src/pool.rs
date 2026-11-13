@@ -174,7 +174,12 @@ impl PoolLedger {
 pub fn reconcile(queue: &Queue, pool: &mut PoolLedger) -> Result<usize> {
     let owed: Vec<(String, String)> =
         queue.file.charges.iter().flat_map(|c| c.pool.iter().map(|p| (p.blinded.clone(), c.txid.clone()))).collect();
-    let behind = pool.file.entries.iter().filter(|e| matches!(e.state, EntryState::Issued { .. }) && owed.iter().any(|(b, _)| *b == e.blinded)).count();
+    let behind = pool
+        .file
+        .entries
+        .iter()
+        .filter(|e| matches!(e.state, EntryState::Issued { .. }) && owed.iter().any(|(b, _)| *b == e.blinded))
+        .count();
     if behind == 0 {
         return Ok(0);
     }
@@ -230,6 +235,7 @@ impl TillKeys {
 /// good for the kit lifetime from this fetch; else a new one. What is answered is in the ledger
 /// first. Each call reclaims kits past their redeem window. `NotReady` without the registry's
 /// certificate key.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_kit(
     pool: &Mutex<PoolLedger>,
     keys: &TillKeys,
@@ -242,7 +248,8 @@ pub fn issue_kit(
 ) -> Result<Kit> {
     let Some(cert_key) = cert_key else {
         bail!(OfflineError::NotReady(
-            "this till has no certificate key from the registry yet (it fetches one while online), so it cannot issue an offline kit".into()
+            "this till has no certificate key from the registry yet (it fetches one while online), so it cannot issue an offline kit"
+                .into()
         ));
     };
     let mut pool = pool.lock().unwrap();
@@ -408,7 +415,8 @@ fn top_up(pool: &PoolLedger, rec: &KitRec, kit: &KitParts) -> Result<Vec<PoolRec
 /// entries never used are dropped with their secrets (a charge naming one is refused all the
 /// same). Entries a charge used stay.
 fn reclaim(pool: &mut PoolLedger, now: u64) -> Result<()> {
-    let due: HashSet<String> = pool.file.kits.iter().filter(|k| !k.reclaimed && k.redeem_until_ms <= now).map(|k| k.kit_id.clone()).collect();
+    let due: HashSet<String> =
+        pool.file.kits.iter().filter(|k| !k.reclaimed && k.redeem_until_ms <= now).map(|k| k.kit_id.clone()).collect();
     let stale = pool.file.entries.iter().any(|e| matches!(e.state, EntryState::Reclaimed));
     if due.is_empty() && !stale {
         return Ok(());
@@ -624,7 +632,11 @@ fn decide(q: &Queue, pl: &PoolLedger, taken: &[OfflineCharge], phone_id: &str, c
     }
     let spent_before = |n: &String| q.file.spent.contains(n) || taken.iter().any(|t| t.inputs.iter().any(|i| i.nonce == *n));
     if let Some(i) = c.inputs.iter().find(|i| spent_before(&i.nonce)) {
-        tracing::warn!("phone charge {}: note {} was already taken offline here; the registry decides which is a double spend", c.txid, i.nonce);
+        tracing::warn!(
+            "phone charge {}: note {} was already taken offline here; the registry decides which is a double spend",
+            c.txid,
+            i.nonce
+        );
     }
     Decision::Take(OfflineCharge {
         state: ChargeState::Queued,
@@ -661,6 +673,7 @@ fn record_sale(sales: &Mutex<SalesStore>, c: &OfflineCharge, phone_id: &str) {
         offline: true,
         double_spent: false,
         rejected: false,
+        short_id: Some(c.short_id.clone()),
     };
     let mut s = sales.lock().unwrap();
     if let Err(e) = s.append(rec.clone()) {
@@ -680,7 +693,8 @@ type Refusal = (&'static str, String);
 fn check(c: &OfflineCharge, keys: &TillKeys, decoders: &ModuleDecoderRegistry) -> Result<Checked, Refusal> {
     let bad = |m: String| ("bad_charge", m);
     let signed = c.signed_hex.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| bad("no signed transaction".into()))?;
-    let mut tx = Transaction::consensus_decode_hex(signed, decoders).map_err(|e| bad(format!("the signed transaction does not decode: {e}")))?;
+    let mut tx =
+        Transaction::consensus_decode_hex(signed, decoders).map_err(|e| bad(format!("the signed transaction does not decode: {e}")))?;
     let txid = tx.tx_hash();
     if txid.to_string() != c.txid {
         return Err(bad(format!("the signed transaction is {txid}, not {}", c.txid)));
@@ -707,10 +721,16 @@ fn check(c: &OfflineCharge, keys: &TillKeys, decoders: &ModuleDecoderRegistry) -
             .and_then(MintInput::maybe_v0_ref)
             .ok_or_else(|| bad("an input that is not a note of this till's mint".into()))?;
         let nonce_hex = hex::encode(note.note.nonce.0.serialize());
-        if note.amount.msats != declared.amount_msat || nonce_hex != declared.nonce || note.note.signature.consensus_encode_to_hex() != declared.signature {
+        if note.amount.msats != declared.amount_msat
+            || nonce_hex != declared.nonce
+            || note.note.signature.consensus_encode_to_hex() != declared.signature
+        {
             return Err(bad(format!("input {nonce_hex} is not what the charge declares")));
         }
-        let pk = keys.tbs_pks.tier(&note.amount).map_err(|_| ("bad_note", format!("{} msat is not a denomination of this federation", note.amount.msats)))?;
+        let pk = keys
+            .tbs_pks
+            .tier(&note.amount)
+            .map_err(|_| ("bad_note", format!("{} msat is not a denomination of this federation", note.amount.msats)))?;
         if !note.note.verify(*pk) {
             return Err(("bad_note", format!("note {nonce_hex}'s federation signature does not verify")));
         }
@@ -762,5 +782,10 @@ fn check(c: &OfflineCharge, keys: &TillKeys, decoders: &ModuleDecoderRegistry) -
         );
     }
     tx.signatures = TransactionSignature::NaiveMultisig(vec![]);
-    Ok(Checked { unsigned_hex: tx.consensus_encode_to_hex(), till_msat, fees_msat: fees, fee_margin_msat: in_sum.saturating_sub(out_sum + fees) })
+    Ok(Checked {
+        unsigned_hex: tx.consensus_encode_to_hex(),
+        till_msat,
+        fees_msat: fees,
+        fee_margin_msat: in_sum.saturating_sub(out_sum + fees),
+    })
 }

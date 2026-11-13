@@ -2497,6 +2497,7 @@ name = "fedimint-card-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "fedimint-api-client",
@@ -2510,6 +2511,7 @@ dependencies = [
  "fedimint-dummy-server",
  "fedimint-ln-client",
  "fedimint-ln-common",
+ "fedimint-ln-server",
  "fedimint-lnv2-client",
  "fedimint-lnv2-server",
  "fedimint-mint-client",
@@ -3151,6 +3153,31 @@ dependencies = [
  "serde_json",
  "subtle",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-ln-server"
+version = "0.13.0-beta.1"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0-beta.1#f9dccb6656cdad6760d6ed4bc33da585ca87a32a"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitcoin_hashes",
+ "erased-serde",
+ "fedimint-api-client",
+ "fedimint-core",
+ "fedimint-ln-common",
+ "fedimint-logging",
+ "fedimint-metrics",
+ "fedimint-server-core",
+ "fedimint-threshold-crypto",
+ "futures",
+ "rand 0.8.8",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
  "tokio",
  "tracing",
 ]

@@ -20,10 +20,10 @@ use fedimint_card_sidecar::till::{self, Class, balance_job, charge_with, classif
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
+use fedimint_core::Amount;
 use fedimint_core::core::OperationId;
 use fedimint_core::secp256k1::XOnlyPublicKey;
 use fedimint_core::secp256k1::schnorr::Signature;
-use fedimint_core::Amount;
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_server::DummyInit;
 use fedimint_mint_client::MintClientInit;
@@ -78,7 +78,6 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     Ok(Fx { _fed: fed, cw, _dir: dir })
 }
 
-
 fn sales_of(f: &Fx) -> Arc<Mutex<SalesStore>> {
     Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales.json")).unwrap()))
 }
@@ -99,10 +98,7 @@ async fn charge_happy_path_records_a_sale() -> anyhow::Result<()> {
     assert!(b["fees_msat"].as_u64().unwrap() >= 200);
     let ins: u64 = b["inputs"].as_array().unwrap().iter().map(|i| i["msat"].as_u64().unwrap()).sum();
     let chg: u64 = b["change"].as_array().unwrap().iter().map(|i| i["msat"].as_u64().unwrap()).sum();
-    assert_eq!(
-        ins,
-        b["price_msat"].as_u64().unwrap() + b["overpaid_msat"].as_u64().unwrap() + chg + b["fees_msat"].as_u64().unwrap()
-    );
+    assert_eq!(ins, b["price_msat"].as_u64().unwrap() + b["overpaid_msat"].as_u64().unwrap() + chg + b["fees_msat"].as_u64().unwrap());
     assert_eq!(b["collection_pending"], false);
     assert!(b["received_msat"].as_u64().unwrap() > 0);
     assert!(b["warnings"].as_array().unwrap().is_empty());
@@ -572,7 +568,10 @@ fn classify_names_the_offline_codes_a_phone_answers_too() {
     let prices = |detail: &str| (detail.to_owned(), 50_000u64, Some(49_000u64), Some(51_000u64));
     let (detail, price_msat, below_msat, above_msat) = prices("p");
     assert_eq!(c(wrap(OfflineError::KitExpired("k".into()).into())), k(403, "offline_kit_expired"));
-    assert_eq!(c(wrap(OfflineError::PoolExhausted { detail, price_msat, below_msat, above_msat }.into())), k(409, "offline_pool_exhausted"));
+    assert_eq!(
+        c(wrap(OfflineError::PoolExhausted { detail, price_msat, below_msat, above_msat }.into())),
+        k(409, "offline_pool_exhausted")
+    );
     assert_eq!(c(wrap(OfflineError::NoteInvalid("n".into()).into())), k(403, "offline_note_invalid"));
     let (detail, price_msat, below_msat, above_msat) = prices("c");
     assert_eq!(c(wrap(OfflineError::NoChangeRoom { detail, price_msat, below_msat, above_msat }.into())), k(409, "offline_no_change_room"));
@@ -598,10 +597,8 @@ fn drain_request(s: &mut std::net::TcpStream) {
         data.extend_from_slice(&buf[..n]);
         if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
-            let want = head
-                .lines()
-                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
-                .unwrap_or(0);
+            let want =
+                head.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
             if data.len() >= end + 4 + want {
                 return;
             }
@@ -658,12 +655,8 @@ impl Card for SlowCard {
 }
 
 async fn call(app: axum::Router, method: &str, uri: &str, body: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_owned()))
-        .unwrap();
+    let req =
+        Request::builder().method(method).uri(uri).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
@@ -683,13 +676,8 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
     let dead_relay = closed_port_url();
-    let (handle, actor) = till::new(
-        f.cw,
-        dead_relay,
-        sales,
-        Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>)),
-    )
-    .await;
+    let (handle, actor) =
+        till::new(f.cw, dead_relay, sales, Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>))).await;
     let app = till::router(handle);
 
     let a = tokio::spawn(call(app.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"a"}"#));
@@ -755,13 +743,8 @@ async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
     f.cw.topup(&[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
-    let (handle, actor) = till::new(
-        f.cw,
-        closed_port_url(),
-        sales,
-        Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>)),
-    )
-    .await;
+    let (handle, actor) =
+        till::new(f.cw, closed_port_url(), sales, Box::new(move || Ok(Box::new(SlowCard(opener_card.clone())) as Box<dyn Card>))).await;
     let app = till::router(handle);
     let a = tokio::spawn(call(app.clone(), "POST", "/v1/charge", r#"{"price_msat":20000,"client_ref":"same"}"#));
     let app2 = app.clone();

@@ -13,11 +13,11 @@ use axum::extract::ConnectInfo;
 use axum::http::Request;
 use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
 use fedimint_card_sidecar::glue::CardWallet;
+use fedimint_card_sidecar::pos;
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, TillHandle};
 use fedimint_card_sidecar::wallet::Wallet;
-use fedimint_card_sidecar::pos;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
 use fedimint_core::Amount;
@@ -214,9 +214,8 @@ async fn a_charge_and_a_balance_over_a_link() -> anyhow::Result<()> {
         assert!(seen.contains(&ins), "INS {ins:02X} not seen: {seen:02X?}");
     }
     assert_eq!(bal.0, 200, "{:?}", bal.1);
-    let paid = charge.1["price_msat"].as_u64().unwrap()
-        + charge.1["overpaid_msat"].as_u64().unwrap()
-        + charge.1["fees_msat"].as_u64().unwrap();
+    let paid =
+        charge.1["price_msat"].as_u64().unwrap() + charge.1["overpaid_msat"].as_u64().unwrap() + charge.1["fees_msat"].as_u64().unwrap();
     assert_eq!(bal.1["live_msat"].as_u64().unwrap(), (1 << 16) + (1 << 14) - paid, "{:?}", bal.1);
     assert!(links.is_empty(), "every link is gone after its job");
     Ok(())
@@ -302,6 +301,46 @@ async fn the_bearer_is_required_off_loopback_only() -> anyhow::Result<()> {
     assert_eq!(call_from(app.clone(), lan, None, "/v1/card/link").await.0, 401);
     // Without a token nothing is asked (a till without one only listens on loopback).
     assert_eq!(call_from(till::router(handle), lan, None, "/v1/health").await.0, 200);
+    Ok(())
+}
+
+/// A token with the pay scope (`till pair --scope pay`): the pay routes, health and the card link,
+/// from every peer; nothing else, loopback included. Not `GET /v1/pays`: that lists every holder's
+/// pays, and the pay token lives in a phone app (it reads its own pay by `client_ref` only). The
+/// POS token still opens everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pay_token_opens_the_pay_routes_and_nothing_else() -> anyhow::Result<()> {
+    let f = fx(&[]).await?;
+    let dir = f.dir.path().to_owned();
+    let sales = SalesStore::open(dir.join("sales.json"))?;
+    let (handle, _actor) = till::new(f.cw, "http://127.0.0.1:1".into(), sales, Box::new(|| anyhow::bail!("unused"))).await;
+    let (token, pay) = ("ab".repeat(32), "cd".repeat(32));
+    // Set before or after the POS token, the pay token is kept.
+    for app in [
+        till::router(handle.clone().with_pay_token(Some(pay.clone())).with_pos_token(Some(token.clone()))),
+        till::router(handle.clone().with_pos_token_everywhere(token.clone()).with_pay_token(Some(pay.clone()))),
+    ] {
+        for peer in ["127.0.0.1:5000", "192.168.1.50:40000"] {
+            assert_eq!(call_from(app.clone(), peer, Some(&pay), "/v1/health").await.0, 200, "{peer}");
+            // A till without pays answers its pay route 503, past the auth.
+            let (s, v) = call_from(app.clone(), peer, Some(&pay), "/v1/pay/1").await;
+            assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{peer}");
+            // The list of every holder's pays is the POS token's: the pay token is refused before
+            // the handler, while the POS token gets past the auth to the same 503.
+            let (s, v) = call_from(app.clone(), peer, Some(&pay), "/v1/pays").await;
+            assert_eq!((s, v["error"].as_str()), (403, Some("forbidden")), "{peer}");
+            let (s, v) = call_from(app.clone(), peer, Some(&token), "/v1/pays").await;
+            assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{peer}");
+            // The card link: past the auth (refused only as a request that is no upgrade).
+            assert_ne!(call_from(app.clone(), peer, Some(&pay), "/v1/card/link").await.0, 403, "{peer}");
+            assert_ne!(call_from(app.clone(), peer, Some(&pay), "/v1/card/link").await.0, 401, "{peer}");
+            for path in ["/v1/status", "/v1/sales", "/v1/topups/waiting", "/v1/offline/kit?phone=00"] {
+                let (s, v) = call_from(app.clone(), peer, Some(&pay), path).await;
+                assert_eq!((s, v["error"].as_str()), (403, Some("forbidden")), "{peer} {path}");
+            }
+            assert_eq!(call_from(app.clone(), peer, Some(&token), "/v1/sales").await.0, 200, "{peer}");
+        }
+    }
     Ok(())
 }
 

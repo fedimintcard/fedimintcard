@@ -262,9 +262,8 @@ impl Store {
                 }
             }
             let clock = now.max(f.high_water_ms);
-            let old = |c: &OfflineCharge| {
-                (c.synced || c.state == ChargeState::Abandoned) && c.ts_unix_ms.saturating_add(KEEP_SYNCED_MS) < clock
-            };
+            let old =
+                |c: &OfflineCharge| (c.synced || c.state == ChargeState::Abandoned) && c.ts_unix_ms.saturating_add(KEEP_SYNCED_MS) < clock;
             let gone: Vec<String> = f.charges.iter().filter(|c| old(c)).flat_map(|c| c.pool.iter().map(|p| p.blinded.clone())).collect();
             f.charges.retain(|c| !old(c));
             f.pool_used.extend(gone);

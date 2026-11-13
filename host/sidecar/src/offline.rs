@@ -55,28 +55,26 @@ pub struct Reach {
 impl Reach {
     /// `(registry, federation)`; the registry is `None` for a till with no registry.
     pub async fn probe(&self, ops: Option<&Ops>, wallet: &crate::wallet::Wallet, dir: &Path) -> (Option<bool>, bool) {
-        if let Some((at, r, f)) = *self.last.lock().unwrap() {
-            if at.elapsed() < PROBE_TTL {
-                return (r, f);
-            }
+        if let Some((at, r, f)) = *self.last.lock().unwrap()
+            && at.elapsed() < PROBE_TTL
+        {
+            return (r, f);
         }
         let reg = async {
             let o = ops?;
             Some(match o.client.cert_key(PROBE_TIMEOUT).await {
                 Ok(key) => {
-                    if let Some(k) = key {
-                        if let Err(e) = crate::claim::write_cert_key(dir, &k) {
-                            tracing::warn!("keeping the registry's certificate key: {e:#}");
-                        }
+                    if let Some(k) = key
+                        && let Err(e) = crate::claim::write_cert_key(dir, &k)
+                    {
+                        tracing::warn!("keeping the registry's certificate key: {e:#}");
                     }
                     true
                 }
                 Err(_) => false,
             })
         };
-        let fed = async {
-            matches!(tokio::time::timeout(PROBE_TIMEOUT, wallet.client.api().session_count()).await, Ok(Ok(_)))
-        };
+        let fed = async { matches!(tokio::time::timeout(PROBE_TIMEOUT, wallet.client.api().session_count()).await, Ok(Ok(_))) };
         let (r, f) = tokio::join!(reg, fed);
         *self.last.lock().unwrap() = Some((Instant::now(), r, f));
         (r, f)
@@ -85,7 +83,7 @@ impl Reach {
     /// Forget the last probe and record the registry down (a call to it just went unanswered).
     pub fn registry_down(&self) {
         let mut g = self.last.lock().unwrap();
-        let fed = g.map_or(true, |(_, _, f)| f);
+        let fed = g.is_none_or(|(_, _, f)| f);
         *g = Some((Instant::now(), Some(false), fed));
     }
 

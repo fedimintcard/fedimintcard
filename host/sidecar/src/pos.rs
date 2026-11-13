@@ -4,6 +4,12 @@
 //!
 //! The token is 32 random bytes, hex, in `<data_dir>/till-pos-token` (mode 0600). It is compared
 //! in constant time and never logged.
+//!
+//! The pay token (`<data_dir>/till-pay-token`, made the same way by `till pair --scope pay`) has
+//! the `pay` scope: it opens `/v1/pay` and `/v1/pay/{id}…`, `/v1/health` and the card link, and
+//! nothing else, from any peer, loopback included ([`pay_scope_allows`]). An app paired with it can
+//! have a card pay its invoices without holding the till: only the card behind its own card link,
+//! and it reads only the pays it names by `client_ref` ([`PayScope`]).
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -24,14 +30,31 @@ use crate::till::{Reply, TillHandle, error_reply};
 
 pub const TOKEN_FILE: &str = "till-pos-token";
 pub const PAIR_SCHEME: &str = "fedimintcard-till:";
+/// The pay token's file: a token with the `pay` scope only.
+pub const PAY_TOKEN_FILE: &str = "till-pay-token";
+/// The pairing text of a pay token, so a POS app never takes it for a till's.
+pub const PAY_PAIR_SCHEME: &str = "fedimintcard-till-pay:";
 
 pub fn token_path(data_dir: &Path) -> PathBuf {
     data_dir.join(TOKEN_FILE)
 }
 
+pub fn pay_token_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PAY_TOKEN_FILE)
+}
+
 /// The POS token, if one has been made. An empty file counts as none.
 pub fn read_token(data_dir: &Path) -> Result<Option<String>> {
-    let path = token_path(data_dir);
+    read_named(data_dir, TOKEN_FILE)
+}
+
+/// The pay token, if one has been made. An empty file counts as none.
+pub fn read_pay_token(data_dir: &Path) -> Result<Option<String>> {
+    read_named(data_dir, PAY_TOKEN_FILE)
+}
+
+fn read_named(data_dir: &Path, name: &str) -> Result<Option<String>> {
+    let path = data_dir.join(name);
     match std::fs::read_to_string(&path) {
         Ok(s) => {
             let t = s.trim().to_owned();
@@ -47,17 +70,26 @@ pub fn read_token(data_dir: &Path) -> Result<Option<String>> {
 /// Two callers at once (a pairing while the till starts) agree on one token: the new token is
 /// written whole to a private temporary file and linked into place only if no token is there yet.
 pub fn ensure_token(data_dir: &Path) -> Result<(String, bool)> {
-    if let Some(t) = read_token(data_dir)? {
+    ensure_named(data_dir, TOKEN_FILE)
+}
+
+/// The pay token, made now (0600) if there is none, as [`ensure_token`] makes the POS token.
+pub fn ensure_pay_token(data_dir: &Path) -> Result<(String, bool)> {
+    ensure_named(data_dir, PAY_TOKEN_FILE)
+}
+
+fn ensure_named(data_dir: &Path, name: &str) -> Result<(String, bool)> {
+    if let Some(t) = read_named(data_dir, name)? {
         return Ok((t, false));
     }
     std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-    let path = token_path(data_dir);
+    let path = data_dir.join(name);
     let token = new_token();
-    let tmp = write_private_temp(data_dir, &token)?;
+    let tmp = write_private_temp(data_dir, name, &token)?;
     // An empty file counts as no token (`read_token`): replace it rather than keep it.
     let placed = match std::fs::hard_link(&tmp, &path) {
         Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_token(data_dir)? {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_named(data_dir, name)? {
             Some(_) => false,
             None => {
                 std::fs::rename(&tmp, &path).with_context(|| format!("creating {}", path.display()))?;
@@ -73,7 +105,7 @@ pub fn ensure_token(data_dir: &Path) -> Result<(String, bool)> {
     if placed {
         Ok((token, true))
     } else {
-        let t = read_token(data_dir)?.context("the POS token vanished while it was being made")?;
+        let t = read_named(data_dir, name)?.with_context(|| format!("{name} vanished while it was being made"))?;
         Ok((t, false))
     }
 }
@@ -81,10 +113,20 @@ pub fn ensure_token(data_dir: &Path) -> Result<(String, bool)> {
 /// Replace the POS token with a new one. Every paired phone must pair again, and a running till
 /// keeps the old token until it restarts.
 pub fn rotate_token(data_dir: &Path) -> Result<String> {
+    rotate_named(data_dir, TOKEN_FILE)
+}
+
+/// Replace the pay token with a new one: every app paired with it must pair again, and a running
+/// till keeps the old one until it restarts.
+pub fn rotate_pay_token(data_dir: &Path) -> Result<String> {
+    rotate_named(data_dir, PAY_TOKEN_FILE)
+}
+
+fn rotate_named(data_dir: &Path, name: &str) -> Result<String> {
     std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let token = new_token();
-    let tmp = write_private_temp(data_dir, &token)?;
-    let path = token_path(data_dir);
+    let tmp = write_private_temp(data_dir, name, &token)?;
+    let path = data_dir.join(name);
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(token)
 }
@@ -93,9 +135,9 @@ fn new_token() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
 
-/// `token` in a new 0600 file next to the token file, synced. Returns its path.
-fn write_private_temp(data_dir: &Path, token: &str) -> Result<PathBuf> {
-    let tmp = data_dir.join(format!(".{TOKEN_FILE}.{}", hex::encode(rand::random::<[u8; 8]>())));
+/// `token` in a new 0600 file next to the token file `name`, synced. Returns its path.
+fn write_private_temp(data_dir: &Path, name: &str, token: &str) -> Result<PathBuf> {
+    let tmp = data_dir.join(format!(".{name}.{}", hex::encode(rand::random::<[u8; 8]>())));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -131,6 +173,11 @@ pub fn pair_text(url: &str, token: &str) -> String {
     format!("{PAIR_SCHEME}{}?t={token}", url.trim_end_matches('/'))
 }
 
+/// `fedimintcard-till-pay:<url>?t=<pay token>`
+pub fn pay_pair_text(url: &str, token: &str) -> String {
+    format!("{PAY_PAIR_SCHEME}{}?t={token}", url.trim_end_matches('/'))
+}
+
 /// The till URL a pairing may carry: `http://` or `https://`, a host, an optional port, and
 /// nothing else (no user, path, query or fragment), as both POS apps parse it. `https://` is for
 /// a till behind a proxy that terminates TLS; the phone then opens the card link with `wss://`.
@@ -164,13 +211,65 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, axum::Json(json!({"ok": false, "error": "unauthorized"}))).into_response()
 }
 
-/// How `/v1/*` is guarded: the POS token, and whether loopback peers are exempt from it.
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "ok": false,
+            "error": "forbidden",
+            "detail": "this token has the pay scope: it opens /v1/pay, /v1/pay/{id}, /v1/pay/{id}/refund, /v1/health and /v1/card/link only",
+        })),
+    )
+        .into_response()
+}
+
+/// How `/v1/*` is guarded: the POS token, and whether loopback peers are exempt from it; and the
+/// pay token, whose bearer reaches only what [`pay_scope_allows`].
 #[derive(Clone, Default)]
 pub struct PosAuth {
     pub token: Option<std::sync::Arc<str>>,
     /// With a token, require it from loopback peers too. Set behind a proxy (StartOS), where
     /// every request may arrive from a local address whoever sent it.
     pub everywhere: bool,
+    /// The pay token (`till pair --scope pay`).
+    pub pay_token: Option<std::sync::Arc<str>>,
+}
+
+/// What a request may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Allowed,
+    /// No token, or a wrong one: 401.
+    Unauthorized,
+    /// The pay token, on a route outside its scope: 403.
+    Forbidden,
+}
+
+/// The routes the pay scope opens: paying invoices with a card (`/v1/pay`, `/v1/pay/{id}`,
+/// `/v1/pay/{id}/refund`), `/v1/health`, and the card link a pay's card goes through. Not
+/// `/v1/pays`: that lists every holder's pays, and the pay token lives in a phone app.
+pub fn pay_scope_allows(path: &str) -> bool {
+    matches!(path, "/v1/health" | "/v1/card/link" | "/v1/pay") || path.starts_with("/v1/pay/")
+}
+
+/// Set on a request the pay token let in ([`auth`]): the pay handlers hold such a caller to its
+/// own card link and its own pays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayScope;
+
+/// Whether `authorization` carries the pay token.
+pub fn pay_bearer(auth: &PosAuth, authorization: Option<&str>) -> bool {
+    let given = authorization.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
+    matches!((auth.pay_token.as_deref(), given), (Some(pay), Some(given)) if token_eq(given.as_bytes(), pay.as_bytes()))
+}
+
+/// [`authorized`], with the pay token: its bearer is held to [`pay_scope_allows`] from every peer,
+/// loopback included, so a pay token never opens more than its scope.
+pub fn access(auth: &PosAuth, path: &str, peer: Option<SocketAddr>, authorization: Option<&str>) -> Access {
+    if pay_bearer(auth, authorization) {
+        return if pay_scope_allows(path) { Access::Allowed } else { Access::Forbidden };
+    }
+    if authorized(auth.token.as_deref(), auth.everywhere, peer, authorization) { Access::Allowed } else { Access::Unauthorized }
 }
 
 /// Is this request allowed? Without a token, yes. With one, loopback peers are (unless
@@ -185,14 +284,21 @@ pub fn authorized(token: Option<&str>, everywhere: bool, peer: Option<SocketAddr
     token_eq(given.trim().as_bytes(), token.as_bytes())
 }
 
-/// Middleware over `/v1/*`: [`authorized`] with the handle's token and the peer's address.
-pub async fn auth(State(a): State<PosAuth>, req: Request, next: Next) -> Response {
+/// Middleware over `/v1/*`: [`access`] with the handle's tokens and the peer's address. A request
+/// the pay token let in carries [`PayScope`].
+pub async fn auth(State(a): State<PosAuth>, mut req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
-    if authorized(a.token.as_deref(), a.everywhere, peer, header) {
-        next.run(req).await
-    } else {
-        unauthorized()
+    let pay = pay_bearer(&a, header);
+    match access(&a, req.uri().path(), peer, header) {
+        Access::Allowed => {
+            if pay {
+                req.extensions_mut().insert(PayScope);
+            }
+            next.run(req).await
+        }
+        Access::Unauthorized => unauthorized(),
+        Access::Forbidden => forbidden(),
     }
 }
 
@@ -297,6 +403,83 @@ mod tests {
             assert!(!authorized(Some("ab"), true, peer, Some("Bearer ac")), "{peer:?}");
             assert!(authorized(Some("ab"), true, peer, Some("Bearer ab")), "{peer:?}");
         }
+    }
+
+    #[test]
+    fn the_pay_token_opens_the_pay_routes_only_from_every_peer() {
+        let lan: SocketAddr = "192.168.1.20:5000".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let open = ["/v1/health", "/v1/card/link", "/v1/pay", "/v1/pay/1", "/v1/pay/1/refund"];
+        let closed = [
+            // Every holder's pays: the POS token's, not the pay token's.
+            "/v1/pays",
+            "/v1/charge",
+            "/v1/status",
+            "/v1/sales",
+            "/v1/card/balance",
+            "/v1/cards/issue",
+            "/v1/topup",
+            "/v1/topup/ab/load",
+            "/v1/offline/kit",
+            "/v1/payments",
+            "/v1/paysx",
+        ];
+        for a in [
+            PosAuth { token: Some("ab".into()), everywhere: false, pay_token: Some("cd".into()) },
+            PosAuth { token: Some("ab".into()), everywhere: true, pay_token: Some("cd".into()) },
+            // No POS token (a loopback-only till): the pay token is still held to its scope.
+            PosAuth { token: None, everywhere: false, pay_token: Some("cd".into()) },
+        ] {
+            for peer in [Some(lan), Some(lo), None] {
+                for p in open {
+                    assert_eq!(access(&a, p, peer, Some("Bearer cd")), Access::Allowed, "{p} {peer:?}");
+                }
+                for p in closed {
+                    assert_eq!(access(&a, p, peer, Some("Bearer cd")), Access::Forbidden, "{p} {peer:?}");
+                }
+            }
+        }
+        let a = PosAuth { token: Some("ab".into()), everywhere: false, pay_token: Some("cd".into()) };
+        // The POS token opens everything, as before; a wrong token opens nothing off loopback.
+        for p in open.iter().chain(closed.iter()) {
+            assert_eq!(access(&a, p, Some(lan), Some("Bearer ab")), Access::Allowed, "{p}");
+            assert_eq!(access(&a, p, Some(lan), Some("Bearer ce")), Access::Unauthorized, "{p}");
+            assert_eq!(access(&a, p, Some(lan), None), Access::Unauthorized, "{p}");
+            assert_eq!(access(&a, p, Some(lo), None), Access::Allowed, "{p}");
+        }
+        // Without a pay token, its value is just a wrong token.
+        let a = PosAuth { token: Some("ab".into()), everywhere: false, pay_token: None };
+        assert_eq!(access(&a, "/v1/pay", Some(lan), Some("Bearer cd")), Access::Unauthorized);
+        assert!(!pay_bearer(&a, Some("Bearer cd")));
+        // Only the pay token's bearer is the pay scope.
+        let a = PosAuth { token: Some("ab".into()), everywhere: false, pay_token: Some("cd".into()) };
+        assert!(pay_bearer(&a, Some("Bearer cd")) && pay_bearer(&a, Some("Bearer  cd ")));
+        assert!(!pay_bearer(&a, Some("Bearer ab")) && !pay_bearer(&a, Some("cd")) && !pay_bearer(&a, None));
+        assert_eq!(pay_pair_text("https://till.example.com/", "ff"), "fedimintcard-till-pay:https://till.example.com?t=ff");
+    }
+
+    #[test]
+    fn the_pay_token_lives_beside_the_pos_token() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_pay_token(dir.path()).unwrap(), None);
+        let (pos, _) = ensure_token(dir.path()).unwrap();
+        let (pay, made) = ensure_pay_token(dir.path()).unwrap();
+        assert!(made);
+        assert_ne!(pos, pay);
+        assert_eq!(ensure_pay_token(dir.path()).unwrap(), (pay.clone(), false));
+        let again = rotate_pay_token(dir.path()).unwrap();
+        assert_ne!(again, pay);
+        assert_eq!(read_pay_token(dir.path()).unwrap(), Some(again));
+        // The POS token is untouched by the pay token's changes.
+        assert_eq!(read_token(dir.path()).unwrap(), Some(pos));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(pay_token_path(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, vec![std::ffi::OsString::from(PAY_TOKEN_FILE), std::ffi::OsString::from(TOKEN_FILE)]);
     }
 
     #[test]

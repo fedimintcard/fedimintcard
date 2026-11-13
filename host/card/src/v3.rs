@@ -373,7 +373,8 @@ impl Certificate {
 
     /// Check an ATTEST answer (DER) over `challenge` against this certificate's attestation key.
     pub fn verify_attest(&self, challenge: &[u8; 32], der: &[u8]) -> Result<()> {
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.attest_key).context("the certificate's attestation key is not a P-256 point")?;
+        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.attest_key)
+            .context("the certificate's attestation key is not a P-256 point")?;
         let sig = p256::ecdsa::Signature::from_der(der).context("the card's attestation is not a DER signature")?;
         vk.verify(&attest_message(challenge, &self.slot0), &sig)
             .map_err(|_| anyhow::anyhow!("the card's attestation does not verify under its certified key"))
@@ -441,7 +442,16 @@ mod tests {
 
     #[test]
     fn limit_is_the_applets_day_after() {
-        let s = |now, window, limit, spent| CardStatus { states: vec![], now, window, limit_msat: limit, spent_msat: spent, cert_len: 0, attest_key: false, registry_key: false };
+        let s = |now, window, limit, spent| CardStatus {
+            states: vec![],
+            now,
+            window,
+            limit_msat: limit,
+            spent_msat: spent,
+            cert_len: 0,
+            attest_key: false,
+            registry_key: false,
+        };
         assert!(s(0, 0, 0, 0).limit_allows(&[u64::MAX]));
         assert!(s(0, 0, 2000, 0).limit_allows(&[1000, 1000]));
         assert!(!s(0, 0, 2000, 0).limit_allows(&[1000, 1000, 1]));

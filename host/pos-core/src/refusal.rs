@@ -49,9 +49,10 @@ pub fn class_of(cause: &(dyn std::error::Error + 'static)) -> Option<(u16, &'sta
     if let Some(p) = cause.downcast_ref::<PlanError>() {
         return Some(match p {
             PlanError::Insufficient { .. } => (402, "insufficient"),
-            PlanError::NoExactPlan { .. } | PlanError::TooManyNotes(_) | PlanError::TooManyInputs { .. } | PlanError::NoFreeSlots { .. } => {
-                (422, "no_exact_plan")
-            }
+            PlanError::NoExactPlan { .. }
+            | PlanError::TooManyNotes(_)
+            | PlanError::TooManyInputs { .. }
+            | PlanError::NoFreeSlots { .. } => (422, "no_exact_plan"),
         });
     }
     None
@@ -87,9 +88,13 @@ mod tests {
         };
         assert_eq!(k(OfflineError::KitExpired("k".into()).into()), (403, "offline_kit_expired"));
         assert_eq!(k(OfflineError::NoteInvalid("n".into()).into()), (403, "offline_note_invalid"));
-        let pool = OfflineError::PoolExhausted { detail: "p".into(), price_msat: 50_000, below_msat: Some(49_000), above_msat: Some(52_000) };
+        let pool =
+            OfflineError::PoolExhausted { detail: "p".into(), price_msat: 50_000, below_msat: Some(49_000), above_msat: Some(52_000) };
         let p = r(pool.into());
-        assert_eq!((p.status, p.code, p.suggested_msat, p.below_msat, p.above_msat), (409, "offline_pool_exhausted", Some(49_000), Some(49_000), Some(52_000)));
+        assert_eq!(
+            (p.status, p.code, p.suggested_msat, p.below_msat, p.above_msat),
+            (409, "offline_pool_exhausted", Some(49_000), Some(49_000), Some(52_000))
+        );
         assert_eq!(k(OfflineError::Cap("c".into()).into()), (503, "offline_cap_reached"));
         assert_eq!(k(OfflineError::Undecided("u".into()).into()), (202, "undecided"));
         assert_eq!(k(BridgeError::NoCard("gone".into()).into()), (409, "no_card"));
@@ -97,7 +102,10 @@ mod tests {
         assert_eq!(k(StatusWord(SW_OVER_LIMIT).into()), (402, "card_limit"));
         assert_eq!(k(anyhow::anyhow!("else")), (500, "internal"));
         let pin = r(StatusWord(0x63C2).into());
-        assert_eq!((pin.code, pin.tries_left, pin.detail.as_str()), ("wrong_pin", Some(2), "wrong PIN; 2 tries left before the card blocks"));
+        assert_eq!(
+            (pin.code, pin.tries_left, pin.detail.as_str()),
+            ("wrong_pin", Some(2), "wrong PIN; 2 tries left before the card blocks")
+        );
         let blocked = r(StatusWord(SW_PIN_BLOCKED).into());
         assert_eq!((blocked.status, blocked.code, blocked.tries_left), (423, "pin_blocked", None));
     }

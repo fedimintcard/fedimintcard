@@ -33,6 +33,15 @@ it. Whichever phone started a charge or a balance read supplies that job's card.
   StartOS package always sets it.
 - The POS stores the scanned till URL and token (Android: encrypted prefs or the Keystore;
   iOS: Keychain). "Pair with till" in POS settings scans the QR; the URL can also be typed.
+- `till pair --scope pay` pairs an app that only pays invoices with a card (`docs/PAY.md`): a
+  second token in `<data_dir>/till-pay-token` (0600, made like the POS token, which it also makes
+  if missing), shown as `fedimintcard-till-pay:<url>?t=<token>` so a POS app never takes it for a
+  till's. Its bearer opens `/v1/pay`, `/v1/pay/{id}`, `/v1/pay/{id}/refund`, `/v1/health` and
+  the card link only, from every peer, loopback included; anything else (`/v1/pays` too) answers
+  `403 {"ok":false,"error":"forbidden"}`. A pay or refund with it must name its card link
+  (`X-Card-Link`; `400 card_link_required` otherwise), and `GET /v1/pay/{id}` with it must name the
+  pay's `client_ref` (`?client_ref=`; `404 unknown_pay` otherwise). `--scope pay --new-token` replaces it; a running till
+  reads it at start.
 
 ## The card link
 
@@ -48,7 +57,8 @@ it. Whichever phone started a charge or a balance read supplies that job's card.
 
 - The phone opens the link once it has the card (Android: tag discovered; iOS: tag connected in
   the NFC session), then sends the job with header `X-Card-Link: <id>`:
-  `POST /v1/charge` and `POST /v1/card/balance`. A job with `X-Card-Link` uses only that link as
+  `POST /v1/charge`, `POST /v1/card/balance`, `POST /v1/topup/{id}/load`, `POST /v1/pay` and
+  `POST /v1/pay/{id}/refund`. A job with `X-Card-Link` uses only that link as
   its card; without it, the till uses `CARD_BRIDGE_URL` as today.
 - An unknown or closed link id -> `409 {"ok":false,"error":"card_link_gone"}` before anything runs.
 - One APDU in flight per link; the till waits up to 10 s for each answer. The link lives at most

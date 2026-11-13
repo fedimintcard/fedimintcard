@@ -19,8 +19,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use fedimint_card_host_card::{
-    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_SLOT_OUT_OF_RANGE, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
-    SW_NO_PIN_SET, SW_PIN_BLOCKED, SW_PIN_REQUIRED, status_word,
+    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED, SW_NO_PIN_SET, SW_PIN_BLOCKED,
+    SW_PIN_REQUIRED, SW_SLOT_OUT_OF_RANGE, status_word,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -156,40 +156,40 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
     let applet_present = on_card(|| cw.card.select_applet()).is_ok();
     if applet_present {
         for slot in 0..SLOTS {
-        match on_card(|| cw.card.get_pub(slot)) {
-            Ok(pk) => {
-                let hexpk = pk.to_string();
-                let known = cw.store.state.slot_pubkey(slot) == Some(hexpk.as_str());
-                if !known {
-                    foreign.push(slot);
+            match on_card(|| cw.card.get_pub(slot)) {
+                Ok(pk) => {
+                    let hexpk = pk.to_string();
+                    let known = cw.store.state.slot_pubkey(slot) == Some(hexpk.as_str());
+                    if !known {
+                        foreign.push(slot);
+                    }
+                    keys.push((slot, hexpk));
                 }
-                keys.push((slot, hexpk));
+                Err(e) => match status_word(&e) {
+                    // Past the card's last slot: the walk is done, and this is the card's size.
+                    Some(SW_SLOT_OUT_OF_RANGE) => {
+                        slots = slot;
+                        break;
+                    }
+                    Some(SW_CONDITIONS_NOT_SATISFIED) | Some(SW_FILE_NOT_FOUND) => empty.push(slot),
+                    // No dispatcher for `B0` at all: a card with no applet, so every slot is empty.
+                    Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED) => empty.push(slot),
+                    // A slot answered a PIN word: the applet is live and this is its PIN state.
+                    Some(SW_PIN_BLOCKED) => {
+                        applet = AppletState::Blocked;
+                        empty.push(slot);
+                    }
+                    Some(SW_PIN_REQUIRED) => {
+                        applet = AppletState::Set;
+                        empty.push(slot);
+                    }
+                    Some(SW_NO_PIN_SET) => {
+                        applet = AppletState::NotSet;
+                        empty.push(slot);
+                    }
+                    _ => return Err(e),
+                },
             }
-            Err(e) => match status_word(&e) {
-                // Past the card's last slot: the walk is done, and this is the card's size.
-                Some(SW_SLOT_OUT_OF_RANGE) => {
-                    slots = slot;
-                    break;
-                }
-                Some(SW_CONDITIONS_NOT_SATISFIED) | Some(SW_FILE_NOT_FOUND) => empty.push(slot),
-                // No dispatcher for `B0` at all: a card with no applet, so every slot is empty.
-                Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED) => empty.push(slot),
-                // A slot answered a PIN word: the applet is live and this is its PIN state.
-                Some(SW_PIN_BLOCKED) => {
-                    applet = AppletState::Blocked;
-                    empty.push(slot);
-                }
-                Some(SW_PIN_REQUIRED) => {
-                    applet = AppletState::Set;
-                    empty.push(slot);
-                }
-                Some(SW_NO_PIN_SET) => {
-                    applet = AppletState::NotSet;
-                    empty.push(slot);
-                }
-                _ => return Err(e),
-            },
-        }
         }
     }
 
@@ -210,11 +210,7 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
     // data is a refusal, and reporting a refusal as `isd_open` would send the app into a load the
     // card will reject.
     let isd = on_card(|| cw.card.get_data_ff21());
-    let isd_open = isd.is_ok()
-        || matches!(
-            isd.err().as_ref().and_then(status_word),
-            Some(SW_FILE_NOT_FOUND) | Some(0x6A88)
-        );
+    let isd_open = isd.is_ok() || matches!(isd.err().as_ref().and_then(status_word), Some(SW_FILE_NOT_FOUND) | Some(0x6A88));
 
     let live_notes: Vec<(u8, u64)> = cw
         .store
@@ -334,7 +330,7 @@ pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutc
     // licence to re-key, and those keys may hold someone else's money.
     if let Some((slot, pk)) = before.iter().enumerate().find_map(|(i, k)| {
         let k = k.as_deref()?;
-        (cw.store.state.slot_pubkey(i as u8) != Some(k)).then(|| (i, k))
+        (cw.store.state.slot_pubkey(i as u8) != Some(k)).then_some((i, k))
     }) {
         return Err(anyhow::Error::new(SpendFault::WrongCard(format!(
             "slot {slot} holds a key this wallet did not produce ({})",
@@ -343,12 +339,8 @@ pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutc
     }
 
     let keys: Vec<(u8, String)> = cw.card_setup(false)?.into_iter().map(|(s, pk)| (s, pk.to_string())).collect();
-    let generated: Vec<u8> = before
-        .iter()
-        .enumerate()
-        .filter(|(i, k)| k.is_none() && keys.iter().any(|(s, _)| *s == *i as u8))
-        .map(|(i, _)| i as u8)
-        .collect();
+    let generated: Vec<u8> =
+        before.iter().enumerate().filter(|(i, k)| k.is_none() && keys.iter().any(|(s, _)| *s == *i as u8)).map(|(i, _)| i as u8).collect();
 
     let sid = short_id(&keys);
     let (pin_state, pin_verified) = match pin {

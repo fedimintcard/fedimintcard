@@ -54,6 +54,19 @@ pays an invoice (with an amount) from the wallet's balance and prints the outcom
 `refunded`, `failed`, or `refused` with nothing spent; exit 1 unless paid or pending). It goes
 through the federation's `ln` module, else its lnv2 module; the till registers the lnv2 client only
 on a federation without `ln`, so on one with both (Island Bitcoin Community) only `ln` is used.
+With no `ln` gateway reachable, an invoice of the same federation is still paid, inside the
+federation with no gateway fee; any other invoice is refused with nothing spent. Paying an invoice
+again answers the earlier payment while it is paid, in flight or `failed` (an error the client
+could not settle, which can leave the contract funded and the gateway able to claim it); only after
+a refund does it fund a new attempt.
+
+Inside the till the same payment is a library call (`sidecar/src/wallet/pay.rs`):
+`Wallet::pay_invoice(bolt11, max_fee_msat, wait)` answers `paid` (preimage, gateway fee),
+`failed` (certain: nothing was funded, or the refund is back in the wallet) or `unknown` (in
+flight, or an outcome the client cannot settle; never to be refunded). `resolve_pay(operation_id)`
+answers it again from the client's record, after a restart too, and `pay_status(bolt11)` finds
+this wallet's payments of an invoice when the operation id was never recorded (`None`: never
+funded).
 
 ## Till service
 

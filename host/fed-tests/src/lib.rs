@@ -18,9 +18,7 @@ use fedimint_core::module::{AmountUnit, ApiRequestErased};
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
 use fedimint_core::secp256k1::{Keypair, Message, Parity, PublicKey, SECP256K1, XOnlyPublicKey, schnorr};
-use fedimint_core::transaction::{
-    Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome,
-};
+use fedimint_core::transaction::{Transaction, TransactionError, TransactionSignature, TransactionSubmissionOutcome};
 use fedimint_core::{IdxRange, NumPeersExt, OutPointRange, PeerId, TransactionId};
 use fedimint_dummy_common::DummyInput;
 use fedimint_dummy_common::config::DummyClientConfig;
@@ -54,9 +52,7 @@ pub async fn setup(fees: bool) -> Env {
         std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
         "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend; unset it"
     );
-    tokio::time::timeout(STEP_TIMEOUT, setup_inner(fees))
-        .await
-        .expect("federation did not start within 60 s")
+    tokio::time::timeout(STEP_TIMEOUT, setup_inner(fees)).await.expect("federation did not start within 60 s")
 }
 
 async fn setup_inner(fees: bool) -> Env {
@@ -73,13 +69,9 @@ async fn setup_inner(fees: bool) -> Env {
     let fed = builder.build().await;
     let client = fed.new_client().await;
     let cfg = client.config().await;
-    let (mint_id, mint_cfg) = cfg
-        .get_first_module_by_kind::<MintClientConfig>(fedimint_mintv2_common::KIND)
-        .expect("mintv2 module");
+    let (mint_id, mint_cfg) = cfg.get_first_module_by_kind::<MintClientConfig>(fedimint_mintv2_common::KIND).expect("mintv2 module");
     let mint_cfg = mint_cfg.clone();
-    let (dummy_id, _) = cfg
-        .get_first_module_by_kind::<DummyClientConfig>(fedimint_dummy_common::KIND)
-        .expect("dummy module");
+    let (dummy_id, _) = cfg.get_first_module_by_kind::<DummyClientConfig>(fedimint_dummy_common::KIND).expect("dummy module");
     Env { fed, client, mint_id, dummy_id, mint_cfg }
 }
 
@@ -96,9 +88,7 @@ pub fn on_card<R>(f: impl FnOnce() -> R) -> R {
 
 fn sign_with_key(tx: &mut Transaction, keys: &[Keypair]) {
     let msg = Message::from_digest(tx.tx_hash().to_byte_array());
-    tx.signatures = TransactionSignature::NaiveMultisig(
-        keys.iter().map(|k| SECP256K1.sign_schnorr(&msg, k)).collect(),
-    );
+    tx.signatures = TransactionSignature::NaiveMultisig(keys.iter().map(|k| SECP256K1.sign_schnorr(&msg, k)).collect());
 }
 
 pub async fn submit(env: &Env, tx: Transaction) -> Result<Result<TransactionId, TransactionError>> {
@@ -130,9 +120,7 @@ pub async fn fetch_blind_signatures(
                 move |peer, shares: Vec<BlindedSignatureShare>| {
                     let res = if shares.len() != check.len() {
                         Err(ServerError::InvalidResponse("wrong number of shares".into()))
-                    } else if check.iter().zip(&shares).all(|((d, m), s)| {
-                        tbs::verify_signature_share(*m, *s, tbs_pks[d][&peer])
-                    }) {
+                    } else if check.iter().zip(&shares).all(|((d, m), s)| tbs::verify_signature_share(*m, *s, tbs_pks[d][&peer])) {
                         Ok(shares)
                     } else {
                         Err(ServerError::InvalidResponse("invalid signature share".into()))
@@ -147,13 +135,7 @@ pub async fn fetch_blind_signatures(
     )
     .await
     .context("timed out waiting for signature shares")?;
-    Ok((0..n)
-        .map(|i| {
-            tbs::aggregate_signature_shares(
-                &shares.iter().map(|(p, v)| (p.to_usize() as u64, v[i])).collect(),
-            )
-        })
-        .collect())
+    Ok((0..n).map(|i| tbs::aggregate_signature_shares(&shares.iter().map(|(p, v)| (p.to_usize() as u64, v[i])).collect())).collect())
 }
 
 /// Step 4: issue one note of `denom` whose nonce is the card's key.
@@ -167,8 +149,7 @@ pub async fn issue_to_card(env: &Env, card_key: XOnlyPublicKey, denom: Denominat
     // The tweak only serves client-side recovery; the server does not check it.
     let output = MintOutput::new_v0(denom, blinded, [0; 16]);
 
-    let amount = denom.amount() + env.mint_cfg.fee_consensus.fee(denom.amount())
-        + fedimint_core::Amount::from_msats(1000);
+    let amount = denom.amount() + env.mint_cfg.fee_consensus.fee(denom.amount()) + fedimint_core::Amount::from_msats(1000);
     let throwaway = Keypair::new(SECP256K1, &mut rand::thread_rng());
     let input = DummyInput { amount, unit: AmountUnit::BITCOIN, pub_key: throwaway.public_key() };
 
@@ -236,20 +217,13 @@ pub fn attach_signatures(tx: &mut Transaction, sigs: Vec<schnorr::Signature>) {
 pub fn card_sign(card: &mut dyn Card, slot: u8, draft: &SpendDraft, key: XOnlyPublicKey) -> Result<schnorr::Signature> {
     let digest = draft.digest();
     let sig = on_card(|| card.sign(slot, &digest))?;
-    SECP256K1
-        .verify_schnorr(&sig, &Message::from_digest(digest), &key)
-        .context("card signature does not verify on the host")?;
+    SECP256K1.verify_schnorr(&sig, &Message::from_digest(digest), &key).context("card signature does not verify on the host")?;
     Ok(sig)
 }
 
 /// Step 5 part 2: after acceptance, fetch signatures for the host's new notes.
 pub async fn finalize_outputs(env: &Env, txid: TransactionId, requests: &[NoteIssuanceRequest]) -> Result<Vec<SpendableNote>> {
-    let sigs = fetch_blind_signatures(
-        env,
-        txid,
-        requests.iter().map(|r| (r.denomination, r.blinded_message())).collect(),
-    )
-    .await?;
+    let sigs = fetch_blind_signatures(env, txid, requests.iter().map(|r| (r.denomination, r.blinded_message())).collect()).await?;
     let notes: Vec<SpendableNote> = requests.iter().zip(sigs).map(|(r, s)| r.finalize(s)).collect();
     Ok(notes)
 }

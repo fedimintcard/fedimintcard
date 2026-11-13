@@ -224,9 +224,7 @@ impl CardState {
     /// Note records for the slot's *current* key.
     pub fn notes_on_current_key(&self, slot: u8) -> impl Iterator<Item = &NoteRec> {
         let pk = self.slot_pubkey(slot).map(str::to_owned);
-        self.notes.iter().filter(move |n| {
-            n.slot == slot && pk.as_deref().is_some_and(|pk| nonce_matches_pubkey(&n.nonce, pk))
-        })
+        self.notes.iter().filter(move |n| n.slot == slot && pk.as_deref().is_some_and(|pk| nonce_matches_pubkey(&n.nonce, pk)))
     }
 
     /// Slots whose key has never carried a note: usable for a new note right now.
@@ -289,16 +287,13 @@ impl StateStore {
         let path = path.into();
         let state = match std::fs::read(&path) {
             Ok(bytes) => {
-                let st: CardState = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parsing {}", path.display()))?;
+                let st: CardState = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
                 if st.version > STATE_VERSION {
                     bail!("{} has version {}, this build understands {STATE_VERSION}", path.display(), st.version);
                 }
                 st
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                CardState { version: STATE_VERSION, ..Default::default() }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CardState { version: STATE_VERSION, ..Default::default() },
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         Ok(Self { path, state })
@@ -323,7 +318,6 @@ impl StateStore {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

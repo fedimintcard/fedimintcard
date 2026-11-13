@@ -204,9 +204,8 @@ impl TopupLightning for WalletLightning {
             let ln = self.wallet.lightning()?;
             ln.update_gateway_cache().await.map_err(|e| anyhow!("reading the federation's gateways: {e:?}"))?;
             let gw = ln.select_available_gateway(None, None).await.map_err(|e| anyhow!("no Lightning gateway answers: {e:?}"))?;
-            let desc = lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new(
-                "fedimintcard top-up".into(),
-            )?);
+            let desc =
+                lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("fedimintcard top-up".into())?);
             let (op, invoice, _) = ln
                 .create_bolt11_invoice(fedimint_core::Amount::from_msats(amount_msat), desc, Some(expiry_secs), (), Some(gw))
                 .await
@@ -264,8 +263,7 @@ impl Topups {
 
     /// Watch every unpaid invoice (at startup).
     pub fn watch_waiting(self: &Arc<Self>) {
-        let waiting: Vec<_> =
-            self.store.lock().unwrap().all().iter().filter(|t| t.state == TopupState::Waiting).cloned().collect();
+        let waiting: Vec<_> = self.store.lock().unwrap().all().iter().filter(|t| t.state == TopupState::Waiting).cloned().collect();
         for t in waiting {
             self.watch(&t);
         }

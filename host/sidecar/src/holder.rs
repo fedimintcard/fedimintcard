@@ -65,6 +65,23 @@ pub struct PendingLoad {
     /// can tell which top-up a load finished by a later run belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Keep a record of how it ended once it is finished ([`Loader::keep_finished`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
+}
+
+/// How a load whose loader asked to keep it ([`Loader::keep_finished`]) ended. Written in the same
+/// save that takes the load out of the journal, so a caller that stopped before recording the
+/// load's result can still tell whether it happened.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptLoad {
+    pub tag: String,
+    pub short_id: String,
+    pub txid: String,
+    /// The federation took it: the notes are live on the card.
+    pub accepted: bool,
+    /// `(slot, msat)` of each note.
+    pub notes: Vec<(u8, u64)>,
 }
 
 /// The card has fewer free slots than the load has notes. Nothing was built or sent.
@@ -100,6 +117,8 @@ pub struct Finished {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Journal {
     loads: Vec<PendingLoad>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kept: Vec<KeptLoad>,
 }
 
 /// What a load put on the card.
@@ -128,6 +147,7 @@ pub struct Loader<'w> {
     ops: OpsClient,
     journal: PathBuf,
     tag: Option<String>,
+    keep: bool,
     /// A till's own registry client (with its token), for keying never-keyed slots.
     keyer: Option<OpsClient>,
     #[doc(hidden)]
@@ -137,13 +157,34 @@ pub struct Loader<'w> {
 impl<'w> Loader<'w> {
     /// A loader paying from `wallet`, against the registry at `ops_url`, journalling in `data_dir`.
     pub fn new(wallet: &'w Wallet, ops_url: &str, data_dir: &Path) -> Result<Self> {
-        Ok(Self { wallet, ops: OpsClient::holder(ops_url)?, journal: data_dir.join(JOURNAL_FILE), tag: None, keyer: None, crash: None })
+        Ok(Self {
+            wallet,
+            ops: OpsClient::holder(ops_url)?,
+            journal: data_dir.join(JOURNAL_FILE),
+            tag: None,
+            keep: false,
+            keyer: None,
+            crash: None,
+        })
     }
 
     /// Mark this loader's loads with `tag` in the journal ([`PendingLoad::tag`]).
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tag = Some(tag.into());
         self
+    }
+
+    /// Keep how this loader's loads end in the journal ([`KeptLoad`], under its tag), so a caller
+    /// that must load at most once can tell, after a crash, whether a load it started happened.
+    /// Kept loads are never dropped: for loads that are rare (a pay's refund), not for top-ups.
+    pub fn keep_finished(mut self) -> Self {
+        self.keep = true;
+        self
+    }
+
+    /// How the kept loads tagged `tag` ended, oldest first.
+    pub fn kept(&self, tag: &str) -> Result<Vec<KeptLoad>> {
+        Ok(self.read_journal()?.kept.into_iter().filter(|k| k.tag == tag).collect())
     }
 
     fn read_journal(&self) -> Result<Journal> {
@@ -155,8 +196,12 @@ impl<'w> Loader<'w> {
     }
 
     fn update_journal(&self, f: impl FnOnce(&mut Vec<PendingLoad>)) -> Result<()> {
+        self.update_whole(|j| f(&mut j.loads))
+    }
+
+    fn update_whole(&self, f: impl FnOnce(&mut Journal)) -> Result<()> {
         let mut j = self.read_journal()?;
-        f(&mut j.loads);
+        f(&mut j);
         write_private_json(&self.journal, &j)
     }
 
@@ -192,11 +237,7 @@ impl<'w> Loader<'w> {
         let short_id = short_id_of(&slot0);
         let mut free = self.ops.free_slots(&short_id).await.context("asking ops for the card's free slots")?;
         let ours = self.wallet.federation_id().to_string();
-        ensure!(
-            free.federation_id == ours,
-            "card {short_id} belongs to federation {}, and this wallet is in {ours}",
-            free.federation_id
-        );
+        ensure!(free.federation_id == ours, "card {short_id} belongs to federation {}, and this wallet is in {ours}", free.federation_id);
         if let Some(keyer) = &self.keyer {
             let n = crate::ops::slots_to_key(notes.len(), free.free.len(), free.unkeyed_slots.len());
             if n > 0 && free.free.len() + n >= notes.len() {
@@ -208,12 +249,7 @@ impl<'w> Loader<'w> {
             }
         }
         if free.free.len() < notes.len() {
-            return Err(anyhow!(CardFull {
-                short_id,
-                free: free.free.len(),
-                needed: notes.len(),
-                unkeyed: free.unkeyed_slots.len()
-            }));
+            return Err(anyhow!(CardFull { short_id, free: free.free.len(), needed: notes.len(), unkeyed: free.unkeyed_slots.len() }));
         }
         let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
         let bal = self.wallet.balance_msat().await?;
@@ -270,6 +306,7 @@ impl<'w> Loader<'w> {
                 })
                 .collect(),
             tag: self.tag.clone(),
+            keep: self.keep && self.tag.is_some(),
         };
 
         // 3. Journal, then ops; a refusal drops the build and nothing has left the wallet.
@@ -306,10 +343,10 @@ impl<'w> Loader<'w> {
                         Some((n.slot, key, n.amount_msat, sig.clone()))
                     })
                     .collect();
-                if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once()) {
-                    if let Err(e) = crate::glue::write_notes(card, &notes) {
-                        tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
-                    }
+                if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once())
+                    && let Err(e) = crate::glue::write_notes(card, &notes)
+                {
+                    tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
                 }
                 let live = pending.notes.iter().map(|n| (n.slot, n.amount_msat)).collect();
                 Ok(LoadReport { short_id, txid: pending.txid, notes: live, resumed })
@@ -328,8 +365,7 @@ impl<'w> Loader<'w> {
     pub async fn resume_each(&self) -> Result<Vec<Finished>> {
         let mut done = vec![];
         for p in self.pending()? {
-            let live =
-                self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
+            let live = self.finish(&p).await.with_context(|| format!("finishing the earlier load {} to card {}", p.txid, p.short_id))?;
             done.push(Finished { load: p, live });
         }
         Ok(done)
@@ -344,9 +380,7 @@ impl<'w> Loader<'w> {
     /// [`Self::finish`], answering each note's signature (hex) in the order of `p.notes`.
     async fn finish_signed(&self, p: &PendingLoad) -> Result<Option<Vec<String>>> {
         let client = &self.wallet.client;
-        let op = OperationId(
-            hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?,
-        );
+        let op = OperationId(hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?);
         let txid = TransactionId::from_str(&p.txid).map_err(|_| anyhow!("bad txid in the journal"))?;
         let outcome = if client.operation_log().get_operation(op).await.is_none() {
             // The build never committed: the federation never saw it.
@@ -389,7 +423,21 @@ impl<'w> Loader<'w> {
             Err(OpsError::UnknownCard(_)) if !accepted => {}
             Err(e) => return Err(e).context("recording the load's outcome in ops"),
         }
-        self.update_journal(|l| l.retain(|q| q.txid != p.txid))?;
+        // Out of the journal, and, for a load to keep, how it ended, in one save.
+        self.update_whole(|j| {
+            j.loads.retain(|q| q.txid != p.txid);
+            if let (true, Some(tag)) = (p.keep, &p.tag)
+                && !j.kept.iter().any(|k| k.txid == p.txid)
+            {
+                j.kept.push(KeptLoad {
+                    tag: tag.clone(),
+                    short_id: p.short_id.clone(),
+                    txid: p.txid.clone(),
+                    accepted,
+                    notes: p.notes.iter().map(|n| (n.slot, n.amount_msat)).collect(),
+                });
+            }
+        })?;
         let sigs = outcome["notes"]
             .as_array()
             .map(|a| a.iter().map(|n| n["signature"].as_str().unwrap_or_default().to_owned()).collect())

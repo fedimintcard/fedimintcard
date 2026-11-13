@@ -123,15 +123,16 @@ impl FakeRegistry {
 
 async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> Json<Value> {
     let n = r.free.load(Ordering::SeqCst);
-    let used: Vec<u64> = r.loads.lock().unwrap().iter().flat_map(|l| l["notes"].as_array().unwrap().iter().map(|n| n["slot"].as_u64().unwrap()).collect::<Vec<_>>()).collect();
-    let mut free: Vec<Value> = (1..r.keys.len() as u64)
-        .filter(|s| !used.contains(s))
-        .take(n)
-        .map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]}))
+    let used: Vec<u64> = r
+        .loads
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|l| l["notes"].as_array().unwrap().iter().map(|n| n["slot"].as_u64().unwrap()).collect::<Vec<_>>())
         .collect();
-    free.extend(
-        r.keyed.lock().unwrap().iter().filter(|(s, _)| !used.contains(&(*s as u64))).map(|(s, k)| json!({"slot": s, "pubkey": k})),
-    );
+    let mut free: Vec<Value> =
+        (1..r.keys.len() as u64).filter(|s| !used.contains(s)).take(n).map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]})).collect();
+    free.extend(r.keyed.lock().unwrap().iter().filter(|(s, _)| !used.contains(&(*s as u64))).map(|(s, k)| json!({"slot": s, "pubkey": k})));
     let unkeyed = r.unkeyed.lock().unwrap().clone();
     Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": unkeyed}))
 }
@@ -168,7 +169,9 @@ async fn slot_keys(
     let unkeyed = r.unkeyed.lock().unwrap().clone();
     (
         axum::http::StatusCode::OK,
-        Json(json!({"ok": true, "version": r.version.load(Ordering::SeqCst), "added": added, "replayed": added.is_empty(), "unkeyed_slots": unkeyed})),
+        Json(
+            json!({"ok": true, "version": r.version.load(Ordering::SeqCst), "added": added, "replayed": added.is_empty(), "unkeyed_slots": unkeyed}),
+        ),
     )
 }
 
@@ -177,7 +180,11 @@ async fn load(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>, Json(
     Json(json!({"ok": true, "version": 2}))
 }
 
-async fn outcome(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>, Json(body): Json<Value>) -> (axum::http::StatusCode, Json<Value>) {
+async fn outcome(
+    State(r): State<Arc<FakeRegistry>>,
+    Path(_id): Path<String>,
+    Json(body): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
     if r.fail_outcomes.load(Ordering::SeqCst) > 0 {
         r.fail_outcomes.fetch_sub(1, Ordering::SeqCst);
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
@@ -272,7 +279,10 @@ async fn start(setup: Setup) -> anyhow::Result<(Fx, impl std::future::Future<Out
 }
 
 /// Run `test` next to the actor (which is not `Send`) on this task.
-async fn with_actor<T: Send + 'static>(actor: impl std::future::Future<Output = ()>, test: impl std::future::Future<Output = T> + Send + 'static) -> T {
+async fn with_actor<T: Send + 'static>(
+    actor: impl std::future::Future<Output = ()>,
+    test: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
     let t = tokio::spawn(test);
     let mut actor = Box::pin(actor);
     tokio::select! {
@@ -364,7 +374,8 @@ fn op_of(topups: &Topups, id: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paid_top_up_loads_the_card_once() -> anyhow::Result<()> {
     let (f, actor) = start(Setup::OnOps).await?;
-    let (addr, ln, topups, registry, card, short_id) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone(), f.short_id.clone());
+    let (addr, ln, topups, registry, card, short_id) =
+        (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone(), f.short_id.clone());
     with_actor(actor, async move {
         // 100 sats rounds to the nearest card amount, 100.352 sats in three notes.
         let (s, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "client_ref": "t1"}))).await;
@@ -497,7 +508,8 @@ async fn waiting_top_ups_are_offered_to_their_card() -> anyhow::Result<()> {
         ln.settle(&op_of(&topups, &expired), LnOutcome::Expired);
         until_state(addr, &expired, "expired").await;
 
-        let ids = |v: &Value| v["topups"].as_array().unwrap().iter().map(|t| t["topup_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let ids =
+            |v: &Value| v["topups"].as_array().unwrap().iter().map(|t| t["topup_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
         let (s, v) = call(addr, "GET", &format!("/v1/topups/waiting?short_id={mine}"), None, None).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!(ids(&v), vec![a.clone(), b.clone()], "{v}");
@@ -863,7 +875,10 @@ async fn keys_a_tap_made_but_never_recorded_are_recorded_by_the_next_tap() -> an
 
 /// A holder's wallet holding `funds` sats (no mint fees) and a fake registry for a fresh 32-slot
 /// `card` registered with keys for slots 0-7 only (split keying), 1-7 free and 8-31 unkeyed.
-async fn holder_on_split(card: &mut SoftCard, funds: u64) -> anyhow::Result<(FederationTest, Wallet, Arc<FakeRegistry>, String, tempfile::TempDir)> {
+async fn holder_on_split(
+    card: &mut SoftCard,
+    funds: u64,
+) -> anyhow::Result<(FederationTest, Wallet, Arc<FakeRegistry>, String, tempfile::TempDir)> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
     let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).disable_mint_fees().build()).await?;
     let client = fed.new_client().await;
@@ -908,7 +923,8 @@ async fn a_till_keys_only_when_keying_makes_the_load_fit() -> anyhow::Result<()>
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
     *registry.unkeyed.lock().unwrap() = vec![8, 9];
-    let err = Loader::new(&wallet, &url, dir.path())?.with_keyer(till.clone()).load(&mut card, &[50_000_000]).await.expect_err("7 + 2 < 12");
+    let err =
+        Loader::new(&wallet, &url, dir.path())?.with_keyer(till.clone()).load(&mut card, &[50_000_000]).await.expect_err("7 + 2 < 12");
     assert!(err.downcast_ref::<CardFull>().is_some(), "{err:#}");
     assert!(registry.key_posts.lock().unwrap().is_empty());
     assert!(card.get_pub(8).is_err());

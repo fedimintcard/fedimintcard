@@ -67,9 +67,7 @@ pub const INS_SET_PIN: u8 = 0x41;
 pub const INS_CHANGE_PIN: u8 = 0x42;
 const INS_SIGN: u8 = 0x12;
 /// `SELECT` by AID `F0 46 4D 43 41 52 44 01`.
-pub const SELECT_APDU: [u8; 14] = [
-    0x00, 0xA4, 0x04, 0x00, 0x08, 0xF0, 0x46, 0x4D, 0x43, 0x41, 0x52, 0x44, 0x01, 0x00,
-];
+pub const SELECT_APDU: [u8; 14] = [0x00, 0xA4, 0x04, 0x00, 0x08, 0xF0, 0x46, 0x4D, 0x43, 0x41, 0x52, 0x44, 0x01, 0x00];
 
 /// Error carrying the card's status word, so callers can match on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,11 +347,7 @@ pub fn v3_apdu(ins: u8, p1: u8, data: &[u8]) -> Vec<u8> {
 /// The bounds are the applet's (`PIN_MIN`..`PIN_MAX`), not a preference: an out-of-range length is
 /// refused here so the card is never asked and cannot burn a try.
 pub fn pin_apdu(ins: u8, pin: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        (PIN_MIN..=PIN_MAX).contains(&pin.len()),
-        "PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}",
-        pin.len()
-    );
+    ensure!((PIN_MIN..=PIN_MAX).contains(&pin.len()), "PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}", pin.len());
     let mut apdu = vec![CLA, ins, 0x00, 0x00, pin.len() as u8];
     apdu.extend_from_slice(pin);
     apdu.push(0x00);
@@ -537,13 +531,7 @@ impl SoftCard {
 
     /// An installed card with `n` key slots: slot `n` and up answer `6B00`.
     pub fn with_slots(n: u8) -> Self {
-        Self {
-            slots: vec![None; n as usize],
-            tries_left: 3,
-            installed: true,
-            v3: vec![V3Slot::empty(); n as usize],
-            ..Default::default()
-        }
+        Self { slots: vec![None; n as usize], tries_left: 3, installed: true, v3: vec![V3Slot::empty(); n as usize], ..Default::default() }
     }
 
     /// An applet 3.0 card: 32 slots and the 3.0 rules.
@@ -696,9 +684,7 @@ impl SoftCard {
     fn apdu_v3(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         let ins = apdu[1];
         let body = apdu_body(apdu)?;
-        let len_is = |n: usize| -> Result<()> {
-            if body.len() == n { Ok(()) } else { Err(StatusWord(v3::SW_WRONG_LENGTH).into()) }
-        };
+        let len_is = |n: usize| -> Result<()> { if body.len() == n { Ok(()) } else { Err(StatusWord(v3::SW_WRONG_LENGTH).into()) } };
         // The applet's `slot()`: P1 a slot, P2 zero.
         let slot = || -> Result<usize> {
             let p1 = apdu[2] as usize;
@@ -878,11 +864,7 @@ impl SoftCard {
     /// gives. Modelled here because the trait methods used to skip the APDU layer and accept
     /// commands a blank card rejects; a real J3R180 answered `6E00` to `GET_PUB` on 2026-10-28.
     fn require_installed(&self) -> Result<()> {
-        if self.installed {
-            Ok(())
-        } else {
-            Err(StatusWord(SW_CLA_NOT_SUPPORTED).into())
-        }
+        if self.installed { Ok(()) } else { Err(StatusWord(SW_CLA_NOT_SUPPORTED).into()) }
     }
 
     /// The applet's `checkPinReady`: blocked outranks no PIN, which outranks not verified in
@@ -1014,10 +996,7 @@ impl Card for SoftCard {
             }
             (CLA, INS_SET_PIN) => {
                 let pin = apdu_data(apdu)?;
-                ensure!(
-                    (PIN_MIN..=PIN_MAX).contains(&pin.len()),
-                    "PIN must be {PIN_MIN} to {PIN_MAX} bytes"
-                );
+                ensure!((PIN_MIN..=PIN_MAX).contains(&pin.len()), "PIN must be {PIN_MIN} to {PIN_MAX} bytes");
                 if self.tries_left == 0 {
                     return Err(StatusWord(SW_PIN_BLOCKED).into());
                 }
@@ -1097,9 +1076,7 @@ pub fn open_from_env() -> Result<Box<dyn Card>> {
         }
         #[cfg(feature = "pcsc")]
         "pcsc" => {
-            let mut c = CardClient::new(pcsc_backend::PcscTransport::connect(
-                std::env::var("CARD_PCSC_READER").ok().as_deref(),
-            )?);
+            let mut c = CardClient::new(pcsc_backend::PcscTransport::connect(std::env::var("CARD_PCSC_READER").ok().as_deref())?);
             c.select()?;
             Ok(Box::new(c))
         }

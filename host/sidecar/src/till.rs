@@ -29,8 +29,8 @@ use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, Query, State};
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -39,9 +39,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::link::{Link, Links};
-use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
 use crate::claim::{Claim, Poll};
+use crate::glue::{BalanceReport, CardWallet, PromotedSale, SpendFault, SpendReport, on_card};
+use crate::link::{Link, Links};
 use crate::ops::{FederationReport, Ops, OpsConfig, OpsError};
 use crate::sales::{SaleRec, SalesStore, SlotMsat};
 use crate::state::NoteStatus;
@@ -51,7 +51,8 @@ use crate::wallet::{Wallet, sales_path};
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9877";
 /// Largest price accepted (2^40 msat, about 11 BTC).
 pub const MAX_PRICE_MSAT: u64 = 1 << 40;
-const MAX_CLIENT_REF: usize = 128;
+/// Longest `client_ref` a charge takes.
+pub const MAX_CLIENT_REF: usize = 128;
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A finished API answer: HTTP status plus JSON body.
@@ -192,7 +193,7 @@ impl Conn {
     }
 
     /// The refusal for a card job while a till that belongs on ops has no token.
-    fn refusal(&self) -> Option<Reply> {
+    pub(crate) fn refusal(&self) -> Option<Reply> {
         let detail = match &self.state {
             OpsState::Local | OpsState::Connected { .. } => return None,
             OpsState::Waiting { code, .. } => {
@@ -377,19 +378,36 @@ pub type CardOpener = Box<dyn Fn() -> Result<Box<dyn Card>>>;
 enum Job {
     /// `pin` is the holder's, typed at the till. Never logged, stored or sent to ops.
     /// `link`: the POS phone's card link (`X-Card-Link`), used instead of the opener.
+    /// `online_only`: never take it offline (a pay's charge: paying an invoice needs the
+    /// federation, `crate::pay`).
     Charge {
         price: u64,
         client_ref: Option<String>,
         pin: Option<Vec<u8>>,
         link: Option<Link>,
+        online_only: bool,
         reply: oneshot::Sender<Reply>,
     },
-    Balance { link: Option<Link>, reply: oneshot::Sender<Reply> },
+    Balance {
+        link: Option<Link>,
+        reply: oneshot::Sender<Reply>,
+    },
     /// Send charges taken offline (docs/OFFLINE-PROTOCOL.md § 4.5).
-    SendOffline { reply: oneshot::Sender<Reply> },
-    Precheck { reply: oneshot::Sender<Reply> },
-    KeySetup { pin: Option<Vec<u8>>, reply: oneshot::Sender<Reply> },
-    Issue { amounts: Vec<u64>, client_ref: Option<String>, reply: oneshot::Sender<Reply> },
+    SendOffline {
+        reply: oneshot::Sender<Reply>,
+    },
+    Precheck {
+        reply: oneshot::Sender<Reply>,
+    },
+    KeySetup {
+        pin: Option<Vec<u8>>,
+        reply: oneshot::Sender<Reply>,
+    },
+    Issue {
+        amounts: Vec<u64>,
+        client_ref: Option<String>,
+        reply: oneshot::Sender<Reply>,
+    },
     /// Load a paid top-up's eCash onto the card (docs/TOPUP.md).
     TopupLoad {
         topup_id: String,
@@ -397,6 +415,22 @@ enum Job {
         ops_url: String,
         link: Option<Link>,
         topups: Arc<Topups>,
+        reply: oneshot::Sender<Reply>,
+    },
+    /// Settle the charge carrying `client_ref` from what it left, with no card and no new spend
+    /// ([`settle_without_card`]): a pay's charge left undecided, which no POS may ask about again.
+    SettleCharge {
+        price: u64,
+        client_ref: String,
+        reply: oneshot::Sender<Reply>,
+    },
+    /// Load a `pay_failed` pay's value back onto the card that paid (`crate::pay::refund_job`).
+    PayRefund {
+        pay_id: u64,
+        ops_url: String,
+        link: Option<Link>,
+        pays: Arc<crate::pay::Pays>,
+        topups: Option<Arc<Topups>>,
         reply: oneshot::Sender<Reply>,
     },
 }
@@ -428,6 +462,8 @@ pub struct TillHandle {
     offline: SharedOffline,
     /// The newest block header, for the phones' offline kits ([`Self::with_headers`]).
     headers: Option<Arc<crate::clock::Headers>>,
+    /// Invoices paid with a card ([`Self::with_pays`]); without them the pay routes answer 503.
+    pays: Option<Arc<crate::pay::Pays>>,
 }
 
 /// The till's offline charges, once [`TillHandle::with_offline`] set them.
@@ -449,6 +485,53 @@ impl TillHandle {
 
     pub(crate) fn wallet(&self) -> &Wallet {
         &self.wallet
+    }
+
+    /// Pay invoices with a card (`POST /v1/pay`, [`crate::pay`]). Records a crash left open are
+    /// picked up by the sweeper ([`crate::pay::spawn_sweeper`]) or by [`crate::pay::sweep`].
+    pub fn with_pays(mut self, pays: Arc<crate::pay::Pays>) -> Self {
+        self.pays = Some(pays);
+        self
+    }
+
+    /// The pays, once [`Self::with_pays`] set them.
+    pub fn pays(&self) -> Option<Arc<crate::pay::Pays>> {
+        self.pays.clone()
+    }
+
+    /// Whether an unresolved charge in the card state carries `client_ref` (as of the last job).
+    pub fn has_pending_ref(&self, client_ref: &str) -> bool {
+        self.pending_refs.lock().unwrap().iter().any(|r| r == client_ref)
+    }
+
+    /// Charge the card in the field (or behind `link`) through the actor, exactly as
+    /// `POST /v1/charge` does once its request is checked; `online_only` refuses to take it offline.
+    pub(crate) async fn charge_card(
+        &self,
+        price: u64,
+        client_ref: String,
+        pin: Option<Vec<u8>>,
+        link: Option<Link>,
+        online_only: bool,
+    ) -> Reply {
+        let cref = client_ref.clone();
+        run_job(self, Some((&cref, price)), |reply| Job::Charge { price, client_ref: Some(client_ref), pin, link, online_only, reply })
+            .await
+    }
+
+    /// Settle the charge carrying `client_ref` through the actor without opening a card: an
+    /// unresolved one is resolved from the federation (accepted: its sale is recorded; never sent
+    /// or rejected: it is gone), never spent anew. Answers the charge's reply when it settled to
+    /// a sale or is still undecided, 404 `no_charge` when nothing carries the ref (any more).
+    pub(crate) async fn settle_charge(&self, price: u64, client_ref: String) -> Reply {
+        let cref = client_ref.clone();
+        run_job(self, Some((&cref, price)), |reply| Job::SettleCharge { price, client_ref, reply }).await
+    }
+
+    /// Refund pay `pay_id` onto the card in the field (or behind `link`) through the actor.
+    pub(crate) async fn refund_pay(&self, pay_id: u64, ops_url: String, link: Option<Link>, pays: Arc<crate::pay::Pays>) -> Reply {
+        let topups = self.topups.clone();
+        run_job(self, None, |reply| Job::PayRefund { pay_id, ops_url, link, pays, topups, reply }).await
     }
 
     pub(crate) fn sales(&self) -> Arc<Mutex<SalesStore>> {
@@ -476,14 +559,21 @@ impl TillHandle {
 
     /// Require `token` as a bearer on every `/v1/*` request not from loopback.
     pub fn with_pos_token(mut self, token: Option<String>) -> Self {
-        self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false };
+        self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false, pay_token: self.pos_auth.pay_token.take() };
         self
     }
 
     /// Require `token` as a bearer on every `/v1/*` request, from loopback too
     /// (`till serve --require-pos-token`, for a till behind a proxy).
     pub fn with_pos_token_everywhere(mut self, token: String) -> Self {
-        self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true };
+        self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true, pay_token: self.pos_auth.pay_token.take() };
+        self
+    }
+
+    /// Take `token` as a bearer with the pay scope only (`till pair --scope pay`): `/v1/pay`,
+    /// `/v1/pay/{id}…`, `/v1/health` and the card link, from every peer ([`crate::pos::access`]).
+    pub fn with_pay_token(mut self, token: Option<String>) -> Self {
+        self.pos_auth.pay_token = token.map(Arc::from);
         self
     }
 
@@ -562,6 +652,7 @@ pub async fn new_with_conn(
         topups: None,
         offline: offline.clone(),
         headers: None,
+        pays: None,
     };
     (handle, actor(cw, rx, busy, inflight, pending_refs, sales, opener, conn, offline))
 }
@@ -601,12 +692,33 @@ async fn actor(
                 };
                 (reply, r)
             }
-            Job::Charge { price, client_ref, pin, link, reply } => {
+            Job::Charge { price, client_ref, pin, link, online_only, reply } => {
                 let r = match on_card(|| open_for(&opener, link.as_ref())) {
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
-                        charge_job_with(&mut cw, ops.as_ref(), off.as_deref(), price, client_ref, &sales).await
+                        // A pay's charge: which card paid, so a refund goes back to it only. A card
+                        // that cannot say is not charged: a charge with no known card could never
+                        // be refunded.
+                        let short_id = match online_only.then(|| on_card(|| cw.card.get_pub(0))) {
+                            None => Ok(None),
+                            Some(Ok(k)) => Ok(Some(crate::ops::short_id_of(&k))),
+                            Some(Err(e)) => Err(e),
+                        };
+                        match short_id {
+                            Err(e) => {
+                                tracing::warn!("a pay's charge: the card's slot 0 key could not be read, so it was not charged: {e:#}");
+                                error_reply(&e)
+                            }
+                            Ok(short_id) => {
+                                let off = if online_only { None } else { off.as_deref() };
+                                let mut r = charge_job_for(&mut cw, ops.as_ref(), off, price, client_ref, &sales, short_id.clone()).await;
+                                if let (Some(c), Some(b)) = (short_id, r.body.as_object_mut()) {
+                                    b.insert("short_id".into(), json!(c));
+                                }
+                                r
+                            }
+                        }
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
@@ -633,7 +745,7 @@ async fn actor(
                 (reply, r)
             }
             Job::Precheck { reply } => {
-                let r = match on_card(|| opener()) {
+                let r = match on_card(&opener) {
                     Ok(card) => {
                         cw.card = card;
                         match crate::cards::precheck(&mut cw) {
@@ -646,7 +758,7 @@ async fn actor(
                 (reply, r)
             }
             Job::KeySetup { pin, reply } => {
-                let r = match on_card(|| opener()) {
+                let r = match on_card(&opener) {
                     Ok(card) => {
                         cw.card = card;
                         match crate::cards::key_setup(&mut cw, pin.as_deref()) {
@@ -659,7 +771,7 @@ async fn actor(
                 (reply, r)
             }
             Job::Issue { amounts, client_ref, reply } => {
-                let r = match on_card(|| opener()) {
+                let r = match on_card(&opener) {
                     Ok(card) => {
                         cw.card = card;
                         match ops.as_ref() {
@@ -681,6 +793,20 @@ async fn actor(
             Job::TopupLoad { topup_id, amount_msat, ops_url, link, topups, reply } => {
                 let keyer = ops.as_ref().map(|o| o.client.clone());
                 let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url, keyer).await;
+                (reply, r)
+            }
+            Job::SettleCharge { price, client_ref, reply } => {
+                // Never opens a card: the job is answered from the card state and the federation.
+                cw.card = Box::new(NoCard);
+                let r = settle_without_card(&mut cw, ops.as_ref(), &client_ref, price, &sales)
+                    .await
+                    .unwrap_or_else(|| Reply::fail(404, "no_charge", "no charge carries this client_ref; nothing was charged"));
+                (reply, r)
+            }
+            Job::PayRefund { pay_id, ops_url, link, pays, topups, reply } => {
+                let till_ops = ops.as_ref().map(|o| o.client.clone());
+                let open = || on_card(|| open_for(&opener, link.as_ref()));
+                let r = crate::pay::refund_job(&cw.wallet, &dir, open, topups.as_deref(), &pays, pay_id, &ops_url, till_ops).await;
                 (reply, r)
             }
         };
@@ -751,17 +877,13 @@ async fn topup_load_job(
             }
         }
         Err(e) => match e.downcast_ref::<crate::holder::CardFull>() {
-            Some(full) => Reply::fail(
-                409,
-                "card_full",
-                format!("{full}: spend on the card, then tap again; the top-up stays paid"),
-            ),
+            Some(full) => Reply::fail(409, "card_full", format!("{full}: spend on the card, then tap again; the top-up stays paid")),
             None => error_reply(&e),
         },
     }
 }
 
-fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
+pub(crate) fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
     let r = topups.store.lock().unwrap().update(id, |t| {
         t.state = TopupState::Loaded;
         t.load_txid = Some(txid.to_owned());
@@ -783,11 +905,9 @@ fn topup_not_loadable(t: &TopupRec) -> Option<Reply> {
         TopupState::Paid | TopupState::Loaded => None,
         TopupState::Waiting => Some(Reply::fail(409, "not_paid", "the invoice is not paid yet")),
         TopupState::Expired => Some(Reply::fail(410, "expired", "the invoice expired unpaid; make a new one")),
-        TopupState::Failed => Some(Reply::fail(
-            409,
-            "topup_failed",
-            t.detail.clone().unwrap_or_else(|| "the Lightning payment did not complete".into()),
-        )),
+        TopupState::Failed => {
+            Some(Reply::fail(409, "topup_failed", t.detail.clone().unwrap_or_else(|| "the Lightning payment did not complete".into())))
+        }
     }
 }
 
@@ -806,42 +926,32 @@ fn open_for(opener: &CardOpener, link: Option<&Link>) -> Result<Box<dyn Card>> {
 /// issue. A card already holding live notes on the keys this call would write to is refused —
 /// issuing again would double its value with no record of having done so.
 async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<String>) -> Reply {
-    if let Some(cref) = client_ref.as_deref() {
-        if let Some(rec) = cw.store.state.issues.iter().find(|r| r.client_ref == cref).cloned() {
-            if rec.amounts != amounts {
-                return Reply::fail(
-                    409,
-                    "ref_mismatch",
-                    format!(
-                        "client_ref {cref} was issued for amounts {:?}, not {amounts:?}",
-                        rec.amounts
-                    ),
-                );
-            }
-            if rec.txid.is_empty() {
-                return undecided_reply(None);
-            }
-            let live_msat = cw
-                .store
-                .state
-                .notes
-                .iter()
-                .filter(|n| n.status == crate::state::NoteStatus::Live)
-                .map(|n| n.amount_msat)
-                .sum::<u64>()
-                / 1000;
-            return Reply::ok(
-                crate::cards::IssueOutcome {
-                    client_ref: Some(cref.to_owned()),
-                    live_msat,
-                    txid: rec.txid,
-                    notes: rec.notes,
-                    plan: json!({"notes": amounts.iter().flat_map(|a| crate::plan::binary(*a)).collect::<Vec<u64>>()}),
-                    replayed: true,
-                }
-                .to_json(),
+    if let Some(cref) = client_ref.as_deref()
+        && let Some(rec) = cw.store.state.issues.iter().find(|r| r.client_ref == cref).cloned()
+    {
+        if rec.amounts != amounts {
+            return Reply::fail(
+                409,
+                "ref_mismatch",
+                format!("client_ref {cref} was issued for amounts {:?}, not {amounts:?}", rec.amounts),
             );
         }
+        if rec.txid.is_empty() {
+            return undecided_reply(None);
+        }
+        let live_msat =
+            cw.store.state.notes.iter().filter(|n| n.status == crate::state::NoteStatus::Live).map(|n| n.amount_msat).sum::<u64>() / 1000;
+        return Reply::ok(
+            crate::cards::IssueOutcome {
+                client_ref: Some(cref.to_owned()),
+                live_msat,
+                txid: rec.txid,
+                notes: rec.notes,
+                plan: json!({"notes": amounts.iter().flat_map(|a| crate::plan::binary(*a)).collect::<Vec<u64>>()}),
+                replayed: true,
+            }
+            .to_json(),
+        );
     }
 
     let preview = match crate::cards::issue_plan(cw, amounts).await {
@@ -869,32 +979,12 @@ async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<Stri
                 .as_deref()
                 .and_then(|c| cw.store.state.issues.iter().find(|r| r.client_ref == c))
                 .map(|r| r.txid.clone())
-                .or_else(|| {
-                    notes
-                        .first()
-                        .and_then(|(slot, _)| cw.store.state.notes_on_current_key(*slot).find_map(|n| n.txid.clone()))
-                })
+                .or_else(|| notes.first().and_then(|(slot, _)| cw.store.state.notes_on_current_key(*slot).find_map(|n| n.txid.clone())))
                 .unwrap_or_default();
-            let live_msat = cw
-                .store
-                .state
-                .notes
-                .iter()
-                .filter(|n| n.status == crate::state::NoteStatus::Live)
-                .map(|n| n.amount_msat)
-                .sum::<u64>()
-                / 1000;
-            Reply::ok(
-                crate::cards::IssueOutcome {
-                    client_ref,
-                    live_msat,
-                    txid,
-                    notes,
-                    plan: preview,
-                    replayed: false,
-                }
-                .to_json(),
-            )
+            let live_msat =
+                cw.store.state.notes.iter().filter(|n| n.status == crate::state::NoteStatus::Live).map(|n| n.amount_msat).sum::<u64>()
+                    / 1000;
+            Reply::ok(crate::cards::IssueOutcome { client_ref, live_msat, txid, notes, plan: preview, replayed: false }.to_json())
         }
         Err(e) => error_reply(&e),
     }
@@ -905,15 +995,15 @@ async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<Stri
 pub async fn balance_job(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) -> Reply {
     ensure_hook(cw, sales);
     let r = match cw.verify_card() {
-        Ok(()) => match {
+        Ok(()) => {
             if cw.ops.is_none() {
                 cw.card_tick();
             }
-            cw.balance().await
-        } {
-            Ok(rep) => balance_reply(&rep),
-            Err(e) => error_reply(&e),
-        },
+            match cw.balance().await {
+                Ok(rep) => balance_reply(&rep),
+                Err(e) => error_reply(&e),
+            }
+        }
         Err(e) => error_reply(&e),
     };
     sync_sales(cw, sales);
@@ -948,7 +1038,21 @@ pub async fn charge_job_with(
     client_ref: Option<String>,
     sales: &Arc<Mutex<SalesStore>>,
 ) -> Reply {
-    let Some(ops) = ops else { return charge_with(cw, price, client_ref, sales).await };
+    charge_job_for(cw, ops, off, price, client_ref, sales, None).await
+}
+
+/// [`charge_job_with`] for the card `short_id`, read from the card in the field before the charge:
+/// its sale records it in the same append (a pay's refund goes back to that card).
+pub async fn charge_job_for(
+    cw: &mut CardWallet,
+    ops: Option<&Ops>,
+    off: Option<&crate::offline::Offline>,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+    short_id: Option<String>,
+) -> Reply {
+    let Some(ops) = ops else { return charge_with_card(cw, price, client_ref, sales, short_id).await };
     if let Some(bad) = validate_price(price) {
         return bad;
     }
@@ -975,7 +1079,7 @@ pub async fn charge_job_with(
             return error_reply(&e);
         }
     };
-    let r = charge_with(cw, price, client_ref, sales).await;
+    let r = charge_with_card(cw, price, client_ref, sales, short_id).await;
     Ops::finish(cw, base).await;
     r
 }
@@ -1069,6 +1173,7 @@ async fn offline_charge(
         offline: true,
         double_spent: false,
         rejected: false,
+        short_id: Some(taken.short_id.clone()),
     };
     match sales.lock().unwrap().append(rec.clone()) {
         Ok(saved) => rec = saved,
@@ -1138,12 +1243,12 @@ pub async fn card_balance_job(cw: &mut CardWallet, ops: Option<&Ops>, sales: &Ar
     };
     let mut r = balance_job(cw, sales).await;
     // The card's id lets a top-up started from this screen fit the card's free slots.
-    if let (Some(link), Some(body)) = (cw.ops.as_ref(), r.body.as_object_mut()) {
-        if r.status == 200 {
-            body.insert("short_id".into(), json!(link.short_id));
-            // Slots with no key yet (split keying): room too, keyed by the tap that needs them.
-            body.insert("unkeyed_slots".into(), json!(link.unkeyed));
-        }
+    if let (Some(link), Some(body)) = (cw.ops.as_ref(), r.body.as_object_mut())
+        && r.status == 200
+    {
+        body.insert("short_id".into(), json!(link.short_id));
+        // Slots with no key yet (split keying): room too, keyed by the tap that needs them.
+        body.insert("unkeyed_slots".into(), json!(link.unkeyed));
     }
     Ops::finish(cw, base).await;
     r
@@ -1195,11 +1300,8 @@ fn status_str(s: NoteStatus) -> &'static str {
 }
 
 fn balance_reply(r: &BalanceReport) -> Reply {
-    let notes: Vec<Value> = r
-        .notes
-        .iter()
-        .map(|n| json!({"slot": n.slot, "msat": n.amount_msat, "status": status_str(n.status)}))
-        .collect();
+    let notes: Vec<Value> =
+        r.notes.iter().map(|n| json!({"slot": n.slot, "msat": n.amount_msat, "status": status_str(n.status)})).collect();
     Reply::ok(json!({"ok": true, "live_msat": r.live_msat, "notes": notes, "free_slots": r.free_slots}))
 }
 
@@ -1242,11 +1344,7 @@ fn validate_price(price: u64) -> Option<Reply> {
 }
 
 fn conflict_reply(client_ref: &str, had: u64, now: u64) -> Reply {
-    Reply::fail(
-        409,
-        "conflict",
-        format!("client_ref {client_ref:?} was used for a sale of {had} msat, not {now} msat"),
-    )
+    Reply::fail(409, "conflict", format!("client_ref {client_ref:?} was used for a sale of {had} msat, not {now} msat"))
 }
 
 /// A completed sale for `client_ref`: the same body again, or `conflict` if the price differs.
@@ -1287,6 +1385,7 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
         offline: false,
         double_spent: false,
         rejected: false,
+        short_id: p.short_id.clone(),
     }
 }
 
@@ -1294,9 +1393,7 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
 /// `sales.json` before the link in `card_state.json` is removed.
 pub fn ensure_hook(cw: &mut CardWallet, sales: &Arc<Mutex<SalesStore>>) {
     let sales = sales.clone();
-    cw.on_promote = Some(Box::new(move |p| {
-        sales.lock().unwrap().append(sale_from(p)).map(|_| ())
-    }));
+    cw.on_promote = Some(Box::new(move |p| sales.lock().unwrap().append(sale_from(p)).map(|_| ())));
 }
 
 /// After a job: sales the federation accepted whose notes are still being collected show up in
@@ -1320,21 +1417,14 @@ fn sync_sales(cw: &mut CardWallet, sales: &Mutex<SalesStore>) {
 /// What a repeated `client_ref` means. `Some(reply)` is the final answer; `None` means the
 /// earlier attempt is proven to have left nothing behind and a fresh attempt may start.
 /// Never needs the card, and never starts a spend.
-pub async fn settle(
-    cw: &mut CardWallet,
-    client_ref: &str,
-    price: u64,
-    sales: &Arc<Mutex<SalesStore>>,
-) -> Option<Reply> {
+pub async fn settle(cw: &mut CardWallet, client_ref: &str, price: u64, sales: &Arc<Mutex<SalesStore>>) -> Option<Reply> {
     ensure_hook(cw, sales);
     // A sale recorded while its notes were still being collected is finished first, so the
     // replay shows the final amounts.
-    let collecting = sales.lock().unwrap().find_ref(client_ref).is_some_and(|r| r.collection_pending)
-        && cw.pending_for_ref(client_ref).is_some();
-    if !collecting {
-        if let Some(r) = replay(sales, Some(client_ref), price) {
-            return Some(r);
-        }
+    let collecting =
+        sales.lock().unwrap().find_ref(client_ref).is_some_and(|r| r.collection_pending) && cw.pending_for_ref(client_ref).is_some();
+    if !collecting && let Some(r) = replay(sales, Some(client_ref), price) {
+        return Some(r);
     }
     // A sale whose record was removed by a process without a ledger: record it now.
     if let Some((sale, _)) = cw.tombstoned_sales().into_iter().find(|(s, _)| s.client_ref == client_ref) {
@@ -1381,6 +1471,7 @@ pub async fn settle(
                 inputs: p.spent.clone(),
                 change: p.change.clone(),
                 collection_pending: true,
+                short_id: cw.card_short_id(),
             };
             let rec = match sales.lock().unwrap().append(sale_from(&sale)) {
                 Ok(r) => r,
@@ -1400,21 +1491,29 @@ pub async fn settle(
 /// A `client_ref` is stored on the transaction record in `card_state.json` in the save that
 /// creates it, before anything is signed or submitted, so a repeat can always find its
 /// transaction. A repeat never starts a second spend while the first may still count.
-pub async fn charge_with(
+pub async fn charge_with(cw: &mut CardWallet, price: u64, client_ref: Option<String>, sales: &Arc<Mutex<SalesStore>>) -> ChargeResponse {
+    charge_with_card(cw, price, client_ref, sales, None).await
+}
+
+/// [`charge_with`], recording the sale against card `short_id` (read from the card in the field)
+/// in the same append; without one, the card the wallet's state belongs to
+/// ([`CardWallet::card_short_id`]).
+pub async fn charge_with_card(
     cw: &mut CardWallet,
     price: u64,
     client_ref: Option<String>,
     sales: &Arc<Mutex<SalesStore>>,
+    short_id: Option<String>,
 ) -> ChargeResponse {
     if let Some(bad) = validate_price(price) {
         return bad;
     }
     ensure_hook(cw, sales);
-    if let Some(c) = client_ref.as_deref() {
-        if let Some(r) = settle(cw, c, price, sales).await {
-            sync_sales(cw, sales);
-            return r;
-        }
+    if let Some(c) = client_ref.as_deref()
+        && let Some(r) = settle(cw, c, price, sales).await
+    {
+        sync_sales(cw, sales);
+        return r;
     }
     if let Err(e) = cw.verify_card() {
         return error_reply(&e);
@@ -1452,6 +1551,7 @@ pub async fn charge_with(
         offline: false,
         double_spent: false,
         rejected: false,
+        short_id: short_id.or_else(|| cw.card_short_id()),
     };
     // The money has moved: a ledger failure must not turn a paid sale into an error. The store
     // keeps the sale in memory, so a repeat still replays it.
@@ -1481,6 +1581,10 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/topup/{topup_id}", get(topup_get))
         .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
+        .route("/v1/pay", post(crate::pay::pay))
+        .route("/v1/pay/{pay_id}", get(crate::pay::pay_get))
+        .route("/v1/pay/{pay_id}/refund", post(crate::pay::pay_refund))
+        .route("/v1/pays", get(crate::pay::pays_list))
         .route("/v1/offline/kit", get(crate::pos::offline_kit))
         .route(
             "/v1/offline/charges",
@@ -1496,11 +1600,11 @@ async fn card_link(State(h): State<TillHandle>, ws: WebSocketUpgrade) -> Respons
     ws.on_upgrade(move |socket| crate::link::run(socket, links))
 }
 
-const LINK_HEADER: &str = "x-card-link";
+pub(crate) const LINK_HEADER: &str = "x-card-link";
 
 /// The link a job names in `X-Card-Link`: `Ok(None)` without the header, `Err(409)` for an id
 /// that is unknown or closed.
-fn link_of(h: &TillHandle, headers: &HeaderMap) -> Result<Option<Link>, Reply> {
+pub(crate) fn link_of(h: &TillHandle, headers: &HeaderMap) -> Result<Option<Link>, Reply> {
     let Some(v) = headers.get(LINK_HEADER) else { return Ok(None) };
     let id = v.to_str().unwrap_or_default().trim();
     match h.links.get(id) {
@@ -1558,11 +1662,7 @@ struct ChargeReq {
 /// Admit a job (or say busy) and wait for the actor's answer. A repeat of the `client_ref` that
 /// is in flight right now is answered `undecided`, never `busy`, and is not queued; one that
 /// finished in the meantime gets its sale.
-async fn run_job(
-    h: &TillHandle,
-    charge: Option<(&str, u64)>,
-    make: impl FnOnce(oneshot::Sender<Reply>) -> Job,
-) -> Reply {
+async fn run_job(h: &TillHandle, charge: Option<(&str, u64)>, make: impl FnOnce(oneshot::Sender<Reply>) -> Job) -> Reply {
     {
         let mut inflight = h.inflight.lock().unwrap();
         if h.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -1635,8 +1735,15 @@ async fn charge_on(h: &TillHandle, link: Option<Link>, body: Bytes) -> Reply {
     }
     let cref = req.client_ref.clone();
     let pin = req.pin.map(String::into_bytes);
-    run_job(h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge { price, client_ref: req.client_ref, pin, link, reply })
-        .await
+    run_job(h, cref.as_deref().map(|c| (c, price)), |reply| Job::Charge {
+        price,
+        client_ref: req.client_ref,
+        pin,
+        link,
+        online_only: false,
+        reply,
+    })
+    .await
 }
 
 async fn card_balance(State(h): State<TillHandle>, headers: HeaderMap) -> Reply {
@@ -1676,10 +1783,10 @@ struct PrecheckReq {
 /// `POST /v1/cards/precheck` — read-only. What is on this card, is the ISD open, does the applet
 /// answer. Nothing is written, so the app can call it on every tap.
 async fn cards_precheck(State(h): State<TillHandle>, body: Bytes) -> Reply {
-    if !body.is_empty() {
-        if let Err(e) = serde_json::from_slice::<PrecheckReq>(&body) {
-            return Reply::fail(400, "bad_request", format!("body must be JSON or empty: {e}"));
-        }
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_slice::<PrecheckReq>(&body)
+    {
+        return Reply::fail(400, "bad_request", format!("body must be JSON or empty: {e}"));
     }
     run_job(&h, None, |reply| Job::Precheck { reply }).await
 }
@@ -1723,8 +1830,7 @@ async fn cards_issue(State(h): State<TillHandle>, body: Bytes) -> Reply {
         return r;
     }
     let cref = req.client_ref.clone();
-    run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue { amounts: req.amounts_msat, client_ref: req.client_ref, reply })
-        .await
+    run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue { amounts: req.amounts_msat, client_ref: req.client_ref, reply }).await
 }
 
 // ------------------------------------------------------------------ top-ups (docs/TOPUP.md)
@@ -1765,10 +1871,10 @@ struct WaitingQuery {
 /// (docs/TOPUP.md § Waiting top-ups), oldest first.
 async fn topups_waiting(State(h): State<TillHandle>, Query(q): Query<WaitingQuery>) -> Reply {
     let Some(t) = h.topups.clone() else { return topups_unavailable() };
-    if let Some(id) = q.short_id.as_deref() {
-        if id.len() != 8 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Reply::fail(400, "bad_request", "short_id must be 8 hex characters");
-        }
+    if let Some(id) = q.short_id.as_deref()
+        && (id.len() != 8 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Reply::fail(400, "bad_request", "short_id must be 8 hex characters");
     }
     let store = t.store.lock().unwrap();
     let list: Vec<Value> = store
@@ -1783,7 +1889,9 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
     let Some(t) = h.topups.clone() else { return topups_unavailable() };
     let req: TopupReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"amount_msat\":N,\"client_ref\":\"…\"}}: {e}")),
+        Err(e) => {
+            return Reply::fail(400, "bad_request", format!("body must be JSON like {{\"amount_msat\":N,\"client_ref\":\"…\"}}: {e}"));
+        }
     };
     if req.client_ref.as_deref().is_some_and(|c| c.is_empty() || c.len() > TOPUP_MAX_CLIENT_REF) {
         return Reply::fail(400, "bad_request", format!("client_ref must be 1 to {TOPUP_MAX_CLIENT_REF} bytes"));
@@ -1798,17 +1906,17 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         return r;
     }
     let _one = t.create.lock().await;
-    if let Some(cref) = req.client_ref.as_deref() {
-        if let Some(had) = t.store.lock().unwrap().by_ref(cref).cloned() {
-            if had.requested_msat != requested {
-                return Reply::fail(
-                    409,
-                    "client_ref_conflict",
-                    format!("client_ref {cref} was a top-up of {} msat, not {requested}", had.requested_msat),
-                );
-            }
-            return Reply::ok(had.to_json());
+    if let Some(cref) = req.client_ref.as_deref()
+        && let Some(had) = t.store.lock().unwrap().by_ref(cref).cloned()
+    {
+        if had.requested_msat != requested {
+            return Reply::fail(
+                409,
+                "client_ref_conflict",
+                format!("client_ref {cref} was a top-up of {} msat, not {requested}", had.requested_msat),
+            );
         }
+        return Reply::ok(had.to_json());
     }
     let mut max_notes = crate::topup::MAX_TOPUP_NOTES;
     if let Some(id) = req.short_id.as_deref() {
@@ -1942,13 +2050,7 @@ async fn sales_list(State(h): State<TillHandle>) -> Reply {
 /// With `require_pos_token`, every `/v1/*` request needs the POS token, loopback included, and
 /// the token is made now if there is none (`till pair` shows it). This is for a till behind a
 /// proxy, where a phone's request can arrive from a local address.
-pub async fn serve(
-    cw: CardWallet,
-    listen: SocketAddr,
-    relay: String,
-    ops: Option<OpsConfig>,
-    require_pos_token: bool,
-) -> Result<()> {
+pub async fn serve(cw: CardWallet, listen: SocketAddr, relay: String, ops: Option<OpsConfig>, require_pos_token: bool) -> Result<()> {
     let (url, token) = match ops {
         Some(c) => (Some(c.url), Some(c.token)),
         None => (None, None),
@@ -1988,6 +2090,8 @@ pub struct ServeOptions {
     pub spares: crate::ops::SpareConfig,
     /// How long the phones' offline kits last, and their grace for redeeming.
     pub kits: crate::pool::KitConfig,
+    /// Paying invoices with a card (`POST /v1/pay`, [`crate::pay`]); off by default.
+    pub pay: crate::pay::PayConfig,
 }
 
 /// [`serve_with`], with the offline options.
@@ -2024,10 +2128,14 @@ pub async fn serve_opts(
         (None, Some(_)) => anyhow::bail!("--ops-token needs --ops-url"),
         (_, None) => match crate::claim::read_ops(&dir)? {
             Some(cfg) => {
-                if let Some(u) = ops_url.as_deref() {
-                    if crate::claim::origin(u).ok() != crate::claim::origin(&cfg.url).ok() {
-                        eprintln!("note: using {} from {}, the registry that issued this till's token, not {u}", cfg.url, crate::claim::OPS_FILE);
-                    }
+                if let Some(u) = ops_url.as_deref()
+                    && crate::claim::origin(u).ok() != crate::claim::origin(&cfg.url).ok()
+                {
+                    eprintln!(
+                        "note: using {} from {}, the registry that issued this till's token, not {u}",
+                        cfg.url,
+                        crate::claim::OPS_FILE
+                    );
                 }
                 (Some(cfg), true)
             }
@@ -2074,7 +2182,10 @@ pub async fn serve_opts(
         } else if h.is_off() {
             eprintln!("federation core consensus {v}: fee margin on offline charges turned off");
         } else {
-            eprintln!("federation core consensus {v}: offline charges keep a fee margin for {} msat + {} ppm per input and output", h.base_msat, h.ppm);
+            eprintln!(
+                "federation core consensus {v}: offline charges keep a fee margin for {} msat + {} ppm per input and output",
+                h.base_msat, h.ppm
+            );
         }
     }
     let (handle, actor) = new_with_conn(cw, relay.clone(), sales, opener, conn.clone()).await;
@@ -2088,9 +2199,14 @@ pub async fn serve_opts(
             loop {
                 tokio::time::sleep(crate::offline::SEND_EVERY).await;
                 let on_ops = conn.lock().unwrap().ops.is_some();
-                let waiting = offline.queue.lock().unwrap().file.charges.iter().any(|c| {
-                    matches!(c.state, crate::offline::ChargeState::Queued | crate::offline::ChargeState::Reported)
-                });
+                let waiting = offline
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .file
+                    .charges
+                    .iter()
+                    .any(|c| matches!(c.state, crate::offline::ChargeState::Queued | crate::offline::ChargeState::Reported));
                 if on_ops && waiting && !h.is_busy() {
                     let r = h.send_offline().await;
                     if r.status != 200 && r.body["error"] != "busy" {
@@ -2104,26 +2220,42 @@ pub async fn serve_opts(
     let handle = match wallet.lightning() {
         Ok(_) => {
             let store = crate::topup::TopupStore::open(crate::topup::TopupStore::path_in(&dir))?;
-            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet })))
+            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet: wallet.clone() })))
         }
         Err(e) => {
             eprintln!("no Lightning top-ups: {e:#}");
             handle
         }
     };
+    // Invoices paid with a card, when the wallet can pay invoices. The records are resolved even
+    // with paying turned off, so a pay a restart left open is still settled.
+    let handle = match crate::pay::Pays::for_wallet(&dir, &wallet, opts.pay).await? {
+        Some(p) => {
+            if opts.pay.enabled {
+                eprintln!("paying invoices with a card: on (POST /v1/pay)");
+            }
+            handle.with_pays(p)
+        }
+        None => handle,
+    };
+    let sweeper = handle.pays().is_some().then(|| crate::pay::spawn_sweeper(handle.clone()));
     let (auth, handle) = match pos_token {
         Some(t) if require_pos_token => ("POS token required on every request", handle.with_pos_token_everywhere(t)),
         Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),
         None => ("no POS token: loopback only", handle.with_pos_token(None)),
     };
-    eprintln!("till service listening on http://{} (card relay {relay}; {auth})", listener.local_addr()?);
+    // A token with the pay scope only (`till pair --scope pay`).
+    let pay_token = crate::pos::read_pay_token(&dir)?;
+    let scoped = if pay_token.is_some() { "; a pay-scope token too" } else { "" };
+    let handle = handle.with_pay_token(pay_token);
+    eprintln!("till service listening on http://{} (card relay {relay}; {auth}{scoped})", listener.local_addr()?);
     // Ctrl-C, or SIGTERM from a service manager (StartOS, systemd): stop taking requests and
     // let the ones in flight finish.
     let shutdown = async {
         #[cfg(unix)]
         {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing the SIGTERM handler");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("installing the SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
@@ -2135,14 +2267,16 @@ pub async fn serve_opts(
         }
     };
     let server = tokio::spawn(std::future::IntoFuture::into_future(
-        axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(shutdown),
+        axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown),
     ));
     // The actor ends once the server has dropped the router (and with it every handle).
     // The sender holds a handle, so it stops with the server, or the actor would never end.
     let server = async {
         let r = server.await;
         sender.abort();
+        if let Some(s) = &sweeper {
+            s.abort();
+        }
         r
     };
     let (served, ()) = tokio::join!(server, actor);
