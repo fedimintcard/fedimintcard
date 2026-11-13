@@ -23,8 +23,13 @@
 //! a `paying` one with an operation id is followed until the federation settles it. Nothing is ever
 //! paid twice, and nothing that could still be paid is called failed.
 //!
+//! A repeated `client_ref` for a pay the card paid (or may have) answers the record, or drives it
+//! on, without the checks that guard the card (the invoice's time left, the price, ops, a PIN): a
+//! finished pay replays its answer, one still settling answers `undecided`.
+//!
 //! The PIN, the invoice (it carries the payment secret) and preimages are never logged; the
-//! preimage is answered only for a paid pay.
+//! preimage is answered only to the caller of a paid pay, in the answer to its `POST` (and that
+//! `POST`'s replay), never by `GET`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -752,7 +757,13 @@ fn fail(pays: &Pays, mut rec: PayRec, operation_id: Option<String>, reason: Stri
         rec.operation_id = operation_id;
     }
     rec.detail = Some(reason);
-    pays.record(&mut rec);
+    // `pay_failed` is what lets the value go back to the holder: it is answered only once it is on
+    // disk. Otherwise the record stays as last saved, and the till settles it again from the wallet.
+    if let Err(e) = pays.write_ahead(&mut rec) {
+        tracing::warn!("pay {}: could not save pay_failed: {e:#}", rec.pay_id);
+        let saved = pays.get(rec.pay_id).unwrap_or(rec);
+        return undecided(&saved, "the till could not record the failure; it settles the pay again, and nothing is charged or paid twice");
+    }
     tracing::warn!("pay {}: the invoice was not paid; {} msat owed to the holder", rec.pay_id, rec.price_msat);
     final_reply(&rec)
 }
@@ -849,96 +860,128 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
         return Reply::fail(400, "bad_request", format!("pin must be {PIN_MIN} to {PIN_MAX} digits"));
     }
     let Some(bolt11) = req.bolt11 else { return Reply::fail(400, "bad_request", "bolt11 is required") };
-    let now = now_ms();
-    let inv = match check_invoice(&bolt11, &pays.currency, &pays.cfg, now) {
-        Ok(i) => i,
-        Err(r) => return r,
+    // Only the payment hash for now: it says which pay a repeated `client_ref` names. A pay the
+    // card already paid (or may have) replays without the checks below, which guard the card.
+    let payment_hash = match parse_bolt11(&bolt11) {
+        Ok(i) => i.payment_hash().to_string(),
+        Err(e) => return Reply::fail(400, "bad_invoice", format!("{e:#}")),
     };
-    let fee_reserve_msat = pays.cfg.fee_reserve(req.max_fee_msat);
-    let margin_msat = pays.cfg.margin(inv.amount_msat);
-    let price_msat = match inv.amount_msat.checked_add(fee_reserve_msat).and_then(|p| p.checked_add(margin_msat)) {
-        Some(p) if p <= MAX_PRICE_MSAT => p,
-        _ => {
-            return Reply::fail(
-                400,
-                "over_limit",
-                format!("the invoice, its fee reserve and margin come to more than {MAX_PRICE_MSAT} msat"),
-            );
-        }
-    };
-    let (refused, pin_required) = {
-        let conn = h.conn();
-        let c = conn.lock().unwrap();
-        (c.refusal(), c.ops.is_some())
-    };
-    if let Some(r) = refused {
-        return r;
-    }
-    if pin_required && req.pin.is_none() {
-        return Reply::fail(400, "pin_required", "this till charges only with the holder's PIN");
-    }
-    tap.pin = req.pin.map(String::into_bytes);
 
     let admit = pays.admit.lock().await;
-    let existing = pays.store.lock().unwrap().by_ref(&client_ref).cloned();
-    let id = match existing {
-        Some(rec) => {
-            if rec.payment_hash != inv.payment_hash || rec.fee_reserve_msat != fee_reserve_msat || rec.price_msat != price_msat {
-                return Reply::fail(
-                    409,
-                    "conflict",
-                    format!("client_ref {client_ref:?} was used for pay {} of another invoice or price", rec.pay_id),
-                );
+    let mut existing = pays.store.lock().unwrap().by_ref(&client_ref).cloned();
+    // A pay whose card was refused, or whose charge a crash cut off: the sales and the card state
+    // say whether its charge exists after all (an undecided charge that resolved later). Then it is
+    // this pay's charge: the pay goes on from it, never refused for it, never charged again.
+    let mut charge_pending = false;
+    if let Some(rec) = existing.as_mut()
+        && matches!(rec.state, PayState::NotCharged | PayState::Charging)
+        && !pays.is_driven(rec.pay_id)
+    {
+        match charge_of(h, rec) {
+            Charge::Sold(sale_id, txid) => {
+                rec.state = PayState::Charged;
+                rec.sale_id = Some(sale_id);
+                rec.txid = Some(txid);
+                rec.detail = None;
+                pays.record(rec);
             }
-            match rec.state {
-                PayState::Paid | PayState::PayFailed => return final_reply(&rec),
-                _ if pays.is_driven(rec.pay_id) => {
+            Charge::Pending => {
+                if rec.state == PayState::NotCharged {
+                    // The sweeper settles it from the charge, as any `charging` record.
+                    rec.state = PayState::Charging;
+                    rec.detail = Some("the card's charge is still being resolved".into());
+                    pays.record(rec);
+                }
+                charge_pending = true;
+            }
+            Charge::None => {}
+        }
+    }
+    let replay = existing.as_ref().filter(|r| charge_pending || !matches!(r.state, PayState::Charging | PayState::NotCharged));
+    let (id, tap) = if let Some(rec) = replay {
+        // The card paid for this pay, or may have: answer it, or drive it on, whatever the
+        // invoice's time left, the till's settings, ops or a PIN say now.
+        let asked_other_fee =
+            req.max_fee_msat.is_some_and(|a| a.min(rec.fee_reserve_msat.max(pays.cfg.max_fee_msat)) != rec.fee_reserve_msat);
+        if rec.payment_hash != payment_hash || asked_other_fee {
+            return conflict(&client_ref, rec);
+        }
+        match rec.state {
+            PayState::Paid | PayState::PayFailed => return final_reply(rec),
+            _ if charge_pending => {
+                return undecided(rec, "the card's charge is still being resolved; nothing was charged again");
+            }
+            _ if pays.is_driven(rec.pay_id) => {
+                return undecided(rec, "an earlier attempt with this client_ref is in flight; nothing was charged or paid again");
+            }
+            _ => {}
+        }
+        // No card is touched: the link closes now.
+        drop(tap);
+        (rec.pay_id, None)
+    } else {
+        // A new pay, or one whose card is still to be charged: every check that guards the card.
+        let now = now_ms();
+        let (inv, fee_reserve_msat, margin_msat, price_msat) =
+            match card_checks(h, &pays, &bolt11, req.max_fee_msat, req.pin.is_some(), now) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+        tap.pin = req.pin.map(String::into_bytes);
+        let id = match existing {
+            Some(rec) => {
+                if rec.payment_hash != inv.payment_hash || rec.fee_reserve_msat != fee_reserve_msat || rec.price_msat != price_msat {
+                    return conflict(&client_ref, &rec);
+                }
+                if pays.is_driven(rec.pay_id) {
                     return undecided(&rec, "an earlier attempt with this client_ref is in flight; nothing was charged or paid again");
                 }
-                PayState::NotCharged => {
+                if rec.state == PayState::NotCharged {
                     if let Some(r) = refuse_new(h, &pays, &rec.client_ref, &inv, rec.price_msat, Some(rec.pay_id), now).await {
                         return r;
                     }
                     let mut again = rec.clone();
                     again.state = PayState::Charging;
                     again.detail = None;
+                    // The charge is made now: the daily cap counts it from now.
+                    again.created_at_ms = now;
                     if let Err(e) = pays.write_ahead(&mut again) {
                         return Reply::fail(500, "internal", format!("could not record the pay, so the card was not charged: {e:#}"));
                     }
-                    rec.pay_id
                 }
-                _ => rec.pay_id,
+                rec.pay_id
             }
-        }
-        None => {
-            if let Some(r) = refuse_new(h, &pays, &client_ref, &inv, price_msat, None, now).await {
-                return r;
+            None => {
+                if let Some(r) = refuse_new(h, &pays, &client_ref, &inv, price_msat, None, now).await {
+                    return r;
+                }
+                let rec = PayRec {
+                    pay_id: 0,
+                    client_ref,
+                    bolt11: inv.bolt11.clone(),
+                    payment_hash: inv.payment_hash.clone(),
+                    invoice_msat: inv.amount_msat,
+                    fee_reserve_msat,
+                    margin_msat,
+                    price_msat,
+                    invoice_expires_at_ms: inv.expires_at_ms,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    state: PayState::Charging,
+                    sale_id: None,
+                    txid: None,
+                    operation_id: None,
+                    preimage: None,
+                    fee_paid_msat: None,
+                    detail: None,
+                };
+                match pays.store.lock().unwrap().insert(rec) {
+                    Ok(r) => r.pay_id,
+                    Err(e) => return Reply::fail(500, "internal", format!("could not record the pay, so the card was not charged: {e:#}")),
+                }
             }
-            let rec = PayRec {
-                pay_id: 0,
-                client_ref,
-                bolt11: inv.bolt11.clone(),
-                payment_hash: inv.payment_hash.clone(),
-                invoice_msat: inv.amount_msat,
-                fee_reserve_msat,
-                margin_msat,
-                price_msat,
-                invoice_expires_at_ms: inv.expires_at_ms,
-                created_at_ms: now,
-                updated_at_ms: now,
-                state: PayState::Charging,
-                sale_id: None,
-                txid: None,
-                operation_id: None,
-                preimage: None,
-                fee_paid_msat: None,
-                detail: None,
-            };
-            match pays.store.lock().unwrap().insert(rec) {
-                Ok(r) => r.pay_id,
-                Err(e) => return Reply::fail(500, "internal", format!("could not record the pay, so the card was not charged: {e:#}")),
-            }
-        }
+        };
+        (id, Some(tap))
     };
     let Some(driving) = pays.take(id) else {
         let rec = pays.get(id);
@@ -950,9 +993,51 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
     let (h, pays, wait) = (h.clone(), pays.clone(), pays.cfg.wait);
     let task = tokio::spawn(async move {
         let _driving = driving;
-        advance(&h, &pays, id, Some(tap), wait).await
+        advance(&h, &pays, id, tap, wait).await
     });
     task.await.unwrap_or_else(|e| Reply::fail(500, "internal", format!("the pay stopped: {e}")))
+}
+
+fn conflict(client_ref: &str, rec: &PayRec) -> Reply {
+    Reply::fail(409, "conflict", format!("client_ref {client_ref:?} was used for pay {} of another invoice or price", rec.pay_id))
+}
+
+/// Every check that guards the card, run before a pay charges it (a new pay, or one whose card is
+/// still to be charged): the invoice ([`check_invoice`]), the price, ops and the PIN. Answers the
+/// invoice, the fee reserve, the margin and the price.
+fn card_checks(
+    h: &TillHandle,
+    pays: &Pays,
+    bolt11: &str,
+    max_fee_msat: Option<u64>,
+    has_pin: bool,
+    now: u64,
+) -> Result<(InvoiceFacts, u64, u64, u64), Reply> {
+    let inv = check_invoice(bolt11, &pays.currency, &pays.cfg, now)?;
+    let fee_reserve_msat = pays.cfg.fee_reserve(max_fee_msat);
+    let margin_msat = pays.cfg.margin(inv.amount_msat);
+    let price_msat = match inv.amount_msat.checked_add(fee_reserve_msat).and_then(|p| p.checked_add(margin_msat)) {
+        Some(p) if p <= MAX_PRICE_MSAT => p,
+        _ => {
+            return Err(Reply::fail(
+                400,
+                "over_limit",
+                format!("the invoice, its fee reserve and margin come to more than {MAX_PRICE_MSAT} msat"),
+            ));
+        }
+    };
+    let (refused, pin_required) = {
+        let conn = h.conn();
+        let c = conn.lock().unwrap();
+        (c.refusal(), c.ops.is_some())
+    };
+    if let Some(r) = refused {
+        return Err(r);
+    }
+    if pin_required && !has_pin {
+        return Err(Reply::fail(400, "pin_required", "this till charges only with the holder's PIN"));
+    }
+    Ok((inv, fee_reserve_msat, margin_msat, price_msat))
 }
 
 /// Why a pay of `inv` for `client_ref` may not start (a new one, or `pay_id` again after its card
@@ -999,11 +1084,12 @@ async fn refuse_new(
     }
 }
 
-/// `GET /v1/pay/{pay_id}`.
+/// `GET /v1/pay/{pay_id}`: the record, without its preimage.
 pub async fn pay_get(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>) -> Reply {
     let Some(pays) = h.pays() else { return unavailable() };
     match id.parse::<u64>().ok().and_then(|id| pays.get(id)) {
-        Some(rec) => Reply::ok(rec.to_json(true)),
+        // No preimage: it goes only to the caller, in the answer to its POST (and the POST's replay).
+        Some(rec) => Reply::ok(rec.to_json(false)),
         None => unknown_pay(),
     }
 }
@@ -1167,6 +1253,48 @@ mod tests {
         }
         assert_eq!(s.charged_since(1_000), 1_111);
         assert_eq!(s.charged_since(0), 1_001_111);
+    }
+
+    /// A wallet side that is never asked.
+    struct NoLn;
+    impl PayLightning for NoLn {
+        fn pay(&self, _: String, _: u64, _: Duration) -> BoxFuture<'_, Result<WalletPay>> {
+            Box::pin(async { bail!("not asked") })
+        }
+        fn resolve(&self, _: String, _: Duration) -> BoxFuture<'_, Result<WalletPay>> {
+            Box::pin(async { bail!("not asked") })
+        }
+        fn status(&self, _: String, _: Duration) -> BoxFuture<'_, Result<Option<WalletPay>>> {
+            Box::pin(async { bail!("not asked") })
+        }
+    }
+
+    #[test]
+    fn a_failure_is_answered_only_once_it_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PayStore::path_in(dir.path());
+        let mut store = PayStore::open(&path).unwrap();
+        let r = store.insert(rec(0, PayState::Paying, 1, 1_000)).unwrap();
+        // A save that fails: pay_failed is neither answered nor kept in memory.
+        store.path = dir.path().join("missing").join("x").join(PAYS_FILE);
+        std::fs::write(dir.path().join("missing"), b"a file, not a directory").unwrap();
+        let pays = Pays::new(store, Arc::new(NoLn), PayConfig::default(), Currency::Regtest);
+        let reply = fail(&pays, r.clone(), None, "the gateway asks more".into());
+        assert_eq!(
+            (reply.status, reply.body["error"].as_str(), reply.body["state"].as_str()),
+            (202, Some("undecided"), Some("paying")),
+            "{}",
+            reply.body
+        );
+        assert!(!reply.body.to_string().contains("owed"), "{}", reply.body);
+        assert_eq!(pays.get(r.pay_id).unwrap().state, PayState::Paying);
+        assert_eq!(PayStore::open(&path).unwrap().get(r.pay_id).unwrap().state, PayState::Paying);
+        // Saved: answered.
+        pays.store.lock().unwrap().path = path.clone();
+        let reply = fail(&pays, r.clone(), None, "the gateway asks more".into());
+        assert_eq!((reply.status, reply.body["error"].as_str()), (502, Some("pay_failed")), "{}", reply.body);
+        assert_eq!(pays.get(r.pay_id).unwrap().state, PayState::PayFailed);
+        assert_eq!(PayStore::open(&path).unwrap().get(r.pay_id).unwrap().state, PayState::PayFailed);
     }
 
     #[test]

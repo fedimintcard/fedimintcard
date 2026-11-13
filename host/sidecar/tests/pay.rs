@@ -70,6 +70,8 @@ struct FakeLn {
     by_op: Mutex<HashMap<String, WalletPay>>,
     /// `pay` calls per invoice.
     calls: Mutex<HashMap<String, usize>>,
+    /// How long `pay` takes before it answers.
+    delay: Mutex<Duration>,
     statuses: AtomicUsize,
 }
 
@@ -82,12 +84,17 @@ impl FakeLn {
             by_invoice: Mutex::new(HashMap::new()),
             by_op: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
+            delay: Mutex::new(Duration::ZERO),
             statuses: AtomicUsize::new(0),
         })
     }
 
     fn set(&self, m: Mode) {
         *self.mode.lock().unwrap() = m;
+    }
+
+    fn delay(&self, d: Duration) {
+        *self.delay.lock().unwrap() = d;
     }
 
     fn calls(&self, bolt11: &str) -> usize {
@@ -126,6 +133,10 @@ impl PayLightning for FakeLn {
     fn pay(&self, bolt11: String, max_fee_msat: u64, _wait: Duration) -> BoxFuture<'_, anyhow::Result<WalletPay>> {
         Box::pin(async move {
             *self.calls.lock().unwrap().entry(bolt11.clone()).or_default() += 1;
+            let delay = *self.delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             // Paying again answers the earlier payment, unless it was refunded.
             if let Some(o) = self.status_of(&bolt11)
                 && !matches!(o, WalletPay::Failed { .. })
@@ -310,6 +321,14 @@ impl Fx {
 
     /// A restart of the pay layer: the records are read back from `pays.json`; the card wallet,
     /// the sales and the wallet side (the federation's memory) are the same.
+    /// Rewrite pay `pay_id` in `pays.json` with `edit` (then [`Self::restart`] reads it back).
+    fn edit_on_disk(&self, pay_id: u64, edit: impl FnOnce(&mut pay::PayRec)) {
+        let mut disk = PayStore::open(PayStore::path_in(self.dir.path())).unwrap();
+        let mut r = disk.get(pay_id).unwrap().clone();
+        edit(&mut r);
+        disk.put(&r).unwrap();
+    }
+
     fn restart(&mut self, cfg: PayConfig) {
         let store = PayStore::open(PayStore::path_in(self.dir.path())).unwrap();
         self.handle = self.handle.clone().with_pays(Pays::new(store, self.ln.clone(), cfg, Currency::Regtest));
@@ -378,9 +397,11 @@ async fn a_card_pays_an_invoice_and_a_repeat_neither_charges_nor_pays_again() ->
     assert_eq!((status, c["error"].as_str()), (409, Some("invoice_in_use")), "{c}");
     assert_eq!((f.ln.total_calls(), f.signs.get(), f.sales_for("b")), (1, signed, 0));
 
-    // The record and the list.
+    // The record and the list. The preimage goes only to the caller (its POST, and that POST
+    // replayed, above), never to whoever reads the record.
     let (status, g) = f.get("/v1/pay/1").await;
-    assert_eq!((status, g["state"].as_str(), g["preimage"].as_str()), (200, Some("paid"), Some("99".repeat(32).as_str())), "{g}");
+    assert_eq!((status, g["state"].as_str(), g["fee_paid_msat"].as_u64()), (200, Some("paid"), Some(FEE_PAID)), "{g}");
+    assert!(g.get("preimage").is_none() && !g.to_string().contains(&"99".repeat(32)), "{g}");
     assert_eq!(g["client_ref"], "a");
     assert_eq!(f.get("/v1/pay/2").await.0, 404);
     assert_eq!(f.get("/v1/pay/x").await.0, 404);
@@ -659,6 +680,161 @@ async fn a_charge_whose_answer_was_lost_pays_once_and_an_unresolved_one_never_pa
     f.restart(cfg());
     pay::sweep(&f.handle).await;
     assert_eq!((f.state_of(id), f.ln.calls(&bolt11), f.ln.total_calls(), f.sales_for("unresolved")), (PayState::Charging, 0, 0, 0));
+
+    // Recorded not_charged, as a refusal read before the charge showed up would leave it: a
+    // repeat finds the charge unresolved, and neither charges again nor refuses the pay for it.
+    f.edit_on_disk(id, |r| r.state = PayState::NotCharged);
+    f.restart(cfg());
+    let signed = f.signs.get();
+    let (s, b) = f.post(req(&bolt11, "unresolved")).await;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("charging")), "{b}");
+    assert_eq!((f.state_of(id), f.signs.get(), f.ln.total_calls(), f.sales_for("unresolved")), (PayState::Charging, signed, 0, 0));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_replays_whatever_the_invoice_the_settings_or_the_till_say_now() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    let bolt11 = hour_invoice(10_000);
+    let (s, paid) = f.post(req(&bolt11, "a")).await;
+    assert_eq!((s, paid["state"].as_str()), (200, Some("paid")), "{paid}");
+    f.ln.set(Mode::InFlight);
+    let slow = hour_invoice(10_000);
+    let (s, b) = f.post(req(&slow, "slow")).await;
+    assert_eq!((s, b["state"].as_str()), (202, Some("paying")), "{b}");
+    let (signed, opens, calls) = (f.signs.get(), f.opens.get(), f.ln.total_calls());
+
+    // The operator restarts with settings no pay of these invoices would pass now: an hour is too
+    // little time left, the margin and the fee cap differ.
+    f.restart(PayConfig { min_expiry_secs: 7200, margin_msat: 999, max_fee_msat: 500, ..cfg() });
+    let (s, again) = f.post(req(&bolt11, "a")).await;
+    assert_eq!((s, &again), (200, &paid));
+    let (s, b) = f.post(req(&slow, "slow")).await;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("paying")), "{b}");
+    // Another invoice, or another fee asked, under the ref is still a conflict.
+    let (s, c) = f.post(req(&hour_invoice(10_000), "a")).await;
+    assert_eq!((s, c["error"].as_str()), (409, Some("conflict")), "{c}");
+    let (s, c) = f.post(json!({"bolt11": bolt11, "max_fee_msat": 999, "client_ref": "a"})).await;
+    assert_eq!((s, c["error"].as_str()), (409, Some("conflict")), "{c}");
+    // A new pay meets the new settings.
+    let (s, c) = f.post(req(&hour_invoice(10_000), "new")).await;
+    assert_eq!((s, c["error"].as_str()), (400, Some("invoice_expired")), "{c}");
+    assert_eq!((f.signs.get(), f.opens.get(), f.ln.total_calls()), (signed, opens, calls), "no card, no payment");
+    assert_eq!((f.sales_for("a"), f.sales_for("slow")), (1, 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_that_exists_after_all_is_this_pays_and_pays_once() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    // Two pays whose card paid, then a crash: one left `charging`, one recorded `not_charged` as a
+    // refusal read before the charge showed up would leave it.
+    let mut cases = vec![];
+    for cref in ["cut", "refused"] {
+        let bolt11 = hour_invoice(10_000);
+        *f.handle.pays().unwrap().crash.lock().unwrap() = Some(PayCrash::AfterCharge);
+        let (s, b) = f.post(req(&bolt11, cref)).await;
+        assert_eq!(s, 500, "{b}");
+        let id = PayStore::open(PayStore::path_in(f.dir.path()))?.by_ref(cref).unwrap().pay_id;
+        assert_eq!(f.sales_for(cref), 1);
+        cases.push((cref, bolt11, id));
+    }
+    f.edit_on_disk(cases[1].2, |r| r.state = PayState::NotCharged);
+    // The invoices now have less time left than a new pay needs: these were charged already.
+    f.restart(PayConfig { min_expiry_secs: 7200, ..cfg() });
+    let signed = f.signs.get();
+    for (cref, bolt11, id) in &cases {
+        let (s, b) = f.post(req(bolt11, cref)).await;
+        assert_eq!((s, b["state"].as_str(), b["pay_id"].as_u64()), (200, Some("paid"), Some(*id)), "{cref}: {b}");
+        assert_eq!((f.sales_for(cref), f.ln.calls(bolt11)), (1, 1), "{cref}");
+    }
+    assert_eq!(f.signs.get(), signed, "the card was not charged again");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retried_pay_counts_to_the_daily_cap_from_its_charge() -> anyhow::Result<()> {
+    let capped = PayConfig { daily_cap_msat: 2 * PRICE, ..cfg() };
+    let mut f = fx_with(capped, None).await?;
+    let old = hour_invoice(10_000);
+    let (s, b) = f.post(json!({"bolt11": old, "max_fee_msat": 1_000, "client_ref": "old", "pin": "9999"})).await;
+    assert_eq!((s, b["state"].as_str()), (403, Some("not_charged")), "{b}");
+    let id = b["pay_id"].as_u64().unwrap();
+    // Recorded a day and a bit ago.
+    f.edit_on_disk(id, |r| r.created_at_ms -= 86_400_001);
+    f.restart(capped);
+    let (s, b) = f.post(req(&hour_invoice(10_000), "today")).await;
+    assert_eq!((s, b["state"].as_str()), (200, Some("paid")), "{b}");
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+    let (s, b) = f.post(json!({"bolt11": old, "max_fee_msat": 1_000, "client_ref": "old", "pin": "1234"})).await;
+    assert_eq!((s, b["state"].as_str(), b["pay_id"].as_u64()), (200, Some("paid"), Some(id)), "{b}");
+    assert!(b["created_at_ms"].as_u64().unwrap() >= before, "{b}");
+    // Both charged today: the cap is reached.
+    let (s, b) = f.post(req(&hour_invoice(10_000), "over")).await;
+    assert_eq!((s, b["error"].as_str()), (403, Some("daily_cap")), "{b}");
+    assert_eq!(f.sales_for("over"), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invoice_that_expires_while_the_till_waits_for_funds_is_pay_failed() -> anyhow::Result<()> {
+    let mut f = fx_with(PayConfig { min_expiry_secs: 1, ..cfg() }, None).await?;
+
+    // The wallet cannot pay yet: `charged`. The invoice expires before it can; the sweeper finds
+    // nothing funded and calls it failed, the value owed to the holder.
+    f.ln.set(Mode::Insufficient);
+    let waiting = invoice(10_000, Duration::from_secs(6));
+    let (s, b) = f.post(req(&waiting, "waiting")).await;
+    assert_eq!((s, b["state"].as_str()), (202, Some("charged")), "{b}");
+    let id = b["pay_id"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    pay::sweep(&f.handle).await;
+    let rec = f.handle.pays().unwrap().get(id).unwrap();
+    assert_eq!((rec.state, f.ln.calls(&waiting), f.sales_for("waiting")), (PayState::PayFailed, 1, 1));
+    assert!(rec.detail.as_deref().unwrap().contains("expired"), "{rec:?}");
+    assert_eq!(PayStore::open(PayStore::path_in(f.dir.path()))?.get(id).unwrap().state, PayState::PayFailed);
+
+    // The wallet answers that it cannot pay only once the invoice has expired: failed at once.
+    f.ln.delay(Duration::from_secs(7));
+    let late = invoice(10_000, Duration::from_secs(6));
+    let (s, b) = f.post(req(&late, "late")).await;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (502, Some("pay_failed"), Some("pay_failed")), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("expired"), "{b}");
+    assert_eq!((f.ln.calls(&late), f.sales_for("late")), (1, 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_while_the_first_is_driven_neither_charges_nor_pays() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    f.ln.set(Mode::InFlight);
+    f.ln.delay(Duration::from_secs(3));
+    let bolt11 = hour_invoice(10_000);
+    let body = req(&bolt11, "twice");
+    let h = f.handle.clone();
+    let (first, second) = with_actor(&mut f.actor, async move {
+        let first = tokio::spawn({
+            let (h, body) = (h.clone(), body.clone());
+            async move { call(&h, "POST", "/v1/pay", body).await }
+        });
+        // The first is paying (its card charged, the wallet not answered yet).
+        let pays = h.pays().unwrap();
+        for _ in 0..200 {
+            if pays.store.lock().unwrap().by_ref("twice").is_some_and(|r| r.state == PayState::Paying) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let second = call(&h, "POST", "/v1/pay", body).await;
+        (first.await.unwrap(), second)
+    })
+    .await;
+    let (s, b) = second;
+    assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (202, Some("undecided"), Some("paying")), "{b}");
+    assert!(b["detail"].as_str().unwrap().contains("in flight"), "{b}");
+    let (s, b) = first;
+    assert_eq!((s, b["state"].as_str()), (202, Some("paying")), "{b}");
+    assert_eq!((f.ln.total_calls(), f.sales_for("twice")), (1, 1));
     Ok(())
 }
 
