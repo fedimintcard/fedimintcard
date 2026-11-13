@@ -2482,6 +2482,7 @@ dependencies = [
  "fedimint-core",
  "fedimint-mint-common",
  "fedimint-tbs",
+ "fs4",
  "hex",
  "p256",
  "rand 0.8.8",
