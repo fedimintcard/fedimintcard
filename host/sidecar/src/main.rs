@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fedimint_card_host_card::open_from_env;
 use fedimint_card_sidecar::glue::{CardWallet, Recovered};
 use fedimint_card_sidecar::sales::SalesStore;
@@ -180,7 +180,8 @@ enum TillCmd {
         replace: bool,
     },
     /// Pair a POS phone: make the POS token if there is none, and print it as a QR code to scan
-    /// in the POS app's settings (docs/POS-LINK.md).
+    /// in the POS app's settings (docs/POS-LINK.md). With `--scope pay`, pair an app that only
+    /// pays invoices with a card (docs/PAY.md).
     Pair {
         /// The till's URL as the phone reaches it: http:// or https:// (behind a proxy that
         /// terminates TLS; the phone then uses wss:// for the card link), host and port only.
@@ -191,10 +192,20 @@ enum TillCmd {
         #[arg(long)]
         text: bool,
         /// Replace the POS token first. Every paired phone must pair again, and a running till
-        /// keeps the old token until it restarts.
+        /// keeps the old token until it restarts. With `--scope pay`, the pay token.
         #[arg(long)]
         new_token: bool,
+        /// What the token opens: `pos`, the whole till API (the POS app), or `pay`, only paying
+        /// invoices with a card (`/v1/pay…`, `/v1/pays`, `/v1/health`, the card link).
+        #[arg(long, value_enum, default_value_t = PairScope::Pos)]
+        scope: PairScope,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PairScope {
+    Pos,
+    Pay,
 }
 
 #[derive(Subcommand)]
@@ -496,7 +507,36 @@ async fn main() -> Result<()> {
                 c.expires_at.saturating_sub(claim::now_ms()) / 60_000
             );
         }
-        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token }) => {
+        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token, scope: PairScope::Pay }) => {
+            use fedimint_card_sidecar::pos;
+            let url = match url {
+                Some(u) => pos::check_till_url(u)?,
+                None => format!("http://{}:9877", pos::lan_ipv4()?),
+            };
+            // The POS token guards everything else on the LAN: a till listens there only with it.
+            let (_, made_pos) = pos::ensure_token(&cli.data_dir)?;
+            let (token, made) =
+                if *new_token { (pos::rotate_pay_token(&cli.data_dir)?, true) } else { pos::ensure_pay_token(&cli.data_dir)? };
+            let text = pos::pay_pair_text(&url, &token);
+            if *text_only {
+                println!("{text}");
+                return Ok(());
+            }
+            if made_pos {
+                eprintln!("made a POS token in {}", pos::token_path(&cli.data_dir).display());
+            }
+            if *new_token {
+                eprintln!("replaced the pay token in {}: every paying app must pair again", pos::pay_token_path(&cli.data_dir).display());
+            } else if made {
+                eprintln!("made a pay token in {}", pos::pay_token_path(&cli.data_dir).display());
+            }
+            qr(&text)?;
+            println!("{text}");
+            eprintln!(
+                "scan it in the app that pays invoices with a card. It opens only /v1/pay…, /v1/pays, /v1/health and the card link. Restart the till to take it."
+            );
+        }
+        Cmd::Till(TillCmd::Pair { url, text: text_only, new_token, scope: PairScope::Pos }) => {
             use fedimint_card_sidecar::pos;
             // Check the URL before touching the token, so a typo changes nothing.
             let url = match url {

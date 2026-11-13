@@ -543,14 +543,21 @@ impl TillHandle {
 
     /// Require `token` as a bearer on every `/v1/*` request not from loopback.
     pub fn with_pos_token(mut self, token: Option<String>) -> Self {
-        self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false };
+        self.pos_auth = crate::pos::PosAuth { token: token.map(Arc::from), everywhere: false, pay_token: self.pos_auth.pay_token.take() };
         self
     }
 
     /// Require `token` as a bearer on every `/v1/*` request, from loopback too
     /// (`till serve --require-pos-token`, for a till behind a proxy).
     pub fn with_pos_token_everywhere(mut self, token: String) -> Self {
-        self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true };
+        self.pos_auth = crate::pos::PosAuth { token: Some(Arc::from(token)), everywhere: true, pay_token: self.pos_auth.pay_token.take() };
+        self
+    }
+
+    /// Take `token` as a bearer with the pay scope only (`till pair --scope pay`): `/v1/pay…`,
+    /// `/v1/pays`, `/v1/health` and the card link, from every peer ([`crate::pos::access`]).
+    pub fn with_pay_token(mut self, token: Option<String>) -> Self {
+        self.pos_auth.pay_token = token.map(Arc::from);
         self
     }
 
@@ -2169,7 +2176,11 @@ pub async fn serve_opts(
         Some(t) => ("POS token required off loopback", handle.with_pos_token(Some(t))),
         None => ("no POS token: loopback only", handle.with_pos_token(None)),
     };
-    eprintln!("till service listening on http://{} (card relay {relay}; {auth})", listener.local_addr()?);
+    // A token with the pay scope only (`till pair --scope pay`).
+    let pay_token = crate::pos::read_pay_token(&dir)?;
+    let scoped = if pay_token.is_some() { "; a pay-scope token too" } else { "" };
+    let handle = handle.with_pay_token(pay_token);
+    eprintln!("till service listening on http://{} (card relay {relay}; {auth}{scoped})", listener.local_addr()?);
     // Ctrl-C, or SIGTERM from a service manager (StartOS, systemd): stop taking requests and
     // let the ones in flight finish.
     let shutdown = async {
