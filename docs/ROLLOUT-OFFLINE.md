@@ -71,7 +71,8 @@ from `registry/` (a new key, never printed):
 - [ ] The till fetches and keeps the registry's certificate key on its first online minute; offline
       charges need it, so let zion run online before the first village use.
 - Rollback: sideload the previous `.s9pk`. An offline queue on zion must be empty first
-  (`offline.queued: 0`), and from `0.1.0:4` on nothing may wait on any POS phone (step 7).
+  (`offline.queued: 0`), and from `0.1.0:4` on nothing may wait on any POS phone (step 7);
+  below `0.1.0:4`, no phone may keep a kit (step 7, Rollback).
 
 ## 5. Apps
 
@@ -118,11 +119,17 @@ log).
   sync and 0 waiting for their cards: what waits syncs only to the till it was taken for, and
   clearing the app's data, uninstalling or downgrading strands it. Each phone opens the app online
   at least once a week, the kit's life; while it reaches the till, the kit renews on its own.
-  Before a day of offline sales, an online balance tap on each card writes the notes of its
-  offline change and keys spare slots (at most 2 a tap); a card still takes only a few offline
-  sales with change in a row (ENG-864).
-- Rollback: only with 0 waiting on every phone; then the previous app on the phones, or the
-  previous `.s9pk` on zion (step 4). A till before `0.1.0:4` takes no charges from phones.
+  Before a day of offline sales, a few online taps on each card: a balance tap writes the notes
+  of its offline change and keys at most 2 never-keyed slots (fewer when it writes notes or sends
+  releases), and only a charge renews settled spent slots, so once every slot is keyed a balance
+  tap adds no fresh one (`TILL-API.md`, "Spare slots for offline change"). A card still takes
+  only a few offline sales with change in a row (ENG-864).
+- Rollback: only with 0 waiting on every phone. Apps: the previous build on the phones. The till
+  below `0.1.0:4`: first remove every phone's kit (Android: clear the POS app's data; iOS: delete
+  the app), then sideload the previous `.s9pk` (step 4), then reinstall the iOS app and pair the
+  phones again. A phone with a kit sells offline whenever it cannot reach the till, a till before
+  `0.1.0:4` has no route to take those sales, unpairing keeps the kit for the same till, and a
+  phone that reaches a till at `0.1.0:4` or later fetches a new one.
 
 ## Afterwards
 
@@ -130,5 +137,7 @@ log).
   `~/.local/share/fedimint-card-staging`, from `a630a22` since 2026-11-11, listening on the LAN
   with caps of 3 payments and 100,000 msat (its wallet held 51,499,000 msat then). Both staging
   cards (`908901dc`, `4f5e6da3`) read 0 live msat on the staging registry on 2026-11-12: load one
-  (`card load`) before step 7's staging pass.
+  (`card load`) before step 7's staging pass. That pass also runs the count cap's refusal (cap 3)
+  and the checks the zion drills did not run (`POS-OFFLINE.md` § Drill log, "Not run in these
+  drills").
 - Open items: `OFFLINE-PLAN.md` § 10, and ENG-864 to ENG-867 (`POS-OFFLINE.md` § Drill log).

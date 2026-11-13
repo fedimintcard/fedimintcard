@@ -2,8 +2,10 @@
 
 A POS phone with no network takes a 3.0 card payment, shows "Paid offline" and what waits to sync,
 and the money reaches the till's wallet when the phone next reaches the till. A genuine card
-cannot pay twice with the same note. A cloned card, or a lost or rooted phone, costs at most the
-phone's caps, never the merchant's proceeds already queued.
+cannot pay twice with the same note. A cloned card, or a lost or rooted phone, costs the merchant
+at most the phone's caps, never the proceeds already queued; a lost or wiped phone also strands,
+on the holders' cards, the inputs of the sales it had not synced, and the caps do not bound that
+(risk 6, ENG-867).
 
 Online, the hosted till does the charge exactly as before (`docs/TILL-API.md`); nothing in the
 online path changes but for a sale the till's own offline queue holds `signing` (below). This
@@ -467,10 +469,21 @@ sale `double_spent`, counted, and its change slots are released at the next onli
 staging pass itself: the staging till stays up on the laptop for a later run, once a staging card
 is loaded.
 
-**Not run in these drills**, from the apps' owner's passes: a card pulled mid-SIGN and Try again,
-Abandon and that card's next tap, the phone locked mid-tap (iOS), the store's file class (iOS), the
-kit's expiry on the Pixel, unpairing or pairing a second till with payments waiting, and a boot
-with 16 KB pages (Android).
+**Not run in these drills**, from the apps' owner's passes, each with what passing means. They
+run in step 7's staging pass (`ROLLOUT-OFFLINE.md` § Afterwards).
+
+- A card pulled mid-SIGN: "Payment not finished"; Try again with Wi-Fi on finishes it on the
+  phone, and the till sees no `POST /v1/charge` for it.
+- Abandon a held sale: that card's next tap on this phone finishes the sale.
+- The phone locked mid-tap (iOS): the sale is held or not taken, never taken twice.
+- The store's file class (iOS): complete for `offline_queue.json`, `phone-id`, `store.lock` and
+  `kit.json`.
+- The kit's expiry on the Pixel, the clock 8 days ahead in airplane mode: "The offline kit has
+  expired", and nothing is asked of the card.
+- Unpairing with payments waiting: "Unpair anyway?" first, and they stay on the phone.
+- A second till paired while payments wait: "N payments wait for the till they were taken for",
+  then they sync after pairing back.
+- A boot with 16 KB pages (Android 15's developer option): the core loads.
 
 **Found by the drills.**
 
@@ -486,7 +499,8 @@ with 16 KB pages (Android).
   notes). CHANGE slots: offline change stays in one until an online tap writes its note, so no
   phone can spend it before then. The note mix: with the notes left (one of 1,048,576 msat, one of
   524,288 and a few small ones), a 16 sat sale costs 4 to 6 change notes. An online balance tap
-  writes the change slots' notes and keys spare slots, at most 2 a tap (step 6).
+  writes the change slots' notes and keys at most 2 never-keyed slots (step 6); only a charge
+  renews settled spent slots, so once every slot is keyed a balance tap adds no fresh one.
 - **ENG-865** (Low): a price above the offline value cap gets the copy for waiting payments, under
   "Till service unreachable" (step 5).
 - **ENG-866** (Low): neither app shows the card's id (the balance answer carries `short_id`), so
@@ -504,9 +518,7 @@ with 16 KB pages (Android).
    spent and the merchant unpaid. The till filters such slots from its copy of the card; a phone
    has none. Fixed at the source by ENG-847 (online taps renew dead KEYED slots first).
 2. A store restored from a backup reuses pool entries: excluded from backups by the apps. A sale
-   lost that way costs the holder too: the inputs and the unfinished change of a lost charge stay
-   stranded on the card, the registry keeps listing those inputs live, no release exists for a
-   charge the registry never saw, and the till's online planner keeps picking them (ENG-867).
+   lost that way costs the holder as in risk 6.
 3. Pool secrets live only in the till's `offline_pool.json` and queue: a lost data directory loses
    the proceeds of charges not yet synced, and a sync after the grace finds the secrets wiped.
 4. The kit travels under the shared POS token, perhaps over plain http on a LAN: a swapped
@@ -515,8 +527,9 @@ with 16 KB pages (Android).
 5. A card pulled between `SET_CHANGE` and `SIGN` that never returns strands its CHANGE slots, as on
    a till.
 6. A lost phone loses its unsynced queue, as a lost till does; the caps bound the merchant's loss
-   (drill (d): 48 sat, the three prices). The holder loses too: the inputs and the unfinished
-   change of the lost charges stay stranded on the card, the registry keeps listing those inputs
-   live (the card's balance counts them), no release exists for a charge the registry never saw,
-   and the till's online planner keeps picking them, so an online sale that needs them fails
-   (ENG-867). A wiped or reinstalled app is the same.
+   (drill (d): 48 sat, the three prices). The holder loses too (drill (d): 65,536 msat stranded for
+   48 sat of sales; the caps count what the till is owed, not the inputs): the inputs and the
+   unfinished change of the lost charges stay stranded on the card, the registry keeps listing
+   those inputs live (the card's balance counts them), no release exists for a charge the registry
+   never saw, and the till's online planner keeps picking them, so an online sale that needs them
+   fails (ENG-867). A wiped or reinstalled app is the same.
