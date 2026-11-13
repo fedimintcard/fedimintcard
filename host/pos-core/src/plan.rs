@@ -789,7 +789,25 @@ pub fn nearest_card_amount(msat: u64, max_notes: u32, min_denom: u64, is_denom: 
             down |= 1 << b;
         }
     }
-    // Smallest value at or above: add the lowest set bit until few enough remain.
+    let down = valid(down);
+    let up = card_amount_at_least(msat, max_notes, min_denom, &is_denom);
+    match (down, up) {
+        (Some(d), Some(u)) => Some(if msat - d <= u - msat { d } else { u }),
+        (d, u) => d.or(u),
+    }
+}
+
+/// The smallest card amount at or above `msat`: at most `max_notes` notes, each a power of two at
+/// least `min_denom` for which `is_denom` holds (the upward candidate of [`nearest_card_amount`]).
+/// For a value that must not come out short, such as a refund. `None` when there is none (no
+/// notes, `msat` 0, an overflow at the top, or a note the federation does not issue).
+pub fn card_amount_at_least(msat: u64, max_notes: u32, min_denom: u64, is_denom: impl Fn(u64) -> bool) -> Option<u64> {
+    if msat == 0 || max_notes == 0 {
+        return None;
+    }
+    let shift = min_denom.max(1).next_power_of_two().trailing_zeros();
+    let floor = msat >> shift;
+    // Add the lowest set bit until few enough remain.
     let mut up = Some(floor + u64::from(floor << shift != msat));
     while let Some(v) = up {
         if v.count_ones() <= max_notes {
@@ -797,12 +815,9 @@ pub fn nearest_card_amount(msat: u64, max_notes: u32, min_denom: u64, is_denom: 
         }
         up = v.checked_add(v & v.wrapping_neg());
     }
-    let down = valid(down);
-    let up = up.and_then(valid);
-    match (down, up) {
-        (Some(d), Some(u)) => Some(if msat - d <= u - msat { d } else { u }),
-        (d, u) => d.or(u),
-    }
+    let units = up?;
+    let v = units.checked_shl(shift).filter(|v| v >> shift == units)?;
+    (units > 0 && binary(v).into_iter().all(is_denom)).then_some(v)
 }
 
 /// Most prices [`exact_prices_near`] checks with [`solve`] on each side of the asked one.
@@ -1393,6 +1408,32 @@ mod tests {
         }
         // Overflow at the top is not a candidate.
         assert_eq!(nearest_card_amount(u64::MAX, 3, 1, any), Some(u64::MAX - (u64::MAX >> 3)));
+    }
+
+    #[test]
+    fn card_amount_at_least_never_comes_out_short() {
+        // Already a card amount: unchanged.
+        assert_eq!(card_amount_at_least(1 << 16, 3, 1, any), Some(1 << 16));
+        assert_eq!(card_amount_at_least(11_150, 6, 1, any), Some(11_150 + 2));
+        // Rounded up, never down, to at most max_notes notes.
+        assert_eq!(card_amount_at_least(1_000_000, 3, 1, any), Some(1_048_576));
+        assert_eq!(card_amount_at_least(6, 1, 1, any), Some(8));
+        assert_eq!(card_amount_at_least(0b1010101, 3, 1, any), Some(0b1011000));
+        // Whole notes of at least min_denom.
+        assert_eq!(card_amount_at_least(700, 3, 1024, any), Some(1024));
+        assert_eq!(card_amount_at_least(1024 + 3, 3, 1024, any), Some(2048));
+        // Nothing to round, an overflow, or a note the federation does not issue.
+        assert_eq!(card_amount_at_least(0, 3, 1, any), None);
+        assert_eq!(card_amount_at_least(5, 0, 1, any), None);
+        assert_eq!(card_amount_at_least(u64::MAX, 3, 1, any), None);
+        let small = |n: u64| n <= 1 << 20;
+        assert_eq!(card_amount_at_least((1 << 20) + 1, 1, 1, small), None);
+        for msat in [1_234_567u64, 999_999, 11_150, 5_000_000, 77_777_777] {
+            for notes in 1..=8 {
+                let v = card_amount_at_least(msat, notes, 4, any).unwrap();
+                assert!(v >= msat && v.count_ones() <= notes && v % 4 == 0, "{msat} in {notes} -> {v}");
+            }
+        }
     }
 
     // ------------------------------------------------------------------ fee margin
