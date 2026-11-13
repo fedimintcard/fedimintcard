@@ -211,6 +211,8 @@ struct Fx {
     /// Times the till opened the card.
     opens: Rc<Cell<u32>>,
     signs: Rc<Cell<u32>>,
+    /// The card behind the opener.
+    card: Rc<RefCell<SoftCard>>,
 }
 
 /// Give `client` ecash out of thin air through the dummy module.
@@ -245,11 +247,11 @@ async fn fx_with(cfg: PayConfig, crash: Option<CrashPoint>) -> anyhow::Result<Fx
     let (fed, client) = fixture(Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit)).await?;
     let wallet = Wallet::from_client(client).await?;
     let ln = FakeLn::new();
-    let (dir, handle, actor, opens, signs) = till_on(wallet, cfg, ln.clone(), crash).await?;
-    Ok(Fx { _fed: fed, dir, handle, actor, ln, opens, signs })
+    let (dir, handle, actor, opens, signs, card) = till_on(wallet, cfg, ln.clone(), crash).await?;
+    Ok(Fx { _fed: fed, dir, handle, actor, ln, opens, signs, card })
 }
 
-type Till = (tempfile::TempDir, TillHandle, Actor, Rc<Cell<u32>>, Rc<Cell<u32>>);
+type Till = (tempfile::TempDir, TillHandle, Actor, Rc<Cell<u32>>, Rc<Cell<u32>>, Rc<RefCell<SoftCard>>);
 
 async fn till_on(wallet: Wallet, cfg: PayConfig, ln: Arc<dyn PayLightning>, crash: Option<CrashPoint>) -> anyhow::Result<Till> {
     let dir = tempfile::tempdir()?;
@@ -263,14 +265,14 @@ async fn till_on(wallet: Wallet, cfg: PayConfig, ln: Arc<dyn PayLightning>, cras
     cw.crash_point = crash;
     let sales = SalesStore::open(dir.path().join("sales.json"))?;
     let opens = Rc::new(Cell::new(0));
-    let (o, s) = (opens.clone(), signs.clone());
+    let (o, s, c) = (opens.clone(), signs.clone(), card.clone());
     let opener = Box::new(move || {
         o.set(o.get() + 1);
-        Ok(Box::new(Shared(card.clone(), s.clone())) as Box<dyn Card>)
+        Ok(Box::new(Shared(c.clone(), s.clone())) as Box<dyn Card>)
     });
     let (handle, actor) = till::new(cw, closed_port_url(), sales, opener).await;
     let pays = Pays::new(PayStore::open(PayStore::path_in(dir.path()))?, ln, cfg, Currency::Regtest);
-    Ok((dir, handle.with_pays(pays), Box::pin(actor), opens, signs))
+    Ok((dir, handle.with_pays(pays), Box::pin(actor), opens, signs, card))
 }
 
 fn closed_port_url() -> String {
@@ -551,6 +553,39 @@ async fn a_certain_failure_is_pay_failed_and_a_refused_charge_can_be_tapped_agai
     let (s, b) = f.post(req(&big, "big")).await;
     assert_eq!((s, b["error"].as_str(), b["state"].as_str()), (402, Some("insufficient"), Some("not_charged")), "{b}");
     assert_eq!(f.ln.calls(&big), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pay_records_the_card_that_paid_and_only_a_till_on_ops_refunds() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    let card_id = fedimint_card_sidecar::ops::short_id_of(&f.card.borrow_mut().get_pub(0)?);
+
+    // The card's short id is read at the charge's tap and kept with the pay.
+    f.ln.set(Mode::Refund);
+    let (s, b) = f.post(req(&hour_invoice(10_000), "failed")).await;
+    assert_eq!((s, b["state"].as_str(), b["short_id"].as_str()), (502, Some("pay_failed"), Some(card_id.as_str())), "{b}");
+    assert_eq!(f.handle.pays().unwrap().get(1).unwrap().short_id.as_deref(), Some(card_id.as_str()));
+    assert_eq!(PayStore::open(PayStore::path_in(f.dir.path()))?.get(1).unwrap().short_id.as_deref(), Some(card_id.as_str()));
+    f.ln.set(Mode::Pay);
+    let (s, b) = f.post(req(&hour_invoice(10_000), "paid")).await;
+    assert_eq!((s, b["short_id"].as_str()), (200, Some(card_id.as_str())), "{b}");
+
+    // A refund is a load recorded in the registry: a till off ops refunds nothing, and the pay
+    // stays pay_failed, owed to the holder.
+    let refund = |id: u64| {
+        let h = f.handle.clone();
+        async move { call(&h, "POST", &format!("/v1/pay/{id}/refund"), json!({})).await }
+    };
+    let (s, r) = with_actor(&mut f.actor, refund(1)).await;
+    assert_eq!((s, r["error"].as_str(), r["state"].as_str()), (503, Some("ops_not_connected"), Some("pay_failed")), "{r}");
+    assert_eq!(f.state_of(1), PayState::PayFailed);
+    // Only a pay_failed pay is refunded; an unknown one is 404.
+    let (s, r) = with_actor(&mut f.actor, refund(2)).await;
+    assert_eq!((s, r["error"].as_str(), r["state"].as_str()), (409, Some("not_refundable"), Some("paid")), "{r}");
+    let (s, r) = with_actor(&mut f.actor, refund(3)).await;
+    assert_eq!((s, r["error"].as_str()), (404, Some("unknown_pay")), "{r}");
+    assert_eq!(f.state_of(2), PayState::Paid);
     Ok(())
 }
 
@@ -867,7 +902,7 @@ async fn a_card_pays_an_invoice_through_the_till_wallet() -> anyhow::Result<()> 
     }
     let bolt11 = bolt11.to_string();
 
-    let (_dir, handle, mut actor, _opens, _signs) = till_on(wallet, cfg(), pays.ln.clone(), None).await?;
+    let (_dir, handle, mut actor, _opens, _signs, _card) = till_on(wallet, cfg(), pays.ln.clone(), None).await?;
     let h = handle.clone();
     let b = bolt11.clone();
     let (s, body) = with_actor(&mut actor, async move { call(&h, "POST", "/v1/pay", req(&b, "real")).await }).await;

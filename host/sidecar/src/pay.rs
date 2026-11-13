@@ -15,6 +15,9 @@
 //! - `paid`: the preimage and the gateway's fee.
 //! - `pay_failed`: certain the invoice was not paid. The value stays in the till's wallet, owed to
 //!   the holder.
+//! - `refunding`: saved before the refund's load ([`refund_job`], `POST /v1/pay/{id}/refund`): the
+//!   value owed goes back onto the card that paid, as a holder load (docs/TOPUP.md).
+//! - `refunded`: the value is back on the card (`refund_msat`, `refund_txid`).
 //!
 //! A record left `charging`, `charged` or `paying` (a crash, a payment still in flight, a till
 //! wallet not yet holding the amount) is driven on by the sweeper ([`sweep`]): a `charging` one is
@@ -22,6 +25,13 @@
 //! with the invoice ([`Wallet::pay_status`]) and pays only when it never funded a payment of it, and
 //! a `paying` one with an operation id is followed until the federation settles it. Nothing is ever
 //! paid twice, and nothing that could still be paid is called failed.
+//!
+//! A refund happens at most once. Its load is tagged `pay-refund:<pay_id>` in the loader's journal
+//! and kept there once finished ([`crate::holder::Loader::keep_finished`]), so a refund cut short
+//! anywhere is settled by the next call from the journal, never loaded twice: a load still in the
+//! journal is finished first, a kept one that the federation took is the refund, and only when
+//! neither exists is the card loaded. Only the card that paid takes it (its short id, read at the
+//! charge's tap).
 //!
 //! A repeated `client_ref` for a pay the card paid (or may have) answers the record, or drives it
 //! on, without the checks that guard the card (the invoice's time left, the price, ops, a PIN): a
@@ -46,9 +56,13 @@ use lightning_invoice::Currency;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::glue::on_card;
+use crate::holder::{CardFull, Loader};
 use crate::link::Link;
+use crate::ops::{OpsClient, short_id_of};
 use crate::state::write_private_json;
-use crate::till::{MAX_PRICE_MSAT, Reply, TillHandle};
+use crate::till::{MAX_PRICE_MSAT, Reply, TillHandle, error_reply};
+use crate::topup::Topups;
 use crate::wallet::{Wallet, WalletPay, parse_bolt11};
 
 pub const PAYS_FILE: &str = "pays.json";
@@ -66,6 +80,21 @@ const STATUS_WAIT: Duration = Duration::from_secs(5);
 const DAY_MS: u64 = 86_400_000;
 /// Most pays `GET /v1/pays` lists, newest last.
 pub const LIST_MAX: usize = 200;
+/// Most notes a refund loads: the price is rounded up to at most this many (and at most the card's
+/// free slots), the rounding paid by the till.
+pub const REFUND_MAX_NOTES: u32 = 6;
+/// The loader's tag of a pay's refund: `pay-refund:<pay_id>`.
+pub const REFUND_TAG_PREFIX: &str = "pay-refund:";
+
+/// The loader's tag of pay `pay_id`'s refund.
+pub fn refund_tag(pay_id: u64) -> String {
+    format!("{REFUND_TAG_PREFIX}{pay_id}")
+}
+
+/// The pay whose refund a loader's tag names.
+pub fn refund_of_tag(tag: &str) -> Option<u64> {
+    tag.strip_prefix(REFUND_TAG_PREFIX)?.parse().ok()
+}
 
 /// The charge `client_ref` of the pay `client_ref`.
 pub fn charge_ref(client_ref: &str) -> String {
@@ -141,6 +170,10 @@ pub enum PayState {
     Paying,
     Paid,
     PayFailed,
+    /// A `pay_failed` pay whose value is being loaded back onto the card.
+    Refunding,
+    /// A `pay_failed` pay whose value is back on the card.
+    Refunded,
 }
 
 impl PayState {
@@ -152,6 +185,8 @@ impl PayState {
             PayState::Paying => "paying",
             PayState::Paid => "paid",
             PayState::PayFailed => "pay_failed",
+            PayState::Refunding => "refunding",
+            PayState::Refunded => "refunded",
         }
     }
 
@@ -197,6 +232,16 @@ pub struct PayRec {
     pub fee_paid_msat: Option<u64>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The card that was charged (its short id, read at the charge's tap): the only card a
+    /// refund goes to.
+    #[serde(default)]
+    pub short_id: Option<String>,
+    /// What a refund loads back onto the card: the price, rounded up to whole notes.
+    #[serde(default)]
+    pub refund_msat: Option<u64>,
+    /// The refund's load.
+    #[serde(default)]
+    pub refund_txid: Option<String>,
 }
 
 impl PayRec {
@@ -231,6 +276,15 @@ impl PayRec {
         }
         if let Some(d) = &self.detail {
             v["detail"] = json!(d);
+        }
+        if let Some(c) = &self.short_id {
+            v["short_id"] = json!(c);
+        }
+        if matches!(self.state, PayState::Refunding | PayState::Refunded) {
+            v["refund_msat"] = json!(self.refund_msat);
+        }
+        if let Some(t) = &self.refund_txid {
+            v["refund_txid"] = json!(t);
         }
         v
     }
@@ -557,6 +611,10 @@ fn about(mut r: Reply, rec: &PayRec) -> Reply {
         b.insert("state".into(), json!(rec.state.name()));
         b.insert("price_msat".into(), json!(rec.price_msat));
         b.insert("sale_id".into(), json!(rec.sale_id));
+        // The card a refund goes to.
+        if let Some(c) = &rec.short_id {
+            b.insert("short_id".into(), json!(c));
+        }
     }
     r
 }
@@ -581,6 +639,22 @@ fn final_reply(rec: &PayRec) -> Reply {
             ),
             rec,
         ),
+        PayState::Refunding | PayState::Refunded => about(
+            Reply::fail(
+                502,
+                "pay_failed",
+                format!(
+                    "the invoice was not paid ({}); {}",
+                    rec.detail.as_deref().unwrap_or("the payment failed"),
+                    if rec.state == PayState::Refunded {
+                        "the value is back on the card"
+                    } else {
+                        "its refund to the card is not finished: refund again with the same card"
+                    }
+                ),
+            ),
+            rec,
+        ),
         PayState::NotCharged => {
             about(Reply::fail(409, "not_charged", rec.detail.clone().unwrap_or_else(|| "the card was not charged".into())), rec)
         }
@@ -597,7 +671,9 @@ async fn advance(h: &TillHandle, pays: &Arc<Pays>, id: u64, mut tap: Option<Tap>
     loop {
         let Some(mut rec) = pays.get(id) else { return unknown_pay() };
         match rec.state {
-            PayState::Paid | PayState::PayFailed | PayState::NotCharged => return final_reply(&rec),
+            PayState::Paid | PayState::PayFailed | PayState::NotCharged | PayState::Refunding | PayState::Refunded => {
+                return final_reply(&rec);
+            }
             PayState::Charging => match tap.take() {
                 None => match charge_of(h, &rec) {
                     Charge::Sold(sale_id, txid) => {
@@ -648,6 +724,10 @@ async fn advance(h: &TillHandle, pays: &Arc<Pays>, id: u64, mut tap: Option<Tap>
 /// After the card's charge answered `r`: `None` once the record is `charged` (go on and pay),
 /// else the answer.
 fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Reply> {
+    // The card that tapped: the one a refund goes back to.
+    if let Some(c) = r.body["short_id"].as_str() {
+        rec.short_id = Some(c.to_owned());
+    }
     let sold = match r.status {
         200 => Charge::Sold(r.body["sale_id"].as_u64().unwrap_or(0), r.body["txid"].as_str().unwrap_or_default().to_owned()),
         // Undecided: the charge layer resolves it; the pay waits for its sale.
@@ -665,6 +745,9 @@ fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Rep
             None
         }
         Charge::Pending => {
+            if rec.short_id.is_some() {
+                pays.record(&mut rec);
+            }
             let detail = r.body["detail"].as_str().unwrap_or("the card's charge is still being resolved").to_owned();
             Some(undecided(&rec, format!("{detail}; the invoice is paid once the charge is settled")))
         }
@@ -907,7 +990,7 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
             return conflict(&client_ref, rec);
         }
         match rec.state {
-            PayState::Paid | PayState::PayFailed => return final_reply(rec),
+            PayState::Paid | PayState::PayFailed | PayState::Refunding | PayState::Refunded => return final_reply(rec),
             _ if charge_pending => {
                 return undecided(rec, "the card's charge is still being resolved; nothing was charged again");
             }
@@ -974,6 +1057,9 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
                     preimage: None,
                     fee_paid_msat: None,
                     detail: None,
+                    short_id: None,
+                    refund_msat: None,
+                    refund_txid: None,
                 };
                 match pays.store.lock().unwrap().insert(rec) {
                     Ok(r) => r.pay_id,
@@ -1109,6 +1195,228 @@ pub async fn pays_list(State(h): State<TillHandle>) -> Reply {
     }))
 }
 
+// ------------------------------------------------------------------ refunds
+
+fn not_refundable(rec: &PayRec) -> Reply {
+    about(
+        Reply::fail(409, "not_refundable", format!("only a pay_failed pay is refunded, and pay {} is {}", rec.pay_id, rec.state.name())),
+        rec,
+    )
+}
+
+/// `POST /v1/pay/{pay_id}/refund`, with the card that paid in the field (`X-Card-Link`, or the
+/// relay): load a `pay_failed` pay's value back onto it.
+pub async fn pay_refund(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>, headers: HeaderMap) -> Reply {
+    let link = match crate::till::link_of(&h, &headers) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let r = refund_on(&h, &id, link.clone()).await;
+    // The link lives for one job.
+    if let Some(l) = link {
+        l.close();
+    }
+    r
+}
+
+async fn refund_on(h: &TillHandle, id: &str, link: Option<Link>) -> Reply {
+    let Some(pays) = h.pays() else { return unavailable() };
+    let Some(rec) = id.parse::<u64>().ok().and_then(|id| pays.get(id)) else { return unknown_pay() };
+    match rec.state {
+        // Done: answered again without a card.
+        PayState::Refunded => return Reply::ok(rec.to_json(false)),
+        PayState::PayFailed | PayState::Refunding => {}
+        _ => return not_refundable(&rec),
+    }
+    if rec.short_id.is_none() {
+        return card_unknown(&rec);
+    }
+    // A refund is a holder load, recorded in the registry.
+    let ops = {
+        let conn = h.conn();
+        let c = conn.lock().unwrap();
+        if let Some(r) = c.refusal() {
+            return about(r, &rec);
+        }
+        c.ops.clone()
+    };
+    let Some(ops) = ops else {
+        return about(
+            Reply::fail(
+                503,
+                "ops_not_connected",
+                "a refund is a load onto the card, recorded in the registry, and this till is not on one",
+            ),
+            &rec,
+        );
+    };
+    h.refund_pay(rec.pay_id, ops.client.url().to_owned(), link, pays.clone()).await
+}
+
+fn card_unknown(rec: &PayRec) -> Reply {
+    about(
+        Reply::fail(
+            409,
+            "card_unknown",
+            "the till did not record which card paid (its charge's answer was lost); the operator settles this pay by hand",
+        ),
+        rec,
+    )
+}
+
+/// Record pay `id` refunded by load `txid` of `msat`. For a pay a refund was started for (or one
+/// still `pay_failed`, whose `refunding` save was lost); any other state is left as it is.
+fn mark_refunded(pays: &Pays, id: u64, txid: &str, msat: u64) {
+    let Some(mut rec) = pays.get(id) else { return };
+    if !matches!(rec.state, PayState::Refunding | PayState::PayFailed) {
+        return;
+    }
+    rec.state = PayState::Refunded;
+    rec.refund_txid = Some(txid.to_owned());
+    rec.refund_msat = Some(msat);
+    pays.record(&mut rec);
+    tracing::info!("pay {id}: refunded {msat} msat to the card in {txid}");
+}
+
+/// The refund of pay `id`, in the till's actor (it shares the job slot with every card job).
+///
+/// 1. Finish every load an earlier run left (a refund's, or a top-up's, which is marked loaded).
+/// 2. A kept load of this refund the federation took: refunded, nothing loaded again.
+/// 3. Otherwise nothing of this refund ever reached the card: open the card, check it is the one
+///    that paid, round the price up to what its free slots hold ([`REFUND_MAX_NOTES`] at most),
+///    save `refunding`, load. A load cut short stays in the journal (the pay stays `refunding`
+///    and the next call finishes it); one that left nothing puts the pay back to `pay_failed`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refund_job(
+    wallet: &crate::wallet::Wallet,
+    dir: &Path,
+    open: impl FnOnce() -> Result<Box<dyn fedimint_card_host_card::Card>>,
+    topups: Option<&Topups>,
+    pays: &Pays,
+    id: u64,
+    ops_url: &str,
+    till_ops: Option<OpsClient>,
+) -> Reply {
+    let tag = refund_tag(id);
+    let loader = match Loader::new(wallet, ops_url, dir) {
+        Ok(l) => l.with_tag(tag.clone()).keep_finished(),
+        Err(e) => return error_reply(&e),
+    };
+    let loader = match till_ops.clone() {
+        Some(k) => loader.with_keyer(k),
+        None => loader,
+    };
+    match loader.resume_each().await {
+        Ok(done) => {
+            for f in done {
+                let (Some(t), Some(live)) = (&f.load.tag, &f.live) else { continue };
+                match refund_of_tag(t) {
+                    Some(pid) => mark_refunded(pays, pid, &f.load.txid, live.iter().map(|(_, m)| m).sum()),
+                    None => {
+                        if let Some(tp) = topups {
+                            crate::till::mark_loaded(tp, t, &f.load.txid, &f.load.short_id);
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return refund_error(pays, &loader, id, error_reply(&e)),
+    }
+    match loader.kept(&tag) {
+        Ok(kept) => {
+            if let Some(k) = kept.iter().find(|k| k.accepted) {
+                mark_refunded(pays, id, &k.txid, k.notes.iter().map(|(_, m)| m).sum());
+            }
+        }
+        Err(e) => return refund_error(pays, &loader, id, error_reply(&e)),
+    }
+    let Some(mut rec) = pays.get(id) else { return unknown_pay() };
+    match rec.state {
+        PayState::Refunded => return Reply::ok(rec.to_json(false)),
+        PayState::PayFailed | PayState::Refunding => {}
+        _ => return not_refundable(&rec),
+    }
+    let Some(want) = rec.short_id.clone() else { return card_unknown(&rec) };
+    let mut card = match open() {
+        Ok(c) => c,
+        Err(e) => return about(error_reply(&e), &rec),
+    };
+    let got = match on_card(|| card.get_pub(0)) {
+        Ok(k) => short_id_of(&k),
+        Err(e) => return about(error_reply(&e), &rec),
+    };
+    if !got.eq_ignore_ascii_case(&want) {
+        return about(
+            Reply::fail(
+                409,
+                "wrong_card",
+                format!("pay {} was paid by card {want}, not this one (card {got}); nothing was loaded", rec.pay_id),
+            ),
+            &rec,
+        );
+    }
+    // The price, rounded up to whole notes the card has room for.
+    let slots = match till_ops.as_ref().map_or_else(|| OpsClient::holder(ops_url), |c| Ok(c.clone())) {
+        Ok(c) => c.free_slots(&want).await,
+        Err(e) => return about(error_reply(&e), &rec),
+    };
+    let room = match slots {
+        // Unkeyed slots (split keying) count: the load keys them at this tap.
+        Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
+        Err(e) => return about(Reply::fail(502, "ops_unreachable", format!("the card's free slots: {e}")), &rec),
+    };
+    if room == 0 {
+        return about(
+            Reply::fail(409, "card_full", "the card has no free slot: spend from it, then refund again; nothing was loaded"),
+            &rec,
+        );
+    }
+    let cfg = &wallet.mint_cfg;
+    let Some(amount) = crate::plan::card_amount_at_least(rec.price_msat, room.min(REFUND_MAX_NOTES), wallet.min_denom(), |n| {
+        cfg.tbs_pks.get(fedimint_core::Amount::from_msats(n)).is_some()
+    }) else {
+        return about(Reply::fail(422, "no_refund_amount", format!("{} msat rounds to no amount the card can hold", rec.price_msat)), &rec);
+    };
+    rec.state = PayState::Refunding;
+    rec.refund_msat = Some(amount);
+    rec.refund_txid = None;
+    if let Err(e) = pays.write_ahead(&mut rec) {
+        let saved = pays.get(id).unwrap_or(rec);
+        return about(Reply::fail(500, "internal", format!("could not record the refund, so nothing was loaded: {e:#}")), &saved);
+    }
+    match loader.load(card.as_mut(), &[amount]).await {
+        Ok(r) => {
+            mark_refunded(pays, id, &r.txid, r.notes.iter().map(|(_, m)| m).sum());
+            match pays.get(id) {
+                Some(rec) => Reply::ok(rec.to_json(false)),
+                None => unknown_pay(),
+            }
+        }
+        Err(e) => {
+            let r = match e.downcast_ref::<CardFull>() {
+                Some(full) => Reply::fail(409, "card_full", format!("{full}: spend from the card, then refund again; nothing was loaded")),
+                None => error_reply(&e),
+            };
+            refund_error(pays, &loader, id, r)
+        }
+    }
+}
+
+/// A refund that stopped with `r`: still `refunding` while its load is in the journal (the next
+/// call finishes it, never loads again), `pay_failed` again when nothing of it is in flight.
+fn refund_error(pays: &Pays, loader: &Loader<'_>, id: u64, r: Reply) -> Reply {
+    let Some(mut rec) = pays.get(id) else { return r };
+    // A journal that cannot be read counts as in flight.
+    let tag = refund_tag(id);
+    let in_flight = loader.pending().map_or(true, |p| p.iter().any(|l| l.tag.as_deref() == Some(tag.as_str())));
+    if rec.state == PayState::Refunding && !in_flight {
+        rec.state = PayState::PayFailed;
+        rec.refund_msat = None;
+        pays.record(&mut rec);
+    }
+    about(r, &rec)
+}
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::bitcoin::hashes::{Hash as _, sha256};
@@ -1152,6 +1460,9 @@ mod tests {
             preimage: None,
             fee_paid_msat: None,
             detail: None,
+            short_id: None,
+            refund_msat: None,
+            refund_txid: None,
         }
     }
 
@@ -1295,6 +1606,35 @@ mod tests {
         assert_eq!((reply.status, reply.body["error"].as_str()), (502, Some("pay_failed")), "{}", reply.body);
         assert_eq!(pays.get(r.pay_id).unwrap().state, PayState::PayFailed);
         assert_eq!(PayStore::open(&path).unwrap().get(r.pay_id).unwrap().state, PayState::PayFailed);
+    }
+
+    #[test]
+    fn a_refund_is_tagged_by_its_pay_and_answered_as_a_failed_pay() {
+        assert_eq!(refund_tag(42), "pay-refund:42");
+        assert_eq!(refund_of_tag(&refund_tag(42)), Some(42));
+        assert_eq!(refund_of_tag("0123456789abcdef"), None);
+        assert_eq!(refund_of_tag("pay-refund:x"), None);
+
+        let mut r = rec(5, PayState::PayFailed, 1, 1_000);
+        r.short_id = Some("3d13135c".into());
+        r.refund_msat = Some(1_024);
+        // pay_failed: the card it is owed to, no refund yet.
+        let v = r.to_json(false);
+        assert_eq!(v["short_id"], "3d13135c");
+        assert!(v.get("refund_msat").is_none() && v.get("refund_txid").is_none(), "{v}");
+        assert_eq!(final_reply(&r).body["short_id"], "3d13135c");
+        for (state, name) in [(PayState::Refunding, "refunding"), (PayState::Refunded, "refunded")] {
+            r.state = state;
+            r.refund_txid = (state == PayState::Refunded).then(|| "ef".repeat(32));
+            let v = r.to_json(true);
+            assert_eq!((v["state"].as_str(), v["refund_msat"].as_u64()), (Some(name), Some(1_024)), "{v}");
+            assert!(v.get("preimage").is_none() && v.get("fee_paid_msat").is_none(), "{v}");
+            // Replaying the POST of a refunded pay still says its invoice was not paid.
+            let f = final_reply(&r);
+            assert_eq!((f.status, f.body["error"].as_str(), f.body["state"].as_str()), (502, Some("pay_failed"), Some(name)));
+            assert!(!state.is_open());
+        }
+        assert_eq!(r.to_json(false)["refund_txid"], "ef".repeat(32));
     }
 
     #[test]

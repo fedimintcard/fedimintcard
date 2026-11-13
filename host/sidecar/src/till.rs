@@ -417,6 +417,15 @@ enum Job {
         topups: Arc<Topups>,
         reply: oneshot::Sender<Reply>,
     },
+    /// Load a `pay_failed` pay's value back onto the card that paid (`crate::pay::refund_job`).
+    PayRefund {
+        pay_id: u64,
+        ops_url: String,
+        link: Option<Link>,
+        pays: Arc<crate::pay::Pays>,
+        topups: Option<Arc<Topups>>,
+        reply: oneshot::Sender<Reply>,
+    },
 }
 
 /// What handlers hold. Cheap to clone, `Send + Sync`.
@@ -501,6 +510,12 @@ impl TillHandle {
         let cref = client_ref.clone();
         run_job(self, Some((&cref, price)), |reply| Job::Charge { price, client_ref: Some(client_ref), pin, link, online_only, reply })
             .await
+    }
+
+    /// Refund pay `pay_id` onto the card in the field (or behind `link`) through the actor.
+    pub(crate) async fn refund_pay(&self, pay_id: u64, ops_url: String, link: Option<Link>, pays: Arc<crate::pay::Pays>) -> Reply {
+        let topups = self.topups.clone();
+        run_job(self, None, |reply| Job::PayRefund { pay_id, ops_url, link, pays, topups, reply }).await
     }
 
     pub(crate) fn sales(&self) -> Arc<Mutex<SalesStore>> {
@@ -659,8 +674,15 @@ async fn actor(
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
+                        // A pay's charge: which card paid, so a refund goes back to it only.
+                        let short_id =
+                            if online_only { on_card(|| cw.card.get_pub(0)).ok().map(|k| crate::ops::short_id_of(&k)) } else { None };
                         let off = if online_only { None } else { off.as_deref() };
-                        charge_job_with(&mut cw, ops.as_ref(), off, price, client_ref, &sales).await
+                        let mut r = charge_job_with(&mut cw, ops.as_ref(), off, price, client_ref, &sales).await;
+                        if let (Some(c), Some(b)) = (short_id, r.body.as_object_mut()) {
+                            b.insert("short_id".into(), json!(c));
+                        }
+                        r
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
@@ -737,6 +759,12 @@ async fn actor(
                 let r = topup_load_job(&cw.wallet, &dir, &opener, link.as_ref(), &topups, &topup_id, amount_msat, &ops_url, keyer).await;
                 (reply, r)
             }
+            Job::PayRefund { pay_id, ops_url, link, pays, topups, reply } => {
+                let till_ops = ops.as_ref().map(|o| o.client.clone());
+                let open = || on_card(|| open_for(&opener, link.as_ref()));
+                let r = crate::pay::refund_job(&cw.wallet, &dir, open, topups.as_deref(), &pays, pay_id, &ops_url, till_ops).await;
+                (reply, r)
+            }
         };
         cw.card = Box::new(NoCard);
         // The holder's PIN lives for one job.
@@ -811,7 +839,7 @@ async fn topup_load_job(
     }
 }
 
-fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
+pub(crate) fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
     let r = topups.store.lock().unwrap().update(id, |t| {
         t.state = TopupState::Loaded;
         t.load_txid = Some(txid.to_owned());
@@ -1480,6 +1508,7 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/topup/{topup_id}/load", post(topup_load))
         .route("/v1/pay", post(crate::pay::pay))
         .route("/v1/pay/{pay_id}", get(crate::pay::pay_get))
+        .route("/v1/pay/{pay_id}/refund", post(crate::pay::pay_refund))
         .route("/v1/pays", get(crate::pay::pays_list))
         .route("/v1/offline/kit", get(crate::pos::offline_kit))
         .route(
