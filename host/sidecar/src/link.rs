@@ -167,10 +167,13 @@ pub async fn run(mut socket: WebSocket, links: Arc<Links>) {
     let id = link.id.clone();
     let deadline = Instant::now() + LINK_LIFE;
     let ready = json!({"type": "ready", "link": id}).to_string();
+    // Registered before the phone hears `ready`: a job sent the moment that frame lands must find
+    // the link, or it is refused `card_link_gone` for nothing (ENG-868).
+    links.insert(link);
     if socket.send(Message::Text(ready.into())).await.is_err() {
+        links.remove(&id);
         return;
     }
-    links.insert(link);
     tracing::info!("card link {id} open");
     let mut next = 0u64;
     let why = 'link: loop {
