@@ -136,7 +136,7 @@ log).
 - Staging keeps running for tests: the laptop till on port 9878 with
   `~/.local/share/fedimint-card-staging`, from `a630a22` since 2026-11-11, listening on the LAN
   with caps of 3 payments and 100,000 msat (its wallet held 51,499,000 msat then). Both staging
-  cards (`908901dc`, `4f5e6da3`) read 0 live msat on the staging registry on 2026-11-12: load one
+  cards (`908901dc`, `4f5e6da3`) read 0 live msat on the staging registry on 2026-11-13: load one
   (`card load`) before step 7's staging pass. That pass also runs the count cap's refusal (cap 3)
   and the checks the zion drills did not run (`POS-OFFLINE.md` § Drill log, "Not run in these
   drills").

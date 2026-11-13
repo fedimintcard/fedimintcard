@@ -181,8 +181,10 @@ tests.
 - **Spare slots offline.** A fresh card ran out of keyed spare slots after two charges with change.
   Online tills should key more ahead; an offline till may re-key the slots its own queued charges
   spent. *Built (online half):* every online tap keeps a 3.0 card at 12 fresh keyed slots (by
-  default), at most 2 keys a tap, settled SPENT slots renewed before new slots are keyed
-  (`docs/TILL-API.md`, "Spare slots for offline change"). Re-keying offline is still open.
+  default), at most 2 keys a tap. Settled SPENT slots are renewed before never-keyed slots are
+  keyed, but renewing takes the holder's PIN, so only a charge renews: a balance tap keys
+  never-keyed slots only (`docs/TILL-API.md`, "Spare slots for offline change"). Re-keying
+  offline is still open.
 - **Messages.** The POS says "card needs a top up" for "no slot for change"; the Setup app says
   "the card left the phone" for a registry refusal. *Built (POS half):* the till refuses with
   `offline_no_change_room` and a price the card can pay; both POS apps show "This card can't take
@@ -223,7 +225,9 @@ drills to zion. Sales of 16 sat, or 8 where 16 was refused:
 - (d) Three offline sales (48 sat) on the Pixel, then its data cleared: the till and the registry
   never saw them. The merchant lost the 48 sat. The three notes they spent on the card (65,536 msat)
   stay live on the registry: the card's balance counts them, and an online sale that picks them
-  fails.
+  fails. The caps bound only the merchant's loss: a lost till or phone also strands, on the
+  holders' cards, the inputs of its unsynced sales (`POS-OFFLINE.md`, risk 6); the "at most the
+  caps" of § 1 is the merchant's bound.
 
 The count cap (200) and a double spend were not staged. Found: no Android phone could open its
 offline store (fixed, PR #26); ENG-864, offline runs of 5 to 10 sales on one card (fresh keyed
