@@ -8,7 +8,8 @@ phone's caps, never the merchant's proceeds already queued.
 Online, the hosted till does the charge exactly as before (`docs/TILL-API.md`); nothing in the
 online path changes but for a sale the till's own offline queue holds `signing` (below). This
 page is how the offline path is built (ENG-841; slice 1 is ENG-842: the shared core and the
-till's routes; the apps are ENG-843, iOS, and ENG-844, Android).
+till's routes; the apps are ENG-843, iOS, and ENG-844, Android) and how it was drilled on
+production (ENG-845, § Drill log).
 
 ## Architecture
 
@@ -105,10 +106,11 @@ again for the same sale, used to have its first transaction finished and a secon
 ## The phone's store
 
 One directory in the app's protected storage: `offline_queue.json` (the till's format, 0600,
-fsync, rename), `phone-id` (16 random bytes, hex, made once) and `store.lock` (an advisory lock: a
-second open of the store is refused). The store must not be restored from a backup: an old queue
-would take pool entries again (the till refuses them, `pool_entry_reused`, and the sale is
-lost). Both apps keep the directory out of the platform's backups.
+fsync, rename), `phone-id` (16 random bytes, hex, made once) and `store.lock` (an advisory lock,
+flock(2) through `fs4` on every platform: a second open of the store is refused). The store must
+not be restored from a backup: an old queue would take pool entries again (the till refuses them,
+`pool_entry_reused`, and the sale is lost). Both apps keep the directory out of the platform's
+backups.
 
 ## The apps' interface
 
@@ -236,21 +238,7 @@ the one paired.
 taken since with the new till's kit. A charge its own till no longer knows (synced after its
 redeem window) waits for good instead of being listed refused.
 
-**The owner's pass on the Max.**
-
-1. Paired online, Settings shows the kit and its caps.
-2. Airplane mode: a sale says "Paid offline · N sats", and the home screen counts it waiting.
-3. Back online: the count moves from the phone to the till in one step, and the till lists the
-   sale.
-4. The card pulled mid-SIGN: "Payment not finished". Wi-Fi on, Try again with the same card
-   finishes it on the phone; the till sees no `POST /v1/charge` for it.
-5. The clock set 8 days ahead, airplane mode: "The offline kit has expired", and nothing is asked
-   of the card.
-6. The phone locked mid-tap: the sale is held or not taken, never taken twice.
-7. The file class of the core's files (`offline_queue.json`, `phone-id`, `store.lock`) and of
-   `kit.json`: complete.
-8. With a second till at hand, pair it while payments wait (they keep waiting, "N payments wait
-   for the till they were taken for"), then pair back (they sync).
+**The owner's pass on the Max:** § Drill log (2026-11-13), with the checks it did not run.
 
 ## Refusals
 
@@ -298,9 +286,10 @@ credential-encrypted storage, which is the encryption at rest: the core does not
 files. It holds signed transactions and the change blinding keys; the pool entries' spend keys
 stay on the till. `allowBackup="false"` and `res/xml/data_extraction_rules.xml` keep `no_backup/`
 out of cloud backup and device-to-device transfer. The store is opened once per process, on the
-core's own thread, and never closed (a second open fails on `store.lock`). A library that does not
-load or a store that does not open turns offline payments off, Settings says why, and online
-charges go on as before.
+core's own thread, and never closed (a second open fails on `store.lock`, an flock taken through
+`fs4`: std's `File::try_lock`, which the core used before PR #26, is not implemented on Android,
+so until then no Android build opened its store). A library that does not load or a store that
+does not open turns offline payments off, Settings says why, and online charges go on as before.
 
 **When the phone takes the charge** (`OfflineTill.runCharge`). A paired phone tries the till first.
 When the card link cannot open (no connection, the quick timeout, a TLS or WebSocket handshake that
@@ -357,15 +346,156 @@ another till leaves what waits on the phone for the till it was taken for: 50 or
 the head of the queue hold back the charges taken since with the new till's kit, and one its own
 till no longer knows (synced after its redeem window, once the till has dropped the entries)
 waits for good instead of being listed refused. Clearing the app's data, uninstalling or
-downgrading strands what waits on the phone.
+downgrading strands what waits on the phone (drill (d); the holder's side is risk 6).
 
-**The owner's Pixel pass** (the build touches no device): a sale in airplane mode ("Paid
-offline"), then reconnect and watch the count move to the till; pull the card mid-SIGN, then Try
-again with Wi-Fi on (it finishes on the phone; the till sees no `POST /v1/charge`); Abandon a held
-sale, then that card's next tap; the clock 8 days ahead (kit expired); unpair with payments
-waiting; with a second till at hand, pair it while payments wait (they keep waiting, "N payments
-wait for the till they were taken for"), then pair back (they sync); and a boot with 16 KB pages
-(Android 15's developer option) that loads the core.
+**The owner's Pixel pass:** § Drill log (2026-11-13), with the checks it did not run.
+
+## Drill log
+
+ENG-845's drills ran on 2026-11-13 on production. A staging rig was ready (the laptop till, built
+from `a630a22`, with caps of 3 payments and 100,000 msat), but both staging cards read 0 live msat
+on the staging registry and were not at hand, so the owner moved the drills to zion.
+
+**Rig.** zion's till, StartOS package `0.1.0:4` (built from `a630a22`), with the package's
+defaults: caps of 200 payments and 100,000 sats, kits good for a week. The production registry,
+the federation Island Bitcoin Community and the owner's card `a5c816c9`. The Max ran iOS POS
+0.1.0 (3), a dev build of `a630a22`. The Pixel ran Android POS 0.3.0 (2), a debug build of
+`a630a22`, and from drill (a) on the PR #26 branch build 0.4.0 (3), installed over it with its data
+kept (and so its pairing with zion). The owner tapped the card and read the phones; in drill
+(d) the Pixel was driven over adb and read from screenshots or, where the app blocks them (the PIN
+pad), from its UI tree (`uiautomator dump`). The card was read on the production registry around
+every step. Each number names its source: the owner's screen, the Pixel's screenshot or UI tree,
+or a registry read. Sales were of 16 sat, or 8 sat where 16 was refused. After the drills both
+phones were rebuilt from `c0a0c2f` (iOS 0.2.0 (4), Android 0.4.0 (3)).
+
+**The card.** Before the drills (registry read, 10:14 PST): 20 keyed and 12 unkeyed slots, 9 live
+notes and 1 spent, no charge open, no release. Its live notes, in msat: slot 1 1,048,576; 2
+524,288; 3 262,144; 4 4,096; 5 65,536; 6 2,048; 7 16,384; 8 8,192; 9 2,048. A balance tap on the
+Max read 1,933.312 sat (owner's screen), the registry's 1,933,312 msat. The registry through the
+drills (reads, PST; amounts in msat):
+
+| read | after | version | live | what moved |
+|---|---|---|---|---|
+| 10:14 | the baseline | 30 | 1,933,312 | the start |
+| 11:47:22 | (a) the Max's sale, before its sync | 30 | 1,933,312 | nothing |
+| 11:49:12 | (a) the Max's sync | 32 | 1,916,928 | slot 7 (16,384) spent by `5ec5755dc7b9`, no change |
+| 12:00:18 | (a) the Pixel's sync | 34 | 1,900,544 | slot 5 (65,536) spent by `19f60514686f`; change 32,768 and 16,384 in slots 10 and 11 |
+| 12:12:27 | (b) both phones' syncs | 38 | 1,875,968 | slot 8 (8,192) spent by `048be2dbb381`, no change; slot 3 (262,144) by `f5cffd11f5f8`, change 131,072, 65,536, 32,768 and 16,384 in slots 12 to 15 |
+| after 12:25 | (c) the refusals | 38 | 1,875,968 | nothing |
+| 12:42:45 | (d) an online balance tap | 39 | 1,875,968 | slot 20 keyed (21 keyed, 11 unkeyed) |
+| 12:48 | (d) three sales on the phone | 39 | 1,875,968 | nothing |
+| 12:54:28 | (d) the wipe, pairing again, online | 39 | 1,875,968 | nothing: no report of the three sales |
+| 12:58:22 | (d) an online balance tap | 40 | 1,875,968 | two slots keyed (23 keyed, 9 unkeyed); the lost sales' notes still live |
+| after 13:03 | (d) an online 16 sat sale, refused, and its retry | 43 | not read | settled spent slots 3 and 5 renewed, two slots keyed (25 keyed, 7 unkeyed) |
+| 13:12:08 | (d) an online 8 sat sale | 51 | 1,867,776 | slots 4, 6 and 9 (8,192) paid and renewed; 65,536 of the live total cannot pay |
+
+1. **Baseline** (10:00 to 10:05 PST). The Max's Settings (owner's screen): the kit fetched 1 min
+   ago and expiring in 6 days, caps of 200 payments or 100,000 sats, 0 waiting to sync, 2 synced.
+   The Pixel on 0.3.0 (2) (owner's screen, and logcat): "Offline payments are off: Store: locking
+   the offline store: try_lock() not supported". No Android build had ever opened its offline
+   store (PR #26, below). On the branch build 0.4.0 (3), installed at 11:46 (owner's screen):
+   "Offline kit: fetched 1 min ago, good for 6 days. What waits to sync is capped at 100,000 sats
+   and 200 payments. On this phone: 0 waiting to sync, 0 waiting for their cards, 0 synced.
+   Offline payments lost to double spends: 0."
+2. **(a) The Max: a sale offline, then the sync** (11:46 to 11:49 PST). Airplane mode, 16 sat:
+   "Paid offline 16 sats 5ec5755d…872c" (owner's screen); the registry had not moved. Airplane off
+   with the app in front: "1 waiting to sync", then 0 within seconds (owner's screen), and the
+   registry recorded the sale under the receipt's txid. The planner paid with the 16,384 msat note
+   whole, 384 msat over (`MAX_TILL_OVERPAY` allows 2,048), since it ranks plans with fewer change
+   notes ahead of a smaller overpay. Settings at about 11:52 (owner's screen): 0 waiting to sync,
+   3 synced.
+3. **(a) The Pixel, on 0.4.0 (3)** (by 12:00 PST). Airplane mode, 16 sat: "Paid 16 sats offline",
+   and the home screen "1 waiting to sync" (owner's screen). Airplane off: about 60 s later 0
+   waiting to sync and the till balance line at 1,494.04 sats (owner's screen). The sale took a
+   65,536 msat note with two change notes (registry): with the small notes left (8,192, 4,096,
+   2,048 and 2,048 msat), no plan without change fits in three inputs.
+4. **(b) Two phones, one card: the control run** (12:02 to 12:10 PST). Both phones with kits, both
+   in airplane mode, each charging the same card. The Max refused 16 sat ("no room for change")
+   and took 8: "Paid offline 8 sats 048be2db…02e7"; the Pixel: "Paid offline 16 sats
+   f5cffd11…a239" (owner's screen). Both back online: after about 30 s both home screens at 0
+   waiting, the till balance line at 1,518.616 sats, and on the Pixel "Offline payments lost to
+   double spends: 0" (owner's screen; the Max's build predates that line). The till's balance rose
+   by 24,576 msat, what the card's live total fell by: two txids, nothing taken twice, no double
+   spend. Neither phone spent the change the Pixel wrote in (a): offline change stays an opening in
+   a CHANGE slot until an online tap writes its note, and a phone plans only over notes
+   (`docs/OFFLINE-PROTOCOL.md` § 1). Why the Max found no room for 16 sat was not settled: the
+   refusal's detail, with the phone's count of free slots, was not read; step 5 met the same
+   refusal with the card's free slots known. The Pixel took about twice as long as the Max to sync
+   (owner).
+5. **(c) Refusals on the Max**, offline, nothing signed (around 12:25 PST). 16 sat (owner's
+   screen): "No room for change offline. This card can't take change while offline. Try 8 sats."
+   (`offline_no_change_room`, `suggested_msat` 8,000): four fresh keyed slots were left (16 to 19,
+   registry), and the smallest note that could pay, 524,288 msat, needs five change notes; 8 sat
+   pays with 4,096, 2,048 and 2,048 msat whole. 100,001 sat (owner's screen): "Till service
+   unreachable. Offline limit reached. Reach the till so waiting payments can sync." The value cap
+   held, but nothing was waiting and no sync makes that price fit (ENG-865). The clock 8 days ahead
+   (Set Automatically off), 8 sat (owner's screen): "Till service unreachable. The offline kit has
+   expired. Reach the till to renew it." With the clock back on automatic and the phone online, the
+   kit was renewed: a refused charge leaves the store's latest-seen time where it was.
+6. **(d) A wiped phone, the Pixel** (12:42 to 13:12 PST). An online balance tap first: "1,875.968
+   sats on this card" (screenshot); it keyed one spare slot, the rest of its budget having gone to
+   the notes of the six change slots (`docs/TILL-API.md`, spare slots). Airplane mode, three sales
+   of 16 sat: "Paid offline 16 sats 054c4710…184c" (screenshot), "Paid offline 16 sats
+   02fc8572…bdb1" (screenshot) and "Paid offline 16 sats 6ecaefe9…14ee" (UI tree); Settings (UI
+   tree): 3 waiting to sync, 2 synced. Airplane mode still on, the app's data cleared (`adb shell pm
+   clear org.fedimintcard.pos`), the phone paired again with zion's QR, then online. The home
+   screen (UI tree): "Till balance: 1,518.616 sats", unchanged; Settings (UI tree): 0 waiting to
+   sync, 0 synced; the registry had no report of the three sales. **The merchant lost 48 sat, the
+   three prices, and nothing else moved.** On the holder's side, the three notes those sales spent
+   (slots 11 and 15, 16,384 msat each, and one of slots 10 and 14, 32,768 msat: 65,536 msat) are
+   spent on the card under the lost sales' hashes and live on the registry: the balance after the
+   wipe read "1,875.968 sats on this card" (UI tree), 65,536 msat more than the card can pay. An
+   online 16 sat sale failed: "Something went wrong: slot 11 has already signed another
+   transaction (an offline charge not yet settled?); its note cannot pay this one". The till plans
+   from the registry's view, finds the slot spent on the card and refuses, and will plan the same
+   way at the next tap (ENG-867). Its retry answered "Till service unreachable", likely the phone's
+   timeout while the till renewed slots on the card. An online 8 sat sale from notes the lost sales
+   did not touch paid: "Paid 8 sats d48b9537…9340" (UI tree). The card's half of (d), a spent slot
+   that signs again only for its own hash, is the silicon measurement of 2026-11-07
+   (`docs/CAP-BUILD.md`: the repeat from storage in 54 ms, another hash refused with 6985); here the
+   till read slot 11 spent under a lost sale's hash and would not use it.
+
+**What could not be staged.** The count cap's refusal: zion's cap is 200 payments and the package
+does not expose the caps; it waits for the staging rig, whose cap is 3. A double spend of a genuine
+card: the card signs a note once, so a double spend needs a clone, and no clone of a genuine card
+exists. The till's side is covered in `host/sidecar/tests/offline.rs`:
+`notes_spent_elsewhere_make_the_offline_sale_a_double_spend` and
+`a_double_spend_releases_the_change_slots_at_the_next_online_tap` (the registry's 409 makes the
+sale `double_spent`, counted, and its change slots are released at the next online tap), with
+`a_phones_charge_reports_as_the_tills_own` for a phone's charge and
+`a_clone_with_an_uncertified_attestation_key_is_refused` for a clone (`card_not_genuine`). The
+staging pass itself: the staging till stays up on the laptop for a later run, once a staging card
+is loaded.
+
+**Not run in these drills**, from the apps' owner's passes: a card pulled mid-SIGN and Try again,
+Abandon and that card's next tap, the phone locked mid-tap (iOS), the store's file class (iOS), the
+kit's expiry on the Pixel, unpairing or pairing a second till with payments waiting, and a boot
+with 16 KB pages (Android).
+
+**Found by the drills.**
+
+- **PR #26** (`c0a0c2f`, merged 2026-11-13): no Android phone could open its offline store. The
+  core locked `store.lock` with std's `File::try_lock`, which Rust's std does not implement on
+  Android ("try_lock() not supported"). It came in PR #19 (`02128d2`), and nothing ran the core on
+  Android: its tests run on Linux and macOS, where the call works, and the app's unit tests fake
+  the core. The lock now goes through `fs4`, flock on every platform. Seen working on the Pixel
+  (step 1).
+- **ENG-864** (High): offline runs of 5 to 10 sales on one card, the owner's use case for an
+  offline community market. Here the card had no room for a 16 sat sale after two offline sales
+  with change. Fresh keyed slots: 10 at the start, and those two sales took 6 (2 and 4 change
+  notes). CHANGE slots: offline change stays in one until an online tap writes its note, so no
+  phone can spend it before then. The note mix: with the notes left (one of 1,048,576 msat, one of
+  524,288 and a few small ones), a 16 sat sale costs 4 to 6 change notes. An online balance tap
+  writes the change slots' notes and keys spare slots, at most 2 a tap (step 6).
+- **ENG-865** (Low): a price above the offline value cap gets the copy for waiting payments, under
+  "Till service unreachable" (step 5).
+- **ENG-866** (Low): neither app shows the card's id (the balance answer carries `short_id`), so
+  the drills read it with the card on the laptop's USB reader. The Pixel syncs about twice as
+  slowly as the Max.
+- **ENG-867** (High): notes spent by a wiped phone's sales stay live on the registry, which never
+  saw the sales: the card's balance counts them, the till's online planner picks them, and an
+  online sale that needs them fails (step 6). No release exists for a charge the registry never
+  saw.
 
 ## Risks
 
@@ -373,7 +503,10 @@ wait for the till they were taken for"), then pair back (they sync); and a boot 
    change key); the registry refuses that change at report (409) and the sale is refused, its notes
    spent and the merchant unpaid. The till filters such slots from its copy of the card; a phone
    has none. Fixed at the source by ENG-847 (online taps renew dead KEYED slots first).
-2. A store restored from a backup reuses pool entries: excluded from backups by the apps.
+2. A store restored from a backup reuses pool entries: excluded from backups by the apps. A sale
+   lost that way costs the holder too: the inputs and the unfinished change of a lost charge stay
+   stranded on the card, the registry keeps listing those inputs live, no release exists for a
+   charge the registry never saw, and the till's online planner keeps picking them (ENG-867).
 3. Pool secrets live only in the till's `offline_pool.json` and queue: a lost data directory loses
    the proceeds of charges not yet synced, and a sync after the grace finds the secrets wiped.
 4. The kit travels under the shared POS token, perhaps over plain http on a LAN: a swapped
@@ -381,4 +514,9 @@ wait for the till they were taken for"), then pair back (they sync); and a boot 
    the loss stays within the phone's caps. Per-phone pairing tokens are ENG-848.
 5. A card pulled between `SET_CHANGE` and `SIGN` that never returns strands its CHANGE slots, as on
    a till.
-6. A lost phone loses its unsynced queue, as a lost till does; the caps bound it.
+6. A lost phone loses its unsynced queue, as a lost till does; the caps bound the merchant's loss
+   (drill (d): 48 sat, the three prices). The holder loses too: the inputs and the unfinished
+   change of the lost charges stay stranded on the card, the registry keeps listing those inputs
+   live (the card's balance counts them), no release exists for a charge the registry never saw,
+   and the till's online planner keeps picking them, so an online sale that needs them fails
+   (ENG-867). A wiped or reinstalled app is the same.
