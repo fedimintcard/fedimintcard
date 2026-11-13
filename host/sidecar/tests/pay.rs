@@ -788,6 +788,56 @@ async fn a_charge_that_exists_after_all_is_this_pays_and_pays_once() -> anyhow::
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pay_cut_off_after_its_charge_still_knows_the_card_that_paid() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    let card_id = fedimint_card_sidecar::ops::short_id_of(&f.card.borrow_mut().get_pub(0)?);
+    let bolt11 = hour_invoice(10_000);
+    // The card is charged, then a crash before the pay recorded the charge's answer.
+    *f.handle.pays().unwrap().crash.lock().unwrap() = Some(PayCrash::AfterCharge);
+    let (s, b) = f.post(req(&bolt11, "cut")).await;
+    assert_eq!(s, 500, "{b}");
+    let rec = PayStore::open(PayStore::path_in(f.dir.path()))?.by_ref("cut").unwrap().clone();
+    assert_eq!((rec.state, rec.short_id), (PayState::Charging, None));
+    // The charge's sale recorded the card in the same append.
+    let sales = SalesStore::open(f.dir.path().join("sales.json"))?;
+    assert_eq!(sales.find_ref(&pay::charge_ref("cut")).unwrap().short_id.as_deref(), Some(card_id.as_str()));
+
+    // Restart; the sweeper settles the pay from its sale, and the payment fails.
+    f.restart(cfg());
+    f.ln.set(Mode::Refund);
+    pay::sweep(&f.handle).await;
+    let got = f.handle.pays().unwrap().get(rec.pay_id).unwrap();
+    assert_eq!((got.state, got.short_id.as_deref()), (PayState::PayFailed, Some(card_id.as_str())));
+    assert_eq!(PayStore::open(PayStore::path_in(f.dir.path()))?.get(rec.pay_id).unwrap().short_id.as_deref(), Some(card_id.as_str()));
+    // So its refund knows its card: not card_unknown (this till is off the registry, which a
+    // refund needs next).
+    let (h, id) = (f.handle.clone(), rec.pay_id);
+    let (s, r) = with_actor(&mut f.actor, async move { call(&h, "POST", &format!("/v1/pay/{id}/refund"), json!({})).await }).await;
+    assert_eq!((s, r["error"].as_str(), r["short_id"].as_str()), (503, Some("ops_not_connected"), Some(card_id.as_str())), "{r}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_that_cannot_say_which_card_it_is_is_not_charged_for_a_pay() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    let card_id = fedimint_card_sidecar::ops::short_id_of(&f.card.borrow_mut().get_pub(0)?);
+    let bolt11 = hour_invoice(10_000);
+    // Slot 0 answers no key: the till cannot tell which card would pay, so it charges nothing.
+    let real = std::mem::replace(&mut *f.card.borrow_mut(), SoftCard::new());
+    let signed = f.signs.get();
+    let (s, b) = f.post(req(&bolt11, "who")).await;
+    assert_ne!(s, 200, "{b}");
+    assert_eq!(b["state"], "not_charged", "{b}");
+    assert_eq!((f.signs.get(), f.sales_for("who"), f.ln.calls(&bolt11)), (signed, 0, 0));
+    // The holder taps their card again: charged once, paid, its card recorded.
+    *f.card.borrow_mut() = real;
+    let (s, b) = f.post(req(&bolt11, "who")).await;
+    assert_eq!((s, b["state"].as_str(), b["short_id"].as_str()), (200, Some("paid"), Some(card_id.as_str())), "{b}");
+    assert_eq!((f.sales_for("who"), f.ln.calls(&bolt11)), (1, 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_retried_pay_counts_to_the_daily_cap_from_its_charge() -> anyhow::Result<()> {
     let capped = PayConfig { daily_cap_msat: 2 * PRICE, ..cfg() };
     let mut f = fx_with(capped, None).await?;

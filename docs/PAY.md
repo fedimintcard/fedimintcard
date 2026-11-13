@@ -60,11 +60,15 @@ safe. The same `client_ref` never charges the card twice or pays the invoice twi
 ## Refunding a failed pay
 
 `POST /v1/pay/{pay_id}/refund` with the card that paid behind `X-Card-Link` loads the price back
-onto it, rounded up to whole notes (the till pays the rounding). It answers the pay with
-`"state":"refunded"`, `refund_msat` and `refund_txid`. It happens at most once: calling it again
-answers the same without touching the card, and a refund cut short finishes on the next call.
-Another card is refused (`wrong_card`), a full card is `card_full` (spend from it, then refund
-again), and a till off its registry cannot refund (`ops_not_connected`).
+onto it, rounded down to whole notes, never up: the till never loads more than it holds for the
+holder. It answers the pay with `"state":"refunded"`, `refund_msat` and `refund_txid`; less than
+one smallest note may stay with the till (`refund_dust_msat`). A card with too few free slots
+takes part of the refund: the answer is `200` with `"state":"pay_failed"`, `refund_msat` (on the
+card so far) and `refund_owed_msat` (the rest), and the holder spends from the card and taps again
+until the pay is `refunded`. Each load happens at most once: calling it again answers the same
+without touching the card, and a refund cut short finishes on the next call. Another card is
+refused (`wrong_card`), a full card is `card_full` (spend from it, then refund again), and a till
+off its registry cannot refund (`ops_not_connected`).
 
 ## What the holder pays
 

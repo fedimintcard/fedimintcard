@@ -58,6 +58,10 @@ pub struct SaleRec {
     /// An offline sale the federation refused after the registry took it (`ChargeState::Rejected`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rejected: bool,
+    /// The card charged (its short id), when the till knew it as it recorded the sale: what a
+    /// pay's refund goes back to (`crate::pay`), even when the pay's own record never saw the tap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

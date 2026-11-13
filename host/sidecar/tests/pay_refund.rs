@@ -51,6 +51,9 @@ struct FakeRegistry {
     outcomes: Mutex<Vec<Value>>,
     /// Answer this many outcomes 503 first (a registry that fails after the load was sent).
     fail_outcomes: AtomicUsize,
+    /// Answer this many loads 503 first, keeping none of them (a registry that may or may not
+    /// have taken the load: the till's journal keeps it, and the federation never sees it).
+    fail_loads: AtomicUsize,
     version: AtomicU64,
 }
 
@@ -68,9 +71,17 @@ async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> J
     Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": []}))
 }
 
-async fn load(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+async fn load(
+    State(r): State<Arc<FakeRegistry>>,
+    Path(_id): Path<String>,
+    Json(body): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    if r.fail_loads.load(Ordering::SeqCst) > 0 {
+        r.fail_loads.fetch_sub(1, Ordering::SeqCst);
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
+    }
     r.loads.lock().unwrap().push(body);
-    Json(json!({"ok": true, "version": 2}))
+    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 2})))
 }
 
 async fn outcome(
@@ -158,6 +169,7 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
         loads: Mutex::new(vec![]),
         outcomes: Mutex::new(vec![]),
         fail_outcomes: AtomicUsize::new(0),
+        fail_loads: AtomicUsize::new(0),
         version: AtomicU64::new(1),
     });
     let url = serve_registry(registry.clone()).await;
@@ -301,9 +313,20 @@ async fn open_link(addr: SocketAddr, card: Arc<Mutex<SoftCard>>) -> (String, tok
     (id, task)
 }
 
-/// What the till loads for a price: rounded up to whole notes, at most six here (seven free slots).
+/// What the till loads for a price with seven free slots: rounded down to whole notes, never up.
 fn refund_for(wallet: &Wallet, price: u64) -> u64 {
-    plan::card_amount_at_least(price, 6, wallet.min_denom(), |n| wallet.mint_cfg.tbs_pks.get(Amount::from_msats(n)).is_some()).unwrap()
+    plan::card_amount_at_most(price, 7, wallet.min_denom(), |n| wallet.mint_cfg.tbs_pks.get(Amount::from_msats(n)).is_some()).unwrap()
+}
+
+/// The msat of every load the registry was sent.
+fn loaded(registry: &FakeRegistry) -> Vec<u64> {
+    registry
+        .loads
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| l["notes"].as_array().unwrap().iter().map(|n| n["amount_msat"].as_u64().unwrap()).sum())
+        .collect()
 }
 
 /// 10,000 msat + a 1,000 msat fee reserve + 150 msat margin.
@@ -316,11 +339,14 @@ async fn a_pay_failed_pay_goes_back_onto_its_card_once() -> anyhow::Result<()> {
     let (f, actor) = start(true).await?;
     let id = put_pay(&f.pays, "a", PayState::PayFailed, PRICE, Some(&f.short_id));
     let want = refund_for(&f.wallet, PRICE);
-    assert!((PRICE..PRICE + 1_000).contains(&want), "{want}");
+    // Never more than the till holds for the holder; what stays is less than the smallest note.
+    let dust = PRICE - want;
+    assert!(dust < f.wallet.min_denom(), "{want}");
     let (addr, pays, registry, card, dir) = (f.addr, f.pays.clone(), f.registry.clone(), f.card.clone(), f.dir.path().to_owned());
     with_actor(actor, async move {
         let (s, v) = refund(addr, id, Some(card.clone())).await;
         assert_eq!((s, v["state"].as_str(), v["refund_msat"].as_u64()), (200, Some("refunded"), Some(want)), "{v}");
+        assert_eq!((v["refund_dust_msat"].as_u64(), v.get("refund_owed_msat")), (Some(dust), None), "{v}");
         let loads = registry.loads.lock().unwrap().clone();
         assert_eq!(loads.len(), 1);
         assert_eq!(v["refund_txid"], loads[0]["txid"]);
@@ -480,6 +506,112 @@ async fn a_refund_cut_short_before_its_load_loads_once_on_the_next_call() -> any
         let (s, v) = refund(addr, id, Some(card)).await;
         assert_eq!((s, v["state"].as_str()), (200, Some("refunded")), "{v}");
         assert_eq!(registry.loads.lock().unwrap().len(), 1);
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_with_too_few_slots_takes_the_refund_over_several_taps_and_never_more() -> anyhow::Result<()> {
+    let (f, actor) = start(true).await?;
+    // One free slot: a refund rounded up would load 2^21 for this price, twice what the till holds.
+    let price = (1u64 << 20) + (1 << 10) + 1;
+    let id = put_pay(&f.pays, "slots", PayState::PayFailed, price, Some(&f.short_id));
+    let min = f.wallet.min_denom();
+    assert!(min <= 1 << 10, "the test federation's smallest note is {min}");
+    let (addr, pays, registry, card, dir) = (f.addr, f.pays.clone(), f.registry.clone(), f.card.clone(), f.dir.path().to_owned());
+    with_actor(actor, async move {
+        registry.free.store(1, Ordering::SeqCst);
+        // The first tap loads the largest note at or below the price: pay_failed, owed the rest.
+        let (s, v) = refund(addr, id, Some(card.clone())).await;
+        assert_eq!((s, v["state"].as_str(), v["refund_msat"].as_u64()), (200, Some("pay_failed"), Some(1 << 20)), "{v}");
+        assert_eq!(v["refund_owed_msat"].as_u64(), Some((1 << 10) + 1), "{v}");
+        assert_eq!(loaded(&registry), vec![1 << 20]);
+        assert_eq!(PayStore::open(PayStore::path_in(&dir)).unwrap().get(id).unwrap().refund_msat, Some(1 << 20));
+        // The next taps load the rest, and never more than is owed: the last msat is dust.
+        for _ in 0..4 {
+            let (s, v) = refund(addr, id, Some(card.clone())).await;
+            assert_eq!(s, 200, "{v}");
+            let sum: u64 = loaded(&registry).iter().sum();
+            assert!(sum <= price, "{sum} loaded for a price of {price}");
+            assert_eq!(v["refund_msat"].as_u64(), Some(sum), "{v}");
+            if v["state"] == "refunded" {
+                break;
+            }
+            assert_eq!((v["state"].as_str(), v["refund_owed_msat"].as_u64()), (Some("pay_failed"), Some(price - sum)), "{v}");
+        }
+        let rec = pays.get(id).unwrap();
+        let sum: u64 = loaded(&registry).iter().sum();
+        assert_eq!((rec.state, rec.refund_msat), (PayState::Refunded, Some(sum)));
+        assert!(price - sum < min, "{sum} of {price}");
+        assert_eq!(loaded(&registry), vec![1 << 20, 1 << 10]);
+        let (s, v) = call(addr, "GET", &format!("/v1/pay/{id}"), None).await;
+        assert_eq!(
+            (s, v["refund_dust_msat"].as_u64(), &v["refund_txid"]),
+            (200, Some(1), &registry.loads.lock().unwrap()[1]["txid"]),
+            "{v}"
+        );
+        // Done: no further load, with or without the card.
+        let (s, v) = refund(addr, id, Some(card)).await;
+        assert_eq!((s, v["state"].as_str()), (200, Some("refunded")), "{v}");
+        assert_eq!(registry.loads.lock().unwrap().len(), 2);
+        // The journal kept both loads, each taken by the federation.
+        let journal: Value = serde_json::from_slice(&std::fs::read(dir.join(JOURNAL_FILE)).unwrap()).unwrap();
+        let kept: Vec<&Value> = journal["kept"].as_array().unwrap().iter().filter(|k| k["tag"] == format!("pay-refund:{id}")).collect();
+        assert_eq!(kept.iter().map(|k| k["accepted"].as_bool()).collect::<Vec<_>>(), vec![Some(true), Some(true)], "{journal}");
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_load_the_federation_never_took_is_kept_as_not_taken_and_loaded_once_again() -> anyhow::Result<()> {
+    let (f, actor) = start(true).await?;
+    let id = put_pay(&f.pays, "never", PayState::PayFailed, PRICE, Some(&f.short_id));
+    let want = refund_for(&f.wallet, PRICE);
+    let before = f.wallet.balance_msat().await?;
+    let (addr, pays, registry, card, dir, wallet) =
+        (f.addr, f.pays.clone(), f.registry.clone(), f.card.clone(), f.dir.path().to_owned(), f.wallet.clone());
+    with_actor(actor, async move {
+        // The registry does not answer the load: the build is dropped, never sent, and the load
+        // stays in the journal, its outcome unknown to the till. The pay stays refunding.
+        registry.fail_loads.store(1, Ordering::SeqCst);
+        let (s, v) = refund(addr, id, Some(card.clone())).await;
+        assert_ne!(s, 200, "{v}");
+        assert_eq!(v["state"], "refunding", "{v}");
+        assert_eq!(pays.get(id).unwrap().state, PayState::Refunding);
+        let tag = format!("pay-refund:{id}");
+        let journal: Value = serde_json::from_slice(&std::fs::read(dir.join(JOURNAL_FILE)).unwrap()).unwrap();
+        let pending: Vec<&Value> = journal["loads"].as_array().unwrap().iter().filter(|l| l["tag"] == tag).collect();
+        assert_eq!(pending.len(), 1, "{journal}");
+        let first = pending[0]["txid"].clone();
+        assert!(registry.loads.lock().unwrap().is_empty());
+
+        // The next call finishes that load as not taken (it is not the refund), then loads once.
+        let (s, v) = refund(addr, id, Some(card)).await;
+        assert_eq!((s, v["state"].as_str(), v["refund_msat"].as_u64()), (200, Some("refunded"), Some(want)), "{v}");
+        assert_ne!(v["refund_txid"], first);
+        let journal: Value = serde_json::from_slice(&std::fs::read(dir.join(JOURNAL_FILE)).unwrap()).unwrap();
+        assert!(journal["loads"].as_array().unwrap().is_empty(), "{journal}");
+        let kept: Vec<&Value> = journal["kept"].as_array().unwrap().iter().filter(|k| k["tag"] == tag).collect();
+        assert_eq!(
+            kept.iter().map(|k| (k["txid"].clone(), k["accepted"].as_bool())).collect::<Vec<_>>(),
+            vec![(first, Some(false)), (v["refund_txid"].clone(), Some(true))],
+            "{journal}"
+        );
+        // Only one load reached the registry and the federation.
+        assert_eq!(loaded(&registry), vec![want]);
+        // The till's wallet paid for one refund, not two (allowing for the federation's fees and
+        // change still being reissued).
+        let mut spent = 0;
+        for _ in 0..60 {
+            spent = before - wallet.balance_msat().await.unwrap();
+            if spent < want + want / 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!((want..want + want / 2).contains(&spent), "the wallet spent {spent} msat for a refund of {want}");
     })
     .await;
     Ok(())

@@ -820,6 +820,31 @@ pub fn card_amount_at_least(msat: u64, max_notes: u32, min_denom: u64, is_denom:
     (units > 0 && binary(v).into_iter().all(is_denom)).then_some(v)
 }
 
+/// The largest card amount at or below `msat`: at most `max_notes` notes, each a distinct power of
+/// two at least `min_denom` for which `is_denom` holds. For a value that must never come out over,
+/// such as a refund of what the till holds for a holder: what is left below it is less than the
+/// smallest note the card could still take. Greedy from the top: a power of two is worth more than
+/// every smaller one together, so taking the largest that fits is never worse. `None` when no note
+/// fits (`msat` below the smallest note, or no notes).
+pub fn card_amount_at_most(msat: u64, max_notes: u32, min_denom: u64, is_denom: impl Fn(u64) -> bool) -> Option<u64> {
+    if msat == 0 || max_notes == 0 {
+        return None;
+    }
+    let shift = min_denom.max(1).next_power_of_two().trailing_zeros();
+    let (mut v, mut notes) = (0u64, 0u32);
+    for b in (shift..64).rev() {
+        if notes == max_notes {
+            break;
+        }
+        let note = 1u64 << b;
+        if v + note <= msat && is_denom(note) {
+            v += note;
+            notes += 1;
+        }
+    }
+    (v > 0).then_some(v)
+}
+
 /// Most prices [`exact_prices_near`] checks with [`solve`] on each side of the asked one.
 const NEAR_TRIES: usize = 8;
 
@@ -1432,6 +1457,41 @@ mod tests {
             for notes in 1..=8 {
                 let v = card_amount_at_least(msat, notes, 4, any).unwrap();
                 assert!(v >= msat && v.count_ones() <= notes && v % 4 == 0, "{msat} in {notes} -> {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn card_amount_at_most_never_comes_out_over() {
+        // Already a card amount: unchanged.
+        assert_eq!(card_amount_at_most(1 << 16, 3, 1, any), Some(1 << 16));
+        // Rounded down, never up: the top max_notes set bits.
+        assert_eq!(card_amount_at_most(1_000_000, 3, 1, any), Some(524_288 + 262_144 + 131_072));
+        assert_eq!(card_amount_at_most(6, 1, 1, any), Some(4));
+        assert_eq!(card_amount_at_most(0b1010101, 3, 1, any), Some(0b1010100));
+        assert_eq!(card_amount_at_most((1 << 20) + (1 << 10) + 1, 1, 1, any), Some(1 << 20));
+        // Whole notes of at least min_denom: what is below the smallest note stays out.
+        assert_eq!(card_amount_at_most(11_150, 7, 512, any), Some(10_752));
+        assert_eq!(card_amount_at_most(1024 + 1023, 3, 1024, any), Some(1024));
+        // A note the federation does not issue is made of smaller ones that it does.
+        let small = |n: u64| n <= 1 << 20;
+        assert_eq!(card_amount_at_most(1 << 21, 2, 1, small), Some((1 << 20) + (1 << 19)));
+        // Nothing fits.
+        assert_eq!(card_amount_at_most(0, 3, 1, any), None);
+        assert_eq!(card_amount_at_most(5, 0, 1, any), None);
+        assert_eq!(card_amount_at_most(700, 3, 1024, any), None);
+        assert_eq!(card_amount_at_most(u64::MAX, 3, 1, any), Some(u64::MAX - (u64::MAX >> 3)));
+        for msat in [1_234_567u64, 999_999, 11_150, 5_000_000, 77_777_777, (1 << 20) + (1 << 10) + 1] {
+            for notes in 1..=8 {
+                for min in [1u64, 4, 512] {
+                    let v = card_amount_at_most(msat, notes, min, any).unwrap();
+                    assert!(v <= msat && v.count_ones() <= notes && v % min == 0, "{msat} in {notes} of {min} -> {v}");
+                    // Never further below than one note less of the smallest it took (or of min).
+                    if v.count_ones() < notes {
+                        assert!(msat - v < min, "{msat} in {notes} of {min} -> {v}");
+                    }
+                    assert_eq!(nearest_card_amount(msat, notes, min, any).map(|n| n >= v), Some(true));
+                }
             }
         }
     }

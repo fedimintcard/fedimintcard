@@ -480,8 +480,11 @@ and preimages are never logged.
 
 ### GET /v1/pay/{pay_id}, GET /v1/pays
 
-`GET /v1/pay/{pay_id}` answers the record as above, without the preimage, and with
-`refund_msat` (and `refund_txid` once loaded) for a refund; `404 unknown_pay`.
+`GET /v1/pay/{pay_id}` answers the record as above, without the preimage, and with the refund's
+fields: `refund_owed_msat` for a `pay_failed` pay (what the till still holds for the holder),
+`refund_msat` once a refund started (what is back on the card, or will be once the load in flight
+lands), `refund_txid` once a load landed, and `refund_dust_msat` for a `refunded` pay;
+`404 unknown_pay`.
 `GET /v1/pays` answers `{"count":N,"total_price_msat":N,"total_invoice_msat":N,"pays":[…]}`, the
 newest 200 oldest first, totals over `paid` pays. Records live in `<data_dir>/pays.json` (0600),
 each state saved before the step it guards.
@@ -490,27 +493,41 @@ each state saved before the step it guards.
 
 Empty body, with `X-Card-Link` (or the relay's card): loads a `pay_failed` pay's price back onto
 the card that paid, as a holder load (the top-up's load, `docs/TOPUP.md`; recorded in ops, so on
-ops only). The card's short id must be the one read at the pay's charge. The amount is the price
-rounded up to whole notes, at most 6 and at most the card's free and unkeyed slots (the till pays
-the rounding); the till's wallet pays it and the mint fees.
+ops only). The card's short id must be the one read at the pay's charge (the till reads it before
+it charges the card, and keeps it on the charge's sale too). The till's wallet pays the load and
+the mint fees.
 
-`200` with the record, `"state":"refunded"`, `"refund_msat":N` and `"refund_txid":"<hex>"`. A
-refunded pay answers the same again without touching a card.
+A refund never loads more than the till holds for the holder: each tap loads what is still owed
+rounded **down** to whole notes, at most 7 and at most the card's free and unkeyed slots. A card
+with room for all of it is refunded in one tap. A card with too few free slots takes part: the
+pay goes back to `pay_failed` with `refund_msat` (on the card so far) and `refund_owed_msat` (the
+rest), and the app asks the holder to free slots (spend from the card) and taps again; each tap
+loads more, never past the price. Once less than the smallest note the federation issues is
+still owed, the pay is `refunded`, and that remainder (`refund_dust_msat`, under one note) stays
+with the till.
 
-A refund happens at most once: `refunding` is saved before the load, and the load is tagged
-`pay-refund:<pay_id>` in `<data_dir>/holder_loads.json` and kept there once finished. A refund cut
-short after its load was sent stays `refunding`, and the next `POST` (with or without the card)
-finishes that load instead of making another; one that left nothing goes back to `pay_failed`.
-The pay's `POST /v1/pay` replay keeps answering `pay_failed` (with `state` `refunded`).
+`200` with the record: `"state":"refunded"`, `"refund_msat":N`, `"refund_dust_msat":N` and
+`"refund_txid":"<hex>"` (the last load) when done; `"state":"pay_failed"`, `"refund_msat":N` and
+`"refund_owed_msat":N` after a partial load, to tap again. A refunded pay answers the same again
+without touching a card.
+
+Each refund load happens at most once: `refunding` is saved before the load, and every load is
+tagged `pay-refund:<pay_id>` in `<data_dir>/holder_loads.json` and kept there once finished, with
+whether the federation took it. What is on the card is the sum of the kept loads it took. A refund
+cut short after its load was journalled stays `refunding`, and the next `POST` (with or without
+the card) finishes that load instead of making another: kept as taken, it counts; kept as not
+taken (the federation never saw it), it does not, and only what is still owed is loaded. A load
+that left nothing puts the pay back to `pay_failed`. The pay's `POST /v1/pay` replay keeps
+answering `pay_failed` (with `state` `refunded`).
 
 | error | HTTP | meaning | app action |
 |---|---|---|---|
 | `unknown_pay` | 404 | no such pay | none |
 | `not_refundable` | 409 | the pay is not `pay_failed` (paid, or not settled yet) | none, or wait for it to settle |
 | `wrong_card` | 409 | the card presented is not the card that paid; nothing was loaded | ask for the card that paid (`short_id`) |
-| `card_unknown` | 409 | the till did not record which card paid (the charge's answer was lost in a crash) | the operator settles it by hand |
-| `card_full` | 409 | the card has no room for the refund's notes; the pay stays `pay_failed` | spend from the card, then refund again |
-| `no_refund_amount` | 422 | the price rounds to no amount the federation's notes can make | the operator settles it by hand |
+| `card_unknown` | 409 | the till did not record which card paid (only a pay recorded before the till kept the card on the charge's sale); the value stays in the till's wallet | none at the till |
+| `card_full` | 409 | the card has no free slot for the refund's notes; the pay stays `pay_failed`, owed `refund_owed_msat` | spend from the card, then refund again |
+| `no_refund_amount` | 422 | what is still owed makes no amount the federation's notes can make | none at the till |
 | `ops_not_connected` | 503 | the till is not on a registry; a refund is a load recorded there | connect the till |
 | `ops_unreachable` | 502 | the registry could not be reached; the pay stays `pay_failed` or, with its load sent, `refunding` | retry |
 | card errors | | as `/v1/topup/{id}/load` (`no_card`, `card_link_gone`, `busy`, …) | as there |

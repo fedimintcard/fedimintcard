@@ -681,15 +681,28 @@ async fn actor(
                     Ok(card) => {
                         cw.card = card;
                         cw.pin = pin;
-                        // A pay's charge: which card paid, so a refund goes back to it only.
-                        let short_id =
-                            if online_only { on_card(|| cw.card.get_pub(0)).ok().map(|k| crate::ops::short_id_of(&k)) } else { None };
-                        let off = if online_only { None } else { off.as_deref() };
-                        let mut r = charge_job_with(&mut cw, ops.as_ref(), off, price, client_ref, &sales).await;
-                        if let (Some(c), Some(b)) = (short_id, r.body.as_object_mut()) {
-                            b.insert("short_id".into(), json!(c));
+                        // A pay's charge: which card paid, so a refund goes back to it only. A card
+                        // that cannot say is not charged: a charge with no known card could never
+                        // be refunded.
+                        let short_id = match online_only.then(|| on_card(|| cw.card.get_pub(0))) {
+                            None => Ok(None),
+                            Some(Ok(k)) => Ok(Some(crate::ops::short_id_of(&k))),
+                            Some(Err(e)) => Err(e),
+                        };
+                        match short_id {
+                            Err(e) => {
+                                tracing::warn!("a pay's charge: the card's slot 0 key could not be read, so it was not charged: {e:#}");
+                                error_reply(&e)
+                            }
+                            Ok(short_id) => {
+                                let off = if online_only { None } else { off.as_deref() };
+                                let mut r = charge_job_for(&mut cw, ops.as_ref(), off, price, client_ref, &sales, short_id.clone()).await;
+                                if let (Some(c), Some(b)) = (short_id, r.body.as_object_mut()) {
+                                    b.insert("short_id".into(), json!(c));
+                                }
+                                r
+                            }
                         }
-                        r
                     }
                     Err(e) => {
                         // A repeat of an earlier attempt can be answered without a card.
@@ -1001,7 +1014,21 @@ pub async fn charge_job_with(
     client_ref: Option<String>,
     sales: &Arc<Mutex<SalesStore>>,
 ) -> Reply {
-    let Some(ops) = ops else { return charge_with(cw, price, client_ref, sales).await };
+    charge_job_for(cw, ops, off, price, client_ref, sales, None).await
+}
+
+/// [`charge_job_with`] for the card `short_id`, read from the card in the field before the charge:
+/// its sale records it in the same append (a pay's refund goes back to that card).
+pub async fn charge_job_for(
+    cw: &mut CardWallet,
+    ops: Option<&Ops>,
+    off: Option<&crate::offline::Offline>,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+    short_id: Option<String>,
+) -> Reply {
+    let Some(ops) = ops else { return charge_with_card(cw, price, client_ref, sales, short_id).await };
     if let Some(bad) = validate_price(price) {
         return bad;
     }
@@ -1028,7 +1055,7 @@ pub async fn charge_job_with(
             return error_reply(&e);
         }
     };
-    let r = charge_with(cw, price, client_ref, sales).await;
+    let r = charge_with_card(cw, price, client_ref, sales, short_id).await;
     Ops::finish(cw, base).await;
     r
 }
@@ -1122,6 +1149,7 @@ async fn offline_charge(
         offline: true,
         double_spent: false,
         rejected: false,
+        short_id: Some(taken.short_id.clone()),
     };
     match sales.lock().unwrap().append(rec.clone()) {
         Ok(saved) => rec = saved,
@@ -1333,6 +1361,7 @@ fn sale_from(p: &PromotedSale) -> SaleRec {
         offline: false,
         double_spent: false,
         rejected: false,
+        short_id: p.short_id.clone(),
     }
 }
 
@@ -1418,6 +1447,7 @@ pub async fn settle(cw: &mut CardWallet, client_ref: &str, price: u64, sales: &A
                 inputs: p.spent.clone(),
                 change: p.change.clone(),
                 collection_pending: true,
+                short_id: cw.card_short_id(),
             };
             let rec = match sales.lock().unwrap().append(sale_from(&sale)) {
                 Ok(r) => r,
@@ -1438,6 +1468,19 @@ pub async fn settle(cw: &mut CardWallet, client_ref: &str, price: u64, sales: &A
 /// creates it, before anything is signed or submitted, so a repeat can always find its
 /// transaction. A repeat never starts a second spend while the first may still count.
 pub async fn charge_with(cw: &mut CardWallet, price: u64, client_ref: Option<String>, sales: &Arc<Mutex<SalesStore>>) -> ChargeResponse {
+    charge_with_card(cw, price, client_ref, sales, None).await
+}
+
+/// [`charge_with`], recording the sale against card `short_id` (read from the card in the field)
+/// in the same append; without one, the card the wallet's state belongs to
+/// ([`CardWallet::card_short_id`]).
+pub async fn charge_with_card(
+    cw: &mut CardWallet,
+    price: u64,
+    client_ref: Option<String>,
+    sales: &Arc<Mutex<SalesStore>>,
+    short_id: Option<String>,
+) -> ChargeResponse {
     if let Some(bad) = validate_price(price) {
         return bad;
     }
@@ -1484,6 +1527,7 @@ pub async fn charge_with(cw: &mut CardWallet, price: u64, client_ref: Option<Str
         offline: false,
         double_spent: false,
         rejected: false,
+        short_id: short_id.or_else(|| cw.card_short_id()),
     };
     // The money has moved: a ledger failure must not turn a paid sale into an error. The store
     // keeps the sale in memory, so a repeat still replays it.

@@ -89,10 +89,12 @@ pub struct PromotedSale {
     pub change: Vec<(u8, u64)>,
     /// The federation accepted it but the till notes are not all in the wallet yet.
     pub collection_pending: bool,
+    /// The card it was charged to ([`CardWallet::card_short_id`]).
+    pub short_id: Option<String>,
 }
 
 impl PromotedSale {
-    fn from_ptx(p: &PendingTx, received_msat: u64, collection_pending: bool) -> Option<Self> {
+    fn from_ptx(p: &PendingTx, received_msat: u64, collection_pending: bool, short_id: Option<String>) -> Option<Self> {
         Some(Self {
             client_ref: p.client_ref.clone()?,
             txid: p.txid.clone(),
@@ -104,6 +106,7 @@ impl PromotedSale {
             inputs: p.spent.clone(),
             change: p.change.clone(),
             collection_pending,
+            short_id,
         })
     }
 }
@@ -1000,7 +1003,8 @@ impl CardWallet {
             // A record that carries a client_ref is never removed unless its sale is recorded:
             // either the hook succeeded, or (no hook, e.g. the CLI without a ledger) a tombstone
             // is written in the same save that removes the record.
-            if let Some(sale) = PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false) {
+            if let Some(sale) = PromotedSale::from_ptx(&ptx, rec.till_received.saturating_sub(received_before), false, self.card_short_id())
+            {
                 match &self.on_promote {
                     Some(hook) => hook(&sale).context("recording the sale")?,
                     None => self.store.state.tombstones.push(Tombstone {
@@ -1033,7 +1037,24 @@ impl CardWallet {
 
     /// Sales the federation has accepted whose records are still waiting for their till notes.
     pub fn accepted_refs(&self) -> Vec<PromotedSale> {
-        self.store.state.pending_txs.iter().filter(|p| p.accepted).filter_map(|p| PromotedSale::from_ptx(p, 0, true)).collect()
+        let card = self.card_short_id();
+        self.store
+            .state
+            .pending_txs
+            .iter()
+            .filter(|p| p.accepted)
+            .filter_map(|p| PromotedSale::from_ptx(p, 0, true, card.clone()))
+            .collect()
+    }
+
+    /// The short id of the card this wallet's state belongs to: the card a job attached on ops,
+    /// else the one whose slot 0 key the local state holds. `None` before a card was set up.
+    pub fn card_short_id(&self) -> Option<String> {
+        if let Some(o) = &self.ops {
+            return Some(o.short_id.clone());
+        }
+        let pk = XOnlyPublicKey::from_str(self.store.state.slot_pubkey(0)?).ok()?;
+        Some(crate::ops::short_id_of(&pk))
     }
 
     /// Check that the card in the field is the one this wallet was set up with: the public key
@@ -1062,6 +1083,7 @@ impl CardWallet {
 
     /// Sales waiting in tombstones.
     pub fn tombstoned_sales(&self) -> Vec<(PromotedSale, Tombstone)> {
+        let card = self.card_short_id();
         self.store
             .state
             .tombstones
@@ -1079,6 +1101,7 @@ impl CardWallet {
                     inputs: t.spent.clone(),
                     change: t.change.clone(),
                     collection_pending: false,
+                    short_id: card.clone(),
                 };
                 (sale, t.clone())
             })

@@ -673,6 +673,7 @@ fn record_sale(sales: &Mutex<SalesStore>, c: &OfflineCharge, phone_id: &str) {
         offline: true,
         double_spent: false,
         rejected: false,
+        short_id: Some(c.short_id.clone()),
     };
     let mut s = sales.lock().unwrap();
     if let Err(e) = s.append(rec.clone()) {
