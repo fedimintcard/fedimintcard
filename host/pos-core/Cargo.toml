@@ -28,6 +28,7 @@ required-features = ["bindgen"]
 anyhow = { workspace = true }
 fedimint-card-host-card = { path = "../card" }
 fedimint-core = { workspace = true }
+fs4 = "0.13"
 fedimint-mint-common = { workspace = true }
 hex = "0.4"
 rand = "0.8"

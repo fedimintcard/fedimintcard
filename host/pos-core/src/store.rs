@@ -110,11 +110,10 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         create_private_dir(dir)?;
         let lock = private_options().open(dir.join(LOCK_FILE)).with_context(|| format!("opening {}", dir.join(LOCK_FILE).display()))?;
-        if let Err(e) = lock.try_lock() {
-            match e {
-                std::fs::TryLockError::WouldBlock => bail!("the offline store in {} is open elsewhere", dir.display()),
-                std::fs::TryLockError::Error(e) => return Err(e).context("locking the offline store"),
-            }
+        // flock(2) through `fs4`: std's `File::try_lock` is unsupported on Android (it answers
+        // "try_lock() not supported"), which left every Android phone without an offline store.
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&lock).context("locking the offline store")? {
+            bail!("the offline store in {} is open elsewhere", dir.display());
         }
         let phone_id = phone_id(dir)?;
         let queue = Queue::open(dir)?;
