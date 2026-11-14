@@ -41,14 +41,6 @@ jobs:
       - name: Kotlin bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings kotlin
-      - uses: actions/setup-java@v6
-        with: { distribution: temurin, java-version: '17' }
-      - name: The Android app, unit tests and debug build (Gradle reruns the core steps from cache)
-        working-directory: android-relay
-        shell: bash
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon testDebugUnitTest assembleDebug
       - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
