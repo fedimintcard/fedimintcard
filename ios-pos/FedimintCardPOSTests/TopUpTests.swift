@@ -223,6 +223,17 @@ final class WaitingTopUpFlowTests: XCTestCase {
         XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000, waiting: w1)) // the oldest
     }
 
+    /// ENG-867: the waiting top-up arriving keeps what is on hold on the screen.
+    func testAWaitingTopUpKeepsWhatIsOnHold() {
+        let f = PosFlow { "ref" }
+        f.dispatch(.cardBalanceOpened)
+        guard case .startBalanceRead(let rid)? = f.dispatch(.cardPresent).first else { return XCTFail("no read") }
+        let held = CardBalance(liveMsat: 5_000, notes: [], freeSlots: [], shortId: "6f94b19b", strandedMsat: 65_536, strandedUntilMs: 1_798_000_000_000)
+        f.dispatch(.balanceDone(readId: rid, result: .read(held)))
+        f.dispatch(.waitingFetched(readId: rid, topUps: [w1]))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 5_000, strandedMsat: 65_536, strandedUntilMs: 1_798_000_000_000, waiting: w1))
+    }
+
     func testAReadWithoutACardIdAsksForNothing() {
         let f = PosFlow { "ref" }
         f.dispatch(.cardBalanceOpened)

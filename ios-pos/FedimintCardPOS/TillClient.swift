@@ -364,7 +364,11 @@ enum TillParse {
             }
             let free = ((o["free_slots"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber)?.intValue }
             let shortId = optStr(o, "short_id").flatMap { $0.isEmpty ? nil : $0 }
-            return .read(CardBalance(liveMsat: optLong(o, "live_msat"), notes: rows, freeSlots: free, shortId: shortId))
+            // A till from before these fields sends neither, and a value that is not a number reads
+            // as absent: nothing on hold, no date.
+            return .read(CardBalance(liveMsat: optLong(o, "live_msat"), notes: rows, freeSlots: free, shortId: shortId,
+                                     strandedMsat: optLong(o, "stranded_msat"),
+                                     strandedUntilMs: (o["stranded_until_ms"] as? NSNumber)?.int64Value))
         } catch {
             if status == 401 { return .refused(code: .unauthorized, detail: "unauthorized") }
             return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))

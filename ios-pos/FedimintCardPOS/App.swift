@@ -77,7 +77,8 @@ struct RootView: View {
         case .receipt(let r): ReceiptScreen(receipt: r)
         case .error(let e): ErrorScreen(info: e)
         case .sales: SalesScreen()
-        case .balanceShown(_, let live, let waiting): BalanceScreen(liveMsat: live, waiting: waiting)
+        case .balanceShown(_, let live, let held, let until, let waiting):
+            BalanceScreen(liveMsat: live, strandedMsat: held, strandedUntilMs: until, waiting: waiting)
         case .balanceFailed(let p, _): BalanceErrorScreen(problem: p)
         }
     }

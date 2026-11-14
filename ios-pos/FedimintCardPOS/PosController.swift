@@ -189,8 +189,8 @@ final class PosController: ObservableObject {
             if case .topUpInvoice(let b, _) = before, b.topupId == t.topupId {} else { watchInvoice(t) }
         }
         // The waiting top-up arriving changes the state, not the read: the countdown keeps going.
-        if case .balanceShown(let rid, _, _) = now {
-            if case .balanceShown(let was, _, _) = before, was == rid {} else { startCountdown(rid) }
+        if case .balanceShown(let rid, _, _, _, _) = now {
+            if case .balanceShown(let was, _, _, _, _) = before, was == rid {} else { startCountdown(rid) }
         }
         for fx in effects { run(fx) }
     }
@@ -258,7 +258,10 @@ final class PosController: ObservableObject {
             Task { [weak self] in
                 guard let self else { return }
                 let r = await self.client.cardBalance(cardLink: linkId)
-                if case .read(let b) = r { self.endCardJob(message: "\(formatSats(b.liveMsat)) sats on this card", ok: true) }
+                if case .read(let b) = r {
+                    let onHold = onHoldText(strandedMsat: b.strandedMsat, untilMs: b.strandedUntilMs, nowMs: Self.clockMs(), timeZone: .current)
+                    self.endCardJob(message: balanceSpoken(liveMsat: b.liveMsat, onHold: onHold), ok: true)
+                }
                 else { self.endCardJob(message: "Couldn't read the card", ok: false) }
                 self.send(.balanceDone(readId: rid, result: r))
             }
@@ -414,7 +417,7 @@ final class PosController: ObservableObject {
         countdownTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, case .balanceShown(let cur, _, _) = self.state, cur == rid else { return }
+                guard let self, case .balanceShown(let cur, _, _, _, _) = self.state, cur == rid else { return }
                 self.balanceCountdown -= 1
                 if self.balanceCountdown <= 0 { self.send(.balanceExpired(readId: rid)); return }
             }
