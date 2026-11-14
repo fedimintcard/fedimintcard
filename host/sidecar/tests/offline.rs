@@ -1,8 +1,9 @@
 //! F3: the till with applet 3.0 cards (docs/OFFLINE-PROTOCOL.md § 4), online and offline, against
 //! the in-process federation of `till_service.rs` and a fake registry that answers the routes a
 //! till uses (`state`, `intent`, `submitted`, `outcome`, slot renewals, `cert-key`,
-//! `offline-charges`, and the releases in the state) as `registry/src/cards.ts` and `offline.ts` do. "Down" makes every route
-//! answer 502 with no body, as an unreachable registry behind a proxy does.
+//! `offline-charges`, `stranded`, and the releases and stranded slots in the state) as
+//! `registry/src/cards.ts` and `offline.ts` do. "Down" makes every route answer 502 with no body,
+//! as an unreachable registry behind a proxy does.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -54,6 +55,60 @@ struct FakeCard {
     /// Split keying: the card's slot count, with every slot not in `slots` listed as unkeyed. 0:
     /// none listed.
     slot_count: u8,
+    /// Registry v13's `strandings`: `{slot, kind, txid, first_seen}` per slot a till held.
+    strandings: Vec<Value>,
+    /// Txids of the card's `offline_reports` rows that count as the registry having seen the
+    /// transaction: recorded or refused, but not the money gate's refusals.
+    reported: Vec<Value>,
+}
+
+/// Registry v13's grace before a stranded slot may be released (`STRANDED_GRACE_MS`,
+/// `registry/src/cards.ts`): an offline kit's 7 days plus its 30-day redeem grace.
+const STRANDED_GRACE_MS: u64 = 37 * DAY_MS;
+
+/// The note on `slot`'s current key, as the registry finds it (`'02' || pubkey`).
+fn note_on_key(c: &FakeCard, slot: u8) -> Option<&Value> {
+    let (_, key) = c.slots.iter().find(|(s, _)| *s == slot)?;
+    let nonce = format!("02{key}");
+    c.notes.iter().find(|n| n["nonce"] == nonce.as_str())
+}
+
+/// Whether the registry has seen transaction `t` (`txKnown`): a charge on record, or an offline
+/// report of it other than the money gate's refusal.
+fn tx_seen(c: &FakeCard, t: &Value) -> bool {
+    c.txs.iter().any(|x| x["txid"] == *t) || c.reported.contains(t)
+}
+
+/// The federation said a note `t` spent is spent (`landed`): its change is real, never released.
+fn landed(c: &FakeCard, t: &Value) -> bool {
+    c.notes.iter().any(|n| n["txid"] == *t && n["status"] == "spent")
+}
+
+/// Whether a stranded row is still open (`openStrandings`): the registry has not seen its
+/// transaction, and no release of its slot for it is signed.
+fn strand_open(c: &FakeCard, s: &Value) -> bool {
+    !tx_seen(c, &s["txid"]) && !c.releases.iter().any(|r| r["slot"] == s["slot"] && r["txid"] == s["txid"])
+}
+
+/// `GET /state`'s `stranded` at `now`, as `cardState` lists the open rows: a spent row with its
+/// live note's amount, a change row with none, and when each may be released.
+fn stranded_of(c: &FakeCard, now: u64) -> Vec<Value> {
+    c.strandings
+        .iter()
+        .filter(|s| strand_open(c, s))
+        .map(|s| {
+            let since = s["first_seen"].as_u64().unwrap();
+            let live = note_on_key(c, s["slot"].as_u64().unwrap() as u8).filter(|n| n["status"] == "live");
+            let amount = match (s["kind"].as_str(), live) {
+                (Some("spent"), Some(n)) => n["amount_msat"].clone(),
+                _ => Value::Null,
+            };
+            json!({
+                "slot": s["slot"], "kind": s["kind"], "txid": s["txid"], "amount_msat": amount, "since": since,
+                "release_after": since + STRANDED_GRACE_MS, "due": now >= since + STRANDED_GRACE_MS,
+            })
+        })
+        .collect()
 }
 
 /// Sign a release per slot for `txid`, as `registry/src/offline.ts` `recordReleases`.
@@ -76,6 +131,10 @@ struct FakeOps {
     key_posts: Mutex<Vec<Value>>,
     /// Every renewal taken (`PUT /slots/:n`), by slot, in order.
     renewals: Mutex<Vec<u8>>,
+    /// Every `POST /stranded` body, in order, those a registry before strandings refused included.
+    stranded_posts: Mutex<Vec<Value>>,
+    /// A registry before v13: no `stranded` in the state, and `POST /stranded` answers 404.
+    before_strandings: AtomicBool,
 }
 
 type S = State<Arc<FakeOps>>;
@@ -98,7 +157,30 @@ impl FakeOps {
             reports: Mutex::new(vec![]),
             key_posts: Mutex::new(vec![]),
             renewals: Mutex::new(vec![]),
+            stranded_posts: Mutex::new(vec![]),
+            before_strandings: AtomicBool::new(false),
         })
+    }
+
+    /// As the registry's `/test/stranded-age {short_id, ms}`: the card's stranded rows, `ms`
+    /// older.
+    fn age_strandings(&self, id: &str, ms: u64) {
+        for s in self.cards.lock().unwrap().get_mut(id).unwrap().strandings.iter_mut() {
+            s["first_seen"] = json!(s["first_seen"].as_u64().unwrap() - ms);
+        }
+    }
+
+    /// The card's stranded rows, open or not.
+    fn strandings(&self, id: &str) -> Vec<Value> {
+        self.cards.lock().unwrap()[id].strandings.clone()
+    }
+
+    /// The slots the card's releases name for `txid`.
+    fn released(&self, id: &str, txid: &str) -> Vec<u64> {
+        let mut v: Vec<u64> =
+            self.cards.lock().unwrap()[id].releases.iter().filter(|r| r["txid"] == txid).map(|r| r["slot"].as_u64().unwrap()).collect();
+        v.sort();
+        v
     }
 
     fn cert_pub(&self) -> Vec<u8> {
@@ -143,14 +225,18 @@ async fn state(State(r): S, Path(id): Path<String>) -> Response {
         .filter(|t| t["status"] == "open")
         .map(|t| json!({"txid": t["txid"], "till_id": 1, "client_ref": t["client_ref"], "signed_hex": t["signed_hex"], "inputs": t["inputs"]}))
         .collect();
-    ok(json!({
+    let mut v = json!({
         "version": c.version,
         "slots": c.slots.iter().map(|(s, k)| json!({"slot": s, "pubkey": k})).collect::<Vec<_>>(),
         "unkeyed_slots": unkeyed_of(c),
         "notes": c.notes,
         "open_txs": open,
         "releases": c.releases,
-    }))
+    });
+    if !r.before_strandings.load(Ordering::SeqCst) {
+        v["stranded"] = json!(stranded_of(c, now_ms()));
+    }
+    ok(v)
 }
 
 fn unkeyed_of(c: &FakeCard) -> Vec<u8> {
@@ -173,6 +259,7 @@ async fn slot_keys(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) ->
             Some(_) => return fail(409, "slot has another key"),
             None if slot < c.slot_count => {
                 c.slots.push((slot, pk));
+                c.strandings.retain(|x| x["slot"] != slot);
                 added.push(slot);
             }
             None => return fail(409, "no such slot"),
@@ -212,6 +299,12 @@ async fn intent(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> Re
         }
     }
     let change = b["change"].as_array().unwrap().clone();
+    // Registry v13: a CHANGE slot held as stranded takes no other change.
+    for ch in &change {
+        if c.strandings.iter().any(|s| s["slot"] == ch["slot"] && s["kind"] == "change" && strand_open(c, s)) {
+            return fail(409, &format!("slot {} is held as stranded change", ch["slot"]));
+        }
+    }
     add_change(c, &b["txid"], &change);
     c.txs.push(json!({"txid": b["txid"], "client_ref": b["client_ref"], "inputs": b["inputs"], "change": change, "signed_hex": null, "status": "open"}));
     c.version += 1;
@@ -290,6 +383,7 @@ async fn renew(State(r): S, Path((id, slot)): Path<(String, u8)>, Json(b): Json<
     }
     s.1 = b["pubkey"].as_str().unwrap().to_owned();
     c.releases.retain(|x| x["slot"] != slot);
+    c.strandings.retain(|x| x["slot"] != slot);
     r.renewals.lock().unwrap().push(slot);
     c.version += 1;
     ok(json!({"ok": true, "version": c.version}))
@@ -308,6 +402,15 @@ async fn offline_charges(State(r): S, Path(id): Path<String>, Json(b): Json<Valu
     if c.txs.iter().any(|t| t["txid"] == b["txid"]) {
         return ok(json!({"ok": true, "version": c.version}));
     }
+    // Registry v13's money gate: a transaction the registry released a slot for is never taken.
+    // Its refusal does not count as the registry having seen the transaction, so the
+    // transaction's other held slots keep to their own release.
+    if c.releases.iter().any(|x| x["txid"] == b["txid"]) {
+        let conflicts: Vec<Value> =
+            b["inputs"].as_array().unwrap().iter().map(|i| json!({"nonce": i, "status": "released", "txid": b["txid"]})).collect();
+        return (StatusCode::CONFLICT, Json(json!({"ok": false, "reason": "double_spend", "conflicts": conflicts}))).into_response();
+    }
+    c.reported.push(b["txid"].clone());
     let mut conflicts = vec![];
     for i in b["inputs"].as_array().unwrap() {
         match c.notes.iter().find(|n| n["nonce"] == *i) {
@@ -335,6 +438,103 @@ async fn offline_charges(State(r): S, Path(id): Path<String>, Json(b): Json<Valu
     ok(json!({"ok": true, "version": c.version}))
 }
 
+/// As `registry/src/offline.ts` `recordStranded` (registry v13, ENG-867): the slots a till held at
+/// a tap. A slot is recorded once (`first_seen`), and ignored when the registry has seen its
+/// transaction or released the slot for it, when the slot is held for another transaction, when
+/// a spent slot has no live note under its current key, or when a change slot's key ever carried
+/// a note. A spent slot marked `spent: true` (the federation says its note is spent) has its note
+/// spent under the transaction and its row dropped, released never. Then each open row of the
+/// card past the grace, unless its transaction landed: a spent row is released with its own
+/// `unspent: true` in this report; a change row when a spent row of its transaction is
+/// `unspent: true` here, when its transaction has no spent row (the card never signed it), or when
+/// its transaction already has a release. No version bump.
+async fn stranded(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> Response {
+    if let Some(d) = r.down() {
+        return d;
+    }
+    r.stranded_posts.lock().unwrap().push(b.clone());
+    if r.before_strandings.load(Ordering::SeqCst) {
+        return fail(404, "no such route");
+    }
+    let mut g = r.cards.lock().unwrap();
+    let c = g.get_mut(&id).unwrap();
+    let rows = b["slots"].as_array().cloned().unwrap_or_default();
+    let flag = |f: &Value| f.is_null() || f.is_boolean();
+    let valid = |x: &Value| {
+        x["slot"].as_u64().is_some_and(|s| s < 32)
+            && matches!(x["kind"].as_str(), Some("spent" | "change"))
+            && x["txid"].as_str().is_some_and(|t| t.len() == 64 && t.bytes().all(|h| h.is_ascii_digit() || (b'a'..=b'f').contains(&h)))
+            && flag(&x["unspent"])
+            && flag(&x["spent"])
+            && !(x["unspent"] == true && x["spent"] == true)
+    };
+    let mut named: Vec<u64> = rows.iter().filter_map(|x| x["slot"].as_u64()).collect();
+    named.sort();
+    named.dedup();
+    if !(1..=32).contains(&rows.len()) || !rows.iter().all(valid) || named.len() != rows.len() {
+        return fail(400, "slots: 1 to 32 of {slot, kind, txid, unspent?, spent?}, each slot once");
+    }
+    let now = now_ms();
+    let open: Vec<Value> = c.strandings.iter().filter(|s| strand_open(c, s)).cloned().collect();
+    let (mut held, mut spent, mut ignored) = (vec![], vec![], vec![]);
+    for x in &rows {
+        let (slot, t) = (x["slot"].as_u64().unwrap() as u8, &x["txid"]);
+        let note = note_on_key(c, slot).cloned();
+        let takes = c.slots.iter().any(|(s, _)| *s == slot)
+            && !tx_seen(c, t)
+            && !c.releases.iter().any(|y| y["slot"] == x["slot"] && y["txid"] == *t)
+            && !open.iter().any(|s| s["slot"] == x["slot"] && (s["txid"] != *t || s["kind"] != x["kind"]))
+            && if x["kind"] == "spent" { note.as_ref().is_some_and(|n| n["status"] == "live") } else { note.is_none() };
+        if !takes {
+            ignored.push(slot);
+            continue;
+        }
+        if !c.strandings.iter().any(|s| s["slot"] == x["slot"] && s["txid"] == *t) {
+            c.strandings.push(json!({"slot": slot, "kind": x["kind"], "txid": t, "first_seen": now}));
+        }
+        if x["kind"] == "spent" && x["spent"] == true {
+            let nonce = note.map(|n| n["nonce"].clone());
+            for n in c.notes.iter_mut().filter(|n| Some(&n["nonce"]) == nonce.as_ref() && n["status"] == "live") {
+                n["status"] = json!("spent");
+                n["txid"] = t.clone();
+            }
+            c.strandings.retain(|s| !(s["slot"] == x["slot"] && s["txid"] == *t));
+            spent.push(slot);
+            continue;
+        }
+        held.push(x.clone());
+    }
+    let unspent: Vec<&Value> = held.iter().filter(|x| x["kind"] == "spent" && x["unspent"] == true).collect();
+    let mut release: Vec<(Value, Vec<u8>)> = vec![];
+    for s in c.strandings.iter().filter(|s| strand_open(c, s)) {
+        let t = &s["txid"];
+        if s["first_seen"].as_u64().unwrap() + STRANDED_GRACE_MS > now || landed(c, t) {
+            continue;
+        }
+        let releasable = if s["kind"] == "spent" {
+            unspent.iter().any(|e| e["slot"] == s["slot"] && e["txid"] == *t)
+        } else {
+            unspent.iter().any(|e| e["txid"] == *t)
+                || !c.strandings.iter().any(|x| x["txid"] == *t && x["kind"] == "spent")
+                || c.releases.iter().any(|x| x["txid"] == *t)
+        };
+        if releasable {
+            let slot = s["slot"].as_u64().unwrap() as u8;
+            match release.iter_mut().find(|(x, _)| x == t) {
+                Some((_, slots)) => slots.push(slot),
+                None => release.push((t.clone(), vec![slot])),
+            }
+        }
+    }
+    let mut released = vec![];
+    for (t, slots) in release {
+        add_releases(&r.cert, c, &t, &slots);
+        released.extend(slots);
+    }
+    let held: Vec<Value> = held.iter().map(|x| x["slot"].clone()).collect();
+    ok(json!({"ok": true, "held": held, "released": released, "spent": spent, "ignored": ignored}))
+}
+
 async fn serve(r: Arc<FakeOps>) -> String {
     let app = axum::Router::new()
         .route("/registry/cert-key", get(cert_key))
@@ -346,6 +546,7 @@ async fn serve(r: Arc<FakeOps>) -> String {
         .route("/cards/{id}/slots/{slot}", put(renew))
         .route("/cards/{id}/slot-keys", post(slot_keys))
         .route("/cards/{id}/offline-charges", post(offline_charges))
+        .route("/cards/{id}/stranded", post(stranded))
         .with_state(r);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1884,5 +2085,390 @@ async fn at_the_default_fees_an_offline_charge_has_no_margin() -> anyhow::Result
     let (status, body) = t.charge(&card, 50_000, "z").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["fee_margin_msat"], 0, "{body}");
+    Ok(())
+}
+
+// ------------------------------------------------------------------ stranded slots (ENG-867)
+
+impl Till {
+    /// A balance tap of `card` on ops, as `POST /v1/card/balance` runs it.
+    async fn balance(&mut self, card: &Rc<RefCell<SoftCard>>) -> Value {
+        self.tap(card);
+        let r = card_balance_job(&mut self.cw, Some(&self.ops), &self.sales).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.body
+    }
+
+    /// The slots of the `n`th `POST /stranded`, ascending, with their kinds and flags.
+    fn stranded_post(&self, n: usize) -> Vec<Value> {
+        let mut rows = self.reg.stranded_posts.lock().unwrap()[n]["slots"].as_array().unwrap().clone();
+        rows.sort_by_key(|x| x["slot"].as_u64());
+        rows
+    }
+
+    fn stranded_posts(&self) -> usize {
+        self.reg.stranded_posts.lock().unwrap().len()
+    }
+}
+
+/// The slots of a balance answer's notes marked `stranded`, ascending.
+fn on_hold(b: &Value) -> Vec<u64> {
+    let mut v: Vec<u64> =
+        b["notes"].as_array().unwrap().iter().filter(|n| n["stranded"] == true).map(|n| n["slot"].as_u64().unwrap()).collect();
+    v.sort();
+    v
+}
+
+/// What a phone's lost offline sales left on a card ([`wiped_phone`]).
+struct Lost {
+    card: Rc<RefCell<SoftCard>>,
+    id: String,
+    /// The phone, for a sale that turns up after all; its store still has the sales.
+    phone: Phone,
+    /// The sales as the phone took them.
+    sales: Vec<OfflineCharge>,
+    /// The slots they spent, ascending, and the one owed the third sale's change.
+    spent: Vec<u64>,
+    change: Vec<u64>,
+}
+
+/// Drill (d) of 2026-11-13 on zion (docs/POS-OFFLINE.md § Drill log), at test scale: a card with
+/// three notes of 16,384 msat and one of 262,144, and a phone that sells offline from it, 15 sat
+/// twice (a whole note each) and 7 sat (a note and one change note), then loses its store before it
+/// syncs. The till and the registry never see the sales, and the registry keeps the three notes
+/// live.
+async fn wiped_phone(t: &mut Till) -> anyhow::Result<Lost> {
+    let (card, phone, kit) = phone_and_card(t, &[1 << 14, 1 << 14, 1 << 14, 1 << 18]).await?;
+    let id = short_id_of(&card.borrow_mut().get_pub(0)?);
+    let mut sales = vec![];
+    for (price, cref) in [(15_000, "lost-1"), (15_000, "lost-2"), (7_000, "lost-3")] {
+        sales.push(phone.take(&card, &kit, price, cref)?);
+    }
+    let shape: Vec<(usize, usize)> = sales.iter().map(|s| (s.inputs.len(), s.change.len())).collect();
+    assert_eq!(shape, vec![(1, 0), (1, 0), (1, 1)], "two whole sales and one with change");
+    let mut spent: Vec<u64> = sales.iter().flat_map(|s| s.inputs.iter().map(|i| i.slot as u64)).collect();
+    spent.sort();
+    let change: Vec<u64> = sales.iter().flat_map(|s| s.change.iter().map(|c| c.slot as u64)).collect();
+    assert_eq!(slot_states(&card, &spent), vec![SlotState::Spent; 3]);
+    assert_eq!(slot_states(&card, &change), vec![SlotState::Change]);
+    for s in &sales {
+        assert_eq!(t.reg.note_status(&id, &s.inputs[0].nonce).as_deref(), Some("live"), "the registry never saw {}", s.txid);
+    }
+    Ok(Lost { card, id, phone, sales, spent, change })
+}
+
+/// Drill (d) itself. The registry keeps a lost sale's notes live; before ENG-867 the card's balance
+/// counted them and the till's online planner picked them, so a 16 sat sale failed ("slot 11 has
+/// already signed another transaction"). Now an online tap holds the slots nothing explains: the
+/// balance counts what the card can pay and puts the rest on hold, the till reports the slots (a
+/// spent row per input, a change row for the change), and the 16 sat sale pays from the other note.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wiped_phones_sales_are_held_and_reported_and_a_sale_pays_around_them() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let lost = wiped_phone(&mut t).await?;
+    // Why the drill's sale failed: over every note the registry calls live (and the change slot,
+    // which it calls free), the planner's best plan for 16 sat spends a lost note.
+    {
+        use fedimint_card_sidecar::plan::solve;
+        let w = &t.cw.wallet;
+        let fee = |a: u64| w.fee(a);
+        let p = solve(&[1 << 14, 1 << 14, 1 << 14, 1 << 18], 16_000, 28, &fee, w.min_denom())?;
+        assert!(p.inputs.iter().any(|i| *i < 3), "{p:?}");
+    }
+
+    let b = t.balance(&lost.card).await;
+    assert_eq!(b["live_msat"], json!(1 << 18), "only what the card can pay: {b}");
+    assert_eq!(b["stranded_msat"], json!(3 * (1 << 14)), "{b}");
+    assert_eq!(b["stranded_until_ms"], Value::Null, "the registry has not dated them yet: {b}");
+    assert_eq!(on_hold(&b), lost.spent, "{b}");
+    assert!(b["notes"].as_array().unwrap().iter().filter(|n| n["stranded"] == true).all(|n| n["status"] == "live"), "{b}");
+    assert!(!b["free_slots"].as_array().unwrap().contains(&json!(lost.change[0])), "the change slot is no room: {b}");
+
+    // Reported once: a spent row per input and a change row for the change, under its sale's txid,
+    // with no flag (nothing is due, so the federation is not asked).
+    assert_eq!(t.stranded_posts(), 1);
+    let rows: Vec<(u64, String, String)> = t
+        .stranded_post(0)
+        .iter()
+        .map(|x| (x["slot"].as_u64().unwrap(), x["kind"].as_str().unwrap().to_owned(), x["txid"].as_str().unwrap().to_owned()))
+        .collect();
+    let mut want: Vec<(u64, String, String)> = lost
+        .sales
+        .iter()
+        .flat_map(|s| {
+            let ins = s.inputs.iter().map(|i| (i.slot as u64, "spent".to_owned(), s.txid.clone()));
+            ins.chain(s.change.iter().map(|c| (c.slot as u64, "change".to_owned(), s.txid.clone())))
+        })
+        .collect();
+    want.sort();
+    assert_eq!(rows, want);
+    assert!(t.stranded_post(0).iter().all(|x| x.get("unspent").is_none() && x.get("spent").is_none()));
+    assert_eq!(t.reg.strandings(&lost.id).len(), 4, "the registry has them");
+
+    // The next tap: the registry lists them, with their date; nothing new to report.
+    let b = t.balance(&lost.card).await;
+    let since = t.reg.strandings(&lost.id)[0]["first_seen"].as_u64().unwrap();
+    assert_eq!(b["stranded_until_ms"], json!(since + STRANDED_GRACE_MS), "{b}");
+    assert_eq!((on_hold(&b), t.stranded_posts()), (lost.spent.clone(), 1), "listed, not due: not posted again");
+
+    // The 16 sat sale that failed in the drill pays from the 262,144 msat note.
+    let (status, body) = t.charge(&lost.card, 16_000, "after-the-wipe").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("offline").is_none(), "{body}");
+    assert!(slots_of(&body, "inputs").iter().all(|s| !lost.spent.contains(s)), "{body}");
+    assert!(slots_of(&body, "change").iter().all(|s| !lost.change.contains(s)), "{body}");
+    Ok(())
+}
+
+/// Past the grace the holder gets the notes back (decision 2). The tap that finds the rows due asks
+/// the federation, which says the notes are unspent, and reports them `unspent: true`; the
+/// registry releases every slot of the three sales, the change slot with its sale's input; the
+/// next tap sends the releases (`RELEASE`): the spent slots hold their notes again and the change
+/// slot is keyed. The balance is whole, and a released note pays.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_the_grace_the_held_notes_are_released_and_pay_again() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let lost = wiped_phone(&mut t).await?;
+    t.balance(&lost.card).await;
+    t.reg.age_strandings(&lost.id, STRANDED_GRACE_MS);
+
+    let b = t.balance(&lost.card).await;
+    assert_eq!(b["stranded_msat"], json!(3 * (1 << 14)), "still held at this tap: {b}");
+    assert_eq!(b["stranded_until_ms"], Value::Null, "due: no date: {b}");
+    assert_eq!(t.stranded_posts(), 2);
+    for x in t.stranded_post(1) {
+        match x["kind"].as_str() {
+            Some("spent") => assert_eq!((x.get("unspent"), x.get("spent")), (Some(&json!(true)), None), "{x}"),
+            _ => assert!(x.get("unspent").is_none() && x.get("spent").is_none(), "{x}"),
+        }
+    }
+    for s in &lost.sales {
+        let mut want: Vec<u64> = s.inputs.iter().map(|i| i.slot as u64).chain(s.change.iter().map(|c| c.slot as u64)).collect();
+        want.sort();
+        assert_eq!(t.reg.released(&lost.id, &s.txid), want, "every slot of {}", s.txid);
+    }
+
+    // The next tap sends the releases before anything else.
+    let b = t.balance(&lost.card).await;
+    assert_eq!(slot_states(&lost.card, &lost.spent), vec![SlotState::Note; 3]);
+    assert_eq!(slot_states(&lost.card, &lost.change), vec![SlotState::Keyed]);
+    assert_eq!(b["live_msat"], json!(3 * (1 << 14) + (1 << 18)), "whole again: {b}");
+    assert_eq!((b["stranded_msat"].clone(), on_hold(&b)), (json!(0), vec![]), "{b}");
+    assert_eq!(t.stranded_posts(), 2, "nothing left to report");
+
+    // A released note pays: 15 sat is one whole 16,384 msat note.
+    let (status, body) = t.charge(&lost.card, 15_000, "released").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!slots_of(&body, "inputs").is_empty() && slots_of(&body, "inputs").iter().all(|s| lost.spent.contains(s)), "{body}");
+    Ok(())
+}
+
+/// A sale in the till's own queue explains its slots: a phone's sale it took in
+/// (`POST /v1/offline/charges`), or its own offline sale, that the sender (every 30 s) has not
+/// reported yet. Such slots are neither held nor reported, and the sender settles them as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sale_in_the_tills_own_queue_is_neither_held_nor_reported() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, phone, kit) = phone_and_card(&mut t, &[1 << 14, 1 << 14, 1 << 18]).await?;
+    let synced = phone.take(&card, &kit, 7_000, "synced")?;
+    assert_eq!((synced.inputs.len(), synced.change.len()), (1, 1));
+    assert_eq!(statuses(&t.ingest(&phone.id(), phone.drained())), vec![("queued", None)]);
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 15_000, "own").await;
+    assert_eq!((status, &body["offline"]), (200, &json!(true)), "{body}");
+    t.set_down(false);
+    assert_eq!(t.off.stats().queued, 2, "neither sent yet");
+
+    let b = t.balance(&card).await;
+    assert_eq!((b["stranded_msat"].clone(), on_hold(&b)), (json!(0), vec![]), "{b}");
+    assert_eq!(t.stranded_posts(), 0, "nothing reported");
+    let change: Vec<u64> = synced.change.iter().map(|c| c.slot as u64).collect();
+    assert_eq!(slot_states(&card, &change), vec![SlotState::Change]);
+
+    let sent = t.send().await;
+    assert_eq!(sent["settled"].as_array().unwrap().len(), 2, "{sent}");
+    let b = t.balance(&card).await;
+    assert_eq!(slot_states(&card, &change), vec![SlotState::Note], "the change landed");
+    assert_eq!((b["stranded_msat"].clone(), t.stranded_posts()), (json!(0), 0), "{b}");
+    Ok(())
+}
+
+/// A registry before v13 lists no stranded slots and answers `POST /stranded` 404. The till holds
+/// the slots all the same (the hold comes from the card), logs the refusal, and the sale pays
+/// around them; unlisted, they are reported again at every tap.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_a_registry_before_strandings_the_slots_are_held_all_the_same() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    t.reg.before_strandings.store(true, Ordering::SeqCst);
+    let lost = wiped_phone(&mut t).await?;
+    let b = t.balance(&lost.card).await;
+    assert_eq!((b["live_msat"].clone(), b["stranded_msat"].clone()), (json!(1 << 18), json!(3 * (1 << 14))), "{b}");
+    assert_eq!(on_hold(&b), lost.spent, "{b}");
+    assert_eq!(t.stranded_posts(), 1, "reported, and refused 404");
+    assert!(t.reg.strandings(&lost.id).is_empty());
+    let (status, body) = t.charge(&lost.card, 16_000, "old-registry").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(slots_of(&body, "inputs").iter().all(|s| !lost.spent.contains(s)), "{body}");
+    assert_eq!(t.stranded_posts(), 2);
+    Ok(())
+}
+
+/// The money gate. Once the registry released a lost sale's slots the holder has the notes back,
+/// so the sale itself, should it reach a till after all (a phone that synced late), is refused as a
+/// double spend: the merchant's loss, within the till's caps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_sale_reported_after_its_release_is_a_double_spend() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let lost = wiped_phone(&mut t).await?;
+    t.balance(&lost.card).await;
+    t.reg.age_strandings(&lost.id, STRANDED_GRACE_MS);
+    t.balance(&lost.card).await;
+    t.balance(&lost.card).await;
+    assert_eq!(slot_states(&lost.card, &lost.spent), vec![SlotState::Note; 3], "released");
+
+    // The phone was not wiped after all: it syncs.
+    assert_eq!(statuses(&t.ingest(&lost.phone.id(), lost.phone.drained())), vec![("queued", None); 3]);
+    let sent = t.send().await;
+    let mut double: Vec<String> = sent["double_spent"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned()).collect();
+    double.sort();
+    let mut want: Vec<String> = lost.sales.iter().map(|s| s.txid.clone()).collect();
+    want.sort();
+    assert_eq!(double, want, "{sent}");
+    for cref in ["lost-1", "lost-2", "lost-3"] {
+        assert!(t.sale(cref).double_spent, "{cref}");
+    }
+    // The holder keeps the notes.
+    let b = t.balance(&lost.card).await;
+    assert_eq!(b["live_msat"], json!(3 * (1 << 14) + (1 << 18)), "{b}");
+    Ok(())
+}
+
+/// Send a phone's signed charge to the federation past every till and the registry, and wait until
+/// its first input is spent there.
+async fn land(t: &Till, c: &OfflineCharge) -> anyhow::Result<()> {
+    use fedimint_core::encoding::Decodable as _;
+    let client = &t.cw.wallet.client;
+    let tx = fedimint_core::transaction::Transaction::consensus_decode_hex(c.signed_hex.as_deref().unwrap(), client.decoders())?;
+    let _ = client.api().submit_transaction(tx).await;
+    let nonce = fedimint_mint_common::Nonce(c.inputs[0].nonce.parse()?);
+    for _ in 0..150 {
+        if t.cw.is_spent(nonce).await? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("{} never landed", c.txid)
+}
+
+/// Decision 5: the federation says a held note is spent (its sale reached the federation some way
+/// the registry never saw). The tap that finds its row due reports it `spent: true`, never
+/// `unspent`: the registry makes the note spent under the sale and drops the row with no release,
+/// the till's copy has it spent too, and the next charge with the PIN renews the slot. The sale
+/// landed, so its change is real: its CHANGE slot is never released, and stays held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_note_the_federation_has_spent_is_reported_spent_and_never_released() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    // The large note first, so the small one is not in slot 0, which names the card and is never
+    // renewed on ops.
+    let (card, phone, kit) = phone_and_card(&mut t, &[1 << 18, 1 << 14]).await?;
+    let id = short_id_of(&card.borrow_mut().get_pub(0)?);
+    let landed = phone.take(&card, &kit, 7_000, "landed")?;
+    assert_eq!((landed.inputs.len(), landed.change.len()), (1, 1));
+    land(&t, &landed).await?;
+    let (slot, nonce, change) = (landed.inputs[0].slot, landed.inputs[0].nonce.clone(), landed.change[0].slot);
+    assert_ne!(slot, 0);
+    let spent_row = json!({"slot": slot, "kind": "spent", "txid": landed.txid});
+    let change_row = json!({"slot": change, "kind": "change", "txid": landed.txid});
+
+    t.balance(&card).await;
+    assert_eq!(t.stranded_post(0), vec![spent_row.clone(), change_row.clone()], "held and reported");
+    t.reg.age_strandings(&id, STRANDED_GRACE_MS);
+    let b = t.balance(&card).await;
+    let mut spent_flagged = spent_row.clone();
+    spent_flagged["spent"] = json!(true);
+    assert_eq!(t.stranded_post(1), vec![spent_flagged, change_row.clone()], "no flag on a change slot");
+    assert_eq!(t.reg.note_status(&id, &nonce).as_deref(), Some("spent"));
+    assert!(t.reg.released(&id, &landed.txid).is_empty(), "nothing released");
+    let rows: Vec<(u64, String)> =
+        t.reg.strandings(&id).iter().map(|s| (s["slot"].as_u64().unwrap(), s["kind"].as_str().unwrap().to_owned())).collect();
+    assert_eq!(rows, vec![(change as u64, "change".to_owned())], "the spent row is gone; the change row stays");
+    assert_eq!(b["stranded_msat"], json!(0), "{b}");
+    let local = StateStore::open(t.ops.card_path(&id))?;
+    let n = local.state.notes.iter().find(|n| n.nonce == nonce).unwrap();
+    assert_eq!(n.status, fedimint_card_sidecar::state::NoteStatus::Spent);
+
+    // The next charge with the PIN renews the spent slot; the change slot stays held, and is
+    // reported again (listed as due) but never released.
+    let (status, body) = t.charge(&card, 16_000, "renews").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!slots_of(&body, "change").contains(&(change as u64)), "{body}");
+    assert!(t.reg.renewals.lock().unwrap().contains(&slot), "renewed: {:?}", t.reg.renewals.lock().unwrap());
+    assert_eq!(card.borrow().slot_state(slot), Some(SlotState::Keyed));
+    assert_eq!(t.stranded_post(2), vec![change_row]);
+    assert!(t.reg.released(&id, &landed.txid).is_empty(), "never released");
+    assert_eq!(card.borrow().slot_state(change), Some(SlotState::Change));
+    Ok(())
+}
+
+/// Decision 4 (docs/POS-OFFLINE.md risk 5): a card taken away between `SET_CHANGE` and `SIGN` owes
+/// change for a transaction it never signed, and has no SPENT slot for it. The till holds the
+/// CHANGE slot (it is no room for change) and reports it; past the grace it reports it again with
+/// no flag, since the federation has nothing to say of a transaction nobody signed, and the
+/// registry releases it. The next tap makes it a keyed slot again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_slot_with_no_spent_partner_is_held_then_released_without_a_flag() -> anyhow::Result<()> {
+    use fedimint_card_host_card::v3::Opening;
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 18]).await?;
+    let slot = (0..32u8).find(|s| card.borrow().slot_state(*s) == Some(SlotState::Keyed)).unwrap();
+    let txid = [7u8; 32];
+    card.borrow_mut().set_change(slot, 1 << 13, &Opening { txid, out_idx: 1, blinding_key: [9; 32] })?;
+    let row = json!({"slot": slot, "kind": "change", "txid": hex::encode(txid)});
+
+    let b = t.balance(&card).await;
+    assert_eq!((b["stranded_msat"].clone(), b["live_msat"].clone()), (json!(0), json!(1 << 18)), "a change slot holds no money: {b}");
+    assert!(!b["free_slots"].as_array().unwrap().contains(&json!(slot)), "{b}");
+    assert_eq!(t.stranded_post(0), vec![row.clone()]);
+    t.reg.age_strandings(&id, STRANDED_GRACE_MS);
+    t.balance(&card).await;
+    assert_eq!(t.stranded_post(1), vec![row], "no flag");
+    assert_eq!(t.reg.released(&id, &hex::encode(txid)), vec![slot as u64]);
+    let b = t.balance(&card).await;
+    assert_eq!(card.borrow().slot_state(slot), Some(SlotState::Keyed));
+    assert!(b["free_slots"].as_array().unwrap().contains(&json!(slot)), "room again: {b}");
+    Ok(())
+}
+
+/// More unexplained slots than one tap asks the card about (8): the rest are held on doubt, out of
+/// the plan and the balance with their transaction not read yet, and are reported at the next tap.
+/// While a held note is not listed, the balance gives no date.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_the_taps_checks_slots_are_held_on_doubt_and_reported_at_the_next_tap() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    // Ten notes, 1,024 to 524,288 msat, in slots 0 to 9; nine signed away for transactions that no
+    // till or registry ever sees.
+    t.load(&card, &[(1 << 20) - (1 << 10)]).await?;
+    let amounts: Vec<u64> = (0..10u8).map(|s| card.borrow_mut().get_slot(s).unwrap().amount_msat).collect();
+    assert!(amounts.iter().all(|a| *a > 0));
+    card.borrow_mut().verify_pin(b"1234")?;
+    for s in 1..=9u8 {
+        card.borrow_mut().sign(s, &[s; 32])?;
+    }
+    let posted = |t: &Till, n: usize| -> Vec<u64> { t.stranded_post(n).iter().map(|x| x["slot"].as_u64().unwrap()).collect() };
+
+    let b = t.balance(&card).await;
+    assert_eq!((b["live_msat"].clone(), b["stranded_msat"].clone()), (json!(amounts[0]), json!(amounts[1..].iter().sum::<u64>())), "{b}");
+    assert_eq!(on_hold(&b), (1..=9).collect::<Vec<u64>>());
+    assert_eq!(posted(&t, 0), (1..=8).collect::<Vec<u64>>(), "eight asked; slot 9 held on doubt");
+    let b = t.balance(&card).await;
+    assert_eq!(posted(&t, 1), (1..=9).collect::<Vec<u64>>());
+    assert_eq!(b["stranded_until_ms"], Value::Null, "slot 9 was not listed yet: {b}");
+    let b = t.balance(&card).await;
+    assert_eq!(t.stranded_posts(), 2, "all listed, none due");
+    assert!(b["stranded_until_ms"].as_u64().is_some(), "{b}");
     Ok(())
 }
