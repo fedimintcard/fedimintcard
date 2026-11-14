@@ -1,10 +1,14 @@
 # Rollout: offline payments to production
 
-Status: checklist, 2026-11-07, for `main` @ `3a0b0e8` (pushed). Each step changes production and
-waits for the owner's OK. Staging has run all of it (two e2e runs, `OFFLINE-PLAN.md` § 10).
+Status: checklist, 2026-11-07, for `main` @ `3a0b0e8`; step 7 (the POS phones) added 2026-11-13.
+Each step changes production and waits for the owner's OK. Production reached step 6 on
+2026-11-07, with zion's till at `0.1.0:3` (built from `efdc3a6`). Since 2026-11-10 zion has run
+`0.1.0:4` (built from `a630a22`, with the phones' kit and charge routes), and step 7 was drilled
+on it on 2026-11-13 (`POS-OFFLINE.md` § Drill log). Staging ran steps 0 to 6 first (two e2e runs,
+`OFFLINE-PLAN.md` § 10); its pass of step 7 is still to run.
 
-What production has now: registry v9 (Worker version `35521a72`, the claim fix), 2.1 cards, the
-zion till `0.1.0:1` or `0.1.0:2`, the Setup and POS apps from before applet 3.0.
+What production had before step 1: registry v9 (Worker version `35521a72`, the claim fix), 2.1
+cards, the zion till `0.1.0:1` or `0.1.0:2`, the Setup and POS apps from before applet 3.0.
 
 What changes for cards already in the field: nothing. 2.1 cards keep working online with the new
 till and registry; only cards set up after step 5 are 3.0 and can pay offline.
@@ -56,16 +60,19 @@ from `registry/` (a new key, never printed):
 ## 4. zion till
 
 - [ ] Build the StartOS package from this `main`: in `~/Repos/fedimintcard-till-startos`, move
-      `upstream-project` to the commit, bump `startos/versions/current.ts` to `0.1.0:3` with
-      release notes (3.0 cards online; offline charges queued and sent later; spare slots; fee
-      margin; releases), `make`, commit, and push with the owner's OK.
+      `upstream-project` to the commit, bump `startos/versions/current.ts` to the next version
+      with release notes, `make`, commit, and push with the owner's OK. `0.1.0:3` (from
+      `efdc3a6`) was the first with offline charges: 3.0 cards online, offline charges queued and
+      sent later, spare slots, fee margin, releases. `0.1.0:4` (from `a630a22`) added the POS
+      phones' kit and charge routes (step 7).
 - [ ] Sideload `fedimintcard-till_x86_64.s9pk` on zion (owner; the Mac's CLI is not authorised).
-- [ ] Check in StartOS: version `0.1.0:3`, health green. Then `/v1/status` through the POS shows
+- [ ] Check in StartOS: the new version, health green. Then `/v1/status` through the POS shows
       `registry_reachable: true`, `federation_reachable: true`, `offline.fee_margin: true`.
 - [ ] The till fetches and keeps the registry's certificate key on its first online minute; offline
       charges need it, so let zion run online before the first village use.
-- Rollback: sideload the previous `.s9pk` (`0.1.0:2`). An offline queue on zion must be empty first
-  (`offline.queued: 0`).
+- Rollback: sideload the previous `.s9pk`. An offline queue on zion must be empty first
+  (`offline.queued: 0`), and from `0.1.0:4` on nothing may wait on any POS phone (step 7);
+  below `0.1.0:4`, no phone may keep a kit (step 7, Rollback).
 
 ## 5. Apps
 
@@ -86,11 +93,51 @@ from `registry/` (a new key, never printed):
       = 130 (certificate), 57 = 1, 58 = 1 (registry key).
 - [ ] Top up by Lightning through zion, a balance tap (the spare reserve grows by 2 a tap), a charge.
 - [ ] Optional, before a village: stop zion's internet for a charge or two and see "Paid offline",
-      then restore it and watch `offline.queued` return to 0.
+      then restore it and watch `offline.queued` return to 0. This is zion's own offline path; the
+      phones' was drilled on zion in step 7.
+
+## 7. POS phones
+
+A phone takes a 3.0 card on its own when it cannot reach the till, and syncs what it took once it
+reaches the till again (`POS-OFFLINE.md`). Drilled on zion on 2026-11-13 (`POS-OFFLINE.md` § Drill
+log).
+
+- [ ] zion at `0.1.0:4` or later (step 4), run online for a minute first: the kit route
+      (`GET /v1/offline/kit`) answers `503 offline_not_ready` until the till has the registry's
+      certificate key, and a till before `0.1.0:4` has no kit route at all.
+- [ ] Both POS apps built from one commit, `c0a0c2f` or later: an Android build from before it
+      never opens its offline store (Settings: "Offline payments are off: Store: locking the
+      offline store: try_lock() not supported"; PR #26).
+- [ ] Pair each phone with zion ("Pair a POS" on zion) and open the app once while it reaches the
+      till. Settings shows the kit: its age, its expiry about a week ahead, and the caps (200
+      payments and 100,000 sats on zion), with 0 waiting to sync.
+- [ ] One sale per phone in airplane mode ("Paid offline"), then airplane off with the app in
+      front: within about a minute the phone shows 0 waiting to sync, and the till's balance
+      has risen by what the sale paid.
+- Order for a fleet: the till first (step 4), then one phone at a time, so the others keep
+  selling. A phone gets another app build or pairing only when its Settings shows 0 waiting to
+  sync and 0 waiting for their cards: what waits syncs only to the till it was taken for, and
+  clearing the app's data, uninstalling or downgrading strands it. Each phone opens the app online
+  at least once a week, the kit's life; while it reaches the till, the kit renews on its own.
+  Before a day of offline sales, a few online taps on each card: a balance tap writes the notes
+  of its offline change and keys at most 2 never-keyed slots (fewer when it writes notes or sends
+  releases), and only a charge renews settled spent slots, so once every slot is keyed a balance
+  tap adds no fresh one (`TILL-API.md`, "Spare slots for offline change"). A card still takes
+  only a few offline sales with change in a row (ENG-864).
+- Rollback: only with 0 waiting on every phone. Apps: the previous build on the phones. The till
+  below `0.1.0:4`: first remove every phone's kit (Android: clear the POS app's data; iOS: delete
+  the app), then sideload the previous `.s9pk` (step 4), then reinstall the iOS app and pair the
+  phones again. A phone with a kit sells offline whenever it cannot reach the till, a till before
+  `0.1.0:4` has no route to take those sales, unpairing keeps the kit for the same till, and a
+  phone that reaches a till at `0.1.0:4` or later fetches a new one.
 
 ## Afterwards
 
-- Staging keeps running for tests: the laptop till on port 9878 with `~/.local/share/fedimint-card-staging`
-  (about 8,475 staging sat), and the staging card `908901dc` (about 13,124 sat; optional drain:
-  12,583 then 540).
-- Open items: `OFFLINE-PLAN.md` § 10.
+- Staging keeps running for tests: the laptop till on port 9878 with
+  `~/.local/share/fedimint-card-staging`, from `a630a22` since 2026-11-11, listening on the LAN
+  with caps of 3 payments and 100,000 msat (its wallet held 51,499,000 msat then). Both staging
+  cards (`908901dc`, `4f5e6da3`) read 0 live msat on the staging registry on 2026-11-13: load one
+  (`card load`) before step 7's staging pass. That pass also runs the count cap's refusal (cap 3)
+  and the checks the zion drills did not run (`POS-OFFLINE.md` § Drill log, "Not run in these
+  drills").
+- Open items: `OFFLINE-PLAN.md` § 10, and ENG-864 to ENG-867 (`POS-OFFLINE.md` § Drill log).
