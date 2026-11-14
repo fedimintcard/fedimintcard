@@ -17,14 +17,15 @@
  *
  * Every note must sit under the card's current key for its slot (`02 || key`, the sidecar's
  * `nonce_for`): a note the card cannot sign for would be worthless and hold the slot. A slot is
- * free while its current key has never carried a note, the rule the tills keep (`cards.ts`).
+ * free while its current key has never carried a note, the rule the tills keep (`cards.ts`), and
+ * no stranded change is held in it (docs/OFFLINE-PROTOCOL.md § 7).
  *
  * A load that expired or was refused leaves no note row behind, so its keys stay free rather than
  * burned: the federation never signed (refused), or ops never heard that it did (expired). A
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, requireVersion, slotCount, unkeyedSlots, versionOf} from './cards';
+import {bump, heldChange, heldChangeSlots, requireVersion, slotCount, unkeyedSlots, versionOf} from './cards';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
 import {cardFederation, checkNotes, isTier, mintKeysFor} from './mint';
@@ -65,7 +66,7 @@ function currentKeys(sql: Sql, shortId: string): Map<number, string> {
 }
 
 /** Whether a note was ever recorded under `nonce` on this card, in any state. */
-function keyUsed(sql: Sql, shortId: string, nonce: string): boolean {
+export function keyUsed(sql: Sql, shortId: string, nonce: string): boolean {
   return sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, nonce).toArray().length > 0;
 }
 
@@ -114,9 +115,10 @@ function spendIn(sql: Sql, shortId: string, now: number): void {
 
 /**
  * `GET /cards/:short_id/slots`: the slots a wallet may load into. Only slots whose current key
- * never carried a note (so none pending either). No balances and no notes: anyone with the short
- * id may ask. `unkeyed_slots` are slots the card has but no key is on record for yet (a 32-slot
- * card registered with 8 keys): nothing can be loaded into them until a till keys them at a tap.
+ * never carried a note (so none pending either) and that hold no stranded change (`cards.ts`
+ * `heldChangeSlots`). No balances and no notes: anyone with the short id may ask.
+ * `unkeyed_slots` are slots the card has but no key is on record for yet (a 32-slot card
+ * registered with 8 keys): nothing can be loaded into them until a till keys them at a tap.
  */
 export function freeSlots(sql: Sql, shortId: string) {
   const fed = cardFederation(sql, shortId);
@@ -125,8 +127,11 @@ export function freeSlots(sql: Sql, shortId: string) {
   }
   const keys = currentKeys(sql, shortId);
   const count = slotCount(sql, shortId);
+  // A held change slot's key never carried a note, but the card holds another transaction's
+  // change opening there (docs/OFFLINE-PROTOCOL.md § 7): a load would reuse the late change's nonce.
+  const held = heldChangeSlots(sql, shortId);
   const free = [...keys]
-    .filter(([, pubkey]) => !keyUsed(sql, shortId, '02' + pubkey))
+    .filter(([slot, pubkey]) => !held.has(slot) && !keyUsed(sql, shortId, '02' + pubkey))
     .sort(([a], [b]) => a - b)
     .map(([slot, pubkey]) => ({slot, pubkey}));
   return {
@@ -200,6 +205,7 @@ export function recordLoad(
     }
     const keys = mintKeysFor(sql, shortId);
     const slots = currentKeys(sql, shortId);
+    const held = heldChangeSlots(sql, shortId);
     for (const n of load.notes) {
       const pubkey = slots.get(n.slot);
       if (pubkey === undefined) {
@@ -207,6 +213,10 @@ export function recordLoad(
       }
       if (n.nonce !== '02' + pubkey) {
         throw new Conflict(`the note for slot ${n.slot} is not under the card's key for that slot`);
+      }
+      const strandedBy = held.get(n.slot);
+      if (strandedBy !== undefined) {
+        throw heldChange(shortId, n.slot, strandedBy);
       }
       if (keyUsed(sql, shortId, n.nonce)) {
         throw new Conflict(`slot ${n.slot} of card ${shortId} is not free; read /slots again`);

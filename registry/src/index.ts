@@ -48,7 +48,11 @@
  *              POST /cards/:short_id/outcome     the federation's answer
  *              POST /cards/:short_id/offline-charges  a charge the card signed offline, reported after the
  *                                                fact: {intent fields, signed_hex, signed_at}; 409 double_spend
- *                                                with conflicts (offline.ts, docs/OFFLINE-PROTOCOL.md § 3)
+ *                                                with conflicts (offline.ts, docs/OFFLINE-PROTOCOL.md § 3), and
+ *                                                for a transaction a stranding release covers (§ 7)
+ *              POST /cards/:short_id/stranded    {slots: [{slot, kind, txid, unspent?, spent?}]}: slots the card
+ *                                                holds for a transaction the registry never saw, held, then
+ *                                                released after the grace (offline.ts, docs/OFFLINE-PROTOCOL.md § 7)
  *              POST /federations                 {federation_id, name, tbs_pks} from the federation's config
  *              PUT  /cards/:short_id/slots/:n    a renewed slot key
  *
@@ -109,6 +113,7 @@ import {
   recordAttestation,
   recordOfflineCharge,
   recordReleases,
+  recordStranded,
   reportRefused,
 } from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
@@ -428,7 +433,7 @@ export class Registry {
     const method = request.method;
     expireLoads(storage, shortId, now);
     if (rest === '/state' && method === 'GET') {
-      return json(200, {ok: true, ...cardState(storage.sql, shortId)});
+      return json(200, {ok: true, ...cardState(storage.sql, shortId, now)});
     }
     const firstKey = /^\/slots\/(\d{1,2})\/key$/.exec(rest);
     const keying = method === 'POST' && (firstKey !== null || rest === '/slot-keys');
@@ -481,6 +486,9 @@ export class Registry {
         return json(409, {ok: false, reason: 'double_spend', conflicts: done.conflicts});
       }
       return json(200, {ok: true, version: done.version});
+    }
+    if (rest === '/stranded' && method === 'POST') {
+      return json(200, {ok: true, ...(await recordStranded(storage, this.certSecret(), shortId, caller.till.till_id, body, now))});
     }
     const slot = /^\/slots\/(\d{1,2})$/.exec(rest);
     if (slot && method === 'PUT') {
@@ -539,7 +547,7 @@ export class Registry {
         'cards', 'batches', 'card_slots', 'card_versions', 'notes', 'card_txs',
         'tills', 'sessions', 'login_attempt_budget', 'federations', 'backup_runs',
         'federation_keys', 'holder_loads', 'holder_budget', 'manager_keys', 'card_resets',
-        'till_claims', 'till_claim_budget', 'offline_reports', 'releases',
+        'till_claims', 'till_claim_budget', 'offline_reports', 'releases', 'strandings',
       ]) {
         sql.exec(`DELETE FROM ${table}`);
       }
@@ -570,6 +578,12 @@ export class Registry {
     if (path === '/test/cert-key') {
       const b = (await objectBody(request)) ?? {};
       this.releaseKeyOff = b.off === true;
+      return json(200, {ok: true});
+    }
+    if (path === '/test/stranded-age') {
+      // Moves a card's stranding rows `ms` into the past, as if first seen that long ago.
+      const b = (await objectBody(request)) ?? {};
+      sql.exec('UPDATE strandings SET first_seen = first_seen - ? WHERE short_id = ?', Number(b.ms), String(b.short_id));
       return json(200, {ok: true});
     }
     if (path === '/test/note') {

@@ -269,6 +269,22 @@ export const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (short_id, slot, txid)
   );
   `,
+  // v13 (docs/OFFLINE-PROTOCOL.md § 7): strandings, the slots a till found SPENT or CHANGE on a
+  // card for a transaction the registry never saw (a wiped phone's sale), held from `first_seen`
+  // until the grace ends and a release is signed. Not in the backup: a restore only restarts the
+  // grace, and the gate on a late report rests on `releases`, which is. `notes.status` keeps its
+  // CHECK: a held note stays live, so a till that does not know holds still parses the state.
+  `
+  CREATE TABLE strandings (
+    short_id   TEXT    NOT NULL,
+    slot       INTEGER NOT NULL,
+    txid       TEXT    NOT NULL,
+    kind       TEXT    NOT NULL CHECK (kind IN ('spent', 'change')),
+    first_seen INTEGER NOT NULL,
+    till_id    INTEGER NOT NULL,
+    PRIMARY KEY (short_id, slot, txid)
+  );
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

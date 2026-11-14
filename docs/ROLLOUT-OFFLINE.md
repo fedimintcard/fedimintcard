@@ -1,6 +1,7 @@
 # Rollout: offline payments to production
 
-Status: checklist, 2026-11-07, for `main` @ `3a0b0e8`; step 7 (the POS phones) added 2026-11-13.
+Status: checklist, 2026-11-07, for `main` @ `3a0b0e8`; step 7 (the POS phones) added 2026-11-13,
+step 8 (registry v13, ENG-867) added 2026-11-14.
 Each step changes production and waits for the owner's OK. Production reached step 6 on
 2026-11-07, with zion's till at `0.1.0:3` (built from `efdc3a6`). Since 2026-11-10 zion has run
 `0.1.0:4` (built from `a630a22`, with the phones' kit and charge routes), and step 7 was drilled
@@ -130,6 +131,26 @@ log).
   phones again. A phone with a kit sells offline whenever it cannot reach the till, a till before
   `0.1.0:4` has no route to take those sales, unpairing keeps the kit for the same till, and a
   phone that reaches a till at `0.1.0:4` or later fetches a new one.
+
+## 8. Registry v13
+
+Holds, then releases, the slots a wiped or lost POS phone's unsynced sales left SPENT or CHANGE on
+holders' cards (`OFFLINE-PROTOCOL.md` § 7, ENG-867). It deploys before the till that reports
+them: a till from before it never calls the new route, and a till built for it answers a v12
+registry's 404 by holding the slots, with nothing released until this step.
+
+- [ ] All suites green on the commit (step 0). Staging first: `cd registry && npx wrangler deploy
+      --env staging`, then a balance tap through the staging till.
+- [ ] `cd registry && npx wrangler deploy` (the top-level environment is production).
+- [ ] Migration v13 runs on the first request; it only adds the `strandings` table, which the
+      backup leaves out.
+- [ ] Check: a balance tap and a charge through zion work as before (zion's till reports nothing
+      until a package with the till's half is on it, step 4's recipe, after this step). The next
+      backup decrypts (step 2) with schema v13 and no `strandings` table.
+- Rollback: `npx wrangler rollback <previous version id>`. v12 code never reads `strandings`, but
+  it has no gate on a late report of a released transaction. A release comes at least 37 days
+  after a slot was first reported, so a rollback within 37 days of this deploy leaves nothing
+  released unguarded; after that, fix forward instead.
 
 ## Afterwards
 
