@@ -150,7 +150,7 @@ fn nonce_hex(n: Nonce) -> String {
     hex::encode(n.0.serialize())
 }
 
-fn nonce_from_hex(s: &str) -> Result<Nonce> {
+pub(crate) fn nonce_from_hex(s: &str) -> Result<Nonce> {
     Ok(Nonce(PublicKey::from_str(s).context("bad nonce hex")?))
 }
 
