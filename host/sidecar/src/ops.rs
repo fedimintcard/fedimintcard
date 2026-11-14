@@ -38,7 +38,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::glue::{CardWallet, on_card};
-use crate::state::{CardState, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingTx, SlotRec, StateStore};
+use crate::state::{
+    CardState, Held, HeldKind, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingTx, SlotRec, StateStore, nonce_matches_pubkey,
+};
 
 /// Every registry call is bounded; a till that cannot reach ops says so instead of hanging.
 const OPS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -61,6 +63,14 @@ pub const MAX_KEY_PER_TAP: usize = 2;
 const GEN_KEY_MS: u64 = 320;
 const RELEASE_MS: u64 = 100;
 const SET_NOTE_MS: u64 = 40;
+
+/// Most slots one tap reads (`GET_SLOT`) to tell whether they are stranded
+/// ([`CardWallet::card_strands`]); the rest are held on doubt and read at a later tap.
+pub const MAX_STRAND_CHECKS: usize = 8;
+/// One bound on the federation's answers about the due spent notes a tap reports.
+const STRAND_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Most rows one `POST /stranded` takes: every slot of the largest card.
+const MAX_STRANDED_ROWS: usize = 32;
 
 /// The spare reserve's settings (`till serve --spare-target`, `--spare-keys-per-tap`). A target
 /// or a per-tap cap of 0 turns it off.
@@ -154,6 +164,33 @@ pub struct RemoteState {
     /// older than releases.
     #[serde(default)]
     pub releases: Vec<RemoteRelease>,
+    /// The card's stranded slots (docs/OFFLINE-PROTOCOL.md § 7). Empty from a registry older than
+    /// them.
+    #[serde(default)]
+    pub stranded: Vec<RemoteStranded>,
+}
+
+/// A slot the registry holds as stranded: a till reported it SPENT, or owed CHANGE, for `txid`,
+/// a transaction the registry never saw.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteStranded {
+    pub slot: u8,
+    /// `spent` or `change` ([`HeldKind::as_str`]); kept as text, so a kind this till does not know
+    /// matches nothing rather than failing the card's state.
+    pub kind: String,
+    /// 32 bytes, hex.
+    pub txid: String,
+    /// The note's amount for a spent slot; none for a change slot.
+    #[serde(default)]
+    pub amount_msat: Option<u64>,
+    /// When the registry first saw it, and when it may release it (ms, by its clock).
+    #[serde(default)]
+    pub since: u64,
+    #[serde(default)]
+    pub release_after: u64,
+    /// Past the grace: a report with the federation's word may release it now.
+    #[serde(default)]
+    pub due: bool,
 }
 
 /// A release: the registry's signature that `txid` will never be accepted, for one slot.
@@ -313,6 +350,12 @@ impl OpsClient {
         }
     }
 
+    /// `POST /cards/:id/stranded` (docs/OFFLINE-PROTOCOL.md § 7): the slots a tap held
+    /// ([`CardWallet::ops_report_strands`]). A registry older than strandings answers 404.
+    pub async fn stranded(&self, short_id: &str, body: &Value) -> Result<Value, OpsError> {
+        self.call(reqwest::Method::POST, &format!("/cards/{short_id}/stranded"), Some(body)).await
+    }
+
     /// `POST /federations`: what a till read from the federation's config ([`FederationReport`]).
     pub async fn federation(&self, report: &FederationReport) -> Result<(), OpsError> {
         let mut body = json!({"federation_id": report.federation_id, "tbs_pks": report.tbs_pks});
@@ -459,6 +502,8 @@ pub struct OpsLink {
     pub open: Vec<String>,
     /// The card's releases as ops last answered them ([`CardWallet::card_releases`]).
     pub releases: Vec<RemoteRelease>,
+    /// The card's stranded slots as ops last answered them ([`CardWallet::card_strands`]).
+    pub stranded: Vec<RemoteStranded>,
 }
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old path.
@@ -486,10 +531,11 @@ impl Ops {
     pub async fn attach(&self, cw: &mut CardWallet) -> Result<StateStore> {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
         let base = self.attach_id(cw, &short_id_of(&pk)).await?;
-        // A 3.0 card: what the registry released (before planning, so this tap can use it), its
-        // clock, any live note it lacks (a load or change finished elsewhere), then its spare
-        // reserve.
+        // A 3.0 card: what the registry released (before planning, so this tap can use it), the
+        // slots nothing explains (held out of this job's plans, reported as it ends), its clock,
+        // any live note it lacks (a load or change finished elsewhere), then its spare reserve.
         let released = cw.card_releases();
+        cw.card_strands(self.cards_dir.parent());
         let written = cw.card_tick();
         match cw.card_spares(released, written).await {
             Ok(r) if !r.renewed.is_empty() || !r.keyed.is_empty() => {
@@ -525,6 +571,7 @@ impl Ops {
             unkeyed: vec![],
             open: vec![],
             releases: vec![],
+            stranded: vec![],
         });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
@@ -537,9 +584,11 @@ impl Ops {
     }
 
     /// End a job [`attach`](Self::attach) started: deliver the writes it queued (a failure stays
-    /// queued in the card's file), then give `cw` its own store back.
+    /// queued in the card's file), report the slots it held ([`CardWallet::ops_report_strands`]),
+    /// then give `cw` its own store back.
     pub async fn finish(cw: &mut CardWallet, base: StateStore) {
         cw.ops_sync().await;
+        cw.ops_report_strands().await;
         cw.ops = None;
         cw.store = base;
     }
@@ -591,6 +640,7 @@ impl CardWallet {
         link.unkeyed = remote.unkeyed_slots.clone();
         link.open = remote.open_txs.iter().map(|t| t.txid.clone()).collect();
         link.releases = remote.releases.clone();
+        link.stranded = remote.stranded.clone();
         Ok(remote)
     }
 
@@ -648,6 +698,191 @@ impl CardWallet {
             }
         }
         n
+    }
+
+    /// Hold back, for this job, what the registry's copy of a 3.0 card cannot explain (ENG-867):
+    /// a SPENT slot whose note it calls live, or a CHANGE slot whose key never carried a note, for
+    /// a transaction it never saw (a POS phone's offline sales, lost with the phone). Unheld, the
+    /// planner picks such a note and the card refuses to sign it again, and a charge's change can
+    /// be planned into such a slot. A slot is explained, and left alone, when its note is an input
+    /// of an open charge, or its transaction is one this till or the registry has: an open charge,
+    /// a live or pending note's transaction, or a charge in this till's offline queue under
+    /// `data_dir` for the card that it has not abandoned (`queued_txids`).
+    ///
+    /// A slot the registry lists as stranded, as the same kind, is held as listed: a SPENT slot
+    /// cannot sign again and a CHANGE slot cannot reopen. Up to [`MAX_STRAND_CHECKS`] others are
+    /// read (`GET_SLOT`) for their transaction; one past that, or whose read fails, is held on
+    /// doubt and read at a later tap. [`Ops::finish`] reports the holds
+    /// ([`ops_report_strands`](Self::ops_report_strands)). Card reads only; never fails the tap.
+    pub fn card_strands(&mut self, data_dir: Option<&Path>) {
+        self.store.state.held.clear();
+        let Some(link) = self.ops.clone() else { return };
+        if !self.card_sign_once() {
+            return;
+        }
+        let st = match on_card(|| self.card.get_state()) {
+            Ok(st) => st,
+            Err(e) => {
+                tracing::warn!("card {}: stranded slots not checked this tap: GET_STATE: {e:#}", link.short_id);
+                return;
+            }
+        };
+        let local = &self.store.state;
+        let open_inputs: HashSet<&str> = local.pending_txs.iter().flat_map(|p| p.inputs.iter().map(String::as_str)).collect();
+        let mut candidates: Vec<(u8, HeldKind, u64)> = vec![];
+        for s in &local.slots {
+            match st.states.get(s.slot as usize) {
+                Some(SlotState::Spent) => {
+                    if let Some(n) = local.notes_on_current_key(s.slot).find(|n| n.status == NoteStatus::Live)
+                        && !open_inputs.contains(n.nonce.as_str())
+                    {
+                        candidates.push((s.slot, HeldKind::Spent, n.amount_msat));
+                    }
+                }
+                Some(SlotState::Change) if local.notes_on_current_key(s.slot).next().is_none() => {
+                    candidates.push((s.slot, HeldKind::Change, 0));
+                }
+                _ => {}
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let mut known: HashSet<String> = local.pending_txs.iter().map(|p| p.txid.clone()).collect();
+        // A live or pending note's txid only: a spent note's can name a transaction that landed
+        // outside every till and the registry (docs/OFFLINE-PROTOCOL.md § 7, decision 5).
+        known.extend(
+            local.notes.iter().filter(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending)).filter_map(|n| n.txid.clone()),
+        );
+        known.extend(link.open.iter().cloned());
+        let mut queue_read = false;
+        let mut held = vec![];
+        let mut asked = 0;
+        for (slot, kind, msat) in candidates {
+            if let Some(r) = link.stranded.iter().find(|r| r.slot == slot && r.kind == kind.as_str()) {
+                held.push(Held { slot, kind, txid: Some(r.txid.clone()), msat, release_after_ms: Some(r.release_after), due: r.due });
+                continue;
+            }
+            let doubt = Held { slot, kind, txid: None, msat, release_after_ms: None, due: false };
+            if asked == MAX_STRAND_CHECKS {
+                held.push(doubt);
+                continue;
+            }
+            asked += 1;
+            let info = match on_card(|| self.card.get_slot(slot)) {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::warn!("card {}: slot {slot} held on doubt: GET_SLOT: {e:#}", link.short_id);
+                    held.push(doubt);
+                    continue;
+                }
+            };
+            // The card holds another key than the registry's: not the registry's note or slot.
+            if info.xonly.map(|k| k.to_string()).as_deref() != self.store.state.slot_pubkey(slot) {
+                continue;
+            }
+            let hash = match (kind, info.state) {
+                (HeldKind::Spent, SlotState::Spent) => info.spent_hash,
+                (HeldKind::Change, SlotState::Change) => info.opening.txid,
+                _ => continue,
+            };
+            let txid = hex::encode(hash);
+            if !queue_read {
+                queue_read = true;
+                known.extend(queued_txids(data_dir, &link.short_id));
+            }
+            if !known.contains(&txid) {
+                held.push(Held { slot, kind, txid: Some(txid), msat, release_after_ms: None, due: false });
+            }
+        }
+        if !held.is_empty() {
+            let slots: Vec<String> = held.iter().map(|h| format!("{} ({})", h.slot, h.kind.as_str())).collect();
+            let msat: u64 = held.iter().map(|h| h.msat).sum();
+            tracing::warn!("card {}: holding {} stranded slot(s) back, {msat} msat: {}", link.short_id, held.len(), slots.join(", "));
+        }
+        self.store.state.held = held;
+    }
+
+    /// Report the slots this job held ([`card_strands`](Self::card_strands)) when the registry
+    /// does not list one yet, or lists one as due: `POST /cards/:id/stranded` with every held slot
+    /// whose transaction is known, so a change slot goes with its transaction's inputs. First the
+    /// federation is asked about each due spent note, all within [`STRAND_CHECK_TIMEOUT`]: unspent
+    /// is `unspent: true`, on which the registry may release the slot; spent is `spent: true`, on
+    /// which it records the note spent and never releases it, and the note is spent here too, so
+    /// the slot renews at the next charge with the PIN; no answer sends neither, and the next tap
+    /// asks again. Releases come back in the card's state and reach the card at its next tap
+    /// ([`card_releases`](Self::card_releases)). Never fails the job: a registry older than
+    /// strandings answers 404, and that or any other error is logged.
+    pub async fn ops_report_strands(&mut self) {
+        let Some(link) = self.ops.clone() else { return };
+        let held: Vec<Held> = self.store.state.held.iter().filter(|h| h.txid.is_some()).cloned().collect();
+        let listed = |h: &Held| {
+            link.stranded.iter().find(|r| r.slot == h.slot && r.kind == h.kind.as_str() && h.txid.as_deref() == Some(r.txid.as_str()))
+        };
+        if !held.iter().any(|h| listed(h).is_none_or(|r| r.due)) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + STRAND_CHECK_TIMEOUT;
+        let mut spent: Vec<(u8, bool)> = vec![];
+        for h in held.iter().filter(|h| h.kind == HeldKind::Spent && listed(h).is_some_and(|r| r.due)) {
+            let Some(nonce) = self
+                .store
+                .state
+                .notes_on_current_key(h.slot)
+                .find(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Spent))
+                .and_then(|n| crate::glue::nonce_from_hex(&n.nonce).ok())
+            else {
+                continue;
+            };
+            match tokio::time::timeout_at(deadline, self.is_spent(nonce)).await {
+                Ok(Ok(s)) => spent.push((h.slot, s)),
+                Ok(Err(e)) => {
+                    tracing::warn!("card {}: slot {}: the federation did not say whether its note is spent: {e:#}", link.short_id, h.slot)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "card {}: the federation did not answer within {STRAND_CHECK_TIMEOUT:?}; asked again at the next tap",
+                        link.short_id
+                    );
+                    break;
+                }
+            }
+        }
+        let flag = |h: &Held| spent.iter().find(|(s, _)| h.kind == HeldKind::Spent && *s == h.slot).map(|(_, x)| *x);
+        let rows: Vec<Value> = held
+            .iter()
+            .take(MAX_STRANDED_ROWS)
+            .map(|h| {
+                let mut v = json!({"slot": h.slot, "kind": h.kind.as_str(), "txid": h.txid});
+                match flag(h) {
+                    Some(false) => v["unspent"] = json!(true),
+                    Some(true) => v["spent"] = json!(true),
+                    None => {}
+                }
+                v
+            })
+            .collect();
+        match link.client.stranded(&link.short_id, &json!({"slots": rows})).await {
+            Ok(_) => tracing::info!("card {}: reported {} stranded slot(s) to ops", link.short_id, rows.len()),
+            Err(OpsError::UnknownCard(m)) => {
+                tracing::warn!("card {}: ops takes no stranded slots (404, a registry older than them?): {m}", link.short_id)
+            }
+            Err(e) => tracing::warn!("card {}: stranded slots not reported this tap: {e}", link.short_id),
+        }
+        // Spent on the federation: spent here too.
+        let mut changed = false;
+        for &(slot, _) in spent.iter().filter(|(_, s)| *s) {
+            let Some(pk) = self.store.state.slot_pubkey(slot).map(str::to_owned) else { continue };
+            for n in self.store.state.notes.iter_mut().filter(|n| n.slot == slot && n.status == NoteStatus::Live) {
+                if nonce_matches_pubkey(&n.nonce, &pk) {
+                    n.status = NoteStatus::Spent;
+                    changed = true;
+                }
+            }
+        }
+        if changed && let Err(e) = self.store.save() {
+            tracing::warn!("card {}: recording a note the federation spent: {e:#}", link.short_id);
+        }
     }
 
     /// Deliver what this till owes ops, then replace the card side of the local file with what
@@ -955,6 +1190,29 @@ impl CardWallet {
     }
 }
 
+/// The transactions this till's offline queue (`<data_dir>/offline_queue.json`) holds for card
+/// `short_id`, abandoned ones aside: this till knows them, so their slots are explained. An
+/// abandoned charge is never sent (an input slot of it paid another transaction or was re-keyed),
+/// so the slots the card spent or opened for it are stranded, and are held and reported like a
+/// lost phone's. A queue that cannot be read is taken as empty: the slot is then held and
+/// reported, and the sender's report of the charge clears its row in the registry.
+fn queued_txids(data_dir: Option<&Path>, short_id: &str) -> Vec<String> {
+    let Some(dir) = data_dir else { return vec![] };
+    match fedimint_card_pos_core::queue::Queue::open(dir) {
+        Ok(q) => q
+            .file
+            .charges
+            .into_iter()
+            .filter(|c| c.short_id == short_id && c.state != fedimint_card_pos_core::queue::ChargeState::Abandoned)
+            .map(|c| c.txid)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("card {short_id}: the offline queue could not be read: {e:#}");
+            vec![]
+        }
+    }
+}
+
 /// Replace the card side of `st` with `remote`, keeping what only this till knows: its own
 /// outputs, its unsent writes and the history of keys ops no longer reports.
 pub fn merge(st: &mut CardState, remote: &RemoteState) {
@@ -1075,6 +1333,7 @@ mod tests {
             notes,
             open_txs: open,
             releases: vec![],
+            stranded: vec![],
         }
     }
 
@@ -1117,6 +1376,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!((new.releases[0].slot, new.releases[0].txid.as_str(), new.releases[0].sig.as_str()), (3, "ab", "30"));
+    }
+
+    #[test]
+    fn stranded_slots_parse_and_default_to_none_from_an_older_registry() {
+        let old: RemoteState = serde_json::from_value(json!({"version": 1, "slots": [], "notes": [], "open_txs": []})).unwrap();
+        assert!(old.stranded.is_empty());
+        let new: RemoteState = serde_json::from_value(json!({
+            "version": 1, "slots": [], "notes": [], "open_txs": [], "stranded": [
+                {"slot": 3, "kind": "spent", "txid": "ab", "amount_msat": 16384, "since": 10, "release_after": 20, "due": false},
+                {"slot": 4, "kind": "change", "txid": "ab", "amount_msat": null, "since": 10, "release_after": 20, "due": true},
+                {"slot": 5, "kind": "later", "txid": "cd"},
+            ],
+        }))
+        .unwrap();
+        let s = &new.stranded;
+        assert_eq!((s[0].slot, s[0].kind.as_str(), s[0].amount_msat, s[0].release_after, s[0].due), (3, "spent", Some(16384), 20, false));
+        assert_eq!((s[1].kind.as_str(), s[1].amount_msat, s[1].due), ("change", None, true));
+        assert_eq!((s[2].kind.as_str(), s[2].since, s[2].due), ("later", 0, false), "a kind this till does not know parses");
+        assert_eq!((HeldKind::Spent.as_str(), HeldKind::Change.as_str()), ("spent", "change"));
     }
 
     #[test]
