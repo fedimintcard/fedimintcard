@@ -706,7 +706,8 @@ impl CardWallet {
     /// planner picks such a note and the card refuses to sign it again, and a charge's change can
     /// be planned into such a slot. A slot is explained, and left alone, when its note is an input
     /// of an open charge, or its transaction is one this till or the registry has: an open charge,
-    /// a note's transaction, or a charge in this till's offline queue under `data_dir` for the card.
+    /// a live or pending note's transaction, or a charge in this till's offline queue under
+    /// `data_dir` for the card that it has not abandoned (`queued_txids`).
     ///
     /// A slot the registry lists as stranded, as the same kind, is held as listed: a SPENT slot
     /// cannot sign again and a CHANGE slot cannot reopen. Up to [`MAX_STRAND_CHECKS`] others are
@@ -748,7 +749,11 @@ impl CardWallet {
             return;
         }
         let mut known: HashSet<String> = local.pending_txs.iter().map(|p| p.txid.clone()).collect();
-        known.extend(local.notes.iter().filter_map(|n| n.txid.clone()));
+        // A live or pending note's txid only: a spent note's can name a transaction that landed
+        // outside every till and the registry (docs/OFFLINE-PROTOCOL.md § 7, decision 5).
+        known.extend(
+            local.notes.iter().filter(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending)).filter_map(|n| n.txid.clone()),
+        );
         known.extend(link.open.iter().cloned());
         let mut queue_read = false;
         let mut held = vec![];
@@ -1186,13 +1191,21 @@ impl CardWallet {
 }
 
 /// The transactions this till's offline queue (`<data_dir>/offline_queue.json`) holds for card
-/// `short_id`, in any state: this till knows them, so their slots are explained. A queue that
-/// cannot be read is taken as empty: the slot is then held and reported, and the sender's report of
-/// the charge clears its row in the registry.
+/// `short_id`, abandoned ones aside: this till knows them, so their slots are explained. An
+/// abandoned charge is never sent (an input slot of it paid another transaction or was re-keyed),
+/// so the slots the card spent or opened for it are stranded, and are held and reported like a
+/// lost phone's. A queue that cannot be read is taken as empty: the slot is then held and
+/// reported, and the sender's report of the charge clears its row in the registry.
 fn queued_txids(data_dir: Option<&Path>, short_id: &str) -> Vec<String> {
     let Some(dir) = data_dir else { return vec![] };
     match fedimint_card_pos_core::queue::Queue::open(dir) {
-        Ok(q) => q.file.charges.into_iter().filter(|c| c.short_id == short_id).map(|c| c.txid).collect(),
+        Ok(q) => q
+            .file
+            .charges
+            .into_iter()
+            .filter(|c| c.short_id == short_id && c.state != fedimint_card_pos_core::queue::ChargeState::Abandoned)
+            .map(|c| c.txid)
+            .collect(),
         Err(e) => {
             tracing::warn!("card {short_id}: the offline queue could not be read: {e:#}");
             vec![]

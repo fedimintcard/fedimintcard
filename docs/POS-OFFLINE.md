@@ -530,12 +530,14 @@ run in step 7's staging pass (`ROLLOUT-OFFLINE.md` § Afterwards).
    (drill (d): 48 sat, the three prices). The holder waits (drill (d): 65,536 msat stranded for
    48 sat of sales; the caps count what the till is owed, not the inputs): the inputs and the
    unfinished change of the lost charges stay stranded on the card, and the registry, which never
-   saw the charges, keeps listing those inputs live. Since ENG-867 every online tap holds the
-   stranded slots back: the balance shows the inputs on hold (`stranded_msat`) beside what the card
-   can pay, the till's planner leaves them alone, so an online sale pays from the other notes, and
-   the till reports them to the registry. 37 days after the registry first hears of them (a kit's
-   7 days plus its 30-day redeem window), and once the federation says the inputs are unspent, the
-   registry releases them and the next tap gives the holder the notes back; a report of a lost
-   charge after that is a double spend, the merchant's loss (`TILL-API.md`, "Stranded slots"). The
-   CHANGE slots of risk 5 are held and released the same way, with no federation check. A wiped or
+   saw the charges, keeps listing those inputs live. Since ENG-867 every charge, balance or issue
+   tap of a 3.0 card on ops holds the stranded slots back: the balance shows the inputs on hold
+   (`stranded_msat`) beside what the card can pay, the till's planner leaves them alone, so an
+   online sale pays from the other notes, and the till reports them to the registry. A top-up
+   load reads no slot state from the card: it relies on the registry leaving held CHANGE slots out
+   of its free slots. 37 days after the registry first hears of them (a kit's 7 days plus its
+   30-day redeem window), and once the federation says the inputs are unspent, the registry
+   releases them and the next tap gives the holder the notes back; a report of a lost charge after
+   that is a double spend, the merchant's loss (`TILL-API.md`, "Stranded slots"). The CHANGE slots
+   of risk 5 are held and released the same way, with no federation check. A wiped or
    reinstalled app is the same.

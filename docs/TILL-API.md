@@ -88,15 +88,18 @@ signatures.
 **Stranded slots.** A charge that reaches no till (a POS phone's offline sales, lost with the
 phone before it synced) leaves its card SPENT slots whose notes the registry still calls live, and
 CHANGE slots it calls free. The card signs a note once, and a CHANGE slot takes only the change
-it is owed, so every online tap of a 3.0 card on ops, after the releases and before anything is
-planned, holds such slots back for that tap: a SPENT slot whose note is live and is no
-input of an open charge, and a CHANGE slot whose key never carried a note, unless the transaction
-the slot signed or waits on is one this till or the registry has (an open charge, a note's
-transaction, a charge in this till's offline queue). A held note is out of the plan and out of
-`live_msat`, and a held CHANGE slot is no room for change. A slot the registry already lists as
-stranded is held as listed; up to 8 others per tap are read (`GET_SLOT`) for their transaction,
-and the rest, or one whose read fails, are held on doubt and read at a later tap. As the tap ends
-the till reports the slots the registry does not list yet, or lists as due
+it is owed, so every charge, balance or issue tap of a 3.0 card on ops, after the releases and
+before anything is planned, holds such slots back for that tap: a SPENT slot whose note is live
+and is no input of an open charge, and a CHANGE slot whose key never carried a note, unless the
+transaction the slot signed or waits on is one this till or the registry has (an open charge, a
+live or pending note's transaction, a charge in this till's offline queue that it has not
+abandoned). A held note is out of the plan and out of `live_msat`, and a held CHANGE slot is no
+room for change. A top-up load (`POST /v1/topup/{topup_id}/load`) reads no slot state from the
+card: it relies on the registry leaving held CHANGE slots out of its free slots. A slot the
+registry already lists as stranded is held as listed; up to 8 others per tap are read
+(`GET_SLOT`) for their transaction, and the rest, or one whose read fails, are held on doubt and
+read at a later tap. As the tap ends the till reports the slots the registry does not list yet,
+or lists as due
 (`POST /cards/:id/stranded`, docs/OFFLINE-PROTOCOL.md § 7). A slot is due 37 days after the
 registry first heard of it: a kit's 7 days plus its 30-day redeem window. For the due spent notes
 the till asks the federation, 3 s for them all. A note it says is unspent goes as
@@ -148,9 +151,11 @@ sale, `offline: true`; the sender's next pass, every 30 s, reports it), and anot
 paid another transaction, or was re-keyed) is set aside at the card's next tap on the offline
 path (`abandoned` in the queue, kept for the operator: the notes the card signed for it stay
 spent on the card, and those it never signed pay again); nothing was charged for it, and the tap
-goes on as a new charge, for the same `client_ref` too. Notes the till's checks refuse (no
-denomination of the federation's, or a federation signature that does not verify) are skipped;
-when the rest do not pay, the charge is `offline_note_invalid` (403), not `insufficient`.
+goes on as a new charge, for the same `client_ref` too. It is never sent, so the slots the card
+spent or opened for it are stranded slots (above): held, reported, and released after the grace.
+Notes the till's checks refuse (no denomination of the federation's, or a federation signature
+that does not verify) are skipped; when the rest do not pay, the charge is
+`offline_note_invalid` (403), not `insufficient`.
 
 **POS phones offline.** A paired POS phone with no network takes a 3.0 card itself, with the
 same charge as the till's (`host/pos-core`, docs/POS-OFFLINE.md), and syncs what it took when it
