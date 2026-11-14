@@ -6,9 +6,9 @@ name: Mobile
 on:
   push:
     branches: ['**']
-    paths: ['host/**', 'android-relay/**', '.github/workflows/mobile.yml']
+    paths: ['host/**', 'android-relay/**', 'ios-pos/**', '.github/workflows/mobile.yml']
   pull_request:
-    paths: ['host/**', 'android-relay/**', '.github/workflows/mobile.yml']
+    paths: ['host/**', 'android-relay/**', 'ios-pos/**', '.github/workflows/mobile.yml']
 permissions: { contents: read }
 # Block form, not a flow mapping: a `{ ... }` map containing `${{ }}` does not parse.
 concurrency:
@@ -41,6 +41,14 @@ jobs:
       - name: Kotlin bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings kotlin
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: '17' }
+      - name: The Android app, unit tests and debug build (Gradle reruns the core steps from cache)
+        working-directory: android-relay
+        shell: bash
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon testDebugUnitTest assembleDebug
       - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -84,6 +92,15 @@ jobs:
       - name: Swift bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings swift
+      - name: The iOS app, package and unit tests on a simulator
+        shell: bash
+        run: |
+          ios-pos/scripts/build-poscore.sh
+          sim=$(xcrun simctl list devices available | grep -o 'iPhone [0-9][0-9A-Za-z ]*' | head -1)
+          echo "simulator: $sim"
+          xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
+            -destination "platform=iOS Simulator,name=$sim" -derivedDataPath /tmp/pos-dd \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/xcodebuild.log | grep -E 'Test Suite|Executed|error:|\*\* TEST'
       - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
