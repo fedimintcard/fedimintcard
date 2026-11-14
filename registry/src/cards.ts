@@ -458,7 +458,90 @@ export function unkeyedSlots(count: number, keyed: Iterable<number>): number[] {
   return Array.from({length: count}, (_, i) => i).filter(i => !have.has(i));
 }
 
-export function cardState(sql: Sql, shortId: string) {
+/* ------------------------------------------------------------------------- */
+/* Strandings (docs/OFFLINE-PROTOCOL.md § 7)                                 */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * How long a stranded slot is held before it may be released, from the registry's first sight of
+ * it: a phone's kit lasts 7 days and its sales are redeemed for 30 days after (the till's
+ * `KitConfig`, `host/sidecar/src/pool.rs`), so a sale the phone could still sync is reported
+ * within the grace.
+ */
+export const STRANDED_GRACE_MS = 37 * 24 * 60 * 60 * 1000;
+
+/**
+ * An offline report that counts as the registry having seen its transaction: any but the money
+ * gate's refusal (`recordOfflineCharge`), whose conflicts are all `released`. The gate refuses a
+ * transaction because a stranding of it was released, so its refusal leaves the transaction's
+ * other held slots to their own release rather than holding them for good.
+ */
+const SEEN_REPORT = `json_extract(o.detail, '$.conflicts[0].status') IS NOT 'released'`;
+
+/**
+ * Whether the registry has seen the transaction: a charge on record, or an offline report of it
+ * for the card (`SEEN_REPORT`). A stranding is held only for a transaction it has not.
+ */
+export function txKnown(sql: Sql, shortId: string, txid: string): boolean {
+  return (
+    sql.exec('SELECT 1 FROM card_txs WHERE txid = ?', txid).toArray().length > 0 ||
+    sql
+      .exec(`SELECT 1 FROM offline_reports o WHERE o.txid = ? AND o.short_id = ? AND ${SEEN_REPORT}`, txid, shortId)
+      .toArray().length > 0
+  );
+}
+
+/**
+ * A stranding row is open (held) while the registry has still not seen its transaction (`txKnown`)
+ * and no release is signed for its slot.
+ */
+const OPEN = `NOT EXISTS (SELECT 1 FROM card_txs t WHERE t.txid = s.txid)
+  AND NOT EXISTS (SELECT 1 FROM offline_reports o WHERE o.txid = s.txid AND o.short_id = s.short_id AND ${SEEN_REPORT})
+  AND NOT EXISTS (SELECT 1 FROM releases r WHERE r.short_id = s.short_id AND r.slot = s.slot AND r.txid = s.txid)`;
+
+export interface Stranding {
+  readonly slot: number;
+  readonly kind: 'spent' | 'change';
+  readonly txid: string;
+  readonly first_seen: number;
+}
+
+/** The card's open stranding rows, by slot and txid. */
+export function openStrandings(sql: Sql, shortId: string): Stranding[] {
+  return sql
+    .exec(`SELECT slot, kind, txid, first_seen FROM strandings s WHERE s.short_id = ? AND ${OPEN} ORDER BY slot, txid`, shortId)
+    .toArray()
+    .map(r => ({
+      slot: Number(r.slot),
+      kind: String(r.kind) as Stranding['kind'],
+      txid: String(r.txid),
+      first_seen: Number(r.first_seen),
+    }));
+}
+
+/**
+ * The open `change` rows by slot: a CHANGE slot on the card holds another transaction's change
+ * opening, so nothing new may be planned into it, and a late report of that transaction puts its
+ * change note under the slot's key.
+ */
+export function heldChangeSlots(sql: Sql, shortId: string): Map<number, string> {
+  return new Map(
+    sql
+      .exec(`SELECT slot, txid FROM strandings s WHERE s.short_id = ? AND s.kind = 'change' AND ${OPEN}`, shortId)
+      .toArray()
+      .map(r => [Number(r.slot), String(r.txid)] as const),
+  );
+}
+
+/** The refusal for change or a load into a held change slot. */
+export function heldChange(shortId: string, slot: number, txid: string): Conflict {
+  return new Conflict(
+    `slot ${slot} of card ${shortId} is held: the card keeps the change of transaction ${txid} there, ` +
+      'which the registry never saw (docs/OFFLINE-PROTOCOL.md § 7)',
+  );
+}
+
+export function cardState(sql: Sql, shortId: string, now: number) {
   const slots = sql
     .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ? ORDER BY slot', shortId)
     .toArray()
@@ -512,6 +595,33 @@ export function cardState(sql: Sql, shortId: string) {
     .exec('SELECT slot, txid, sig FROM releases WHERE short_id = ? ORDER BY slot, txid', shortId)
     .toArray()
     .map(r => ({slot: Number(r.slot), txid: String(r.txid), sig: String(r.sig)}));
+  // Strandings (docs/OFFLINE-PROTOCOL.md § 7): slots a till found SPENT or CHANGE for a
+  // transaction the registry never saw. A till keeps its plans off them and reports them again
+  // once `due`. A spent slot's note is still live here and carries its amount; a change slot's
+  // amount is the card's, not the registry's.
+  const stranded = openStrandings(sql, shortId).map(s => {
+    const note =
+      s.kind === 'spent'
+        ? sql
+            .exec(
+              `SELECT n.amount_msat FROM notes n JOIN card_slots k ON k.short_id = n.short_id AND n.nonce = '02' || k.pubkey
+               WHERE n.short_id = ? AND k.slot = ? AND n.status = 'live'`,
+              shortId,
+              s.slot,
+            )
+            .toArray()[0]
+        : undefined;
+    const releaseAfter = s.first_seen + STRANDED_GRACE_MS;
+    return {
+      slot: s.slot,
+      kind: s.kind,
+      txid: s.txid,
+      amount_msat: note ? Number(note.amount_msat) : null,
+      since: s.first_seen,
+      release_after: releaseAfter,
+      due: now >= releaseAfter,
+    };
+  });
   const count = slotCount(sql, shortId);
   return {
     short_id: shortId,
@@ -522,6 +632,7 @@ export function cardState(sql: Sql, shortId: string) {
     notes,
     open_txs: open,
     releases,
+    stranded,
   };
 }
 
@@ -603,7 +714,8 @@ export function parseIntent(r: Record<string, unknown>, slots: number) {
  * A till's charge, recorded before the card signs. Replaying the same intent
  * answers the current version; a different body under the same txid, a
  * stale version, a second open charge, an input that is not a live note of
- * this card, or change into an occupied or unknown slot is refused.
+ * this card, or change into an occupied, unknown or held slot is refused (a
+ * held slot is a stranded CHANGE slot, docs/OFFLINE-PROTOCOL.md § 7).
  */
 export function recordIntent(
   storage: DurableObjectStorage,
@@ -656,9 +768,15 @@ export function recordIntent(
         ),
       ),
     );
+    const strandedChange = heldChangeSlots(sql, shortId);
     for (const c of intent.body.change) {
       if (!slots.has(c.slot)) {
         throw new Conflict(`card ${shortId} has no key in slot ${c.slot} yet; key it first (POST /slots/${c.slot}/key)`);
+      }
+      // A CHANGE slot of a transaction the registry never saw: the card takes no change there.
+      const strandedBy = strandedChange.get(c.slot);
+      if (strandedBy !== undefined) {
+        throw heldChange(shortId, c.slot, strandedBy);
       }
       const held = sql
         .exec(
@@ -984,6 +1102,7 @@ export function renewSlot(
     );
     // A new key: whatever the slot held for an old transaction is gone with the old one.
     sql.exec('DELETE FROM releases WHERE short_id = ? AND slot = ?', shortId, slot);
+    sql.exec('DELETE FROM strandings WHERE short_id = ? AND slot = ?', shortId, slot);
     return {version: bump(sql, shortId)};
   });
 }
@@ -1083,6 +1202,7 @@ export function addSlotKeys(
     for (const k of added) {
       sql.exec('INSERT INTO card_slots (short_id, slot, pubkey) VALUES (?, ?, ?)', shortId, k.slot, k.pubkey);
       sql.exec('DELETE FROM releases WHERE short_id = ? AND slot = ?', shortId, k.slot);
+      sql.exec('DELETE FROM strandings WHERE short_id = ? AND slot = ?', shortId, k.slot);
     }
     const version = added.length > 0 ? bump(sql, shortId) : versionOf(sql, shortId);
     const keyed = sql
