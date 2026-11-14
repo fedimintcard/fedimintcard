@@ -324,7 +324,11 @@ internal fun parseSales(body: String): TillResult<SalesList> = try {
     TillResult.Err(TillError.BadResponse(e.message ?: "bad json"))
 }
 
-/** `{"ok":true,"live_msat":N,"notes":[{"slot","msat","status"}],"free_slots":[..]}`. */
+/**
+ * `{"ok":true,"live_msat":N,"stranded_msat":N,"stranded_until_ms":N|null,"notes":[{"slot","msat","status"}],"free_slots":[..]}`.
+ * A till from before these fields sends neither, and a value that is not a number reads as
+ * absent: nothing on hold, no date.
+ */
 internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = try {
     val o = JSONObject(body)
     if (!o.optBoolean("ok", false)) {
@@ -340,7 +344,13 @@ internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = tr
         val f = o.optJSONArray("free_slots")
         val free = if (f == null) emptyList() else (0 until f.length()).map { f.getInt(it) }
         val shortId = if (o.isNull("short_id")) null else o.optString("short_id").ifEmpty { null }
-        BalanceResult.Read(CardBalance(o.optL("live_msat"), rows, free, shortId))
+        BalanceResult.Read(
+            CardBalance(
+                o.optL("live_msat"), rows, free, shortId,
+                strandedMsat = (o.opt("stranded_msat") as? Number)?.toLong() ?: 0,
+                strandedUntilMs = (o.opt("stranded_until_ms") as? Number)?.toLong(),
+            )
+        )
     }
 } catch (e: JSONException) {
     BalanceResult.Failed(TillError.BadResponse(e.message ?: "bad json"))

@@ -78,8 +78,18 @@ sealed class PosState {
     object BalanceWaiting : PosState()
     /** A card is on the phone and the till is reading it; [readId] matches the reply. */
     data class BalanceReading(val readId: Int) : PosState()
-    /** What the card holds, shown to the holder until Done or [PosFlow.BALANCE_SHOWN_MS] pass. */
-    data class BalanceShown(val readId: Int, val liveMsat: Long, val shortId: String? = null, val waiting: WaitingTopUp? = null) : PosState()
+    /**
+     * What the card holds, shown to the holder until Done or [PosFlow.BALANCE_SHOWN_MS] pass: what it
+     * can pay, and what the till holds back ([CardBalance.strandedMsat], [CardBalance.strandedUntilMs]).
+     */
+    data class BalanceShown(
+        val readId: Int,
+        val liveMsat: Long,
+        val shortId: String? = null,
+        val waiting: WaitingTopUp? = null,
+        val strandedMsat: Long = 0,
+        val strandedUntilMs: Long? = null,
+    ) : PosState()
     /** The read failed; [detail] is the till's own words, kept for diagnosis and never shown. */
     data class BalanceFailed(val problem: BalanceProblem, val detail: String = "") : PosState()
 
@@ -449,7 +459,9 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             e is PosEvent.CancelPressed && (s is PosState.BalanceWaiting || s is PosState.BalanceReading) -> state = PosState.Entering
             e is PosEvent.BalanceDone && s is PosState.BalanceReading && e.readId == s.readId -> {
                 state = when (val r = e.result) {
-                    is BalanceResult.Read -> PosState.BalanceShown(s.readId, r.balance.liveMsat, r.balance.shortId)
+                    is BalanceResult.Read -> r.balance.let {
+                        PosState.BalanceShown(s.readId, it.liveMsat, it.shortId, strandedMsat = it.strandedMsat, strandedUntilMs = it.strandedUntilMs)
+                    }
                     is BalanceResult.Refused -> PosState.BalanceFailed(balanceProblem(r), r.detail)
                     is BalanceResult.Failed -> PosState.BalanceFailed(balanceProblem(r), (r.error as? TillError.BadResponse)?.detail ?: "")
                 }

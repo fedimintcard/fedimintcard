@@ -19,6 +19,23 @@ class BalanceFlowTest {
         assertEquals(PosState.BalanceShown(fx.readId, 65_500), f.state)
     }
 
+    /** ENG-867: the shown balance is still what the card can pay, with what is on hold beside it. */
+    @Test fun whatIsOnHoldGoesToTheScreenBesideThePayableBalance() {
+        val f = flow(); f.dispatch(PosEvent.CardBalanceOpened)
+        val fx = f.dispatch(PosEvent.CardPresent).single() as PosEffect.StartBalanceRead
+        val held = CardBalance(65_536, emptyList(), emptyList(), strandedMsat = 131_072, strandedUntilMs = 1_798_000_000_000)
+        f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(held)))
+        assertEquals(PosState.BalanceShown(fx.readId, 65_536, strandedMsat = 131_072, strandedUntilMs = 1_798_000_000_000), f.state)
+    }
+
+    @Test fun aReadWithNothingOnHoldShowsNone() {
+        val f = flow(); f.dispatch(PosEvent.CardBalanceOpened)
+        val fx = f.dispatch(PosEvent.CardPresent).single() as PosEffect.StartBalanceRead
+        f.dispatch(PosEvent.BalanceDone(fx.readId, read))
+        val s = f.state as PosState.BalanceShown
+        assertEquals(0L, s.strandedMsat); assertNull(s.strandedUntilMs)
+    }
+
     @Test fun aCardAlreadyOnThePhoneIsReadAtOnce() {
         val f = flow(); f.dispatch(PosEvent.CardPresent)
         assertTrue(f.dispatch(PosEvent.CardBalanceOpened).single() is PosEffect.StartBalanceRead)

@@ -21,7 +21,10 @@ data class Note(val slot: Int, val msat: Long)
 /** One card slot's contents, from `POST /v1/card/balance`. */
 data class CardNote(val slot: Int, val msat: Long, val status: String)
 
-/** What the card holds, read off the card itself rather than the till's wallet. */
+/**
+ * What the card holds, read off the card itself rather than the till's wallet. [liveMsat] is what
+ * the card can pay.
+ */
 data class CardBalance(
     val liveMsat: Long,
     val notes: List<CardNote>,
@@ -29,6 +32,16 @@ data class CardBalance(
     /** The card's id on the registry (`short_id`), when the till is on ops: a top-up started from
      *  the balance screen sends it so the till fits the amount to this card's free slots. */
     val shortId: String? = null,
+    /**
+     * Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
+     * in [liveMsat], until the registry releases them. 0 from a till from before these fields.
+     */
+    val strandedMsat: Long = 0,
+    /**
+     * When the last of them may be released, by the registry's clock (`stranded_until_ms`); null
+     * when there is no date to wait for, or the till does not say.
+     */
+    val strandedUntilMs: Long? = null,
 )
 
 data class ChargeReceipt(

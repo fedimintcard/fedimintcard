@@ -193,6 +193,10 @@
                 android:autoSizeStepGranularity="2sp" android:textColor="@color/gold_hi" />
             <TextView style="@style/Body" android:layout_width="match_parent" android:layout_height="wrap_content"
                 android:layout_marginTop="4dp" android:text="@string/on_this_card" android:textSize="20sp" />
+            <!-- what the till holds back from the card (onHoldLine); gone when nothing is on hold -->
+            <TextView android:id="@+id/card_balance_on_hold" style="@style/Body" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="8dp" android:textColor="@color/dim"
+                android:textSize="14sp" android:visibility="gone" />
         </LinearLayout>
         <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
         <TextView android:id="@+id/card_balance_countdown" style="@style/Body" android:layout_width="match_parent"
