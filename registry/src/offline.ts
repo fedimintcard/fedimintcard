@@ -16,6 +16,7 @@
 import {
   bump,
   cardOwner,
+  landed,
   MAX_TX_HEX,
   openStrandings,
   parseIntent,
@@ -538,14 +539,6 @@ function hasSpentRow(sql: Sql, shortId: string, txid: string): boolean {
 
 function liveNote(sql: Sql, shortId: string, nonce: string): boolean {
   return sql.exec("SELECT 1 FROM notes WHERE short_id = ? AND nonce = ? AND status = 'live'", shortId, nonce).toArray().length > 0;
-}
-
-/**
- * The federation said a note the transaction spent is spent (`recordStranded` marks it spent under
- * the transaction): the transaction landed, so its change is real and is never released.
- */
-function landed(sql: Sql, shortId: string, txid: string): boolean {
-  return sql.exec("SELECT 1 FROM notes WHERE short_id = ? AND txid = ? AND status = 'spent'", shortId, txid).toArray().length > 0;
 }
 
 /**

@@ -798,6 +798,27 @@ describe('stranded notes (docs/OFFLINE-PROTOCOL.md § 7)', () => {
     expect(await rowsOf(shortId)).toEqual([]);
   });
 
+  it('reads a null flag as absent and ignores a flag on a change slot', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await strandedCard(token);
+    // A till that serializes an absent flag as null is not refused.
+    expect(await reported(till.token, shortId, [
+      spentSlot(2, T, {unspent: null, spent: null}),
+      {...changeSlot(5), unspent: null, spent: null},
+    ])).toEqual({ok: true, held: [2, 5], released: [], spent: [], ignored: []});
+    await age(shortId);
+    // T has a spent row with no answer: a change slot's own flags release nothing and mark nothing spent.
+    expect(await reported(till.token, shortId, [spentSlot(2), {...changeSlot(5), unspent: true}])).toEqual({
+      ok: true, held: [2, 5], released: [], spent: [], ignored: [],
+    });
+    expect(await reported(till.token, shortId, [{...changeSlot(5), spent: true}])).toEqual({
+      ok: true, held: [5], released: [], spent: [], ignored: [],
+    });
+    expect(await releasesOf(till.token, shortId)).toEqual([]);
+    expect(await rowsOf(shortId)).toEqual([[2, T, 'spent'], [5, T, 'change']]);
+  });
+
   it('signs nothing before the grace; after it, a spent slot on its own unspent:true, and the change on an unspent input of its transaction', async () => {
     const token = await signIn();
     const till = await newTill(token);
@@ -884,9 +905,10 @@ describe('stranded notes (docs/OFFLINE-PROTOCOL.md § 7)', () => {
     expect(s.notes.find(n => n.slot === 2)).toEqual(expect.objectContaining({nonce: keyNonce(shortId, 2), status: 'spent', txid: T}));
     expect(await rowsOf(shortId)).toEqual([[5, T, 'change']]);
     expect(await releasesOf(till.token, shortId)).toEqual([]);
-    // T landed, so its change is real: the slot stays held, never released without a flag.
+    // T landed, so its change is real: the slot stays held, never released without a flag, and is
+    // never due, so a till has nothing to post for it again.
     expect(await reported(till.token, shortId, [changeSlot(5)])).toEqual({ok: true, held: [5], released: [], spent: [], ignored: []});
-    expect((await strandedOf(till.token, shortId)).map(x => [x.slot, x.kind, x.due])).toEqual([[5, 'change', true]]);
+    expect((await strandedOf(till.token, shortId)).map(x => [x.slot, x.kind, x.due])).toEqual([[5, 'change', false]]);
     // The spent slot renews at the next charge, as any spent slot does.
     const renew = {version: s.version, old_pubkey: slots(shortId)[2], pubkey: key(0x42)};
     expect((await call('PUT', `/cards/${shortId}/slots/2`, till.token, renew)).status).toBe(200);
@@ -895,6 +917,28 @@ describe('stranded notes (docs/OFFLINE-PROTOCOL.md § 7)', () => {
       ok: true, held: [], released: [], spent: [3], ignored: [],
     });
     expect((await state(till.token, shortId)).notes.find(n => n.slot === 3)?.status).toBe('spent');
+  });
+
+  it('keeps a landed transaction’s other spent slots due, so the federation’s spent ends them, and its change never due', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await strandedCard(token);
+    await reported(till.token, shortId, [spentSlot(2), spentSlot(3), changeSlot(5)]);
+    await age(shortId);
+    // The federation answered for slot 2 only (slot 3's check timed out): T landed.
+    expect(await reported(till.token, shortId, [spentSlot(2, T, {spent: true}), spentSlot(3), changeSlot(5)])).toEqual({
+      ok: true, held: [3, 5], released: [], spent: [2], ignored: [],
+    });
+    const list = await strandedOf(till.token, shortId);
+    expect(list.map(x => [x.slot, x.kind, x.due])).toEqual([[3, 'spent', true], [5, 'change', false]]);
+    for (const x of list) expect(x.release_after - x.since).toBe(STRANDED_GRACE_MS);
+    // Slot 3 is still due, so the next tap asks the federation again: spent ends its row as slot 2's.
+    expect(await reported(till.token, shortId, [spentSlot(3, T, {spent: true}), changeSlot(5)])).toEqual({
+      ok: true, held: [5], released: [], spent: [3], ignored: [],
+    });
+    expect(await rowsOf(shortId)).toEqual([[5, T, 'change']]);
+    expect((await strandedOf(till.token, shortId)).map(x => [x.slot, x.due])).toEqual([[5, false]]);
+    expect(await releasesOf(till.token, shortId)).toEqual([]);
   });
 
   it('records a late report during the grace, and the rows drop out on their own', async () => {

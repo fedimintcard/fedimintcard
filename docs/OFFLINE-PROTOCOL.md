@@ -164,14 +164,15 @@ phone's caps bound.
   live and is not the input of a charge it knows, and a CHANGE slot whose current key carried no
   note. GET_SLOT gives the slot's transaction (its spent hash, or its opening's txid); a slot whose
   key is not the registry's, or whose transaction the till knows (a charge it holds or the
-  registry lists open, a note's txid, its own offline queue), is not held, and a slot it could not
-  read is held anyway. A slot the registry lists in `stranded` is held as listed. A held slot is
-  out of the planner and out of the payable balance: `live_msat` counts payable notes only, with
-  `stranded_msat` and `stranded_until_ms` beside it. After the job the till posts its holds when
-  one is not listed or is listed `due`. For a due spent slot it first asks the federation, under
-  one short timeout, whether the note's nonce is spent: unspent sends `unspent: true`, spent sends
-  `spent: true`, no answer sends no flag and is asked again at the next tap. Reporting never fails
-  the tap; releases arrive in the card's state and are sent at its next online tap (§ 6).
+  registry lists open, a live or pending note's txid, its own offline queue), is not held, and a
+  slot it could not read is held anyway. A slot the registry lists in `stranded` is held as
+  listed. A held slot is out of the planner and out of the payable balance: `live_msat` counts
+  payable notes only, with `stranded_msat` and `stranded_until_ms` beside it. After the job the
+  till posts its holds when one is not listed or is listed `due`. For a due spent slot it first
+  asks the federation, under one short timeout, whether the note's nonce is spent: unspent sends
+  `unspent: true`, spent sends `spent: true`, no answer sends no flag and is asked again at the
+  next tap. Reporting never fails the tap; releases arrive in the card's state and are sent at its
+  next online tap (§ 6).
 - **Route.** `POST /cards/:short_id/stranded`, till token (403 for an operator):
   `{slots: [{slot, kind, txid, unspent?, spent?}]}`, 1 to 32 slots, each named once; `kind` is
   `spent` or `change`, `txid` 32 bytes hex, the flags booleans (null reads as absent), meaningful on
@@ -187,16 +188,18 @@ phone's caps bound.
   unchanged, so a till that knows nothing of holds still reads the state) and no version is
   bumped. `GET /cards/:id/state` lists the open rows as
   `stranded: [{slot, kind, txid, amount_msat, since, release_after, due}]`: the live note's amount
-  for a spent slot, null for a change slot; `release_after` is `since` plus the grace, and `due` is
-  true once the registry's clock reaches it. A row is open until the registry knows its
-  transaction or releases its slot; renewing or keying its slot (`PUT /slots/:n`,
-  `POST /slot-keys`) or resetting the card deletes it. While a change slot is held, `/intent`
-  refuses change into it, `/load` refuses it and `GET /slots` leaves it out: a note there would
-  take the key the late change needs.
+  for a spent slot, null for a change slot; `release_after` is `since` plus the grace, and `due`
+  is true once the registry's clock reaches it, but never on a change slot of a transaction found
+  landed (below): nothing releases it, so a till has nothing to post for it. A row is open until
+  the registry knows its transaction or releases its slot; renewing or keying its slot
+  (`PUT /slots/:n`, `POST /slot-keys`) or resetting the card deletes it. While a change slot is
+  held, `/intent` refuses change into it, `/load` refuses it and `GET /slots` leaves it out: a
+  note there would take the key the late change needs.
 - **Grace: 37 days** from the registry's first sight (`STRANDED_GRACE_MS`). A phone's kit lasts 7
   days and the till redeems its sales for 30 days after (`KitConfig`, `host/sidecar/src/pool.rs`),
   so a sale its phone can still sync is reported within the grace. Until then a late report of
-  the transaction records as any other (§ 3), and its rows drop out on their own.
+  the transaction records as any other (§ 3), and its rows drop out on their own. The same bound
+  applies to a till's own offline queue.
 - **Release rules.** After recording, each report releases the card's open rows past the grace,
   per transaction, through § 6's signing, written only if the transaction is still unseen, has
   not landed, and every slot is still held when the signing ends:
@@ -214,7 +217,10 @@ phone's caps bound.
   spent under the transaction's txid and deletes the row, at once, signing no release: the slot
   renews at the next PIN charge like any spent slot, and the till marks its own note spent. The
   transaction landed, so its change is real: a change slot of a transaction with a note spent
-  under it is never released by the rules above and stays held.
+  under it is never released by the rules above and stays held, and is never `due`. A spent slot
+  of the transaction still held is due after its grace like any other: a till asks the federation
+  again, and the `spent: true` it gets ends that row the same way. A spent note's txid can name
+  such a landed transaction, so a till does not count it as known.
 - **The money gate.** `POST /offline-charges` refuses a transaction the card has a release for,
   after its replay checks: `409 double_spend` with every input as `{nonce, status: 'released',
   txid}`, kept as a `double_spend` report, nothing new signed; a repeat answers the same. A
@@ -235,6 +241,8 @@ As built (registry migration v13, `offline.ts` `recordStranded`, `cards.ts` `ope
 `strandings` is not in the nightly backup, so a restore restarts the grace of what was held and
 the tills report it again. Without `CERT_SIGNING_KEY` the rows are recorded and nothing is signed;
 they stay held and `due` until a key is set. The registry trusts the till's flags as it trusts
-outcomes. A sale another till took offline and has not reported yet is held until that till's
-report makes it known. A till whose kit window is longer than the grace can hold a phone's sale
-the registry has already refused (the merchant's loss, within the caps).
+outcomes. A sale another till took offline and has not reported yet is held until that till
+reports it, but only for the grace: a till that stays off ops for longer than 37 days can have
+those sales refused by the gate when it reconnects, the merchant's loss, as a wiped phone's would
+be. A till whose kit window is longer than the grace can hold a phone's sale the registry has
+already refused (the merchant's loss, within the caps).

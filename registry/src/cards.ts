@@ -492,6 +492,14 @@ export function txKnown(sql: Sql, shortId: string, txid: string): boolean {
 }
 
 /**
+ * The federation said a note the transaction spent is spent (`recordStranded` marks it spent under
+ * the transaction): the transaction landed, so its change is real and is never released.
+ */
+export function landed(sql: Sql, shortId: string, txid: string): boolean {
+  return sql.exec("SELECT 1 FROM notes WHERE short_id = ? AND txid = ? AND status = 'spent'", shortId, txid).toArray().length > 0;
+}
+
+/**
  * A stranding row is open (held) while the registry has still not seen its transaction (`txKnown`)
  * and no release is signed for its slot.
  */
@@ -598,7 +606,10 @@ export function cardState(sql: Sql, shortId: string, now: number) {
   // Strandings (docs/OFFLINE-PROTOCOL.md § 7): slots a till found SPENT or CHANGE for a
   // transaction the registry never saw. A till keeps its plans off them and reports them again
   // once `due`. A spent slot's note is still live here and carries its amount; a change slot's
-  // amount is the card's, not the registry's.
+  // amount is the card's, not the registry's. A change slot of a transaction found landed is never
+  // due: no report releases it (`recordStranded`), so a till has nothing to post for it. A spent
+  // slot of that transaction stays due after its grace, since the till's next federation check
+  // answers `spent: true` and ends its row.
   const stranded = openStrandings(sql, shortId).map(s => {
     const note =
       s.kind === 'spent'
@@ -612,6 +623,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
             .toArray()[0]
         : undefined;
     const releaseAfter = s.first_seen + STRANDED_GRACE_MS;
+    const heldForGood = s.kind === 'change' && landed(sql, shortId, s.txid);
     return {
       slot: s.slot,
       kind: s.kind,
@@ -619,7 +631,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
       amount_msat: note ? Number(note.amount_msat) : null,
       since: s.first_seen,
       release_after: releaseAfter,
-      due: now >= releaseAfter,
+      due: !heldForGood && now >= releaseAfter,
     };
   });
   const count = slotCount(sql, shortId);
