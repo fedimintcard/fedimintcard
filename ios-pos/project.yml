@@ -2,7 +2,7 @@ name: FedimintCardPOS
 options:
   bundleIdPrefix: org.fedimintcard
   deploymentTarget:
-    iOS: "26.5"
+    iOS: "26.0"
   createIntermediateGroups: true
 settings:
   base:

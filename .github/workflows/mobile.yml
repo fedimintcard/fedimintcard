@@ -88,15 +88,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
         working-directory: host
-        run: scripts/pos-core-mobile.sh ios
+        # For the app's deployment target, as ios-pos/scripts/build-poscore.sh builds them, so the
+        # app's step below finds them built: the cc crate otherwise builds the core's C code for the
+        # Xcode SDK's iOS version, newer than the app's.
+        run: |
+          IPHONEOS_DEPLOYMENT_TARGET=$(../ios-pos/scripts/deployment-target.sh)
+          export IPHONEOS_DEPLOYMENT_TARGET
+          scripts/pos-core-mobile.sh ios
       - name: Swift bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings swift
       - name: The iOS app, package and unit tests on a simulator
         shell: bash
         run: |
-          # The project's deployment target is iOS 26.5: use the newest Xcode 26 on the runner (the
-          # default one ships an older simulator runtime) and an iPhone on its newest iOS runtime.
+          # The deployment target is iOS 26.0: every Xcode 26 on the runner builds the app and every
+          # iOS 26 runtime runs it. The step still takes the newest Xcode 26 (the image's default is
+          # older), the one closest to the current Xcode the store builds are archived with, and an
+          # iPhone on its newest iOS runtime, the one testers' phones most likely run.
           xc=$(ls -d /Applications/Xcode_26.*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$xc" ] && sudo xcode-select -s "$xc"
           xcodebuild -version | tr '\n' ' '; echo
