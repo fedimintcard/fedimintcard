@@ -1,9 +1,11 @@
 /**
- * Offline card payments, the registry's half (docs/OFFLINE-PROTOCOL.md § 2-3).
+ * Offline card payments, the registry's half (docs/OFFLINE-PROTOCOL.md § 2-3, 6-7).
  *
- * Three things live here: the certificate that vouches for a card's attestation
- * key (signed with `CERT_SIGNING_KEY`), the route a till uses to report a charge
- * the card signed with no connection, and the report log an operator reads.
+ * What lives here: the certificate that vouches for a card's attestation key
+ * (signed with `CERT_SIGNING_KEY`), the route a till uses to report a charge
+ * the card signed with no connection, the report log an operator reads, the
+ * releases (§ 6), and the slots a till found stranded by a sale the registry
+ * never saw, held and then released (§ 7).
  *
  * The registry cannot stop an offline double spend; the federation's spent set
  * does. What it does is decide, once the till is back online, whether the
@@ -11,7 +13,19 @@
  * intent/submitted/outcome flow already open and signed; if not it is refused
  * with the conflicting notes and kept as a report.
  */
-import {bump, cardOwner, MAX_TX_HEX, parseIntent, slotCount, versionOf, type ChangeOut} from './cards';
+import {
+  bump,
+  cardOwner,
+  landed,
+  MAX_TX_HEX,
+  openStrandings,
+  parseIntent,
+  slotCount,
+  STRANDED_GRACE_MS,
+  txKnown,
+  versionOf,
+  type ChangeOut,
+} from './cards';
 import {
   BadRequest,
   Conflict,
@@ -22,6 +36,7 @@ import {
   ServiceUnavailable,
   toHex,
 } from './http';
+import {keyUsed} from './loads';
 
 type Sql = SqlStorage;
 
@@ -231,6 +246,10 @@ export type OfflineResult =
  *
  * Idempotency, by txid: a charge already in `card_txs` answers the current
  * version; a double spend already reported answers its stored conflicts.
+ *
+ * A transaction the registry released a stranded slot for (§ 7) is refused as
+ * a double spend whose conflicts name every input `released`, whatever the
+ * notes' state: it will never be accepted.
  */
 export function recordOfflineCharge(
   storage: DurableObjectStorage,
@@ -270,6 +289,23 @@ export function recordOfflineCharge(
       const stored = (JSON.parse(String(reported.detail)) as {conflicts: Conflicts[]}).conflicts;
       return {recorded: false, conflicts: stored, release: null};
     }
+    const report = (result: 'recorded' | 'double_spend', detail: unknown) =>
+      sql.exec(
+        'INSERT INTO offline_reports (txid, short_id, till_id, result, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        intent.txid, shortId, tillId, result, JSON.stringify(detail), now,
+      );
+    // The money gate (§ 7): a release is the registry's word that this transaction will never be
+    // accepted, and the card may already pay with the released note again. Here a release can only
+    // be a stranding's (a charge on record or a refused report answered above, and neither row is
+    // ever deleted), so the gate rests on `releases` alone, which the backup keeps. Its report's
+    // conflicts are all `released`, which `txKnown` reads: the transaction's other held slots keep
+    // to their own release.
+    if (hasRelease(sql, shortId, intent.txid)) {
+      const refused: Conflicts[] = intent.body.inputs.map(nonce => ({nonce, status: 'released', txid: intent.txid}));
+      report('double_spend', {client_ref: intent.client_ref, signed_at: r.signed_at, inputs: intent.body.inputs, conflicts: refused});
+      // Its slots are released already: nothing new to sign.
+      return {recorded: false, conflicts: refused, release: null};
+    }
     const conflicts: Conflicts[] = [];
     for (const nonce of intent.body.inputs) {
       const note = sql
@@ -280,11 +316,6 @@ export function recordOfflineCharge(
         conflicts.push({nonce, status: String(note.status), txid: note.txid === null ? null : String(note.txid)});
       }
     }
-    const report = (result: 'recorded' | 'double_spend', detail: unknown) =>
-      sql.exec(
-        'INSERT INTO offline_reports (txid, short_id, till_id, result, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        intent.txid, shortId, tillId, result, JSON.stringify(detail), now,
-      );
     if (conflicts.length > 0) {
       report('double_spend', {client_ref: intent.client_ref, signed_at: r.signed_at, inputs: intent.body.inputs, conflicts});
       // The card's change slots wait for change that will never come; its inputs were spent
@@ -434,6 +465,202 @@ export const reportRefused = (txid: string, shortId: string) => (sql: SqlStorage
   sql
     .exec("SELECT 1 FROM offline_reports WHERE txid = ? AND short_id = ? AND result = 'double_spend'", txid, shortId)
     .toArray().length > 0;
+
+/* ------------------------------------------------------------------------- */
+/* Strandings (§ 7)                                                          */
+/* ------------------------------------------------------------------------- */
+
+/** Most slots one report names: every slot of the largest card. */
+const MAX_STRANDED = 32;
+
+/** A slot a till found SPENT or CHANGE for a transaction it could not account for. */
+interface StrandedSlot {
+  readonly slot: number;
+  readonly kind: 'spent' | 'change';
+  /** The slot's spent hash (SPENT) or its change opening's txid (CHANGE), hex. */
+  readonly txid: string;
+  /** A spent slot only: the federation answered that its note is unspent. */
+  readonly unspent: boolean;
+  /** A spent slot only: the federation answered that its note is spent. */
+  readonly spent: boolean;
+}
+
+/** `{slots: [{slot, kind, txid, unspent?, spent?}]}`, 1 to 32 slots, each named once. */
+function parseStranded(r: Record<string, unknown>, slots: number): StrandedSlot[] {
+  if (!Array.isArray(r.slots) || r.slots.length === 0 || r.slots.length > MAX_STRANDED) {
+    throw new BadRequest(`slots must list 1 to ${MAX_STRANDED} {slot, kind, txid}`);
+  }
+  // A flag is a boolean when sent; null reads as not sent.
+  const isFlag = (v: unknown) => v === undefined || v === null || typeof v === 'boolean';
+  const out = r.slots.map((e): StrandedSlot => {
+    const o = e as Record<string, unknown>;
+    if (
+      typeof o !== 'object' ||
+      o === null ||
+      !Number.isSafeInteger(o.slot) ||
+      (o.slot as number) < 0 ||
+      (o.slot as number) >= slots ||
+      (o.kind !== 'spent' && o.kind !== 'change') ||
+      !isHex(o.txid, 32) ||
+      !isFlag(o.unspent) ||
+      !isFlag(o.spent)
+    ) {
+      throw new BadRequest(
+        `each slot needs slot 0-${slots - 1}, kind 'spent' or 'change', txid (32 bytes hex), and unspent or spent only as booleans`,
+      );
+    }
+    if (o.unspent === true && o.spent === true) {
+      throw new BadRequest(`slot ${o.slot as number}: a note is not both spent and unspent`);
+    }
+    // The federation's answer is about a note: a change slot has none, so the flags mean nothing there.
+    const note = o.kind === 'spent';
+    return {slot: o.slot as number, kind: o.kind, txid: o.txid, unspent: note && o.unspent === true, spent: note && o.spent === true};
+  });
+  if (new Set(out.map(s => s.slot)).size !== out.length) {
+    throw new BadRequest('slots name a slot twice');
+  }
+  return out;
+}
+
+/** Any release of the card for the transaction. */
+function hasRelease(sql: Sql, shortId: string, txid: string): boolean {
+  return sql.exec('SELECT 1 FROM releases WHERE short_id = ? AND txid = ?', shortId, txid).toArray().length > 0;
+}
+
+/** The release of one slot for the transaction. */
+function slotReleased(sql: Sql, shortId: string, slot: number, txid: string): boolean {
+  return sql.exec('SELECT 1 FROM releases WHERE short_id = ? AND slot = ? AND txid = ?', shortId, slot, txid).toArray().length > 0;
+}
+
+/** A stranding row of the transaction for a SPENT slot, held or released. */
+function hasSpentRow(sql: Sql, shortId: string, txid: string): boolean {
+  return sql.exec("SELECT 1 FROM strandings WHERE short_id = ? AND txid = ? AND kind = 'spent'", shortId, txid).toArray().length > 0;
+}
+
+function liveNote(sql: Sql, shortId: string, nonce: string): boolean {
+  return sql.exec("SELECT 1 FROM notes WHERE short_id = ? AND nonce = ? AND status = 'live'", shortId, nonce).toArray().length > 0;
+}
+
+/**
+ * Still true when a stranding's releases are written (signing awaits between the decision and the
+ * write): the registry has still never seen the transaction, so a late report that raced the
+ * signing wins; every slot is still held for it (no renewal or reset meanwhile); and it has not
+ * been found landed.
+ */
+export const strandingOpen = (shortId: string, txid: string, slots: readonly number[]) => (sql: SqlStorage) =>
+  !txKnown(sql, shortId, txid) &&
+  !landed(sql, shortId, txid) &&
+  slots.every(
+    slot => sql.exec('SELECT 1 FROM strandings WHERE short_id = ? AND slot = ? AND txid = ?', shortId, slot, txid).toArray().length > 0,
+  );
+
+/** What one report did, by slot, ascending. */
+export interface StrandedAnswer {
+  /** The report's slots held after it. */
+  readonly held: number[];
+  /** Slots this report released, any of the card's: listed in its state for the next tap. */
+  readonly released: number[];
+  /** The report's slots whose note the federation said is spent: marked spent, held no more. */
+  readonly spent: number[];
+  /** The report's slots not held (see `recordStranded`). */
+  readonly ignored: number[];
+}
+
+/**
+ * `POST /cards/:short_id/stranded` (docs/OFFLINE-PROTOCOL.md § 7): the slots a till found SPENT or
+ * CHANGE on the card for a transaction it could not account for, a phone's sale that never synced.
+ *
+ * One transaction records the rows, `first_seen = now`. A slot is ignored when the registry has
+ * seen its transaction (`txKnown`) or released the slot for it; when it has no key; when it is
+ * held for another transaction; and, for a SPENT slot, without a live note under its current key,
+ * or for a CHANGE slot, when its key ever carried a note (`keyUsed`). A repeat changes nothing.
+ * `spent: true` on a spent slot (ENG-867 decision 5) marks its note spent under the transaction and
+ * drops the row, at once: a spent note is spent for good.
+ *
+ * Then each open row past the grace (`STRANDED_GRACE_MS`) is released, per transaction, by
+ * `recordReleases`: a spent slot only on its own `unspent: true` in this report; a change slot,
+ * unless its transaction landed, when a spent slot of that transaction is `unspent: true` in this
+ * report (one unspent input proves the transaction never landed), when the transaction has no
+ * spent slot on record (ENG-867 decision 4: no slot signed it), or when it is released already
+ * (the gate in `recordOfflineCharge` refuses it for good).
+ *
+ * No version bump: the notes the card can pay are unchanged until the till sends a release. With
+ * no `CERT_SIGNING_KEY` the rows are recorded and nothing is signed.
+ */
+export async function recordStranded(
+  storage: DurableObjectStorage,
+  secret: string | undefined,
+  shortId: string,
+  tillId: number,
+  r: Record<string, unknown>,
+  now: number,
+): Promise<StrandedAnswer> {
+  const sql = storage.sql;
+  const entries = parseStranded(r, slotCount(sql, shortId));
+  const decided = storage.transactionSync(() => {
+    const keys = new Map(
+      sql
+        .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ?', shortId)
+        .toArray()
+        .map(k => [Number(k.slot), String(k.pubkey)] as const),
+    );
+    const open = openStrandings(sql, shortId);
+    const held: StrandedSlot[] = [];
+    const spent: number[] = [];
+    const ignored: number[] = [];
+    for (const e of entries) {
+      const pubkey = keys.get(e.slot);
+      const nonce = pubkey === undefined ? null : '02' + pubkey;
+      const takes =
+        nonce !== null &&
+        !txKnown(sql, shortId, e.txid) &&
+        !slotReleased(sql, shortId, e.slot, e.txid) &&
+        !open.some(s => s.slot === e.slot && (s.txid !== e.txid || s.kind !== e.kind)) &&
+        (e.kind === 'spent' ? liveNote(sql, shortId, nonce) : !keyUsed(sql, shortId, nonce));
+      if (!takes) {
+        ignored.push(e.slot);
+        continue;
+      }
+      sql.exec(
+        'INSERT OR IGNORE INTO strandings (short_id, slot, txid, kind, first_seen, till_id) VALUES (?, ?, ?, ?, ?, ?)',
+        shortId, e.slot, e.txid, e.kind, now, tillId,
+      );
+      if (e.spent) {
+        sql.exec("UPDATE notes SET status = 'spent', txid = ? WHERE short_id = ? AND nonce = ? AND status = 'live'", e.txid, shortId, nonce);
+        sql.exec('DELETE FROM strandings WHERE short_id = ? AND slot = ? AND txid = ?', shortId, e.slot, e.txid);
+        spent.push(e.slot);
+        continue;
+      }
+      held.push(e);
+    }
+    const unspent = held.filter(e => e.unspent);
+    const release = new Map<string, number[]>();
+    for (const s of openStrandings(sql, shortId)) {
+      if (s.first_seen + STRANDED_GRACE_MS > now || landed(sql, shortId, s.txid)) continue;
+      const releasable =
+        s.kind === 'spent'
+          ? unspent.some(e => e.slot === s.slot && e.txid === s.txid)
+          : unspent.some(e => e.txid === s.txid) || !hasSpentRow(sql, shortId, s.txid) || hasRelease(sql, shortId, s.txid);
+      if (releasable) release.set(s.txid, [...(release.get(s.txid) ?? []), s.slot]);
+    }
+    return {held, spent, ignored, release};
+  });
+  const released: number[] = [];
+  for (const [txid, slots] of decided.release) {
+    if ((await recordReleases(storage, secret, shortId, txid, slots, strandingOpen(shortId, txid, slots), now)) > 0) {
+      released.push(...slots);
+    }
+  }
+  // Read again after the signing: a late report that raced it leaves its rows no longer held.
+  const open = new Set(openStrandings(sql, shortId).map(s => `${s.slot}:${s.txid}`));
+  const asc = (a: number, b: number) => a - b;
+  return {
+    held: decided.held.filter(e => open.has(`${e.slot}:${e.txid}`)).map(e => e.slot).sort(asc),
+    released: released.sort(asc),
+    spent: decided.spent.sort(asc),
+    ignored: decided.ignored.sort(asc),
+  };
+}
 
 /* ------------------------------------------------------------------------- */
 /* Reports                                                                   */
