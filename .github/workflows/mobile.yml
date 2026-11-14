@@ -95,12 +95,31 @@ jobs:
       - name: The iOS app, package and unit tests on a simulator
         shell: bash
         run: |
+          # The project's deployment target is iOS 26.5: use the newest Xcode 26 on the runner (the
+          # default one ships an older simulator runtime) and an iPhone on its newest iOS runtime.
+          xc=$(ls -d /Applications/Xcode_26.*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$xc" ] && sudo xcode-select -s "$xc"
+          xcodebuild -version | tr '\n' ' '; echo
           ios-pos/scripts/build-poscore.sh
-          udid=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; ds=[x for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")]; print(ds[0]["udid"] if ds else sys.exit("no iPhone simulator"))')
-          echo "simulator: $udid $(xcrun simctl list devices available | grep -m1 "$udid" | sed -E 's/ *\(.*//')"
+          udid=$(python3 - <<'PY'
+          import json, subprocess, sys
+          out = subprocess.run(["xcrun", "simctl", "list", "devices", "available", "-j"], capture_output=True, text=True, check=True).stdout
+          d = json.loads(out)["devices"]
+          def ver(k): return tuple(int(x) for x in k.rsplit("iOS-", 1)[-1].split("-"))
+          for k in sorted((k for k in d if "SimRuntime.iOS-" in k), key=ver, reverse=True):
+              ds = [x for x in d[k] if x["name"].startswith("iPhone")]
+              if ds:
+                  print(ds[0]["udid"]); print(k.rsplit(".", 1)[-1], ds[0]["name"], file=sys.stderr); break
+          else:
+              sys.exit("no iPhone simulator")
+          PY
+          )
+          echo "simulator: $udid"
           xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
             -destination "platform=iOS Simulator,id=$udid" -derivedDataPath /tmp/pos-dd \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/xcodebuild.log | grep -E 'Test Suite|Executed|error:|\*\* TEST'
+            CODE_SIGNING_ALLOWED=NO > /tmp/xcodebuild.log 2>&1 \
+            || { grep -E -A20 'Unable to find|error:|failed' /tmp/xcodebuild.log | head -80; exit 1; }
+          grep -E 'Test Suite .*(passed|failed)|Executed|\*\* TEST' /tmp/xcodebuild.log | tail -6
       - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
