@@ -25,6 +25,29 @@ struct Keypad: View {
     }
 }
 
+/// The flexible middle of a pad screen, split as the Android app splits it (`activity_main.xml`,
+/// layout weights 1 and 3): the reading, the amount or the PIN dots, gets one share of the height
+/// left by the fixed rows and the keypad three, so the keys stay tall on every phone. Before this
+/// the reading took that height first and the keys were left at the height of their labels.
+struct PadStack<Reading: View>: View {
+    let onKey: (Int?) -> Void
+    var disabled = false
+    @ViewBuilder let reading: () -> Reading
+
+    var body: some View {
+        GeometryReader { g in
+            VStack(spacing: 0) {
+                reading()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: g.size.height * 0.25)
+                Keypad(onKey: onKey)
+                    .frame(height: g.size.height * 0.75)
+                    .disabled(disabled)
+            }
+        }
+    }
+}
+
 struct AmountScreen: View {
     @EnvironmentObject var pos: PosController
     let openSettings: () -> Void
@@ -87,13 +110,11 @@ struct AmountScreen: View {
                 .padding(.top, 10)
                 .accessibilityLabel("\(problem). Open settings")
             }
-            Text("\(pos.amountDisplay) sats")
-                .font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.ink)
-                .minimumScaleFactor(0.4).lineLimit(1)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
-            Keypad { pos.key($0) }
-                .frame(maxHeight: 380)
+            PadStack(onKey: { pos.key($0) }) {
+                Text("\(pos.amountDisplay) sats")
+                    .font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.ink)
+                    .minimumScaleFactor(0.4).lineLimit(1)
+            }
             Button(pos.chargeable ? "Charge \(pos.amountDisplay) sats" : "Charge") { pos.send(.chargePressed) }
                 .buttonStyle(GoldButtonStyle(enabled: pos.chargeable))
                 .disabled(!pos.chargeable)
@@ -120,11 +141,11 @@ struct PinScreen: View {
             if wrongPin {
                 Text(wrongPinCopy(triesLeft)).font(Fig.regular(16)).foregroundStyle(Palette.bad).padding(.top, 8)
             }
-            Text(String(repeating: "●", count: pos.pinLength))
-                .font(Fig.extraBold(48)).kerning(14).foregroundStyle(Palette.ink)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityLabel("\(pos.pinLength) digits entered")
-            Keypad { pos.pinKey($0) }.frame(maxHeight: 380)
+            PadStack(onKey: { pos.pinKey($0) }) {
+                Text(String(repeating: "●", count: pos.pinLength))
+                    .font(Fig.extraBold(48)).kerning(14).foregroundStyle(Palette.ink)
+                    .accessibilityLabel("\(pos.pinLength) digits entered")
+            }
             Button("Pay") { pos.send(.pinConfirmed) }
                 .buttonStyle(GoldButtonStyle(enabled: pos.pinComplete))
                 .disabled(!pos.pinComplete)
@@ -295,14 +316,11 @@ struct TopUpScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Top up").font(Fig.extraBold(28)).kerning(-0.4).foregroundStyle(Palette.goldHi).padding(.top, 16)
-            Text("\(pos.topUpDisplay) sats")
-                .font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.ink)
-                .minimumScaleFactor(0.4).lineLimit(1)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
-            Keypad { pos.key($0) }
-                .frame(maxHeight: 380)
-                .disabled(creating)
+            PadStack(onKey: { pos.key($0) }, disabled: creating) {
+                Text("\(pos.topUpDisplay) sats")
+                    .font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.ink)
+                    .minimumScaleFactor(0.4).lineLimit(1)
+            }
             let ok = pos.topUpChargeable && !creating
             Button(creating ? "Creating invoice…" : "Create invoice") { pos.send(.createInvoicePressed) }
                 .buttonStyle(GoldButtonStyle(enabled: ok))
