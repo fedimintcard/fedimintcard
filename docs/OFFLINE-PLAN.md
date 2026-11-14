@@ -233,4 +233,5 @@ The count cap (200) and a double spend were not staged. Found: no Android phone 
 offline store (fixed, PR #26); ENG-864, offline runs of 5 to 10 sales on one card (fresh keyed
 slots, change waiting for an online tap, the note mix); ENG-865, the copy for a price over the cap;
 ENG-866, the card's id in the apps, and the Pixel's slower sync; ENG-867, notes stranded by a wiped
-phone. Details: `POS-OFFLINE.md` § Drill log.
+phone, which online taps now hold back until the registry releases them, 37 days on (`TILL-API.md`,
+"Stranded slots"). Details: `POS-OFFLINE.md` § Drill log.

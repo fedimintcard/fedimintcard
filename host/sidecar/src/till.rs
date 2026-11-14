@@ -1299,10 +1299,29 @@ fn status_str(s: NoteStatus) -> &'static str {
     }
 }
 
+/// `live_msat` is what the card can pay. A note held back as stranded (ENG-867) keeps its status
+/// and is marked `"stranded": true`; together they are `stranded_msat`, on hold until
+/// `stranded_until_ms` (null when there is no date to wait for).
 fn balance_reply(r: &BalanceReport) -> Reply {
-    let notes: Vec<Value> =
-        r.notes.iter().map(|n| json!({"slot": n.slot, "msat": n.amount_msat, "status": status_str(n.status)})).collect();
-    Reply::ok(json!({"ok": true, "live_msat": r.live_msat, "notes": notes, "free_slots": r.free_slots}))
+    let notes: Vec<Value> = r
+        .notes
+        .iter()
+        .map(|n| {
+            let mut v = json!({"slot": n.slot, "msat": n.amount_msat, "status": status_str(n.status)});
+            if n.held {
+                v["stranded"] = json!(true);
+            }
+            v
+        })
+        .collect();
+    Reply::ok(json!({
+        "ok": true,
+        "live_msat": r.live_msat,
+        "stranded_msat": r.stranded_msat,
+        "stranded_until_ms": r.stranded_until_ms,
+        "notes": notes,
+        "free_slots": r.free_slots,
+    }))
 }
 
 fn charge_body(s: &SaleRec, warnings: &[String], duration_ms: u64) -> Value {

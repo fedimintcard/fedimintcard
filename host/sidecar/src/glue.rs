@@ -150,7 +150,7 @@ fn nonce_hex(n: Nonce) -> String {
     hex::encode(n.0.serialize())
 }
 
-fn nonce_from_hex(s: &str) -> Result<Nonce> {
+pub(crate) fn nonce_from_hex(s: &str) -> Result<Nonce> {
     Ok(Nonce(PublicKey::from_str(s).context("bad nonce hex")?))
 }
 
@@ -167,6 +167,9 @@ pub struct NoteView {
     pub slot: u8,
     pub amount_msat: u64,
     pub status: NoteStatus,
+    /// A live note this job holds back: its slot signed a transaction nobody here knows
+    /// ([`crate::state::Held`]).
+    pub held: bool,
 }
 
 /// What recovery of interrupted work found and did.
@@ -190,7 +193,13 @@ pub struct Recovered {
 pub struct BalanceReport {
     /// Every note on the card's current keys with its status (history is in the state file).
     pub notes: Vec<NoteView>,
+    /// What the card can pay: its live notes, less those held back.
     pub live_msat: u64,
+    /// The live notes held back, until the registry releases them ([`crate::state::Held`]).
+    pub stranded_msat: u64,
+    /// When the last of them may be released (ms, the registry's clock); `None` when there is no
+    /// date to wait for ([`crate::state::CardState::stranded_until_ms`]).
+    pub stranded_until_ms: Option<u64>,
     pub free_slots: Vec<u8>,
     pub overwritable_slots: Vec<u8>,
     pub recovered: Recovered,
@@ -1140,12 +1149,15 @@ impl CardWallet {
         let mut notes = vec![];
         for s in &st.slots {
             for n in st.notes_on_current_key(s.slot) {
-                notes.push(NoteView { slot: n.slot, amount_msat: n.amount_msat, status: n.status });
+                let held = n.status == NoteStatus::Live && st.is_held(n.slot, crate::state::HeldKind::Spent);
+                notes.push(NoteView { slot: n.slot, amount_msat: n.amount_msat, status: n.status, held });
             }
         }
         Ok(BalanceReport {
             notes,
             live_msat: st.live_total_msat(),
+            stranded_msat: st.stranded_total_msat(),
+            stranded_until_ms: st.stranded_until_ms(),
             free_slots: st.free_slots(),
             overwritable_slots: st.overwritable_slots(),
             recovered,

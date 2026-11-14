@@ -8,6 +8,10 @@
 //! output records a `pending` note on it; once the federation signed it, it is `live`; after the
 //! federation reports the note spent it is `spent`. A spent or `dead` slot still holds the old
 //! key and must be overwritten (GEN_KEY with P2 = 1) before it can carry another note.
+//!
+//! An online tap may also hold slots back for one job ([`Held`], ENG-867): a 3.0 card's SPENT
+//! slot whose note this file calls live, or its CHANGE slot whose key never carried a note, for a
+//! transaction nobody here knows. A held note is no live note and a held slot no free one.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -143,6 +147,50 @@ pub struct CardState {
     /// ops in between sends them on its next job with this card.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ops_outbox: Vec<OpsWrite>,
+    /// Slots this job holds back ([`Held`]). Never saved: every job swaps in the card's file and
+    /// reads the card again (`CardWallet::card_strands` in `crate::ops`).
+    #[serde(skip)]
+    pub held: Vec<Held>,
+}
+
+/// Why an online tap holds a slot back (ENG-867).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldKind {
+    /// The card signed the slot's note away; the registry still calls the note live.
+    Spent,
+    /// The card is owed change on the slot; the registry sees a free keyed slot.
+    Change,
+}
+
+impl HeldKind {
+    /// The registry's name for it (`strandings.kind`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldKind::Spent => "spent",
+            HeldKind::Change => "change",
+        }
+    }
+}
+
+/// A slot of a 3.0 card that an online tap holds back for the job: the card SPENT its note, or is
+/// owed CHANGE on it, for a transaction neither this till nor the registry has (a POS phone's
+/// offline sales lost with the phone). The card would refuse to sign the note again, and refuse
+/// other change on the slot, so it stays out of the plan, out of [`CardState::live_total_msat`] and
+/// out of the free slots. The registry releases it once its grace has run and the federation says
+/// the note is unspent (docs/OFFLINE-PROTOCOL.md § 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub slot: u8,
+    pub kind: HeldKind,
+    /// The transaction the card signed or waits on, hex. `None`: held on doubt, the card not
+    /// asked (`GET_SLOT`) this tap; it is reported at a later one.
+    pub txid: Option<String>,
+    /// The note's amount (a spent slot); 0 for a change slot, which holds no note.
+    pub msat: u64,
+    /// When the registry may release it (ms, by its clock), once it lists the slot.
+    pub release_after_ms: Option<u64>,
+    /// The registry lists it as past its grace.
+    pub due: bool,
 }
 
 /// One write to the ops registry that this till has decided on and not yet delivered.
@@ -227,13 +275,20 @@ impl CardState {
         self.notes.iter().filter(move |n| n.slot == slot && pk.as_deref().is_some_and(|pk| nonce_matches_pubkey(&n.nonce, pk)))
     }
 
-    /// Slots whose key has never carried a note: usable for a new note right now.
+    /// Whether this job holds `slot` back as `kind` ([`Held`]).
+    pub fn is_held(&self, slot: u8, kind: HeldKind) -> bool {
+        self.held.iter().any(|h| h.slot == slot && h.kind == kind)
+    }
+
+    /// Slots whose key has never carried a note: usable for a new note right now. A held CHANGE
+    /// slot is not: the card is owed another transaction's change there.
     pub fn free_slots(&self) -> Vec<u8> {
         self.slots
             .iter()
             .filter(|s| !s.unknown)
             .filter(|s| !self.notes_on_current_key(s.slot).any(|_| true))
             .filter(|s| !self.pending_overwrites.iter().any(|p| p.slot == s.slot))
+            .filter(|s| !self.is_held(s.slot, HeldKind::Change))
             .map(|s| s.slot)
             .collect()
     }
@@ -261,12 +316,40 @@ impl CardState {
             .collect()
     }
 
+    /// The live notes the card can pay with: a note on a held SPENT slot is not one.
     pub fn live_notes(&self) -> Vec<&NoteRec> {
-        self.notes.iter().filter(|n| n.status == NoteStatus::Live).collect()
+        self.notes.iter().filter(|n| n.status == NoteStatus::Live && !self.is_held(n.slot, HeldKind::Spent)).collect()
     }
 
     pub fn live_total_msat(&self) -> u64 {
         self.live_notes().iter().map(|n| n.amount_msat).sum()
+    }
+
+    /// The live notes this job holds back ([`Held`]): the card signed them away for a transaction
+    /// nobody here knows, so they are on hold until the registry releases them.
+    pub fn stranded_notes(&self) -> Vec<&NoteRec> {
+        self.notes.iter().filter(|n| n.status == NoteStatus::Live && self.is_held(n.slot, HeldKind::Spent)).collect()
+    }
+
+    pub fn stranded_total_msat(&self) -> u64 {
+        self.stranded_notes().iter().map(|n| n.amount_msat).sum()
+    }
+
+    /// When the last of [`stranded_notes`](Self::stranded_notes) may be released (ms, by the
+    /// registry's clock). `None` while there is no date to wait for: none is held, one is not
+    /// listed by the registry yet (its grace starts when its report lands), or every one is due.
+    pub fn stranded_until_ms(&self) -> Option<u64> {
+        let mut until = None;
+        for h in self.held.iter().filter(|h| h.kind == HeldKind::Spent) {
+            if !self.notes.iter().any(|n| n.slot == h.slot && n.status == NoteStatus::Live) {
+                continue;
+            }
+            let at = h.release_after_ms?;
+            if !h.due {
+                until = until.max(Some(at));
+            }
+        }
+        until
     }
 }
 
@@ -387,6 +470,78 @@ mod tests {
         // A pending overwrite blocks reuse until resolved.
         st.pending_overwrites.push(PendingOverwrite { slot: 2, old_pubkey: pk(3) });
         assert!(st.free_slots().is_empty());
+    }
+
+    fn held(slot: u8, kind: HeldKind) -> Held {
+        Held { slot, kind, txid: Some("ab".repeat(32)), msat: 1024, release_after_ms: None, due: false }
+    }
+
+    #[test]
+    fn held_slots_leave_the_live_notes_the_total_and_the_free_slots() {
+        let mut st = CardState::default();
+        for i in 0..5 {
+            st.set_slot_pubkey(i, pk(i + 1));
+        }
+        st.notes.push(note(0, 1, NoteStatus::Live));
+        st.notes.push(note(1, 2, NoteStatus::Live));
+        assert_eq!((st.live_total_msat(), st.free_slots()), (2048, vec![2, 3, 4]));
+        // Slot 1 signed its note away for a transaction nobody here knows; slot 3 waits for change.
+        st.held = vec![held(1, HeldKind::Spent), held(3, HeldKind::Change)];
+        assert_eq!(st.live_notes().iter().map(|n| n.slot).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(st.live_total_msat(), 1024);
+        assert_eq!((st.stranded_total_msat(), st.stranded_notes().len()), (1024, 1));
+        assert_eq!(st.free_slots(), vec![2, 4]);
+        assert!(st.overwritable_slots().is_empty(), "the held note is live; the change slot never carried one");
+        // Held as the other kind, neither slot changes anything.
+        st.held = vec![held(1, HeldKind::Change), held(3, HeldKind::Spent)];
+        assert_eq!((st.live_total_msat(), st.stranded_total_msat(), st.free_slots()), (2048, 0, vec![2, 3, 4]));
+        // A held slot whose note is no longer live is no money on hold.
+        st.held = vec![held(1, HeldKind::Spent)];
+        st.notes[1].status = NoteStatus::Spent;
+        assert_eq!((st.live_total_msat(), st.stranded_total_msat()), (1024, 0));
+    }
+
+    #[test]
+    fn the_held_slots_are_never_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card_state.json");
+        let mut s = StateStore::open(&path).unwrap();
+        s.state.set_slot_pubkey(0, pk(1));
+        s.state.notes.push(note(0, 1, NoteStatus::Live));
+        s.state.held.push(held(0, HeldKind::Spent));
+        assert_eq!(s.state.live_total_msat(), 0);
+        s.save().unwrap();
+        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(file.get("held").is_none(), "{file}");
+        let back = StateStore::open(&path).unwrap();
+        assert!(back.state.held.is_empty());
+        assert_eq!(back.state.live_total_msat(), 1024, "the next job reads the card again");
+    }
+
+    #[test]
+    fn the_stranded_date_is_the_last_one_while_every_held_note_has_one_and_some_wait() {
+        let mut st = CardState::default();
+        for i in 0..4 {
+            st.set_slot_pubkey(i, pk(i + 1));
+        }
+        for i in 0..3 {
+            st.notes.push(note(i, i + 1, NoteStatus::Live));
+        }
+        let dated = |slot, at, due| Held { release_after_ms: Some(at), due, ..held(slot, HeldKind::Spent) };
+        assert_eq!(st.stranded_until_ms(), None, "nothing held");
+        st.held = vec![dated(0, 5_000, false), dated(1, 9_000, false)];
+        assert_eq!(st.stranded_until_ms(), Some(9_000));
+        st.held.push(held(2, HeldKind::Spent));
+        assert_eq!(st.stranded_until_ms(), None, "slot 2 is not listed by the registry yet");
+        st.held = vec![dated(0, 5_000, true), dated(1, 9_000, false)];
+        assert_eq!(st.stranded_until_ms(), Some(9_000), "one due, one to wait for");
+        st.held = vec![dated(0, 5_000, true), dated(1, 9_000, true)];
+        assert_eq!(st.stranded_until_ms(), None, "all due: released at the next report");
+        // A change slot holds no note to wait for, and nor does a note no longer live.
+        st.held = vec![Held { release_after_ms: Some(7_000), ..held(3, HeldKind::Change) }, dated(1, 9_000, false)];
+        assert_eq!(st.stranded_until_ms(), Some(9_000));
+        st.notes[1].status = NoteStatus::Spent;
+        assert_eq!(st.stranded_until_ms(), None);
     }
 
     #[test]
