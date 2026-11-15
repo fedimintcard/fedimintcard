@@ -1,8 +1,9 @@
 name: Mobile
 # The POS apps' Rust core (host/pos-core, docs/POS-OFFLINE.md) for Android and iOS, with its
-# Kotlin and Swift bindings. Proves the cross-compile on every change under host/; the libraries,
-# the bindings and their sizes are uploaded for the apps. The Android POS app (android-relay/)
-# builds on them: its unit tests and a debug APK whose libraries are 16 KB aligned.
+# Kotlin and Swift bindings, and the two POS apps built on it. Runs on every change under host/,
+# android-relay/, ios-pos/ and this file; the libraries, the bindings and their sizes are uploaded
+# for the apps. The Android POS app (android-relay/): its unit tests and a debug APK whose libraries
+# are 16 KB aligned. The iOS POS app (ios-pos/): its core package and unit tests on a simulator.
 on:
   push:
     branches: ['**']
