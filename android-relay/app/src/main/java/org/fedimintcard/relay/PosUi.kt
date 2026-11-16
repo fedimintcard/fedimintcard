@@ -221,12 +221,12 @@ class PosUi(
         when (state) {
             PosState.BalanceWaiting, is PosState.BalanceReading -> tapAmount.text = act.getString(R.string.card_balance_label)
             is PosState.BalanceShown -> {
-                cardBalanceAmount.text = "${formatSats(state.liveMsat)} sats"
+                val copy = balanceShownCopy(state)
+                cardBalanceAmount.text = copy.amount
                 // Under the payable balance, what the till holds back; no line at all when nothing is.
-                val onHold = onHoldLine(state.strandedMsat, state.strandedUntilMs, System.currentTimeMillis(), ZoneId.systemDefault())
-                cardBalanceOnHold.text = onHold ?: ""
-                cardBalanceOnHold.visibility = if (onHold == null) View.GONE else View.VISIBLE
-                cardBalancePanel.contentDescription = balanceDescription(state.liveMsat, onHold)
+                cardBalanceOnHold.text = copy.onHold ?: ""
+                cardBalanceOnHold.visibility = if (copy.onHold == null) View.GONE else View.VISIBLE
+                cardBalancePanel.contentDescription = copy.description
                 val w = state.waiting
                 if (w == null) loadWaiting.visibility = View.GONE
                 else {
@@ -564,6 +564,22 @@ private val HOLD_DAY: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d", L
 /** What the balance panel says to a screen reader: the payable balance, then [onHold] if any. */
 fun balanceDescription(liveMsat: Long, onHold: String?): String =
     "Card balance: ${formatSats(liveMsat)} sats on this card" + (onHold?.let { ". $it" } ?: "")
+
+/**
+ * What the balance screen says of a shown balance: its [amount], the [onHold] line under it (null:
+ * no line at all) and the [description] a screen reader reads for the whole panel.
+ */
+data class BalanceCopy(val amount: String, val onHold: String?, val description: String)
+
+/**
+ * The balance screen's copy for [s], by the phone's clock [nowMs] and in its zone [zone], which
+ * default to the phone's own as the screen uses them. [PosUi.render] only places what this returns,
+ * so a test reads it here without a view.
+ */
+fun balanceShownCopy(s: PosState.BalanceShown, nowMs: Long = System.currentTimeMillis(), zone: ZoneId = ZoneId.systemDefault()): BalanceCopy {
+    val onHold = onHoldLine(s.strandedMsat, s.strandedUntilMs, nowMs, zone)
+    return BalanceCopy("${formatSats(s.liveMsat)} sats", onHold, balanceDescription(s.liveMsat, onHold))
+}
 
 /** Title and detail for a failed balance read, in words the card holder can act on. */
 fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {

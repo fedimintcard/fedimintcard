@@ -5,9 +5,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.TimeZone
 
 class CardBalanceTest {
     @Test
@@ -176,5 +180,53 @@ class CardBalanceTest {
             "Card balance: 1,000 sats on this card. 200 sats on hold until Dec 22",
             balanceDescription(1_000_000, onHoldLine(200_000, at(12, 21, 15), now, zone)),
         )
+    }
+
+    // The balance screen's copy, as PosUi.render places it: by the phone's own clock and zone, the defaults.
+
+    private fun shown(held: Long = 0, until: Long? = null) = PosState.BalanceShown(1, 1_000_000, strandedMsat = held, strandedUntilMs = until)
+
+    @Test
+    fun theScreenSaysWhatIsOnHoldAfterTheBalance() {
+        val c = balanceShownCopy(shown(held = 200_000))
+        assertEquals("1,000 sats", c.amount)
+        assertEquals("200 sats on hold", c.onHold)
+        assertEquals("Card balance: 1,000 sats on this card. 200 sats on hold", c.description)
+    }
+
+    /**
+     * A hold ahead of the phone's clock: the line names the day, in the phone's time zone. CI's JVM runs
+     * in UTC, so the test sets the default zone to Jamaica, where UTC names another day for this hold:
+     * it ends exactly at a local midnight about ten days on, and the day is the one that midnight starts.
+     */
+    @Test
+    fun theScreenNamesTheDayOfAHoldAhead() {
+        val saved = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone(zone))
+        try {
+            val midnight = LocalDate.now(zone).plusDays(10).atStartOfDay(zone)
+            val day = DateTimeFormatter.ofPattern("MMM d", Locale.US).format(midnight)
+            val c = balanceShownCopy(shown(held = 200_000, until = midnight.toInstant().toEpochMilli()))
+            assertEquals("200 sats on hold until $day", c.onHold)
+            assertEquals("Card balance: 1,000 sats on this card. 200 sats on hold until $day", c.description)
+        } finally {
+            TimeZone.setDefault(saved)
+        }
+    }
+
+    /** Due by the phone's clock (the time is past): no date. */
+    @Test
+    fun theScreenGivesNoDateForAHoldThatIsDue() {
+        val c = balanceShownCopy(shown(held = 200_000, until = System.currentTimeMillis() - 60_000))
+        assertEquals("200 sats on hold", c.onHold)
+        assertEquals("Card balance: 1,000 sats on this card. 200 sats on hold", c.description)
+    }
+
+    /** Nothing on hold: no line at all, and the description says the balance only. */
+    @Test
+    fun theScreenSaysOnlyTheBalanceWhenNothingIsOnHold() {
+        val c = balanceShownCopy(shown())
+        assertNull(c.onHold)
+        assertEquals("Card balance: 1,000 sats on this card", c.description)
     }
 }
