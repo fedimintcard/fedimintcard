@@ -43,7 +43,7 @@ final class PosController: ObservableObject {
     private var tickTask: Task<Void, Never>?
     private var invoiceTask: Task<Void, Never>?
 
-    static func clockMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+    nonisolated static func clockMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
     static let invoicePollNanos: UInt64 = 1_500_000_000
 
     // The card job in progress.

@@ -482,8 +482,16 @@ struct BalanceScreen: View {
     /// A paid top-up the till holds for this card; arrives after the balance.
     var waiting: WaitingTopUp? = nil
 
+    /// What the screen says of the hold, under the payable balance (nil: no line at all), and the
+    /// label VoiceOver reads for the whole panel, by the phone's clock and in its time zone. `body`
+    /// reads both here, once; a test reads them here too, with no environment to build.
+    func text(nowMs: Int64 = PosController.clockMs(), timeZone: TimeZone = .current) -> (line: String?, label: String) {
+        let line = onHoldText(strandedMsat: strandedMsat, untilMs: strandedUntilMs, nowMs: nowMs, timeZone: timeZone)
+        return (line, "Card balance: " + balanceSpoken(liveMsat: liveMsat, onHold: line))
+    }
+
     var body: some View {
-        let onHold = onHoldText(strandedMsat: strandedMsat, untilMs: strandedUntilMs, nowMs: PosController.clockMs(), timeZone: .current)
+        let (onHold, label) = text()
         VStack(spacing: 0) {
             Spacer()
             VStack(spacing: 0) {
@@ -502,7 +510,7 @@ struct BalanceScreen: View {
             .frame(maxWidth: .infinity)
             .cardPanel()
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Card balance: " + balanceSpoken(liveMsat: liveMsat, onHold: onHold))
+            .accessibilityLabel(label)
             Spacer()
             Text("Back to the amount in \(pos.balanceCountdown) s").font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.bottom, 12)
             if let w = waiting {

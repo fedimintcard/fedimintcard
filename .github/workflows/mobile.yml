@@ -116,7 +116,10 @@ jobs:
           PY
           )
           echo "simulator: $udid"
-          xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
+          # The runner's time zone is UTC, so the tests of the day a hold names could not tell the phone's
+          # own zone from UTC. xcodebuild hands TEST_RUNNER_ variables to the hosted tests without the
+          # prefix: they run in America/Jamaica, the zone the wording tests pin.
+          TEST_RUNNER_TZ=America/Jamaica xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
             -destination "platform=iOS Simulator,id=$udid" -derivedDataPath /tmp/pos-dd \
             CODE_SIGNING_ALLOWED=NO > /tmp/xcodebuild.log 2>&1 \
             || { grep -E -A20 'Unable to find|error:|failed' /tmp/xcodebuild.log | head -80; exit 1; }
