@@ -2,7 +2,7 @@
 # Build the POS core (host/pos-core, docs/POS-OFFLINE.md) for this app, in one run:
 #
 #   1. host/scripts/pos-core-mobile.sh ios: the static libraries for aarch64-apple-ios,
-#      aarch64-apple-ios-sim and x86_64-apple-ios;
+#      aarch64-apple-ios-sim and x86_64-apple-ios, for the app's deployment target (project.yml);
 #   2. host/scripts/pos-core-mobile.sh bindings swift: the Swift bindings, from the same tree;
 #   3. Packages/FedimintCardPosCore/FedimintCardPosCoreFFI.xcframework: the device library, and the
 #      two simulator libraries as one (lipo), each with the FFI header and its module map;
@@ -25,7 +25,11 @@ out="$target/pos-core-mobile"
 lib=libfedimint_card_pos_core.a
 ffi=FedimintCardPosCoreFFI
 
-"$host/scripts/pos-core-mobile.sh" ios
+# The cc crate builds the core's C code for IPHONEOS_DEPLOYMENT_TARGET, or else for the iOS version
+# of the Xcode SDK, which can be newer than the app's: the app's link then warns about objects built
+# for a newer iOS.
+deployment_target=$("$ios_pos/scripts/deployment-target.sh")
+IPHONEOS_DEPLOYMENT_TARGET="$deployment_target" "$host/scripts/pos-core-mobile.sh" ios
 "$host/scripts/pos-core-mobile.sh" bindings swift
 
 bindings="$out/bindings/swift"

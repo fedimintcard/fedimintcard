@@ -3,8 +3,9 @@ import XCTest
 
 // PosController's offline wiring (docs/POS-OFFLINE.md § Kit and sync, ENG-843), over the fake till
 // and core of OfflineFlowTests: when a poll syncs and fetches the kit, what it publishes, and the
-// local charge's order. The NFC session is a fake; the real one and the card link stay on the
-// owner's pass on the Max.
+// local charge's order. Also what a balance read says of what the till holds back (ENG-867): the NFC
+// sheet's last word and the balance screen's text. The NFC session is a fake; the real one and the
+// card link stay on the owner's pass on the Max.
 
 /// The NFC session: keeps what the controller asks of it, and a test hands it the card.
 final class FakeReader: CardReader {
@@ -86,6 +87,29 @@ final class ControllerRig {
     }
 }
 
+/// A hold ahead for the tests that go through the phone's own clock and time zone (`.current`): it
+/// ends exactly at a local midnight about ten days on, so the day it names is the one that midnight
+/// starts. Where the process's zone is UTC or east of it, UTC names that same day and a controller or
+/// a screen that passed UTC would pass those tests too, so they fail there instead. CI's simulator
+/// runs in UTC: the iOS job sets TEST_RUNNER_TZ=America/Jamaica for it.
+private func holdAhead(file: StaticString = #filePath, line: UInt = #line) -> (untilMs: Int64, day: String) {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = .current
+    let midnight = cal.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(PosController.clockMs() + 10 * 86_400_000) / 1000))
+    let until = Int64((midnight.timeIntervalSince1970 * 1000).rounded())
+    let fmt = DateFormatter()
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.calendar = cal
+    fmt.timeZone = .current
+    fmt.dateFormat = "MMM d"
+    let day = fmt.string(from: midnight)
+    let inUtc = onHoldText(strandedMsat: 200_000, untilMs: until, nowMs: PosController.clockMs(), timeZone: TimeZone(identifier: "UTC")!)
+    XCTAssertNotEqual(inUtc, "200 sats on hold until \(day)",
+                      "the test process's time zone (\(TimeZone.current.identifier)) cannot tell the phone's zone from UTC: run with TEST_RUNNER_TZ=America/Jamaica",
+                      file: file, line: line)
+    return (until, day)
+}
+
 @MainActor
 final class PosControllerOfflineTests: XCTestCase {
     private func status(queued: Int) -> String {
@@ -95,6 +119,19 @@ final class PosControllerOfflineTests: XCTestCase {
     private func taken(_ txid: String) -> String { #"{"ok":true,"results":[{"txid":"\#(txid)","status":"queued"}]}"# }
 
     private let heldAbandon = "The card already signed part of this payment. Its next tap on this phone still finishes it."
+
+    /// A balance read through the controller, the till answering `body`: what the NFC sheet was
+    /// told, from its opening to its last word.
+    private func sheetAfterBalanceRead(_ body: String) async -> [String] {
+        let r = ControllerRig()
+        await r.open()
+        r.till.answer("/v1/card/balance", 200, body)
+        r.pos.send(.cardBalanceOpened)
+        r.pos.send(.cardPresent)
+        await r.until("the balance") { if case .balanceShown = r.pos.state { return true }; return false }
+        r.pos.stop()
+        return r.reader.log
+    }
 
     func testADrainThatFindsNothingStopsTheSyncUntilTheNextForeground() async {
         let r = ControllerRig()
@@ -326,5 +363,72 @@ final class PosControllerOfflineTests: XCTestCase {
         await r.poll()
         XCTAssertEqual(r.posts, 2, "still wanted: a minute on, the sync asks again")
         XCTAssertEqual(r.core.waiting, ["t1", "t2"])
+    }
+
+    /// ENG-867: the NFC sheet's last word on a balance read names what the till holds back, after
+    /// the balance. With no date to wait for (`stranded_until_ms` null), it gives none.
+    func testTheSheetSaysWhatIsOnHoldAfterTheBalance() async {
+        let log = await sheetAfterBalanceRead(#"{"ok":true,"live_msat":1000000,"stranded_msat":200000,"stranded_until_ms":null,"notes":[],"free_slots":[]}"#)
+        XCTAssertEqual(log, ["begin", "success: 1,000 sats on this card. 200 sats on hold"])
+    }
+
+    /// A hold ahead of the phone's clock: the sheet names the day, in the phone's time zone. This one
+    /// ends exactly at a local midnight about ten days on, so the day is the one that midnight starts.
+    func testTheSheetNamesTheDayOfAHoldAhead() async {
+        let hold = holdAhead()
+        let log = await sheetAfterBalanceRead(#"{"ok":true,"live_msat":1000000,"stranded_msat":200000,"stranded_until_ms":\#(hold.untilMs),"notes":[],"free_slots":[]}"#)
+        XCTAssertEqual(log, ["begin", "success: 1,000 sats on this card. 200 sats on hold until \(hold.day)"])
+    }
+
+    /// Due by the phone's clock (the time is past): the notes come back within a tap or two, so the
+    /// sheet gives no date.
+    func testTheSheetGivesNoDateForAHoldThatIsDue() async {
+        let due = PosController.clockMs() - 60_000
+        let log = await sheetAfterBalanceRead(#"{"ok":true,"live_msat":1000000,"stranded_msat":200000,"stranded_until_ms":\#(due),"notes":[],"free_slots":[]}"#)
+        XCTAssertEqual(log, ["begin", "success: 1,000 sats on this card. 200 sats on hold"])
+    }
+
+    /// A till from before these fields sends neither: the sheet says the balance and nothing else.
+    func testTheSheetSaysOnlyTheBalanceWhenNothingIsOnHold() async {
+        let log = await sheetAfterBalanceRead(#"{"ok":true,"live_msat":1000000,"notes":[],"free_slots":[]}"#)
+        XCTAssertEqual(log, ["begin", "success: 1,000 sats on this card"])
+    }
+}
+
+/// What the balance screen says of what a card has on hold (ENG-867), read from `text()`, where
+/// `body` reads it: `body` needs the controller in the environment, which a test has not, so none
+/// evaluates it. The NFC sheet's four cases above, on the phone's own clock and time zone.
+@MainActor
+final class BalanceScreenTextTests: XCTestCase {
+    private func screen(held: Int64 = 0, until: Int64? = nil) -> BalanceScreen {
+        BalanceScreen(liveMsat: 1_000_000, strandedMsat: held, strandedUntilMs: until)
+    }
+
+    func testTheScreenSaysWhatIsOnHoldAfterTheBalance() {
+        let text = screen(held: 200_000).text()
+        XCTAssertEqual(text.line, "200 sats on hold")
+        XCTAssertEqual(text.label, "Card balance: 1,000 sats on this card. 200 sats on hold")
+    }
+
+    /// A hold ahead of the phone's clock: the line names the day, in the phone's time zone.
+    func testTheScreenNamesTheDayOfAHoldAhead() {
+        let hold = holdAhead()
+        let text = screen(held: 200_000, until: hold.untilMs).text()
+        XCTAssertEqual(text.line, "200 sats on hold until \(hold.day)")
+        XCTAssertEqual(text.label, "Card balance: 1,000 sats on this card. 200 sats on hold until \(hold.day)")
+    }
+
+    /// Due by the phone's clock (the time is past): no date.
+    func testTheScreenGivesNoDateForAHoldThatIsDue() {
+        let text = screen(held: 200_000, until: PosController.clockMs() - 60_000).text()
+        XCTAssertEqual(text.line, "200 sats on hold")
+        XCTAssertEqual(text.label, "Card balance: 1,000 sats on this card. 200 sats on hold")
+    }
+
+    /// Nothing on hold: no line at all, and the label says the balance only.
+    func testTheScreenSaysOnlyTheBalanceWhenNothingIsOnHold() {
+        let text = screen().text()
+        XCTAssertNil(text.line)
+        XCTAssertEqual(text.label, "Card balance: 1,000 sats on this card")
     }
 }

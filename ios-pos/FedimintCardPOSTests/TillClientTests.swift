@@ -50,6 +50,42 @@ final class TillClientTests: XCTestCase {
         XCTAssertEqual(t.requests.first?.url.path, "/v1/card/balance")
     }
 
+    /// ENG-867: the till's reply carries what it holds back beside the payable `live_msat`.
+    func testBalanceReadsWhatIsOnHold() async {
+        let t = MockTransport()
+        t.reply = .success(RawResponse(status: 200, body: body(#"{"ok":true,"live_msat":65536,"stranded_msat":131072,"stranded_until_ms":1798000000000,"notes":[{"slot":0,"msat":65536,"status":"live"},{"slot":1,"msat":131072,"status":"live","stranded":true}],"free_slots":[],"short_id":"6f94b19b"}"#)))
+        let c = TillClient(pairing: { self.pairing }, transport: t)
+        let r = await c.cardBalance(cardLink: "ffff")
+        XCTAssertEqual(r, .read(CardBalance(liveMsat: 65_536, notes: [CardNote(slot: 0, msat: 65_536, status: "live"), CardNote(slot: 1, msat: 131_072, status: "live")],
+                                            freeSlots: [], shortId: "6f94b19b", strandedMsat: 131_072, strandedUntilMs: 1_798_000_000_000)))
+        let due = TillParse.cardBalance(status: 200, body: body(#"{"ok":true,"live_msat":0,"stranded_msat":131072,"stranded_until_ms":null,"notes":[],"free_slots":[]}"#))
+        XCTAssertEqual(due, .read(CardBalance(liveMsat: 0, notes: [], freeSlots: [], strandedMsat: 131_072, strandedUntilMs: nil)), "no date to wait for")
+    }
+
+    /// A till from before these fields sends neither: nothing on hold and no date.
+    func testABalanceFromAnOlderTillHasNothingOnHold() {
+        guard case .read(let b) = TillParse.cardBalance(status: 200, body: body(#"{"ok":true,"live_msat":21000,"notes":[],"free_slots":[1,2]}"#)) else {
+            return XCTFail("not read")
+        }
+        XCTAssertEqual(b.liveMsat, 21_000)
+        XCTAssertEqual(b.strandedMsat, 0)
+        XCTAssertNil(b.strandedUntilMs)
+        XCTAssertNil(onHoldText(strandedMsat: b.strandedMsat, untilMs: b.strandedUntilMs, nowMs: 0, timeZone: .current))
+    }
+
+    /// A value that is not a number reads as absent; the payable balance still shows.
+    func testOddHoldValuesReadAsAbsent() {
+        for (extra, held) in [(#""stranded_msat":null"#, Int64(0)), (#""stranded_msat":"65536""#, 0), (#""stranded_msat":{}"#, 0),
+                              (#""stranded_msat":65536,"stranded_until_ms":"soon""#, 65_536), (#""stranded_msat":65536,"stranded_until_ms":[1]"#, 65_536)] {
+            guard case .read(let b) = TillParse.cardBalance(status: 200, body: body(#"{"ok":true,"live_msat":5,"# + extra + #","notes":[],"free_slots":[]}"#)) else {
+                XCTFail(extra); continue
+            }
+            XCTAssertEqual(b.liveMsat, 5, extra)
+            XCTAssertEqual(b.strandedMsat, held, extra)
+            XCTAssertNil(b.strandedUntilMs, extra)
+        }
+    }
+
     func testNotPairedSendsNothing() async {
         let t = MockTransport()
         let c = TillClient(pairing: { nil }, transport: t)

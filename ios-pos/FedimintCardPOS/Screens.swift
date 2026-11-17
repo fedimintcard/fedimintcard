@@ -474,11 +474,24 @@ struct BalanceErrorScreen: View {
 /// Shown to the holder, so money only, in plain words.
 struct BalanceScreen: View {
     @EnvironmentObject var pos: PosController
+    /// What the card can pay.
     let liveMsat: Int64
+    /// What the till holds back from the card, and until when (`CardBalance`).
+    var strandedMsat: Int64 = 0
+    var strandedUntilMs: Int64? = nil
     /// A paid top-up the till holds for this card; arrives after the balance.
     var waiting: WaitingTopUp? = nil
 
+    /// What the screen says of the hold, under the payable balance (nil: no line at all), and the
+    /// label VoiceOver reads for the whole panel, by the phone's clock and in its time zone. `body`
+    /// reads both here, once; a test reads them here too, with no environment to build.
+    func text(nowMs: Int64 = PosController.clockMs(), timeZone: TimeZone = .current) -> (line: String?, label: String) {
+        let line = onHoldText(strandedMsat: strandedMsat, untilMs: strandedUntilMs, nowMs: nowMs, timeZone: timeZone)
+        return (line, "Card balance: " + balanceSpoken(liveMsat: liveMsat, onHold: line))
+    }
+
     var body: some View {
+        let (onHold, label) = text()
         VStack(spacing: 0) {
             Spacer()
             VStack(spacing: 0) {
@@ -488,12 +501,16 @@ struct BalanceScreen: View {
                 Text("\(formatSats(liveMsat)) sats").font(Fig.extraBold(64)).kerning(-1.2).foregroundStyle(Palette.goldHi)
                     .lineLimit(1).minimumScaleFactor(0.4).frame(height: 96).padding(.top, 20)
                 Text("on this card").font(Fig.regular(20)).foregroundStyle(Palette.mist).padding(.top, 4)
+                // Under the payable balance, what the till holds back; no line at all when nothing is.
+                if let onHold {
+                    Text(onHold).font(Fig.regular(14)).foregroundStyle(Palette.dim).multilineTextAlignment(.center).padding(.top, 8)
+                }
             }
             .padding(.vertical, 36).padding(.horizontal, 20)
             .frame(maxWidth: .infinity)
             .cardPanel()
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Card balance: \(formatSats(liveMsat)) sats on this card")
+            .accessibilityLabel(label)
             Spacer()
             Text("Back to the amount in \(pos.balanceCountdown) s").font(Fig.regular(14)).foregroundStyle(Palette.dim).padding(.bottom, 12)
             if let w = waiting {

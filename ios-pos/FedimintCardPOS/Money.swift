@@ -67,6 +67,42 @@ func receiptHeadline(_ receipt: ChargeReceipt) -> String {
         : "Paid \(formatSats(receipt.priceMsat)) sats"
 }
 
+/// The line under a card's payable balance for the notes the till holds back from it (ENG-867,
+/// `stranded_msat` and `stranded_until_ms` in docs/TILL-API.md), or nil when none is held: no line
+/// at all. "N sats on hold until D" while `untilMs` is ahead of the phone's clock `nowMs`; "N sats
+/// on hold" when there is no date to show (nil, or not ahead of the clock).
+///
+/// D is the first whole day in `timeZone` the notes can come back: the local day that starts at or
+/// after `untilMs`. A hold that ends at 15:00 on Dec 21 names Dec 22, and one that ends exactly at
+/// the midnight that starts Dec 21 names Dec 21: the line never promises the money a day early.
+func onHoldText(strandedMsat: Int64, untilMs: Int64?, nowMs: Int64, timeZone: TimeZone) -> String? {
+    guard strandedMsat > 0 else { return nil }
+    let held = "\(formatSats(strandedMsat)) sats on hold"
+    guard let untilMs, untilMs > nowMs, let day = firstWholeDay(untilMs, timeZone) else { return held }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX") // the app's copy is English whatever the phone's language
+    f.calendar = Calendar(identifier: .gregorian)
+    f.timeZone = timeZone
+    f.dateFormat = "MMM d"
+    return "\(held) until \(f.string(from: day))"
+}
+
+/// The first local day in `timeZone` that starts at or after `ms`, as the moment it starts.
+private func firstWholeDay(_ ms: Int64, _ timeZone: TimeZone) -> Date? {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = timeZone
+    let start = cal.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
+    // Compared in whole milliseconds, as the till sends them.
+    if Int64((start.timeIntervalSince1970 * 1000).rounded()) == ms { return start }
+    return cal.date(byAdding: .day, value: 1, to: start)
+}
+
+/// What the NFC sheet and VoiceOver say of a balance read: the payable balance, then `onHold`
+/// (`onHoldText`) when there is one.
+func balanceSpoken(liveMsat: Int64, onHold: String?) -> String {
+    "\(formatSats(liveMsat)) sats on this card" + (onHold.map { ". \($0)" } ?? "")
+}
+
 /// "N payments waiting to sync" for the till's offline queue; nil when nothing is waiting.
 func waitingToSyncText(_ queued: Int64) -> String? {
     queued > 0 ? "\(queued) \(queued == 1 ? "payment" : "payments") waiting to sync" : nil

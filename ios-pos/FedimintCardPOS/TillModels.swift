@@ -17,6 +17,7 @@ struct TillStatus: Equatable {
 struct Note: Equatable { let slot: Int; let msat: Int64 }
 struct CardNote: Equatable { let slot: Int; let msat: Int64; let status: String }
 
+/// What the card holds, read off the card itself. `liveMsat` is what the card can pay.
 struct CardBalance: Equatable {
     let liveMsat: Int64
     let notes: [CardNote]
@@ -24,6 +25,12 @@ struct CardBalance: Equatable {
     /// The card's id on the registry (`short_id`), when the till is on ops: a top-up started from
     /// the balance screen sends it so the till fits the amount to this card's free slots.
     var shortId: String? = nil
+    /// Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
+    /// in `liveMsat`, until the registry releases them. 0 from a till from before these fields.
+    var strandedMsat: Int64 = 0
+    /// When the last of them may be released, by the registry's clock (`stranded_until_ms`); nil
+    /// when there is no date to wait for, or the till does not say.
+    var strandedUntilMs: Int64? = nil
 }
 
 struct ChargeReceipt: Equatable {

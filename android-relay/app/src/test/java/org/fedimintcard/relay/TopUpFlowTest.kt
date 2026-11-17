@@ -242,6 +242,19 @@ class TopUpFlowTest {
         assertEquals(w1, (f.state as PosState.BalanceShown).waiting) // the oldest
     }
 
+    /** ENG-867: the waiting top-up arriving keeps what is on hold on the screen. */
+    @Test fun aWaitingTopUpKeepsWhatIsOnHold() {
+        val f = flow()
+        f.dispatch(PosEvent.CardPresent)
+        val fx = f.dispatch(PosEvent.CardBalanceOpened).single() as PosEffect.StartBalanceRead
+        val held = CardBalance(5_000, emptyList(), emptyList(), "6f94b19b", strandedMsat = 65_536, strandedUntilMs = 1_798_000_000_000)
+        val ask = f.dispatch(PosEvent.BalanceDone(fx.readId, BalanceResult.Read(held))).single() as PosEffect.FetchWaiting
+        f.dispatch(PosEvent.WaitingFetched(ask.readId, listOf(w1)))
+        val s = f.state as PosState.BalanceShown
+        assertEquals(w1, s.waiting); assertEquals(5_000L, s.liveMsat)
+        assertEquals(65_536L, s.strandedMsat); assertEquals(1_798_000_000_000L, s.strandedUntilMs)
+    }
+
     @Test fun aReadWithoutACardIdAsksForNothing() {
         val f = flow()
         f.dispatch(PosEvent.CardPresent)

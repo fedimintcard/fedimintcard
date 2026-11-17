@@ -266,6 +266,18 @@ final class PosFlowTests: XCTestCase {
         XCTAssertTrue(f.dispatch(.cardBalanceOpened).isEmpty)
         guard case .enteringPin = f.state else { return XCTFail() }
     }
+
+    /// ENG-867: the shown balance is still what the card can pay, with what is on hold beside it.
+    func testWhatIsOnHoldGoesToTheScreenBesideThePayableBalance() {
+        let f = flow()
+        f.dispatch(.cardBalanceOpened)
+        guard case .startBalanceRead(let rid)? = f.dispatch(.cardPresent).first else { return XCTFail() }
+        let held = CardBalance(liveMsat: 65_536, notes: [], freeSlots: [], strandedMsat: 131_072, strandedUntilMs: 1_798_000_000_000)
+        f.dispatch(.balanceDone(readId: rid, result: .read(held)))
+        XCTAssertEqual(f.state, .balanceShown(readId: rid, liveMsat: 65_536, strandedMsat: 131_072, strandedUntilMs: 1_798_000_000_000))
+        f.dispatch(.balanceExpired(readId: rid))
+        XCTAssertEqual(f.state, .entering, "the hold goes with the balance")
+    }
 }
 
 /// The copy for the phone as an offline till (ENG-843, one set for both apps).
@@ -398,5 +410,68 @@ final class OfflineCopyTests: XCTestCase {
         XCTAssertEqual(offlinePanelLines(phone, nowMs: 0), kitAndCounts + [stopped], "no till status read yet")
         XCTAssertEqual(offlinePanelLines(.disabled, nowMs: 0, till: till(#"{"double_spent":2}"#)),
                        ["Offline payments are off on this phone.", "Offline payments lost to double spends: 2"])
+    }
+}
+
+/// The line for what the till holds back from a card (ENG-867), on a fixed clock in a fixed zone:
+/// Jamaica keeps UTC-5 all year.
+final class OnHoldCopyTests: XCTestCase {
+    private let zone = TimeZone(identifier: "America/Jamaica")!
+    private let utc = TimeZone(identifier: "UTC")!
+
+    private func at(_ year: Int, _ month: Int, _ day: Int, _ hour: Int, _ minute: Int = 0, _ second: Int = 0, in tz: TimeZone? = nil) -> Int64 {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz ?? zone
+        let d = cal.date(from: DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second))!
+        return Int64((d.timeIntervalSince1970 * 1000).rounded())
+    }
+    private var now: Int64 { at(2026, 12, 1, 12) }
+    private func line(_ msat: Int64, _ until: Int64?, in tz: TimeZone? = nil) -> String? {
+        onHoldText(strandedMsat: msat, untilMs: until, nowMs: now, timeZone: tz ?? zone)
+    }
+
+    func testNothingOnHoldIsNoLine() {
+        XCTAssertNil(line(0, nil))
+        XCTAssertNil(line(0, at(2026, 12, 21, 15)))
+        XCTAssertNil(line(-65_536, at(2026, 12, 21, 15)))
+    }
+
+    func testAHoldWithNoDateSaysOnlyHowMuch() {
+        XCTAssertEqual(line(65_536, nil), "65.536 sats on hold")
+    }
+
+    /// Due now or already: the notes come back within a tap or two, so no date.
+    func testAHoldThatIsNoLongerAheadHasNoDate() {
+        XCTAssertEqual(line(200_000, now), "200 sats on hold")
+        XCTAssertEqual(line(200_000, now - 1), "200 sats on hold")
+        XCTAssertEqual(line(200_000, at(2026, 11, 3, 9)), "200 sats on hold")
+    }
+
+    /// The first whole day the notes can come back: a hold ending mid-afternoon names the next day.
+    func testAHoldAheadNamesTheFirstWholeDayAfterIt() {
+        XCTAssertEqual(line(12_345_000, at(2026, 12, 21, 15)), "12,345 sats on hold until Dec 22")
+        XCTAssertEqual(line(200_000, now + 1), "200 sats on hold until Dec 2")
+        XCTAssertEqual(line(200_000, at(2027, 1, 6, 23, 59, 59)), "200 sats on hold until Jan 7")
+    }
+
+    /// A hold ending exactly at local midnight names the day that midnight starts, and not a ms later.
+    func testTheMidnightEdge() {
+        let midnight = at(2026, 12, 21, 0)
+        XCTAssertEqual(line(200_000, midnight), "200 sats on hold until Dec 21")
+        XCTAssertEqual(line(200_000, midnight + 1), "200 sats on hold until Dec 22")
+        XCTAssertEqual(line(200_000, midnight - 1), "200 sats on hold until Dec 21")
+    }
+
+    /// The day is the phone's: 03:00 UTC on Dec 22 is still Dec 21 in Jamaica.
+    func testTheDayIsInThePhonesTimeZone() {
+        let t = at(2026, 12, 22, 3, in: utc)
+        XCTAssertEqual(line(200_000, t), "200 sats on hold until Dec 22")
+        XCTAssertEqual(line(200_000, t, in: utc), "200 sats on hold until Dec 23")
+    }
+
+    func testTheSheetAndVoiceOverSayTheHoldAfterTheBalance() {
+        XCTAssertEqual(balanceSpoken(liveMsat: 1_000_000, onHold: nil), "1,000 sats on this card")
+        XCTAssertEqual(balanceSpoken(liveMsat: 1_000_000, onHold: line(200_000, at(2026, 12, 21, 15))),
+                       "1,000 sats on this card. 200 sats on hold until Dec 22")
     }
 }

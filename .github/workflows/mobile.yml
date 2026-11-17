@@ -1,8 +1,9 @@
 name: Mobile
 # The POS apps' Rust core (host/pos-core, docs/POS-OFFLINE.md) for Android and iOS, with its
-# Kotlin and Swift bindings. Proves the cross-compile on every change under host/; the libraries,
-# the bindings and their sizes are uploaded for the apps. The Android POS app (android-relay/)
-# builds on them: its unit tests and a debug APK whose libraries are 16 KB aligned.
+# Kotlin and Swift bindings, and the two POS apps built on it. Runs on every change under host/,
+# android-relay/, ios-pos/ and this file; the libraries, the bindings and their sizes are uploaded
+# for the apps. The Android POS app (android-relay/): its unit tests and a debug APK whose libraries
+# are 16 KB aligned. The iOS POS app (ios-pos/): its core package and unit tests on a simulator.
 on:
   push:
     branches: ['**']
@@ -41,14 +42,6 @@ jobs:
       - name: Kotlin bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings kotlin
-      - uses: actions/setup-java@v6
-        with: { distribution: temurin, java-version: '17' }
-      - name: The Android app, unit tests and debug build (Gradle reruns the core steps from cache)
-        working-directory: android-relay
-        shell: bash
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon testDebugUnitTest assembleDebug
       - run: cat host/target/pos-core-mobile/sizes.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -88,15 +81,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
         working-directory: host
-        run: scripts/pos-core-mobile.sh ios
+        # For the app's deployment target, as ios-pos/scripts/build-poscore.sh builds them, so the
+        # app's step below finds them built: the cc crate otherwise builds the core's C code for the
+        # Xcode SDK's iOS version, newer than the app's.
+        run: |
+          IPHONEOS_DEPLOYMENT_TARGET=$(../ios-pos/scripts/deployment-target.sh)
+          export IPHONEOS_DEPLOYMENT_TARGET
+          scripts/pos-core-mobile.sh ios
       - name: Swift bindings
         working-directory: host
         run: scripts/pos-core-mobile.sh bindings swift
       - name: The iOS app, package and unit tests on a simulator
         shell: bash
         run: |
-          # The project's deployment target is iOS 26.5: use the newest Xcode 26 on the runner (the
-          # default one ships an older simulator runtime) and an iPhone on its newest iOS runtime.
+          # The deployment target is iOS 26.0: every Xcode 26 on the runner builds the app and every
+          # iOS 26 runtime runs it. The step still takes the newest Xcode 26 (the image's default is
+          # older), the one closest to the current Xcode the store builds are archived with, and an
+          # iPhone on its newest iOS runtime, the one testers' phones most likely run.
           xc=$(ls -d /Applications/Xcode_26.*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$xc" ] && sudo xcode-select -s "$xc"
           xcodebuild -version | tr '\n' ' '; echo
@@ -115,7 +116,10 @@ jobs:
           PY
           )
           echo "simulator: $udid"
-          xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
+          # The runner's time zone is UTC, so the tests of the day a hold names could not tell the phone's
+          # own zone from UTC. xcodebuild hands TEST_RUNNER_ variables to the hosted tests without the
+          # prefix: they run in America/Jamaica, the zone the wording tests pin.
+          TEST_RUNNER_TZ=America/Jamaica xcodebuild test -project ios-pos/FedimintCardPOS.xcodeproj -scheme FedimintCardPOS \
             -destination "platform=iOS Simulator,id=$udid" -derivedDataPath /tmp/pos-dd \
             CODE_SIGNING_ALLOWED=NO > /tmp/xcodebuild.log 2>&1 \
             || { grep -E -A20 'Unable to find|error:|failed' /tmp/xcodebuild.log | head -80; exit 1; }

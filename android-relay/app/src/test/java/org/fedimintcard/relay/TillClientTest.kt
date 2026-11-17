@@ -158,6 +158,24 @@ class TillClientTest {
         assertNull(n.balance.shortId)
     }
 
+    /** ENG-867: the till's reply carries what it holds back beside the payable `live_msat`. */
+    @Test fun cardBalanceReadsWhatIsOnHold() {
+        val f = Fake(raw(200, """{"ok":true,"live_msat":65536,"stranded_msat":131072,"stranded_until_ms":1798000000000,
+            "notes":[{"slot":0,"msat":65536,"status":"live"},{"slot":1,"msat":131072,"status":"live","stranded":true}],"free_slots":[],"short_id":"6f94b19b"}"""))
+        val b = (client(f).cardBalance() as BalanceResult.Read).balance
+        assertEquals("http://h:1/v1/card/balance", f.url); assertEquals("POST", f.method)
+        assertEquals(CardBalance(65_536, listOf(CardNote(0, 65_536, "live"), CardNote(1, 131_072, "live")), emptyList(), "6f94b19b", 131_072, 1_798_000_000_000), b)
+        val due = parseCardBalance(200, """{"ok":true,"live_msat":0,"stranded_msat":131072,"stranded_until_ms":null,"notes":[],"free_slots":[]}""") as BalanceResult.Read
+        assertEquals(131_072L, due.balance.strandedMsat); assertNull(due.balance.strandedUntilMs)
+    }
+
+    /** A till from before these fields sends neither: nothing on hold and no date. */
+    @Test fun cardBalanceFromAnOlderTill() {
+        val b = (client(Fake(raw(200, """{"ok":true,"live_msat":21000,"notes":[{"slot":0,"msat":21000,"status":"live"}],"free_slots":[1,2]}"""))).cardBalance() as BalanceResult.Read).balance
+        assertEquals(CardBalance(21_000, listOf(CardNote(0, 21_000, "live")), listOf(1, 2)), b)
+        assertEquals(0L, b.strandedMsat); assertNull(b.strandedUntilMs)
+    }
+
     @Test fun createTopUpRefused() {
         val r = client(Fake(raw(400, """{"ok":false,"error":"bad_amount","detail":"too much"}"""))).createTopUp(1, "r") as TopUpReply.Refused
         assertEquals("bad_amount", r.error); assertEquals("too much", r.detail); assertEquals(400, r.httpStatus)

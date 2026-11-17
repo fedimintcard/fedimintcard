@@ -15,6 +15,10 @@ import android.widget.EditText
 import android.widget.ListView
 import android.widget.TextView
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
 
@@ -32,6 +36,7 @@ class PosUi(
     private val fedName: TextView = v(R.id.federation_name)
     private val balance: TextView = v(R.id.balance_line)
     private val cardBalanceAmount: TextView = v(R.id.card_balance_amount)
+    private val cardBalanceOnHold: TextView = v(R.id.card_balance_on_hold)
     private val loadWaiting: Button = v(R.id.btn_load_waiting)
     private val cardBalancePanel: View = v(R.id.card_balance_panel)
     private val cardBalanceCountdown: TextView = v(R.id.card_balance_countdown)
@@ -216,9 +221,12 @@ class PosUi(
         when (state) {
             PosState.BalanceWaiting, is PosState.BalanceReading -> tapAmount.text = act.getString(R.string.card_balance_label)
             is PosState.BalanceShown -> {
-                val amount = "${formatSats(state.liveMsat)} sats"
-                cardBalanceAmount.text = amount
-                cardBalancePanel.contentDescription = "Card balance: $amount on this card"
+                val copy = balanceShownCopy(state)
+                cardBalanceAmount.text = copy.amount
+                // Under the payable balance, what the till holds back; no line at all when nothing is.
+                cardBalanceOnHold.text = copy.onHold ?: ""
+                cardBalanceOnHold.visibility = if (copy.onHold == null) View.GONE else View.VISIBLE
+                cardBalancePanel.contentDescription = copy.description
                 val w = state.waiting
                 if (w == null) loadWaiting.visibility = View.GONE
                 else {
@@ -523,6 +531,54 @@ class PosUi(
             return row
         }
     }
+}
+
+/**
+ * The line under a card's payable balance for the notes the till holds back from it (ENG-867,
+ * `stranded_msat` and `stranded_until_ms` in docs/TILL-API.md), or null when none is held: no
+ * line at all. "N sats on hold until D" while [strandedUntilMs] is ahead of the phone's clock
+ * [nowMs]; "N sats on hold" when there is no date to show (null, or not ahead of the clock).
+ *
+ * D is the first whole day in [zone] the notes can come back: the local day that starts at or
+ * after [strandedUntilMs]. A hold that ends at 15:00 on Dec 21 names Dec 22, and one that ends
+ * exactly at the midnight that starts Dec 21 names Dec 21: the line never promises the money a day
+ * early.
+ */
+fun onHoldLine(strandedMsat: Long, strandedUntilMs: Long?, nowMs: Long, zone: ZoneId): String? {
+    if (strandedMsat <= 0) return null
+    val held = "${formatSats(strandedMsat)} sats on hold"
+    if (strandedUntilMs == null || strandedUntilMs <= nowMs) return held
+    return "$held until ${HOLD_DAY.format(firstWholeDay(strandedUntilMs, zone))}"
+}
+
+/** The local day in [zone] that starts at or after [ms]. */
+private fun firstWholeDay(ms: Long, zone: ZoneId): LocalDate {
+    val at = Instant.ofEpochMilli(ms)
+    val day = at.atZone(zone).toLocalDate()
+    return if (day.atStartOfDay(zone).toInstant() == at) day else day.plusDays(1)
+}
+
+/** "Dec 21": the app's copy is English whatever the phone's language. */
+private val HOLD_DAY: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d", Locale.US)
+
+/** What the balance panel says to a screen reader: the payable balance, then [onHold] if any. */
+fun balanceDescription(liveMsat: Long, onHold: String?): String =
+    "Card balance: ${formatSats(liveMsat)} sats on this card" + (onHold?.let { ". $it" } ?: "")
+
+/**
+ * What the balance screen says of a shown balance: its [amount], the [onHold] line under it (null:
+ * no line at all) and the [description] a screen reader reads for the whole panel.
+ */
+data class BalanceCopy(val amount: String, val onHold: String?, val description: String)
+
+/**
+ * The balance screen's copy for [s], by the phone's clock [nowMs] and in its zone [zone], which
+ * default to the phone's own as the screen uses them. [PosUi.render] only places what this returns,
+ * so a test reads it here without a view.
+ */
+fun balanceShownCopy(s: PosState.BalanceShown, nowMs: Long = System.currentTimeMillis(), zone: ZoneId = ZoneId.systemDefault()): BalanceCopy {
+    val onHold = onHoldLine(s.strandedMsat, s.strandedUntilMs, nowMs, zone)
+    return BalanceCopy("${formatSats(s.liveMsat)} sats", onHold, balanceDescription(s.liveMsat, onHold))
 }
 
 /** Title and detail for a failed balance read, in words the card holder can act on. */
