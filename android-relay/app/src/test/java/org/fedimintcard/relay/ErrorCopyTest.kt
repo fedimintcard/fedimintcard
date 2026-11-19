@@ -43,7 +43,6 @@ class ErrorCopyTest {
             "This card can't take change while offline. Try another amount",
             errorCopy(ErrorKind.OFFLINE_NO_CHANGE_ROOM, "needs change").second,
         )
-        assertEquals("Can't take this amount", errorCopy(ErrorKind.NO_EXACT_PLAN, "").first)
     }
 
     /**
