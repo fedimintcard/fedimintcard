@@ -134,7 +134,7 @@ An offline charge whose price needs change the card has no room for is refused w
 `offline_no_change_room` (409), and the answer adds the prices the card can pay with the slots it
 has, in whole sats: `"suggested_msat":N|null` (the nearer of the two), `"suggest_below_msat"`
 and `"suggest_above_msat"` (each `N` or null). The POS shows "This card can't take change while
-offline. Try N sats" (or "Try another amount"), not "card needs a top up".
+offline. Try N sats" (or "Try another amount").
 
 **A card taken away mid-tap.** A card pulled after it signed some of an offline charge's inputs
 leaves the charge `signing`, and that tap is answered `undecided` (202): only the card's next tap
@@ -297,7 +297,7 @@ earlier attempt.
 | `relay_unreachable` | 502 | the phone relay could not be reached from the laptop | check USB / adb forward |
 | `card_error` | 502 | the card returned an error status, or a different card than the wallet's was presented ("different card presented") | retry; if it persists, card fault |
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
-| `no_exact_plan` | 422 | notes cannot make the price without too many change notes | decline; card needs a top up |
+| `no_exact_plan` | 422 | the card cannot pay this price in one tap: the price needs more of its notes than one tap signs (`plan::MAX_INPUTS`, 3 today), or no exact layout of the change fits its free slots; `detail` says which and is meant for a log | decline; the POS says "Can't take this amount" (try a smaller amount, or take the sale another way) and does not show `detail` |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
 | `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
