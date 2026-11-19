@@ -597,6 +597,7 @@ final class OfflineFlowTests: XCTestCase {
     }
 
     func testEveryCoreAnswerMapsToItsScreen() async {
+        let noPlan = "a spend of 5000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way"
         let cases: [(CoreOutcome, ErrorKind, String)] = [
             (.refused(code: "offline_kit_expired", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineKitExpired, "Till service unreachable"),
             (.refused(code: "offline_note_invalid", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineNoteInvalid, "Till service unreachable"),
@@ -608,6 +609,7 @@ final class OfflineFlowTests: XCTestCase {
             (.refused(code: "card_limit", detail: "d", suggestedMsat: nil, triesLeft: nil), .cardLimit, "Card limit reached"),
             (.refused(code: "offline_no_change_room", detail: "d", suggestedMsat: 7_000, triesLeft: nil), .offlineNoChangeRoom, "No room for change offline"),
             (.refused(code: "insufficient", detail: "d", suggestedMsat: nil, triesLeft: nil), .insufficient, "Card balance too low"),
+            (.refused(code: "no_exact_plan", detail: noPlan, suggestedMsat: nil, triesLeft: nil), .noExactPlan, "Can't take this amount"),
             (.refused(code: "no_card", detail: "d", suggestedMsat: nil, triesLeft: nil), .noCard, "Card not detected"),
             (.refused(code: "undecided", detail: "d", suggestedMsat: nil, triesLeft: nil), .heldOnPhone, "Payment not finished"),
             (.refused(code: "something_new", detail: "the card said 6F00", suggestedMsat: nil, triesLeft: nil), .cardError, "Card error"),
@@ -624,6 +626,12 @@ final class OfflineFlowTests: XCTestCase {
             if kind == .offlinePoolExhausted {
                 XCTAssertEqual(e.suggestedMsat, 12_000)
                 XCTAssertEqual(errorCopy(e.kind, e.detail, suggestedMsat: e.suggestedMsat).1, "Try 12 sats, or reach the till for a new kit.")
+            }
+            // The core's sentence is the till's: kept, and not shown on the phone either.
+            if kind == .noExactPlan {
+                XCTAssertEqual(e.detail, noPlan)
+                XCTAssertEqual(errorCopy(e.kind, e.detail, suggestedMsat: e.suggestedMsat, unresolved: e.unresolvedRef != nil).1,
+                               "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
             }
             if kind == .cardError { XCTAssertEqual(e.detail, "the card said 6F00") }
         }

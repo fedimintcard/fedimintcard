@@ -1,6 +1,8 @@
 package org.fedimintcard.relay
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class ErrorCopyTest {
@@ -29,8 +31,8 @@ class ErrorCopyTest {
     }
 
     /**
-     * Offline with no slot for change is not a full card: "Card needs a top up" sent holders to top
-     * up a card that only needed another price (OFFLINE-PLAN.md § 10).
+     * Offline with no slot for change is not a full card: a title that asked for a top up sent
+     * holders to top up a card that only needed another price (OFFLINE-PLAN.md § 10).
      */
     @Test
     fun noRoomForChangeOfflineIsNotATopUp() {
@@ -41,7 +43,34 @@ class ErrorCopyTest {
             "This card can't take change while offline. Try another amount",
             errorCopy(ErrorKind.OFFLINE_NO_CHANGE_ROOM, "needs change").second,
         )
-        assertEquals("Card needs a top up", errorCopy(ErrorKind.NO_EXACT_PLAN, "").first)
+        assertEquals("Can't take this amount", errorCopy(ErrorKind.NO_EXACT_PLAN, "").first)
+    }
+
+    /**
+     * `no_exact_plan` reads the same whatever the till's `detail` says: each sentence the planner
+     * gives a charge it refuses with this code today, the first of them without its "cash out and
+     * reload" clause, or nothing. The detail speaks of msat, notes and slots, and asks for a top up
+     * or a cash out nobody at the counter can give, so it is never shown.
+     */
+    @Test
+    fun aCardThatCannotPayInOneTapIsToldSoWhateverTheTillSays() {
+        val copy = "Can't take this amount" to "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."
+        val details = listOf(
+            "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or cash out and reload to merge notes",
+            "no exact-balance spend of 60000 msat with 2 free slot(s); top up to get more free slots, or spend a different amount",
+            "33 live notes is more than a card can hold; state file is inconsistent",
+            "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way",
+            "",
+        )
+        for (detail in details) {
+            val answer = JSONObject().put("ok", false).put("error", "no_exact_plan").put("detail", detail).toString()
+            val r = parseCharge(422, answer) as ChargeResult.Declined
+            assertEquals(detail, ChargeResult.Declined(ChargeErrorCode.NO_EXACT_PLAN, detail, 422), r)
+            val shown = errorCopy(ErrorKind.from(r.code), r.detail)
+            assertEquals(detail, copy, shown)
+            val text = "${shown.first} ${shown.second}".lowercase()
+            for (word in listOf("top up", "cash out", "msat", "slot", "note")) assertFalse("\"$word\" shown for: $detail", word in text)
+        }
     }
 
     @Test

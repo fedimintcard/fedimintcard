@@ -227,13 +227,42 @@ final class ErrorMappingTests: XCTestCase {
         }
         XCTAssertEqual(errorCopy(.pinBlocked, "").0, "PIN blocked")
         XCTAssertEqual(errorCopy(.insufficient, "").0, "Card balance too low")
+        XCTAssertEqual(errorCopy(.noExactPlan, "").0, "Can't take this amount")
+        XCTAssertEqual(errorCopy(.noExactPlan, "").1, "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
         // Offline with no slot for change is not a full card (OFFLINE-PLAN.md § 10).
-        XCTAssertEqual(errorCopy(.noExactPlan, "").0, "Card needs a top up")
         XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d", suggestedMsat: 12_000).0, "No room for change offline")
         XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d", suggestedMsat: 12_000).1, "This card can't take change while offline. Try 12 sats")
         XCTAssertEqual(errorCopy(.offlineNoChangeRoom, "d").1, "This card can't take change while offline. Try another amount")
         for p: BalanceProblem in [.cardMoved, .notOurCard, .tillUnreachable, .relayUnreachable, .busy, .cardService, .timeout, .notPaired, .other] {
             XCTAssertFalse(balanceErrorCopy(p).0.isEmpty)
+        }
+    }
+
+    /// `no_exact_plan` reads the same whatever the till's `detail` says: each sentence the planner
+    /// gives a charge it refuses with this code today, the first of them without its "cash out and
+    /// reload" clause, or nothing. The detail speaks of msat, notes and slots, and asks for a top up
+    /// or a cash out nobody at the counter can give, so it is never shown.
+    func testNoExactPlanReadsTheSameWhateverTheTillSays() throws {
+        let title = "Can't take this amount"
+        let body = "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."
+        let details = [
+            "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or cash out and reload to merge notes",
+            "no exact-balance spend of 60000 msat with 2 free slot(s); top up to get more free slots, or spend a different amount",
+            "33 live notes is more than a card can hold; state file is inconsistent",
+            "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way",
+            "",
+        ]
+        for detail in details {
+            let answer = try JSONSerialization.data(withJSONObject: ["ok": false, "error": "no_exact_plan", "detail": detail] as [String: Any])
+            let r = TillParse.charge(status: 422, body: answer)
+            XCTAssertEqual(r, .declined(code: .noExactPlan, detail: detail, httpStatus: 422), detail)
+            guard case .declined(let code, let d, _, _) = r else { return XCTFail(detail) }
+            let (t, b) = errorCopy(ErrorKind.from(code), d)
+            XCTAssertEqual(t, title, detail)
+            XCTAssertEqual(b, body, detail)
+            for word in ["top up", "cash out", "msat", "slot", "note"] {
+                XCTAssertFalse((t + " " + b).lowercased().contains(word), "\"\(word)\" shown for: \(detail)")
+            }
         }
     }
 }

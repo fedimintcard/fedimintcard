@@ -240,6 +240,20 @@ class OfflineTillTest {
         assertEquals(ok, charge("r1") { sent -> sent(); ok })
     }
 
+    /** The phone's own charge of a card it cannot pay from in one tap reads as the till's refusal does. */
+    @Test fun aCardWithTooManyNotesIsRefusedOnThePhoneAndReadsTheSame() {
+        withKit()
+        val noPlan = "a spend of 5000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way"
+        core.onCharge = { CoreCharge.Refused("no_exact_plan", noPlan) }
+        val r = declined(charge("r1", online = linkDown))
+        assertEquals(ChargeErrorCode.NO_EXACT_PLAN, r.code); assertEquals(noPlan, r.detail)
+        assertTrue(r.local); assertFalse(r.held); assertEquals(0, r.httpStatus)
+        assertEquals(
+            "Can't take this amount" to "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.",
+            errorCopy(ErrorKind.from(r.code), r.detail),
+        )
+    }
+
     @Test fun noCoreNoKitOrAnotherPairingsKitIsNotReady() {
         // No kit.
         val noKit = declined(charge("r1", online = linkDown))
