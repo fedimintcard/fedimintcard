@@ -270,8 +270,10 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   contact; a card at any other version, FF included, stops before anything is written), and prove
   both with a full login under the factory keys and a GET STATUS that lists none of ours. No
   reinstall, no new PIN, no new card row: the card is blank, and goes through a new batch to be
-  used again (the install tap gets the same per-card keys back from ops). **Built 2026-11-04, not
-  deployed, silicon pending**:
+  used again (the install tap gets the same per-card keys back from ops). **Built 2026-11-04; run
+  on silicon against staging, 2026-11-15 to 2026-11-18** (one J3R452 and one J3R180, a Pixel 8 Pro
+  and an iPhone, with the holder's PIN and once down the blocked-PIN path:
+  [HARDWARE_TEST_REPORT_2026-11-19.j3r452.md](HARDWARE_TEST_REPORT_2026-11-19.j3r452.md)):
   `apps/provisioner/src/reset.ts` and `screens/ResetScreen.tsx` over cardkit's `factoryReset`
   (`tools/cardkit/gp/reset.ts`), two taps (read slot 0 and the PIN's state without spending a try;
   then slot 0 again, ops' check again, `VERIFY_PIN`, CPLC, keys, one INITIALIZE UPDATE checked
@@ -289,7 +291,7 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   the chip's `manager_keys` escrow row (the chip is released: the next operator to ask owns it and
   gets the same derived bytes) and stores a `card_resets` row (migration 7); a repeat answers the
   stored record and changes nothing. After a reset the old short id answers 410 to holder routes and
-  till writes. **By chip (2026-11-04, not deployed, silicon pending):** the first tap also reads the
+  till writes. **By chip (2026-11-04, silicon pending):** the first tap also reads the
   chip's CPLC id and the check always sends it (`reset-check?chip=`), so ops can find a `needsReset`
   card whose short id it has no row for (or only a stopped row): such a card is the caller's when the
   chip's escrow is, and another operator's chip answers 404 like an unknown id. It resets **without

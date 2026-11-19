@@ -136,9 +136,14 @@ version 00). At version 01 it sends a J3R180 the same bytes as before
 before, and names FF in its own refusal: only the install tap's first contact
 takes a card off FF.
 
-First contact, in-place PUT KEY under SCP03 and the reset of a J3R452 have run
-against the fake card and the four captures in `gp/test/fixtures` only, never
-on a card in a reader.
+In-place PUT KEY under SCP03 and the reset of a J3R452 have run on one card,
+through the Setup app on a Pixel 8 Pro and an iPhone (2026-11-15 to
+2026-11-18,
+[HARDWARE_TEST_REPORT_2026-11-19.j3r452.md](../../docs/HARDWARE_TEST_REPORT_2026-11-19.j3r452.md)).
+The Pixel's log shows both by command size only, and the iPhone left no
+trace. First contact has still run against the fake card and the four
+captures in `gp/test/fixtures` only, never on a card: the test card was
+already at version 01.
 
 Migration from 0.1.0:
 
