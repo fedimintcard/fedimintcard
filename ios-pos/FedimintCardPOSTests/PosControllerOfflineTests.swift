@@ -343,6 +343,50 @@ final class PosControllerOfflineTests: XCTestCase {
         r.pos.stop()
     }
 
+    /// A 500 `internal` and a gateway's 5xx (a body that is not the till's JSON) from the charge
+    /// route do not say whether the till took the sale. Through the parse, the flow and the
+    /// controller the sale stays unresolved, as after a lost reply: no Back, the online Abandon
+    /// alert, and Try again sends the same `client_ref` to the till again.
+    func testA500AndAGatewayErrorFromTheChargeRouteLeaveTheSaleUnresolved() async {
+        let answers: [(Int, String)] = [
+            (500, #"{"ok":false,"error":"internal","detail":"the till service stopped before answering"}"#),
+            (502, "<html><body><h1>502 Bad Gateway</h1></body></html>"),
+        ]
+        for (status, body) in answers {
+            let r = ControllerRig()
+            await r.open()
+            await r.poll()
+            r.till.answer("/v1/charge", status, body)
+            func onError() -> Bool { if case .error = r.pos.state { return true }; return false }
+            func chargeRefs() -> [String?] {
+                r.till.requests.filter { $0.url.path == "/v1/charge" }.map { req in
+                    req.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["client_ref"] as? String
+                }
+            }
+            r.ring(5)
+            r.pos.send(.cardPresent)
+            await r.until("the till's answer") { onError() }
+            guard case .error(let e) = r.pos.state else { return XCTFail("\(status): \(r.pos.state)") }
+            XCTAssertEqual(e.kind, .timeoutUnknown, "\(status)")
+            XCTAssertEqual(e.unresolvedRef, e.clientRef, "\(status)")
+            XCTAssertNotNil(r.pos.flow.unresolvedRef, "\(status)")
+            XCTAssertEqual(errorCopy(e.kind, e.detail, unresolved: true).0, "Outcome unknown", "\(status)")
+            XCTAssertEqual(r.pos.abandonMessage(for: e),
+                           "If the payment did go through, the customer will have paid without a receipt. Check Sales first.", "\(status)")
+            XCTAssertEqual(r.reader.log, ["begin", "error: Payment didn't go through"], "\(status)")
+            r.pos.send(.backPressed)
+            XCTAssertEqual(r.pos.state, .error(e), "\(status): no Back while the outcome is unknown")
+            // Try again: the PIN, the card, and the same sale to the till's charge route.
+            r.pos.send(.retryPressed)
+            r.typePin()
+            r.pos.send(.cardPresent)
+            await r.until("the retry's answer") { chargeRefs().count == 2 && onError() }
+            XCTAssertEqual(chargeRefs(), [e.clientRef, e.clientRef], "\(status): Try again never starts a new sale")
+            XCTAssertEqual(r.pos.flow.unresolvedRef, e.clientRef, "\(status)")
+            r.pos.stop()
+        }
+    }
+
     /// Charges another till does not know wait for the till they were taken for, and the polls of
     /// the next minute do not post them again; the sync stays wanted and goes a minute on.
     func testChargesKeptForTheirTillArePostedOnceAMinute() async {

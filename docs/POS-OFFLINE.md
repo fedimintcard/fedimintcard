@@ -8,10 +8,11 @@ on the holders' cards, the inputs of the sales it had not synced, and the caps d
 (risk 6, ENG-867).
 
 Online, the hosted till does the charge exactly as before (`docs/TILL-API.md`); nothing in the
-online path changes but for a sale the till's own offline queue holds `signing` (below). This
-page is how the offline path is built (ENG-841; slice 1 is ENG-842: the shared core and the
-till's routes; the apps are ENG-843, iOS, and ENG-844, Android) and how it was drilled on
-production (ENG-845, § Drill log).
+online path changes but for a sale the till's own offline queue holds `signing` (below), and the
+apps' reading of an answer that does not say whether the till took the sale, which leaves the sale
+unresolved as a lost reply does (ENG-859, `docs/TILL-API.md`). This page is how the offline path is
+built (ENG-841; slice 1 is ENG-842: the shared core and the till's routes; the apps are ENG-843,
+iOS, and ENG-844, Android) and how it was drilled on production (ENG-845, § Drill log).
 
 ## Architecture
 
@@ -76,8 +77,9 @@ tills are found by the registry at report, as today, and counted: the till's cou
 Settings on both apps.
 
 **What does not change.** Applet 3.0, the online charge path (but for a sale the till's own
-offline queue holds `signing`, taken the offline way as above), the registry API and the Setup
-app.
+offline queue holds `signing`, taken the offline way as above, and an answer that does not say
+whether the till took the sale, which the apps leave unresolved: ENG-859), the registry API and
+the Setup app.
 
 ## One charge
 
@@ -185,13 +187,16 @@ before it looks at an earlier attempt with that `client_ref`, so a refusal prove
 the attempt before it. Once a `POST /v1/charge` was sent for the sale, whatever it answered (a
 refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at all), only the
 till's own `client_ref` guard stops a second charge, so a retry that cannot reach the till shows
-the unreachable screen and takes nothing. A 401 or 403 never falls back: the pairing is dead. An
-unresolved sale whose retry cannot reach the till stays on the unreachable screen with the lost
-reply's copy, and "Outcome unknown" is as it was. Otherwise the unreachable screen says which: no
-kit yet, the kit expired, or the caps reached. Balance reads and top-ups never fall back. The
-till's own answers with the codes of its offline path (`offline_cap_reached`, `offline_not_ready`,
-`offline_note_invalid`) read as before, in the till's words: the phone's copy for them is about
-the phone's kit and queue.
+the unreachable screen and takes nothing. Of those answers, a 500, a 5xx the app cannot read, a
+code it does not know and no answer in time or a connection cut after the request was sent leave
+the sale unresolved ("Outcome unknown": Try again with the same `client_ref`, Check sales, Abandon
+sale, no Back; ENG-859), while a refusal still proves nothing about the attempt before it. A 401 or
+403 never falls back: the pairing is dead. An unresolved sale whose retry cannot reach the till
+stays on the unreachable screen with the lost reply's copy. Otherwise the unreachable screen says
+which: no kit yet, the kit expired, or the caps reached. Balance reads and top-ups never fall back.
+The till's own answers with the codes of its offline path (`offline_cap_reached`,
+`offline_not_ready`, `offline_note_invalid`) read as before, in the till's words: the phone's copy
+for them is about the phone's kit and queue.
 
 **Local only.** A sale in `signing_refs()`, or whose last local charge answered `undecided` or
 threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatever the till's

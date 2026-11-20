@@ -318,7 +318,14 @@ earlier attempt.
 | `offline_note_invalid` | 403 | offline: some of the card's notes do not check against the federation's keys (no denomination of its, or a signature that does not verify) and the rest do not pay the price; nothing was signed | decline: the card cannot be checked offline; it pays online |
 | `offline_kit_expired` | 403 | a POS phone's offline charge only: its offline kit is past its expiry, by the phone's clock or the card's; nothing was asked of the card | take the card online, or fetch a new kit from the till |
 | `offline_pool_exhausted` | 409 | a POS phone's offline charge only: the price needs a till note of a tier the phone's offline kit has run out of; the answer has the prices the kit still pays (`suggested_msat`, `below_msat`, `above_msat`, as `offline_no_change_room`); nothing moved | show "Try N sats", and fetch a new kit when online |
-| `internal` | 500 | anything else | show detail |
+| `internal` | 500 | anything else. The till may have taken the sale: an error after the federation accepted it, or the till service stopped before answering | treat as `undecided`: keep the `client_ref`, send it again, look in `/v1/sales`; never start a new sale for the card |
+
+An answer that does not say whether the till took the sale is `undecided` for an app: a 500
+`internal`, a 5xx whose body is not this JSON (a gateway or proxy answering for the till), no
+answer in time or a connection cut after the request was sent, and an `error` that is neither in
+this table nor `unauthorized` or `card_link_gone` (both above). The POS apps show
+"Outcome unknown" with Try again (the same `client_ref`, which never charges twice), Check sales
+and Abandon sale, and no Back.
 
 ## GET /v1/sales
 `200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>","offline":bool,"double_spent":bool,"rejected":bool,"collection_pending":bool}]}`

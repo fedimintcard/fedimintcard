@@ -331,7 +331,7 @@ enum TillParse {
             switch status {
             case 202: return .declined(code: .undecided, detail: "", httpStatus: status)
             case 401: return .declined(code: .unauthorized, detail: "", httpStatus: status)
-            case 200...299: return .failed(.interrupted) // accepted but unreadable: outcome unknown
+            case 200...299, 500...599: return .failed(.interrupted) // unreadable: a 2xx was accepted, a 5xx may have been; outcome unknown
             default: return .failed(.badResponse(msg))
             }
         }

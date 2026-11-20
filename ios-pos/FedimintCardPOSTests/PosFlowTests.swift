@@ -197,6 +197,60 @@ final class PosFlowTests: XCTestCase {
         XCTAssertEqual(f.state, .entering); XCTAssertEqual(f.pad.sats, 0)
     }
 
+    /// An answer from the till that does not say whether it took the sale leaves the sale
+    /// unresolved, as a lost reply does: "Outcome unknown", no Back, Try again asks the PIN for the
+    /// same sale (the same `client_ref`), and Abandon clears the sale and the amount.
+    private func assertUnresolvedSale(_ answer: ChargeResult, file: StaticString = #filePath, line: UInt = #line) {
+        let f = flow()
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: answer))
+        guard case .error(let e) = f.state else { return XCTFail("\(answer): \(f.state)", file: file, line: line) }
+        XCTAssertEqual(e.kind, .timeoutUnknown, "\(answer)", file: file, line: line)
+        XCTAssertEqual(e.unresolvedRef, ref, "\(answer)", file: file, line: line)
+        XCTAssertEqual(errorCopy(e.kind, e.detail, unresolved: true).0, "Outcome unknown", "\(answer)", file: file, line: line)
+        f.dispatch(.backPressed)
+        XCTAssertEqual(f.state, .error(e), "\(answer): no Back while the outcome is unknown", file: file, line: line)
+        f.dispatch(.retryPressed)
+        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: false, triesLeft: nil, returnTo: e),
+                       "\(answer)", file: file, line: line)
+        let (id2, ref2, _) = chargeToSigning(f)
+        XCTAssertEqual(ref2, ref, "\(answer): Try again sends the same client_ref", file: file, line: line)
+        f.dispatch(.chargeDone(chargeId: id2, result: answer))
+        XCTAssertEqual(f.unresolvedRef, ref, "\(answer)", file: file, line: line)
+        f.dispatch(.abandonPressed)
+        XCTAssertEqual(f.state, .entering, "\(answer)", file: file, line: line)
+        XCTAssertEqual(f.pad.sats, 0, "\(answer): Abandon clears the amount", file: file, line: line)
+    }
+
+    /// A 500 `internal`: the till may have taken the sale (an error after the federation accepted
+    /// it, or the till service stopping before it answered).
+    func testAnInternalAnswerFromTheTillIsAnUnresolvedSale() {
+        assertUnresolvedSale(.declined(code: .internal, detail: "the till service stopped before answering", httpStatus: 500))
+    }
+
+    /// A code the app does not know (a newer till, or JSON from something in front of the till),
+    /// whatever its status.
+    func testACodeTheAppDoesNotKnowIsAnUnresolvedSale() {
+        assertUnresolvedSale(.declined(code: .unknown, detail: "", httpStatus: 500))
+        assertUnresolvedSale(.declined(code: .unknown, detail: "something new", httpStatus: 409))
+    }
+
+    /// Every other code the app knows is a refusal of this request, as before: nothing is left
+    /// unresolved and Back goes back to the amount. A code added to `ChargeErrorCode` lands here,
+    /// so whether it leaves a sale unresolved is decided when it is added.
+    func testEveryOtherCodeTheAppKnowsStillOffersBack() {
+        let unclear: Set<ChargeErrorCode> = [.undecided, .internal, .unknown]
+        for code in ChargeErrorCode.allCases where !unclear.contains(code) && code != .wrongPin {
+            let f = flow()
+            let (id, _, _) = chargeToSigning(f)
+            f.dispatch(.chargeDone(chargeId: id, result: declined(code)))
+            guard case .error(let e) = f.state else { XCTFail("\(code): \(f.state)"); continue }
+            XCTAssertNil(e.unresolvedRef, "\(code)")
+            f.dispatch(.backPressed)
+            XCTAssertEqual(f.state, .entering, "\(code)")
+        }
+    }
+
     func testLinkFailureBeforeChargeKeepsUnresolvedState() {
         let f = flow()
         f.dispatch(.chargePressed); typePin(f); f.dispatch(.pinConfirmed)
