@@ -45,6 +45,8 @@ import React, {
 } from 'react';
 import {TextInput, type TextInputProps} from 'react-native';
 
+import {secureRandomUnit} from './secureRandom';
+
 /** Where the PIN enters: BatchSetup itself, or the loop's generated reveal. */
 export type PinPolicy = 'batch' | 'perCard';
 
@@ -149,12 +151,13 @@ function randomPin(random: () => number, length: number): string {
 }
 
 /**
- * A fresh PIN for one card. The default source is the platform CSPRNG; a test
- * injects its own. A regenerated PIN is retried, never weakened, so the result
- * always satisfies `isValidPin` for the lengths this app generates.
+ * A fresh PIN for one card. The default source is the platform CSPRNG
+ * (`secureRandomUnit`), which throws on a phone without one; a test injects
+ * its own. A regenerated PIN is retried, never weakened, so the result always
+ * satisfies `isValidPin` for the lengths this app generates.
  */
 export function generatePin(
-  random: () => number = platformRandom,
+  random: () => number = secureRandomUnit,
   length: number = GENERATED_PIN_LENGTH,
 ): string {
   if (length < PIN_MIN || length > PIN_MAX) {
@@ -169,18 +172,6 @@ export function generatePin(
   // 32 weak draws in a row is not a plausible CSPRNG; refusing beats a weak PIN.
   throw new Error('the random source produced no usable PIN');
 }
-
-/** Uniform in [0, 1) from the platform CSPRNG, without bias for a single digit. */
-const platformRandom = (): number => {
-  const g = globalThis as {crypto?: {getRandomValues?: (a: Uint32Array) => Uint32Array}};
-  const c = g.crypto;
-  if (c?.getRandomValues) {
-    const b = new Uint32Array(1);
-    c.getRandomValues(b);
-    return b[0] / 0x1_0000_0000;
-  }
-  return Math.random();
-};
 
 /**
  * The only string form of a PIN that may be displayed or logged: the length,

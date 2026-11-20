@@ -42,6 +42,7 @@ import {CardFigure} from '../CardFigure';
 import {fromHex, toHex} from '../cardkit';
 import {holdsPlace, installTap} from '../installTap';
 import {generatePin, useAttemptedPin, useBatchPin, usePinReveal} from '../pin';
+import {secureRandomBytes} from '../secureRandom';
 import {phaseMessage, setCardMessage, withCard} from '../session';
 import {CALM, LOOP, STATE, registryHeldWhat} from '../strings';
 import {
@@ -251,8 +252,7 @@ export function LoopScreen({
             onResume: () => {
               resuming = true;
             },
-            random: length =>
-              Array.from({length}, () => (Math.random() * 256) | 0),
+            random: secureRandomBytes,
             now: Date.now,
             onPhase: step => {
               if (!cancelled.current) {

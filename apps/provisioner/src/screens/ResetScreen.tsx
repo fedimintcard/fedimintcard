@@ -34,6 +34,7 @@ import {
   type ResetPhase,
   type ResetStop,
 } from '../reset';
+import {secureRandomBytes} from '../secureRandom';
 import {CANCELLED, createCardSession} from '../session';
 import {RESET} from '../strings';
 import {formatShortId, useStore} from '../store';
@@ -224,7 +225,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
           blockedConfirmed,
           ops,
           journal,
-          random: n => Array.from({length: n}, () => (Math.random() * 256) | 0),
+          random: secureRandomBytes,
           now: Date.now,
           onPhase: (p: ResetPhase) => setLine(RESET.phase[p]),
         }),
