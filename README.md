@@ -37,6 +37,7 @@ docs/           plans, protocols and results (below)
 | [DESIGN-NOTE.md](docs/DESIGN-NOTE.md) | the design: how a card holds Fedimint notes, and what it trusts |
 | [SPIKE.md](docs/SPIKE.md), [SPIKE-PLAN.md](docs/SPIKE-PLAN.md) | the first spike: one card, one federation |
 | [CAP-BUILD.md](docs/CAP-BUILD.md) | building and installing the applet; 32 slots on silicon; the end-to-end run and the production rollout |
+| [HARDWARE_TEST_REPORT_2026-11-19.j3r452.md](docs/HARDWARE_TEST_REPORT_2026-11-19.j3r452.md) | hardware test report: the Setup app and a staging till on a J3R452 and a J3R180, 2026-11-15 to 2026-11-19 |
 | [OPS-PLAN.md](docs/OPS-PLAN.md) | the registry ("ops") and how tills, holders and operators use it |
 | [PROVISIONER-PLAN.md](docs/PROVISIONER-PLAN.md), [PROVISIONER-HANDOFF.md](docs/PROVISIONER-HANDOFF.md) | the Setup app and cardkit |
 | [TILL-API.md](docs/TILL-API.md), [TILL-CLAIM.md](docs/TILL-CLAIM.md), [POS-LINK.md](docs/POS-LINK.md) | the till's HTTP API, connecting a till to the registry, pairing a POS |
