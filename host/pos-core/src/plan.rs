@@ -161,7 +161,7 @@ impl std::fmt::Display for PlanError {
             PlanError::TooManyInputs { price, max_inputs } => write!(
                 f,
                 "a spend of {price} msat needs more than {max_inputs} of the card's notes; \
-                 spend a smaller amount, or cash out and reload to merge notes"
+                 spend a smaller amount, or pay another way"
             ),
             PlanError::NoExactPlan { price, free_slots } => write!(
                 f,

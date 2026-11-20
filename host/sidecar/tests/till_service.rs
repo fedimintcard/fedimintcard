@@ -168,6 +168,24 @@ async fn insufficient_leaves_card_state_unchanged() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// More of the card's notes than one tap signs: `no_exact_plan`, in words that ask for nothing the
+/// counter cannot do, and nothing moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_spread_over_too_many_notes_is_no_exact_plan_in_plain_words() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    // 65,536 msat in four notes, but the three a tap may spend (`plan::MAX_INPUTS`) hold 49,152.
+    f.cw.topup(&[1 << 14; 4]).await?;
+    let before = std::fs::read(f._dir.path().join("card_state.json"))?;
+    let sales = sales_of(&f);
+    let r = charge_with(&mut f.cw, 60_000, None, &sales).await;
+    assert_eq!((r.status, r.body["error"].as_str()), (422, Some("no_exact_plan")), "{:?}", r.body);
+    assert_eq!(r.body["ok"], false);
+    assert_eq!(std::fs::read(f._dir.path().join("card_state.json"))?, before);
+    assert!(sales.lock().unwrap().file.sales.is_empty());
+    assert_eq!(r.body["detail"], "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sales_persist_and_a_repeated_client_ref_does_not_charge_twice() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;

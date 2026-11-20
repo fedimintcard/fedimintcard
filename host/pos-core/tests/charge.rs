@@ -360,6 +360,23 @@ fn no_room_for_change_offline_is_said_with_prices_the_card_pays() {
     assert!(t.charge.change.is_empty());
 }
 
+/// More of the card's notes than one tap signs: refused as the till refuses it, in words that ask
+/// for nothing the counter cannot do, and the card signs nothing.
+#[test]
+fn a_card_spread_over_too_many_notes_is_refused_in_plain_words() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    // 65,536 msat in four notes, but the three a tap may spend (`plan::MAX_INPUTS`) hold 49,152.
+    let card = fx.card(32, &[1 << 14; 4]);
+    let r = take(&s, &card, &fx.kit_json(s.phone_id()), 60_000, "spread");
+    let f = refusal(r.as_ref().expect_err("refused"));
+    assert_eq!((f.status, f.code), (422, "no_exact_plan"), "{}", f.detail);
+    assert_eq!(slots_in(&card, SlotState::Spent), Vec::<u8>::new(), "nothing signed");
+    assert_eq!(slots_in(&card, SlotState::Note), vec![0, 1, 2, 3], "every note still on the card");
+    assert!(s.charges().is_empty(), "nothing queued");
+    assert_eq!(f.detail, "a spend of 60000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way");
+}
+
 #[test]
 fn a_note_that_does_not_check_is_refused_as_invalid() {
     let fx = Fx::new(true);
