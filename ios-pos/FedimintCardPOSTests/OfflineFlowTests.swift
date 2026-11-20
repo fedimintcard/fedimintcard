@@ -328,25 +328,28 @@ final class OfflineFlowTests: XCTestCase {
         XCTAssertEqual(errorInfo(g)?.kind, .tillUnreachable)
     }
 
-    /// Answers to a first `POST /v1/charge` that leave nothing unresolved and yet do not prove that
-    /// nothing moved: a 500 (the till's worker dropped a job it had taken), a 5xx the app cannot
-    /// read (a proxy that gave up first), a code the app does not know, no answer at all. The till
+    /// Answers to a first `POST /v1/charge` that do not prove that nothing moved. A 500 (the till's
+    /// worker dropped a job it had taken), a 5xx the app cannot read (a proxy that gave up first)
+    /// and a code the app does not know leave the sale unresolved; a 3xx or 4xx the app cannot read
+    /// and a till out of reach once the link was open leave nothing unresolved. Either way the till
     /// may have taken the sale, and only its own `client_ref` guard stops a second charge, so the
     /// retry's link failing never takes the card on the phone.
     func testARetryOfASaleTheTillsChargeRouteHadIsNeverTakenOnThePhone() {
-        let answers: [ChargeResult] = [
-            .declined(code: .internal, detail: "the till service stopped before answering", httpStatus: 500),
-            .failed(.badResponse("bad json")),
-            .declined(code: .unknown, detail: "", httpStatus: 500),
-            .failed(.unreachable),
+        let lostReply = "The last reply was lost, so this sale can't be taken on the phone. Try again once the till answers."
+        let answers: [(ChargeResult, unresolved: Bool)] = [
+            (.declined(code: .internal, detail: "the till service stopped before answering", httpStatus: 500), true),
+            (TillParse.charge(status: 502, body: Data("<html><body><h1>502 Bad Gateway</h1></body></html>".utf8)), true),
+            (.declined(code: .unknown, detail: "", httpStatus: 500), true),
+            (.failed(.badResponse("bad json")), false),
+            (.failed(.unreachable), false),
         ]
-        for answer in answers {
+        for (answer, unresolved) in answers {
             let f = flow()
             _ = toWaiting(f)
             guard case .startCharge(let id, _, let ref, _)? = f.dispatch(.cardPresent).first else { return XCTFail("\(answer)") }
             f.dispatch(.chargeDone(chargeId: id, result: answer))
             guard let first = errorInfo(f) else { return XCTFail("\(answer): \(f.state)") }
-            XCTAssertNil(first.unresolvedRef, "\(answer): the online path's screen is as it was")
+            XCTAssertEqual(first.unresolvedRef, unresolved ? ref : nil, "\(answer)")
             XCTAssertTrue(first.kind.retryable, "\(answer)")
             f.dispatch(.retryPressed)
             guard case .startCardSession(.charge)? = toWaiting(f).first else { return XCTFail("\(answer): the till is asked first") }
@@ -355,8 +358,10 @@ final class OfflineFlowTests: XCTestCase {
             guard let e = errorInfo(f) else { return XCTFail("\(answer): \(f.state)") }
             XCTAssertEqual(e.kind, .tillUnreachable, "\(answer)")
             XCTAssertEqual(e.clientRef, ref, "\(answer)")
-            XCTAssertNil(e.unresolvedRef, "\(answer)")
-            XCTAssertEqual(errorCopy(e.kind, e.detail).1, tillUnreachableCopy.1, "\(answer)")
+            XCTAssertEqual(e.unresolvedRef, unresolved ? ref : nil, "\(answer)")
+            let (title, detail) = errorCopy(e.kind, e.detail, unresolved: e.unresolvedRef != nil)
+            XCTAssertEqual(title, "Till service unreachable", "\(answer)")
+            XCTAssertEqual(detail, unresolved ? lostReply : tillUnreachableCopy.1, "\(answer)")
             XCTAssertFalse(f.holdsPin, "\(answer)")
             // Nor on any later retry.
             f.dispatch(.retryPressed)
@@ -679,6 +684,27 @@ final class OfflineFlowTests: XCTestCase {
             guard case .startCharge(let id, _, _, _)? = f.dispatch(.cardPresent).first else { return XCTFail() }
             f.dispatch(.chargeDone(chargeId: id, result: .declined(code: code, detail: "", httpStatus: 409)))
             XCTAssertEqual(errorInfo(f)?.kind, kind, code.rawValue)
+        }
+    }
+
+    /// `internal`, or a code this app does not know, from the phone's own core is not an unclear
+    /// answer from the till: a charge the core may have signed is held here (it is in
+    /// `signing_refs()`, or the core answered `undecided` or threw), so with nothing held the
+    /// refusal means nothing was signed. It reads as before: a plain error with Back.
+    func testALocalInternalRefusalIsNotAnUnclearTillAnswer() {
+        for code: ChargeErrorCode in [.internal, .unknown] {
+            let f = flow()
+            _ = toWaiting(f)
+            guard case .startLocalCharge(let cid, _, let ref, _)? = f.dispatch(.linkFailed(.unreachable)).first else {
+                return XCTFail("\(code): the phone takes the card")
+            }
+            XCTAssertFalse(f.offline.localOnlyRefs.contains(ref), "\(code)")
+            f.dispatch(.chargeDone(chargeId: cid, result: .declined(code: code, detail: "the core's words", httpStatus: 0)))
+            guard let e = errorInfo(f) else { return XCTFail("\(code): \(f.state)") }
+            XCTAssertEqual(e.kind, ErrorKind.from(code), "\(code)")
+            XCTAssertNil(e.unresolvedRef, "\(code)")
+            f.dispatch(.backPressed)
+            XCTAssertEqual(f.state, .entering, "\(code)")
         }
     }
 

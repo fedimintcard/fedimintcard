@@ -163,7 +163,9 @@ final class ErrorMappingTests: XCTestCase {
         for c in ChargeErrorCode.allCases where c != .unknown {
             let r = TillParse.charge(status: 409, body: Data(#"{"ok":false,"error":"\#(c.rawValue)","detail":"x"}"#.utf8))
             XCTAssertEqual(r, .declined(code: c, detail: "x", httpStatus: 409))
-            XCTAssertEqual(ErrorKind.from(c) == .unknown, false, c.rawValue)
+            // `ops_not_connected` is listed so that it stays a refusal (a code the app does not know
+            // leaves the sale unresolved), and reads in the till's own words, as before it was listed.
+            XCTAssertEqual(ErrorKind.from(c) == .unknown, c == .opsNotConnected, c.rawValue)
         }
         XCTAssertEqual(ChargeErrorCode.fromWire("nonsense"), .unknown)
         XCTAssertEqual(ChargeErrorCode.fromWire(nil), .unknown)
@@ -180,7 +182,45 @@ final class ErrorMappingTests: XCTestCase {
     func testUnreadableBodies() {
         XCTAssertEqual(TillParse.charge(status: 202, body: Data("x".utf8)), .declined(code: .undecided, detail: "", httpStatus: 202))
         XCTAssertEqual(TillParse.charge(status: 200, body: Data("x".utf8)), .failed(.interrupted))
-        XCTAssertEqual(TillParse.charge(status: 500, body: Data("x".utf8)), .failed(.badResponse("bad json")))
+        XCTAssertEqual(TillParse.charge(status: 500, body: Data("x".utf8)), .failed(.interrupted))
+        XCTAssertEqual(TillParse.charge(status: 400, body: Data("x".utf8)), .failed(.badResponse("bad json")))
+    }
+
+    /// A 5xx whose body is not the till's JSON comes from something in front of the till (a
+    /// gateway, a proxy that gave up first) while the till may still take the sale: outcome
+    /// unknown, as a connection cut after the request was sent. An unreadable 3xx or 4xx stays a
+    /// plain error, and the till's own JSON at a 5xx is its answer, as before.
+    func testAnUnreadable5xxIsAnOutcomeUnknown() {
+        let html = "<html><body><h1>502 Bad Gateway</h1></body></html>"
+        for body in [html, "", #"{"message":"upstream timed out"}"#] {
+            for status in [500, 502, 503, 504] {
+                XCTAssertEqual(TillParse.charge(status: status, body: Data(body.utf8)), .failed(.interrupted), "\(status) \(body)")
+            }
+        }
+        for status in [302, 400, 404, 413] {
+            XCTAssertEqual(TillParse.charge(status: status, body: Data(html.utf8)), .failed(.badResponse("bad json")), "\(status)")
+        }
+        XCTAssertEqual(TillParse.charge(status: 401, body: Data(html.utf8)), .declined(code: .unauthorized, detail: "", httpStatus: 401))
+        XCTAssertEqual(TillParse.charge(status: 202, body: Data(html.utf8)), .declined(code: .undecided, detail: "", httpStatus: 202))
+        XCTAssertEqual(TillParse.charge(status: 503, body: Data(#"{"ok":false,"error":"recovering","detail":"d"}"#.utf8)),
+                       .declined(code: .recovering, detail: "d", httpStatus: 503))
+    }
+
+    /// Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone` and
+    /// `unauthorized` above it) is one the app knows. An `error` the app does not know leaves the
+    /// sale unresolved, so a documented refusal missing from `ChargeErrorCode` would read as
+    /// "Outcome unknown". The list is the doc's, and changes with it.
+    func testEveryDocumentedChargeCodeIsKnown() {
+        let documented = [
+            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
+            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_blocked", "card_changed", "unknown_card",
+            "ops_unreachable", "ops_refused", "ops_not_connected", "card_limit", "offline_unsupported_card", "offline_not_ready",
+            "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
+            "offline_pool_exhausted", "internal",
+            // § Auth and the card link.
+            "card_link_gone", "unauthorized",
+        ]
+        for code in documented { XCTAssertNotEqual(ChargeErrorCode.fromWire(code), .unknown, code) }
     }
 
     func testTriesLeft() {

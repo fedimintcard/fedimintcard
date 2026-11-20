@@ -8,7 +8,9 @@ enum ErrorKind: Equatable {
     case offlineNoChangeRoom
     /// The phone could not reach the till (nothing was sent).
     case tillUnreachable
-    /// The till did not answer in time: the outcome may already have happened.
+    /// The till's answer does not say whether it took the sale (none in time, a connection cut
+    /// after the request was sent, a 500, a 5xx the app cannot read, a code the app does not know):
+    /// the outcome may already have happened.
     case timeoutUnknown
     /// No till is paired on this phone.
     case notPaired
@@ -46,6 +48,7 @@ enum ErrorKind: Equatable {
         case .unknownCard: return .unknownCard
         case .opsUnreachable: return .opsUnreachable
         case .opsRefused: return .opsRefused
+        case .opsNotConnected: return .unknown // the till's own words, as before it was listed
         case .offlineNoChangeRoom: return .offlineNoChangeRoom
         case .cardLinkGone: return .cardLinkGone
         case .unauthorized: return .unauthorized
@@ -72,7 +75,8 @@ enum ErrorKind: Equatable {
         }
     }
 
-    /// Outcome may already have happened: starts an unresolved sale.
+    /// The outcome may already have happened (`undecided`, an answer that does not say whether the
+    /// till took the sale, a sale held on this phone): starts an unresolved sale.
     var needsSalesCheck: Bool { self == .undecided || self == .timeoutUnknown || self == .heldOnPhone }
 
     /// Nothing moved: clears an unresolved sale. A till without ops refuses the PIN from inside the
@@ -277,8 +281,8 @@ final class PosFlow {
     /// since or their unresolved state. The route had the sale, and nothing it answers later proves
     /// the earlier attempt was not taken: a till on ops answers `no_card`, `card_error`, `wrong_pin`
     /// and `pin_blocked` from its card attach before it looks at an earlier attempt with the same
-    /// `client_ref`, and a 500, a 5xx the app cannot read or a code it does not know leave nothing
-    /// unresolved. Only the till's own `client_ref` guard stops a second charge
+    /// `client_ref`, and those four clear an unresolved sale, while a refusal of a first attempt
+    /// leaves nothing unresolved. Only the till's own `client_ref` guard stops a second charge
     /// (docs/POS-OFFLINE.md). Dropped on success, when the sale is done.
     private var sentToTill: Set<String> = []
 
@@ -312,11 +316,14 @@ final class PosFlow {
 
     private func id() -> Int { nextId += 1; return nextId }
 
-    /// A refusal's kind. On the phone, `undecided` is a sale held here. From the till, the codes
-    /// whose copy speaks of this phone's kit and queue read as before: the till's own words.
+    /// A refusal's kind. On the phone, `undecided` is a sale held here. From the till, `internal`
+    /// and a code this app does not know leave the sale unresolved, as a lost reply does, and the
+    /// codes whose copy speaks of this phone's kit and queue read as before: the till's own words.
     private static func kind(_ code: ChargeErrorCode, local: Bool) -> ErrorKind {
         let k = ErrorKind.from(code)
         if local { return k == .undecided ? .heldOnPhone : k }
+        // From the till, a 500 and a code outside its documented list do not say whether it took the sale.
+        if code == .internal || code == .unknown { return .timeoutUnknown }
         return k.phoneOnly ? .unknown : k
     }
 
