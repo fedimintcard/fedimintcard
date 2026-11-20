@@ -182,21 +182,22 @@ queue, where the NFC tag answers; an APDU the card does not answer in 15 s is lo
 **When the phone takes the card.** At `linkFailed` of a charge only, in the same NFC session, when
 the till is not serving (no connection, the link's quick timeout, a handshake that fails, a 5xx),
 no earlier attempt of the sale was sent to the till's charge route at all, and the kit is there,
-unexpired and under its caps. A till on ops refuses from its card checks (`no_card`, `wrong_pin`)
-before it looks at an earlier attempt with that `client_ref`, so a refusal proves nothing about
-the attempt before it. Once a `POST /v1/charge` was sent for the sale, whatever it answered (a
-refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at all), only the
-till's own `client_ref` guard stops a second charge, so a retry that cannot reach the till shows
-the unreachable screen and takes nothing. Of those answers, a 500, a 5xx the app cannot read, a
-code it does not know and no answer in time or a connection cut after the request was sent leave
-the sale unresolved ("Outcome unknown": Try again with the same `client_ref`, Check sales, Abandon
-sale, no Back; ENG-859), while a refusal still proves nothing about the attempt before it. A 401 or
-403 never falls back: the pairing is dead. An unresolved sale whose retry cannot reach the till
-stays on the unreachable screen with the lost reply's copy. Otherwise the unreachable screen says
-which: no kit yet, the kit expired, or the caps reached. Balance reads and top-ups never fall back.
-The till's own answers with the codes of its offline path (`offline_cap_reached`,
-`offline_not_ready`, `offline_note_invalid`) read as before, in the till's words: the phone's copy
-for them is about the phone's kit and queue.
+unexpired and under its caps. A till answers a repeated `client_ref` from its own records before
+it reads the card (`docs/TILL-API.md`), so its card refusals (`no_card`, `wrong_pin`) come after
+the earlier attempt was looked at, except in the two offline cases `docs/TILL-API.md` names (a
+charge a card left `signing`, and a queued offline charge whose sale a crash kept out of
+`sales.json`). Once a `POST /v1/charge` was sent for the sale, whatever it
+answered (a refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at
+all), only the till's own `client_ref` guard stops a second charge, so a retry that cannot reach
+the till shows the unreachable screen and takes nothing. Of those answers, a 500, a 5xx the app
+cannot read, a code it does not know and no answer in time or a connection cut after the request
+was sent leave the sale unresolved ("Outcome unknown": Try again with the same `client_ref`,
+Check sales, Abandon sale, no Back; ENG-859). A 401 or 403 never falls back: the pairing is dead.
+An unresolved sale whose retry cannot reach the till stays on the unreachable screen with the lost
+reply's copy. Otherwise the unreachable screen says which: no kit yet, the kit expired, or the
+caps reached. Balance reads and top-ups never fall back. The till's own answers with the codes of
+its offline path (`offline_cap_reached`, `offline_not_ready`, `offline_note_invalid`) read as
+before, in the till's words: the phone's copy for them is about the phone's kit and queue.
 
 **Local only.** A sale in `signing_refs()`, or whose last local charge answered `undecided` or
 threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatever the till's
