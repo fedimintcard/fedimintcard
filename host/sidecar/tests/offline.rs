@@ -933,17 +933,24 @@ async fn a_queued_charge_survives_a_restart_and_is_sent() -> anyhow::Result<()> 
 // ------------------------------------------------------------------ a card taken away mid-SIGN
 
 /// The card, taken out of the field at its `at`th SIGN (from 0): that SIGN and every command
-/// after it fail as a phone's card link reports a lost card.
+/// after it fail as a phone's card link reports a lost card. With `answer_lost` the card makes
+/// that signature first, and only its answer is lost.
 struct PulledAt {
     card: Shared,
     at: usize,
     signs: usize,
     pulled: bool,
+    answer_lost: bool,
 }
 
 impl PulledAt {
     fn new(card: &Rc<RefCell<SoftCard>>, at: usize) -> Self {
-        Self { card: Shared(card.clone()), at, signs: 0, pulled: false }
+        Self { card: Shared(card.clone()), at, signs: 0, pulled: false, answer_lost: false }
+    }
+
+    /// The card signs at its `at`th SIGN, then leaves the field before it answers.
+    fn answer_lost(card: &Rc<RefCell<SoftCard>>, at: usize) -> Self {
+        Self { answer_lost: true, ..Self::new(card, at) }
     }
 
     fn here(&self) -> anyhow::Result<()> {
@@ -968,12 +975,14 @@ impl Card for PulledAt {
         self.card.get_pub(slot)
     }
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> anyhow::Result<Signature> {
-        if self.signs == self.at {
-            self.pulled = true;
-        }
+        let last = self.signs == self.at;
+        self.pulled |= last && !self.answer_lost;
         self.here()?;
         self.signs += 1;
-        self.card.sign(slot, msg32)
+        let sig = self.card.sign(slot, msg32)?;
+        // With `answer_lost` the card has made this signature; its answer leaves with the card.
+        self.pulled |= last;
+        self.here().map(|()| sig)
     }
     fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.here()?;
@@ -984,8 +993,13 @@ impl Card for PulledAt {
 impl Till {
     /// An offline charge on a card that leaves the field at its `at`th SIGN.
     async fn charge_pulled(&mut self, card: &Rc<RefCell<SoftCard>>, at: usize, price: u64, cref: &str) -> (u16, Value) {
-        self.cw.card = Box::new(PulledAt::new(card, at));
-        self.cw.pin = Some(b"1234".to_vec());
+        self.charge_with_gone(PulledAt::new(card, at), price, cref).await
+    }
+
+    /// A charge on the card `gone`, which leaves the field at one of its SIGNs.
+    async fn charge_with_gone(&mut self, gone: PulledAt, price: u64, cref: &str) -> (u16, Value) {
+        self.cw.card = Box::new(gone);
+        self.cw.pin = Some(TEST_PIN.to_vec());
         let r = charge_job_with(&mut self.cw, Some(&self.ops), Some(&self.off), price, Some(cref.into()), &self.sales).await;
         self.cw.pin = None;
         (r.status, r.body)
@@ -2937,5 +2951,201 @@ async fn repeat_after_a_charge_proven_never_sent(same_card: bool) -> anyhow::Res
     } else {
         assert!(spent_slots(&b) > 0, "card B signed");
     }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ a charge a card left signing, at an online tap (ENG-873)
+
+/// How a card leaves the field mid-sale ([`PulledAt`]).
+type Gone = fn(&Rc<RefCell<SoftCard>>) -> PulledAt;
+
+/// A card with four notes of 65,536 msat, tapped for a 90,000 msat sale (`pulled`: two of the
+/// notes, with change) while the registry is down, that leaves the field as `gone` says; then the
+/// registry is back. Answers the card and the charge it left `signing` in the till's queue.
+async fn left_signing_offline(t: &mut Till, gone: Gone) -> anyhow::Result<(Rc<RefCell<SoftCard>>, OfflineCharge)> {
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge_with_gone(gone(&card), 90_000, "pulled").await;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let q = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!(q.len(), 1);
+    assert_eq!((q[0].state, q[0].inputs.len()), (ChargeState::Signing, 2));
+    assert!(!q[0].change.is_empty(), "a charge with change");
+    t.set_down(false);
+    Ok((card, q[0].clone()))
+}
+
+/// The slots of a balance answer's notes the card can pay: `live`, and not held as stranded.
+fn live_slots(b: &Value) -> Vec<u64> {
+    let mut v: Vec<u64> = b["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["status"] == "live" && n["stranded"] != true)
+        .map(|n| n["slot"].as_u64().unwrap())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A card taken away mid-sale while the registry was down left a charge `signing` in the till's
+/// queue; back online, the card is tapped for another sale. The `signing` charge counted as known,
+/// so the tap held none of its slots: the planner picked the note the card had signed for it, which
+/// the card will not sign again (500 `internal` until ENG-873), and could plan change into its
+/// CHANGE slots. Now the online charge settles it first. The card signed one input of two, so the
+/// till finishes the charge from the card's stored signature and a fresh one for the other input,
+/// records its sale (`offline`) and reports it in the same tap. The new sale pays around its slots,
+/// nothing is held, and the sender settles the charge.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_sale_settles_a_charge_the_card_left_signing_and_pays_around_it() -> anyhow::Result<()> {
+    settled_at_an_online_sale(|c| PulledAt::new(c, 1), 1).await
+}
+
+/// [`an_online_sale_settles_a_charge_the_card_left_signing_and_pays_around_it`] for a card that
+/// signed both inputs and left before its last answer reached the till: the charge is finished from
+/// the card's stored signatures alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_sale_settles_a_charge_whose_last_answer_was_lost_and_pays_around_it() -> anyhow::Result<()> {
+    settled_at_an_online_sale(|c| PulledAt::answer_lost(c, 1), 2).await
+}
+
+/// A charge the card left `signing` as `gone` says, `signed` of its two inputs signed, then an
+/// online sale of that card under another `client_ref`.
+async fn settled_at_an_online_sale(gone: Gone, signed: usize) -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, gone).await?;
+    assert_eq!(spent_slots(&card), signed);
+    let ins: Vec<u64> = left.inputs.iter().map(|i| u64::from(i.slot)).collect();
+    let change: Vec<u64> = left.change.iter().map(|c| u64::from(c.slot)).collect();
+
+    let (status, body) = t.charge(&card, 20_000, "next").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("offline").is_none(), "taken online: {body}");
+    let q = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!(
+        q.iter().map(|c| (c.txid.as_str(), c.state)).collect::<Vec<_>>(),
+        vec![(left.txid.as_str(), ChargeState::Reported)],
+        "finished and reported in the same tap"
+    );
+    assert_eq!(t.reg.reports.lock().unwrap().len(), 1);
+    let sale = t.sale("pulled");
+    assert!(sale.offline && sale.txid == left.txid, "the sale the card began: {sale:?}");
+    assert!(!t.sale("next").offline);
+    assert!(slots_of(&body, "inputs").iter().all(|s| !ins.contains(s)), "{body}");
+    assert!(slots_of(&body, "change").iter().all(|s| !ins.contains(s) && !change.contains(s)), "{body}");
+    assert_eq!(t.stranded_posts(), 0, "nothing held");
+    // The charge's inputs are spent in the card's file once it is settled. Its report has the
+    // registry mark them `pending` under it, and left so they passed for outputs of the charge
+    // still to collect: each held the sale up for a whole collection timeout.
+    let file = StateStore::open(t.ops.card_path(&left.short_id))?.state;
+    for i in &left.inputs {
+        let status: Vec<NoteStatus> = file.notes.iter().filter(|n| n.nonce == i.nonce).map(|n| n.status).collect();
+        assert_eq!(status, vec![NoteStatus::Spent], "the input on slot {}", i.slot);
+    }
+    assert!(body["duration_ms"].as_u64().is_some_and(|ms| ms < 60_000), "no collection timeout waited out: {body}");
+
+    let sent = t.send().await;
+    assert_eq!(sent["settled"], json!([left.txid]), "{sent}");
+    let b = t.balance(&card).await;
+    assert_eq!((b["stranded_msat"].clone(), on_hold(&b)), (json!(0), vec![]), "{b}");
+    assert!(live_slots(&b).iter().all(|s| !ins.contains(s)), "{b}");
+    assert!(slot_states(&card, &change).iter().all(|s| *s != SlotState::Change), "its change landed");
+    assert_eq!(t.stranded_posts(), 0);
+    Ok(())
+}
+
+/// A charge a card left `signing` whose other input has since paid another transaction can never
+/// be finished. The card's online charge sets it aside first, as its next offline tap would
+/// (`abandoned`, its `client_ref` freed, no sale), so the tap holds its slots as a lost phone's:
+/// the note the card signed for it and its CHANGE slots, reported in the same tap, and the sale
+/// pays around them. Until ENG-873 the `signing` charge explained them, and the sale that picked
+/// the note the card had signed was answered 500 `internal`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_sale_sets_aside_a_charge_the_card_can_never_finish_and_holds_its_slots() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
+    let (signed, unsigned) = (u64::from(left.inputs[0].slot), u64::from(left.inputs[1].slot));
+    let change: Vec<u64> = left.change.iter().map(|c| u64::from(c.slot)).collect();
+    assert_eq!(slot_states(&card, &[signed, unsigned]), vec![SlotState::Spent, SlotState::Note]);
+    // Elsewhere the input the card had not signed for it pays another transaction.
+    card.borrow_mut().verify_pin(TEST_PIN)?;
+    card.borrow_mut().sign(unsigned as u8, &[9; 32])?;
+
+    let (status, body) = t.charge(&card, 20_000, "next").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("offline").is_none(), "{body}");
+    let mut lost = vec![signed, unsigned];
+    lost.sort();
+    assert!(slots_of(&body, "inputs").iter().all(|s| !lost.contains(s)), "{body}");
+    assert!(slots_of(&body, "change").iter().all(|s| !lost.contains(s) && !change.contains(s)), "{body}");
+    let gone = t.off.queue.lock().unwrap().file.charges.iter().find(|c| c.txid == left.txid).cloned().expect("kept for the operator");
+    assert_eq!((gone.state, gone.client_ref.as_deref()), (ChargeState::Abandoned, None));
+    let detail = gone.detail.unwrap_or_default();
+    assert!(detail.contains(&format!("input slot {unsigned}")), "{detail}");
+    assert!(t.sales.lock().unwrap().find_ref("pulled").is_none(), "nothing was charged for it");
+    assert_eq!(t.stranded_posts(), 1, "reported in the same tap");
+    let rows = t.stranded_post(0);
+    assert!(rows.contains(&json!({"slot": signed, "kind": "spent", "txid": left.txid})), "{rows:?}");
+    for s in &change {
+        assert!(rows.contains(&json!({"slot": s, "kind": "change", "txid": left.txid})), "{rows:?}");
+    }
+
+    let b = t.balance(&card).await;
+    assert_eq!(on_hold(&b), lost, "the note signed for the set aside charge, and the other one: {b}");
+    assert_eq!(b["stranded_msat"], json!(2 * (1 << 16)), "{b}");
+    let free = b["free_slots"].as_array().unwrap();
+    assert!(change.iter().all(|s| !free.contains(&json!(s))), "its CHANGE slots are no room: {b}");
+    assert_eq!(t.stranded_posts(), 1, "listed now, so not reported again");
+    Ok(())
+}
+
+/// A card taken away at the first SIGN of a charge, before it signed anything, leaves the charge
+/// `signing` all the same: the till could not read the card to tell. The card's online charge
+/// drops it first, as its next offline tap would (the card signed none of its inputs, so it can
+/// never be sent: the entry and its spent marks go), so the CHANGE slots the card opened for it are
+/// stranded: held, reported as change rows with no spent row, and no room for the sale's change.
+/// Until ENG-873 the `signing` charge explained them, and the sale planned its change into them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_sale_drops_a_charge_no_input_of_which_the_card_signed() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 0)).await?;
+    assert_eq!(spent_slots(&card), 0, "nothing signed");
+    let change: Vec<u64> = left.change.iter().map(|c| u64::from(c.slot)).collect();
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "{change:?}");
+
+    let (status, body) = t.charge(&card, 20_000, "next").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(slots_of(&body, "change").iter().all(|s| !change.contains(s)), "the CHANGE slots are no room: {body}");
+    let q = t.off.queue.lock().unwrap().file.clone();
+    assert!(q.charges.iter().all(|c| c.txid != left.txid), "dropped: {:?}", q.charges);
+    assert!(left.inputs.iter().all(|i| !q.spent.contains(&i.nonce)), "its spent marks are gone");
+    assert!(t.sales.lock().unwrap().find_ref("pulled").is_none());
+    assert_eq!(t.stranded_posts(), 1, "reported in the same tap");
+    let rows: Vec<(u64, String)> = t
+        .stranded_post(0)
+        .iter()
+        .filter(|x| x["txid"] == json!(left.txid))
+        .map(|x| (x["slot"].as_u64().unwrap(), x["kind"].as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(rows, change.iter().map(|s| (*s, "change".to_owned())).collect::<Vec<_>>(), "change rows, no spent row");
+    Ok(())
+}
+
+/// A balance tap carries no PIN, and the card signs nothing without one, not even a stored
+/// signature: the tap settles no charge the card left `signing`. The charge stays as it was and
+/// still explains its slots, so nothing is held or reported, and the note the card signed for it
+/// counts in `live_msat` until the card's next charge settles it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_balance_tap_leaves_a_charge_a_card_left_signing_alone() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
+    let b = t.balance(&card).await;
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "the charge is as it was");
+    assert_eq!((b["stranded_msat"].clone(), on_hold(&b)), (json!(0), vec![]), "{b}");
+    assert_eq!(t.stranded_posts(), 0, "nothing reported");
+    assert!(live_slots(&b).contains(&u64::from(left.inputs[0].slot)), "the note it signed still counts: {b}");
+    assert_eq!(spent_slots(&card), 1, "nothing signed");
     Ok(())
 }
