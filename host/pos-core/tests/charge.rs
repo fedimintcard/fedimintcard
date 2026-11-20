@@ -14,11 +14,11 @@ use fedimint_card_pos_core::charge::{Env, Pin, Taken, TillOuts, charge};
 use fedimint_card_pos_core::queue::{ChargeState, QUEUE_FILE, Queue};
 use fedimint_card_pos_core::refusal;
 use fedimint_card_pos_core::store::Store;
-use fedimint_core::TransactionId;
-use fedimint_core::encoding::Decodable;
+use fedimint_core::encoding::{Decodable, Encodable as _};
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::{Message, SECP256K1, XOnlyPublicKey};
 use fedimint_core::transaction::{Transaction, TransactionSignature};
+use fedimint_core::{Amount, TransactionId};
 use serde_json::{Value, json};
 
 /// Mainnet block 900,200's header (as `card/tests/v3_softcard.rs`), and its time, 2025-06-07.
@@ -173,6 +173,30 @@ fn a_kit_with_a_header_sets_the_cards_clock_and_pays() {
         kit.block_header = Some(bad.into());
         let (r, apdus) = take_counted(&s, &card, &serde_json::to_string(&kit).unwrap(), 10_000, "bad-header", b"1234");
         assert_eq!((code(&r), apdus), ("offline_not_ready", 0), "{bad}");
+    }
+}
+
+/// fedimint makes two fee schedules only: none, and a 100 msat base with at most 1,000 parts per
+/// million. A kit with any other (base, ppm) cannot be used, and is refused before the card hears
+/// anything; the two shapes, up to the limit, decode.
+#[test]
+fn a_kit_whose_fee_schedule_fedimint_would_not_make_is_unusable() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16]);
+    let mut kit = fx.kit(s.phone_id(), 8, now_ms(), DAY_MS);
+    let schedule = |base: u64, ppm: u64| (Amount::from_msats(base), ppm).consensus_encode_to_hex();
+    for (base, ppm) in [(50, 0), (0, 1), (100, 1_001)] {
+        kit.fee_consensus = schedule(base, ppm);
+        let Err(e) = kit.decode(s.phone_id()) else { panic!("({base}, {ppm}) decoded") };
+        assert!(format!("{e:#}").contains("its fee schedule"), "({base}, {ppm}): {e:#}");
+        let json = serde_json::to_string(&kit).unwrap();
+        let (r, apdus) = take_counted(&s, &card, &json, 20_000, &format!("fees-{base}-{ppm}"), b"1234");
+        assert_eq!((code(&r), apdus), ("offline_not_ready", 0), "({base}, {ppm})");
+    }
+    for (base, ppm) in [(0, 0), (100, 0), (100, 1_000)] {
+        kit.fee_consensus = schedule(base, ppm);
+        assert!(kit.decode(s.phone_id()).is_ok(), "({base}, {ppm})");
     }
 }
 
