@@ -77,6 +77,24 @@ class TillClientTest {
         assertEquals(ChargeErrorCode.UNKNOWN, (parseCharge(500, """{"ok":false,"error":"wat"}""") as ChargeResult.Declined).code)
         assertEquals(ChargeErrorCode.UNKNOWN, ChargeErrorCode.fromWire(""))
     }
+    /**
+     * Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone`,
+     * `unauthorized` and `forbidden` above it) is one the app knows. An `error` the app does not
+     * know leaves the sale unresolved, so a documented refusal missing from [ChargeErrorCode] would
+     * read as "Outcome unknown". The list is copied from the doc.
+     */
+    @Test fun everyDocumentedChargeCodeIsKnown() {
+        val documented = listOf(
+            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
+            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_blocked", "card_changed", "unknown_card",
+            "ops_unreachable", "ops_refused", "ops_not_connected", "card_limit", "offline_unsupported_card", "offline_not_ready",
+            "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
+            "offline_pool_exhausted", "internal",
+            // § Auth and the card link.
+            "card_link_gone", "unauthorized", "forbidden",
+        )
+        assertEquals(emptyList<String>(), documented.filter { ChargeErrorCode.fromWire(it) == ChargeErrorCode.UNKNOWN })
+    }
     @Test fun okTrueWithMissingFieldsIsStillSuccess() {
         val r = parseCharge(200, """{"ok":true}""")
         assertTrue(r is ChargeResult.Success)

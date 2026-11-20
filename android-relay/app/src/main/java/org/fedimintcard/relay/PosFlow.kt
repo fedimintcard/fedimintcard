@@ -36,7 +36,11 @@ enum class ErrorKind {
     val retryable: Boolean get() = this != PIN_BLOCKED
 
     companion object {
-        fun from(c: ChargeErrorCode): ErrorKind = valueOf(c.name)
+        fun from(c: ChargeErrorCode): ErrorKind = when (c) {
+            // Refused before anything ran: the till's own words, as before they were listed.
+            ChargeErrorCode.OPS_NOT_CONNECTED, ChargeErrorCode.UNAUTHORIZED, ChargeErrorCode.FORBIDDEN -> UNKNOWN
+            else -> valueOf(c.name)
+        }
     }
 }
 

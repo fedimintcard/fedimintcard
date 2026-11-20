@@ -190,7 +190,10 @@ class PosFlowTest {
         for (r in listOf<ChargeResult>(declined(ChargeErrorCode.BUSY), declined(ChargeErrorCode.RECOVERING),
             declined(ChargeErrorCode.RELAY_UNREACHABLE), declined(ChargeErrorCode.INTERNAL), declined(ChargeErrorCode.UNKNOWN),
             ChargeResult.Failed(TillError.Unreachable), ChargeResult.Failed(TillError.Interrupted),
-            ChargeResult.Failed(TillError.Timeout), declined(ChargeErrorCode.UNDECIDED), ChargeResult.Failed(TillError.BadResponse("x")))) {
+            ChargeResult.Failed(TillError.Timeout), declined(ChargeErrorCode.UNDECIDED), ChargeResult.Failed(TillError.BadResponse("x")),
+            // Refused before the till looks at the earlier attempt: they prove nothing about it.
+            declined(ChargeErrorCode.fromWire("ops_not_connected")), declined(ChargeErrorCode.fromWire("unauthorized")),
+            declined(ChargeErrorCode.fromWire("forbidden")))) {
             val (f, fx) = unresolved(declined(ChargeErrorCode.UNDECIDED))
             f.retry()
             f.dispatch(PosEvent.ChargeDone(f.signingId(), r))
@@ -261,6 +264,39 @@ class PosFlowTest {
     @Test fun aCodeTheAppDoesNotKnowIsAnUnresolvedSale() {
         assertUnresolvedSale(ChargeResult.Declined(ChargeErrorCode.UNKNOWN, "", 500))
         assertUnresolvedSale(ChargeResult.Declined(ChargeErrorCode.fromWire("a_code_from_a_newer_till"), "something new", 409))
+    }
+
+    /**
+     * Refusals of a charge that ran nothing (docs/TILL-API.md): `ops_not_connected` (a till that
+     * belongs on a registry and has no token yet), `unauthorized` (no bearer the till takes) and
+     * `forbidden` (a token with the pay scope). Each reads as before, in the till's own words with
+     * Back, and leaves no sale unresolved.
+     */
+    @Test fun opsNotConnectedUnauthorizedAndForbiddenArePlainRefusals() {
+        for ((wire, status) in listOf("ops_not_connected" to 503, "unauthorized" to 401, "forbidden" to 403)) {
+            val (f, _) = unresolved(ChargeResult.Declined(ChargeErrorCode.fromWire(wire), "the till's words", status))
+            val e = f.state as PosState.Error
+            assertEquals(wire, ErrorKind.UNKNOWN, e.kind)
+            assertNull(wire, e.unresolvedRef); assertNull(wire, f.unresolvedRef)
+            assertEquals(wire, "Something went wrong" to "the till's words", errorCopy(e.kind, e.detail, e.suggestedMsat, unresolved = false))
+            f.dispatch(PosEvent.BackPressed); assertEquals(wire, PosState.Entering, f.state)
+        }
+    }
+
+    /**
+     * Every other code the app knows is a refusal of this request, as before: nothing is left
+     * unresolved and Back goes back to the amount. A code added to [ChargeErrorCode] lands here, so
+     * whether it leaves a sale unresolved is decided when it is added.
+     */
+    @Test fun everyOtherCodeTheAppKnowsStillOffersBack() {
+        val unclear = setOf(ChargeErrorCode.UNDECIDED, ChargeErrorCode.INTERNAL, ChargeErrorCode.UNKNOWN)
+        for (c in ChargeErrorCode.values()) {
+            if (c in unclear || c == ChargeErrorCode.WRONG_PIN) continue // a wrong PIN asks for it again
+            val (f, _) = unresolved(declined(c))
+            val e = f.state as PosState.Error
+            assertNull(c.name, e.unresolvedRef)
+            f.dispatch(PosEvent.BackPressed); assertEquals(c.name, PosState.Entering, f.state)
+        }
     }
 
     @Test fun pollGenerationSupersedes() {
