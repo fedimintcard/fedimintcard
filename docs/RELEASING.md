@@ -104,9 +104,11 @@ or HEAD is no longer the commit it printed. It archives the workspace with autom
 checks the archive: the bundle id is `org.fedimintcard.provisioner`, the version and build are
 `package.json`'s, and the app's `main.jsbundle` holds every registry origin the configuration gate
 printed and the load file hash. The archive holds whatever the tree held while xcodebuild ran, so
-it checks `git status` and HEAD once more: a change or a commit in the worktree during the archive
-stops it, with no `.commit` written. Then it writes the commit to the `.commit` file and prints a
-summary: bundle id, version and build, commit and team. Its last line is the archive's path.
+it checks `git status` and HEAD once more when xcodebuild returns: a change still in the worktree
+then, or a new commit, stops it with no `.commit` written. A change made and undone while the
+archive ran goes unseen, so leave the worktree alone until the build ends. Then it writes the
+commit to the `.commit` file and prints a summary: bundle id, version and build, commit and team.
+Its last line is the archive's path.
 
 Read the summary. The upload is the release itself, so it waits for the decision to release; then
 upload that archive in a second run:
