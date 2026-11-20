@@ -209,7 +209,7 @@ final class ErrorMappingTests: XCTestCase {
     /// Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone` and
     /// `unauthorized` above it) is one the app knows. An `error` the app does not know leaves the
     /// sale unresolved, so a documented refusal missing from `ChargeErrorCode` would read as
-    /// "Outcome unknown". The list is the doc's, and changes with it.
+    /// "Outcome unknown". The list is copied from the doc.
     func testEveryDocumentedChargeCodeIsKnown() {
         let documented = [
             "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",

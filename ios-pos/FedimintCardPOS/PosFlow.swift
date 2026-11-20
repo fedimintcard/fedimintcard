@@ -281,8 +281,7 @@ final class PosFlow {
     /// since or their unresolved state. The route had the sale, and nothing it answers later proves
     /// the earlier attempt was not taken: a till on ops answers `no_card`, `card_error`, `wrong_pin`
     /// and `pin_blocked` from its card attach before it looks at an earlier attempt with the same
-    /// `client_ref`, and those four clear an unresolved sale, while a refusal of a first attempt
-    /// leaves nothing unresolved. Only the till's own `client_ref` guard stops a second charge
+    /// `client_ref`. Only the till's own `client_ref` guard stops a second charge
     /// (docs/POS-OFFLINE.md). Dropped on success, when the sale is done.
     private var sentToTill: Set<String> = []
 
