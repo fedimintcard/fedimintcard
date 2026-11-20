@@ -568,6 +568,15 @@ bump; until then these are accepted risk, and the exposure is iroh's DNS resolut
 their alerts fire on *other* locked copies, and the older `lru` 0.12/0.13 and
 `rustls-webpki` 0.101/0.102 copies are pinned by crates that have not moved.
 
+Rechecked at the move to fedimint v0.13.0 (2026-11-20): `hickory-proto` and
+`hickory-resolver` 0.25.2, `lru` 0.12.5 and 0.13.0, and `rustls-webpki` 0.102.8 remain,
+behind `iroh =0.35.0`, which v0.13.0 still pins. `rustls` 0.21.12 and `rustls-webpki`
+0.101.7 left with `fedimint-ldk-node` 0.6.1 (tests only), and the 0.103 copy of
+`rustls-webpki` moved from 0.103.15 to 0.103.17. The `rand` row's route through
+`fedimint-ldk-node` reaches the sidecar's tests only (through `fedimint-testing`, a
+dev-dependency); `rand` 0.8.8 ships by other routes, the sidecar's own `rand = "0.8"`
+among them.
+
 ## 7. Next moves, in order
 
 1. ~~Commit P1b and P1a (§ 1).~~ ~~Merge the branch.~~ **Merged 2026-10-28** as

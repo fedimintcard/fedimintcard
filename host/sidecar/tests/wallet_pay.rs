@@ -9,12 +9,14 @@
 //!   outside the federation is refused with nothing spent.
 //! - ln (v1) through a test gateway registered with the guardians, the path a till on a
 //!   federation with ln takes: paid with the gateway's fee, refused over the fee cap, an error the
-//!   client cannot settle that stays unknown and is never funded twice, and an unanswered
-//!   gateway that stays unknown until the contract times out and the refund comes back.
+//!   client cannot settle that stays unknown and is never funded twice, an unanswered gateway
+//!   that stays unknown until the contract times out and the refund comes back, and a gateway
+//!   that answers a preimage which is not the invoice's, never taken as paid.
 //!
 //! Nothing here reaches a real federation, gateway or Lightning node.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use fedimint_api_client::api::{FederationApiExt as _, ServerError};
@@ -331,16 +333,23 @@ async fn ln_pays_inside_the_federation_once_and_resolves_after_reopening() -> an
 const LN_GATEWAY_FEES: lightning_invoice::RoutingFees = lightning_invoice::RoutingFees { base_msat: 1_000, proportional_millionths: 1_000 };
 /// An invoice the ln test gateway answers with an error the client cannot settle.
 const BROKEN: [u8; 32] = [214; 32];
+/// An invoice the ln test gateway answers with a preimage that is not the invoice's.
+const MISMATCHED: [u8; 32] = [215; 32];
+
+/// The preimage of each `PAYABLE` invoice `ln_invoice` made, by payment hash: what the ln test
+/// gateway answers when it pays one.
+static LN_PREIMAGES: LazyLock<Mutex<HashMap<sha256::Hash, [u8; 32]>>> = LazyLock::new(Mutex::default);
 
 fn ln_gateway_fee_msat() -> u64 {
     use fedimint_ln_common::config::FeeToAmount as _;
     LN_GATEWAY_FEES.to_amount(&Amount::from_msats(INVOICE_MSAT)).msats
 }
 
-/// An ln (v1) gateway that pays `PAYABLE` invoices, answers `BROKEN` ones with
-/// `OutgoingContractError` (the pay state machine ends in `Failure`, which the client reports as
-/// an unexpected error while the contract stays funded) and fails `UNANSWERED` ones with an
-/// internal error, which the client retries while the contract waits for its timelock.
+/// An ln (v1) gateway that pays `PAYABLE` invoices with their preimage, answers `MISMATCHED` ones
+/// with `PREIMAGE`, which is not theirs, answers `BROKEN` ones with `OutgoingContractError` (the
+/// pay state machine ends in `Failure`, which the client reports as an unexpected error while the
+/// contract stays funded) and fails `UNANSWERED` ones with an internal error, which the client
+/// retries while the contract waits for its timelock.
 #[derive(Debug)]
 struct TestLnGateway;
 
@@ -360,21 +369,35 @@ impl fedimint_ln_client::GatewayConnection for TestLnGateway {
             PaymentData::Invoice(invoice) => invoice.payment_secret().0,
             PaymentData::PrunedInvoice(pruned) => pruned.payment_secret,
         };
+        let down =
+            |error_message: &str| GatewayPayError::GatewayInternalError { error_code: Some(500), error_message: error_message.into() };
         match secret {
-            PAYABLE => Ok(hex::encode(PREIMAGE)),
+            PAYABLE => LN_PREIMAGES
+                .lock()
+                .unwrap()
+                .get(&payload.payment_data.payment_hash())
+                .map(hex::encode)
+                .ok_or_else(|| down("no preimage for this invoice")),
+            MISMATCHED => Ok(hex::encode(PREIMAGE)),
             BROKEN => Err(GatewayPayError::OutgoingContractError),
-            _ => Err(GatewayPayError::GatewayInternalError { error_code: Some(500), error_message: "the gateway is down".into() }),
+            _ => Err(down("the gateway is down")),
         }
     }
 }
 
 /// A regtest invoice for `INVOICE_MSAT` that the ln test gateway treats by `secret`, with a
-/// payment hash of its own (ln keeps its attempts per payment hash).
+/// payment hash of its own (ln keeps its attempts per payment hash): the hash of a new random
+/// preimage, which the gateway is given for a `PAYABLE` invoice and nobody keeps for another.
 fn ln_invoice(secret: [u8; 32]) -> Bolt11Invoice {
     let key = SecretKey::new(&mut OsRng);
+    let preimage = rand::random::<[u8; 32]>();
+    let payment_hash = sha256::Hash::hash(&preimage);
+    if secret == PAYABLE {
+        LN_PREIMAGES.lock().unwrap().insert(payment_hash, preimage);
+    }
     InvoiceBuilder::new(Currency::Regtest)
         .description(String::new())
-        .payment_hash(sha256::Hash::hash(&rand::random::<[u8; 32]>()))
+        .payment_hash(payment_hash)
         .payment_secret(PaymentSecret(secret))
         .current_timestamp()
         .min_final_cltv_expiry_delta(18)
@@ -422,13 +445,14 @@ async fn ln_through_a_gateway_pays_and_never_settles_an_unexpected_error_as_fail
     let fee = ln_gateway_fee_msat();
     assert!(fee > 0);
 
-    // (1) Paid through the gateway, with the fee its contract was funded with; the client's
-    // record and the invoice alone give the same answer.
-    let payable = ln_invoice(PAYABLE).to_string();
+    // (1) Paid through the gateway, with the invoice's preimage and the fee its contract was
+    // funded with; the client's record and the invoice alone give the same answer.
+    let payable_invoice = ln_invoice(PAYABLE);
+    let payable = payable_invoice.to_string();
     let before = w.balance_msat().await?;
     let paid = w.pay_invoice(&payable, fee, WAIT).await?;
     let WalletPay::Paid { preimage, fee_msat, operation_id } = &paid else { panic!("{paid:?}") };
-    assert_eq!(*preimage, hex::encode(PREIMAGE));
+    assert_eq!(sha256::Hash::hash(&hex::decode(preimage)?), *payable_invoice.payment_hash(), "{preimage}");
     assert_eq!(*fee_msat, fee);
     let after = w.balance_msat().await?;
     assert!(before - after >= INVOICE_MSAT + fee, "{before} -> {after}");
@@ -491,5 +515,19 @@ async fn ln_through_a_gateway_pays_and_never_settles_an_unexpected_error_as_fail
     let WalletPay::Unknown { operation_id: ref next, .. } = again else { panic!("{again:?}") };
     assert_ne!(*next, op);
     assert_eq!(w.pay_status(&unanswered, short).await?, Some(again.clone()));
+
+    // (5) The gateway answers a preimage that is not the invoice's: never paid. The contract
+    // stays funded and in flight, unknown as for a gateway that never answers, and the invoice
+    // alone finds it unknown again.
+    let mismatched = ln_invoice(MISMATCHED).to_string();
+    let held = w.balance_msat().await?;
+    let out = w.pay_invoice(&mismatched, fee, Duration::from_secs(3)).await?;
+    let WalletPay::Unknown { operation_id, .. } = &out else { panic!("{out:?}") };
+    assert!(matches!(
+        w.pay_status(&mismatched, short).await?,
+        Some(WalletPay::Unknown { operation_id: ref o, .. }) if o == operation_id
+    ));
+    let unpaid = w.balance_msat().await?;
+    assert!(held - unpaid >= INVOICE_MSAT + fee, "{held} -> {unpaid}");
     Ok(())
 }

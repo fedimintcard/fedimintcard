@@ -40,7 +40,9 @@ the till's own offline charges. Idempotent by txid. The registry is unchanged.
 
 **The offline kit.** Fetched while online and on every sync, and good for a week (by default)
 from the fetch that answered it, a kit the till gives again included: the
-federation's id and mint module instance, its note keys per tier, its mint fees and the fee
+federation's id and mint module instance, its note keys per tier, its mint fees (a core built on
+fedimint v0.13.0 refuses a fee schedule that is neither none nor a 100 msat base with at most
+1,000 ppm) and the fee
 headroom, the registry's certificate key the till pins, the phone's caps (count and msat, the
 till's `--offline-cap-*`), the validity, the newest block header, and a **pool of till outputs per
 tier**: blinded nonces whose spend keys and blinding keys stay on the till. The phone holds

@@ -51,5 +51,5 @@
       "signature": "8fe2f004572c567b999e168a3edefd30c7a3ee5206d96a10ffd98f9a4aa082e76747e1f8cbf61a815389b8ee09ba7902"
     }
   ],
-  "source": "host/sidecar/tests/tbs_vectors.rs (fedimint v0.13.0-beta.1 tbs, mint-common Note::verify)"
+  "source": "host/sidecar/tests/tbs_vectors.rs (fedimint v0.13.0 tbs, mint-common Note::verify)"
 }

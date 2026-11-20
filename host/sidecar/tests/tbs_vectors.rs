@@ -66,7 +66,7 @@ fn vectors() -> Value {
         }
     }
     json!({
-        "source": "host/sidecar/tests/tbs_vectors.rs (fedimint v0.13.0-beta.1 tbs, mint-common Note::verify)",
+        "source": "host/sidecar/tests/tbs_vectors.rs (fedimint v0.13.0 tbs, mint-common Note::verify)",
         "messages": messages,
         "notes": notes,
     })
