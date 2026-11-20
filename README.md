@@ -28,7 +28,7 @@ scripts/        release builds
 docs/           plans, protocols and results (below)
 ```
 
-[docs/RELEASING.md](docs/RELEASING.md) says how the two POS apps are built for TestFlight and Play.
+[docs/RELEASING.md](docs/RELEASING.md) says how the POS and Setup apps are built for TestFlight and Play.
 
 ## Docs
 
