@@ -2846,10 +2846,11 @@ async fn a_repeat_over_http_with_no_card_and_the_registry_down_is_undecided() ->
     Ok(())
 }
 
-/// A first attempt that proved nothing moved (the card left before it signed: `no_card`, and no
-/// record of the charge is left) leaves nothing for a repeat to answer: the repeat is a fresh
-/// attempt with the same ref, and pays. It passed before ENG-858 and passes after: it guards
-/// against an answer from the till's records that would hold such a repeat back.
+/// A first attempt that left no record (the card left before it signed: `no_card`, and the record
+/// of the charge was removed) gives a repeat nothing to answer from: the repeat is a fresh attempt
+/// with the same ref, and pays. It passed before ENG-858 and passes after: a first attempt that
+/// left no record is not held back. A record that the repeat itself proves left nothing behind is
+/// the case of the two tests after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repeat_after_a_charge_that_left_nothing_is_a_fresh_attempt() -> anyhow::Result<()> {
     let mut t = Till::new(OfflineConfig::default()).await?;
@@ -2866,5 +2867,70 @@ async fn a_repeat_after_a_charge_that_left_nothing_is_a_fresh_attempt() -> anyho
     assert_eq!(status, 200, "{body}");
     assert!(body.get("offline").is_none(), "{body}");
     assert_eq!(json!(t.sale("f1").txid), body["txid"], "{body}");
+    Ok(())
+}
+
+/// A first attempt whose record the repeat proves left nothing behind (the till died after the
+/// card signed, before it posted the signed bytes to the registry: never sent) frees the ref. The
+/// repeat settles that record from its card's file, the rejection reaches the registry, and another
+/// card in the field pays the sale as a fresh attempt. Before ENG-858 the other card paid, but the
+/// first card's record stayed in its file and its charge open at the registry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_of_a_charge_proven_never_sent_is_a_fresh_attempt() -> anyhow::Result<()> {
+    repeat_after_a_charge_proven_never_sent(false).await
+}
+
+/// [`a_repeat_of_a_charge_proven_never_sent_is_a_fresh_attempt`] with the first card in the field
+/// again (the common retry): the record is settled before the card is attached, so the registry's
+/// release of the slot the first attempt signed reaches the card in the same job, and the card pays
+/// the sale once, from that slot. Before ENG-858 the record was settled after the attach, and the
+/// retap was answered 500 `internal`: the slot had signed the first attempt and was not released
+/// yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_card_after_a_charge_proven_never_sent_pays_the_sale_once() -> anyhow::Result<()> {
+    repeat_after_a_charge_proven_never_sent(true).await
+}
+
+/// A first attempt on card A that is never sent, then its repeat on card A (`same_card`) or on
+/// card B.
+async fn repeat_after_a_charge_proven_never_sent(same_card: bool) -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (a, b) = (v3_card(), v3_card());
+    let id_a = provision(&t.reg, &a);
+    let id_b = provision(&t.reg, &b);
+    t.load(&a, &[1 << 16, 1 << 14]).await?;
+    t.load(&b, &[1 << 16, 1 << 14]).await?;
+    t.cw.crash_point = Some(CrashPoint::SubmittedUnreachable);
+    let (status, body) = t.charge(&a, 20_000, "r7").await;
+    t.cw.crash_point = None;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    // The till died before it posted the signed bytes: never sent, so proven to have left nothing.
+    let mut file = StateStore::open(t.ops.card_path(&id_a))?;
+    let old = file.state.pending_txs[0].txid.clone();
+    file.state.pending_txs[0].ops_unconfirmed = false;
+    file.save()?;
+
+    let (card, id) = if same_card { (&a, &id_a) } else { (&b, &id_b) };
+    let (w, calls) = Watched::new(card, false);
+    let (status, body) = t.charge_watched(w, 20_000, "r7").await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["txid"], json!(old), "a fresh charge, not the first attempt: {body}");
+    assert!(calls.get() > 0, "the card in the field was charged");
+    assert!(t.pending(&id_a).is_empty(), "card A's record is settled");
+    assert_eq!(t.open_charges(&id_a), 0, "its rejection reached the registry, and nothing of card A is left open there");
+    assert_eq!(t.sales_count(), 1);
+    let sale = t.sale("r7");
+    assert_eq!((sale.short_id.as_deref(), json!(sale.txid)), (Some(id.as_str()), body["txid"].clone()), "the sale is the card's");
+    if same_card {
+        // Paid from the slot the first attempt signed, which the registry's release gave back.
+        let released = t.reg.released(&id_a, &old);
+        assert!(
+            !released.is_empty() && sale.inputs.iter().all(|i| released.contains(&u64::from(i.slot))),
+            "released {released:?}, inputs {:?}",
+            sale.inputs
+        );
+    } else {
+        assert!(spent_slots(&b) > 0, "card B signed");
+    }
     Ok(())
 }

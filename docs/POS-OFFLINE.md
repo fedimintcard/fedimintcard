@@ -184,7 +184,9 @@ the till is not serving (no connection, the link's quick timeout, a handshake th
 no earlier attempt of the sale was sent to the till's charge route at all, and the kit is there,
 unexpired and under its caps. A till answers a repeated `client_ref` from its own records before
 it reads the card (`docs/TILL-API.md`), so its card refusals (`no_card`, `wrong_pin`) come after
-the earlier attempt was looked at. Once a `POST /v1/charge` was sent for the sale, whatever it
+the earlier attempt was looked at, except in the two offline cases `docs/TILL-API.md` names (a
+charge a card left `signing`, and a queued offline charge whose sale a crash kept out of
+`sales.json`). Once a `POST /v1/charge` was sent for the sale, whatever it
 answered (a refusal, a 500, a 5xx the app cannot read, a code it does not know, no answer at
 all), only the till's own `client_ref` guard stops a second charge, so a retry that cannot reach
 the till shows the unreachable screen and takes nothing. Of those answers, a 500, a 5xx the app
