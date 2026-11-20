@@ -264,7 +264,8 @@ is shown as its generic card error.
 | `wrong_pin` | the card refused the PIN (`tries_left`) | ask again |
 | `pin_blocked` | the PIN is blocked | the card cannot pay |
 | `card_limit` | the card's daily limit | decline |
-| `insufficient`, `no_exact_plan` | the card's notes do not make the price | decline |
+| `insufficient` | the card's notes do not cover the price | decline: "Card balance too low" |
+| `no_exact_plan` | the card cannot pay this price in one tap | decline: "Can't take this amount", then "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."; the core's `detail` is not shown |
 | `no_card` | the card left the field before it signed anything | tap again, same `client_ref` |
 | `card_error`, `internal` | anything else | show `detail` |
 

@@ -601,7 +601,8 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
 fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unresolved: Boolean = false): Pair<String, String> = when (kind) {
     ErrorKind.NO_CARD -> "Card not detected" to "Hold card flat on the phone's NFC antenna"
     ErrorKind.INSUFFICIENT -> "Card balance too low" to ""
-    ErrorKind.NO_EXACT_PLAN -> "Card needs a top up" to ""
+    // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
+    ErrorKind.NO_EXACT_PLAN -> "Can't take this amount" to "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."
     // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.
     ErrorKind.OFFLINE_NO_CHANGE_ROOM -> "No room for change offline" to
         ("This card can't take change while offline. " +

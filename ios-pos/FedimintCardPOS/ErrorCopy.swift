@@ -27,7 +27,8 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     switch kind {
     case .noCard: return ("Card not detected", "Hold the card to the top of the phone and keep it there")
     case .insufficient: return ("Card balance too low", "")
-    case .noExactPlan: return ("Card needs a top up", "")
+    // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
+    case .noExactPlan: return ("Can't take this amount", "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
     // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.
     case .offlineNoChangeRoom:
         let tip = suggestedMsat.map { "Try \(formatSats($0)) sats" } ?? "Try another amount"
