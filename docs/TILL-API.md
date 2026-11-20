@@ -88,8 +88,8 @@ rejection its notes and change slots. The card's next online tap at any till sen
 that still fit (`RELEASE`) before the charge is planned, so a rejected charge's notes pay again
 and its change slots take notes again; a card provisioned without the registry key keeps them as
 they are. The next tap of the card writes its change (`SET_NOTE`). A queue survives restarts; an entry cut off between
-the card signing and the save is finished at the card's next offline tap from the card's stored
-signatures.
+the card signing and the save is finished at the card's next offline tap or online charge from the
+card's stored signatures.
 
 **Stranded slots.** A charge that reaches no till (a POS phone's offline sales, lost with the
 phone before it synced) leaves its card SPENT slots whose notes the registry still calls live, and
@@ -99,8 +99,9 @@ before anything is planned, holds such slots back for that tap: a SPENT slot who
 and is no input of an open charge, and a CHANGE slot whose key never carried a note, unless the
 transaction the slot signed or waits on is one this till or the registry has (an open charge, a
 live or pending note's transaction, a charge in this till's offline queue that it has not
-abandoned). A held note is out of the plan and out of `live_msat`, and a held CHANGE slot is no
-room for change. A top-up load (`POST /v1/topup/{topup_id}/load`) reads no slot state from the
+abandoned, once a charge tap has settled any `signing` one). A held note is out of the plan and
+out of `live_msat`, and a held CHANGE slot is no room for change. A top-up load
+(`POST /v1/topup/{topup_id}/load`) reads no slot state from the
 card: it relies on the registry leaving held CHANGE slots out of its free slots. A slot the
 registry already lists as stranded is held as listed; up to 8 others per tap are read
 (`GET_SLOT`) for their transaction, and the rest, or one whose read fails, are held on doubt and
@@ -144,8 +145,9 @@ offline. Try N sats" (or "Try another amount").
 
 **A card taken away mid-tap.** A card pulled after it signed some of an offline charge's inputs
 leaves the charge `signing`, and that tap is answered `undecided` (202): only the card's next tap
-can say whether it paid. (A card pulled before it signed anything leaves nothing behind, and the
-answer is `no_card`.) Tapped again with the same `client_ref`,
+can say whether it paid. (A card pulled before the till saved the charge leaves nothing behind,
+and the answer is `no_card`; one pulled after that, even before it signed, leaves the charge
+`signing`, because the till cannot read the card to tell.) Tapped again with the same `client_ref`,
 the till finishes that charge from the card's stored signatures and answers it, as a repeat; it
 never signs a second transaction for the sale. Another card tapped with that `client_ref` while
 the first card's charge is still signing is answered `undecided` (202) with nothing signed: only
@@ -159,6 +161,18 @@ path (`abandoned` in the queue, kept for the operator: the notes the card signed
 spent on the card, and those it never signed pay again); nothing was charged for it, and the tap
 goes on as a new charge, for the same `client_ref` too. It is never sent, so the slots the card
 spent or opened for it are stranded slots (above): held, reported, and released after the grace.
+At an online charge of that card, whatever its `client_ref`, the till first settles every charge
+of that card left `signing`, before it reports, attaches or plans. It reads each input slot
+(`GET_SLOT`). A charge the card signed in part or in whole is finished as at an offline tap (SIGN
+answers the stored signature of a spent slot and signs a slot still holding its note, so the tap
+needs the holder's PIN), queued, reported in the same tap and recorded as an `offline` sale. A
+charge none of whose inputs the card signed is dropped. One that can never be finished is set
+aside as above. The slots of a dropped or set aside charge are stranded slots, held and reported
+in the same tap. A failure of this step is logged and the tap goes on, except a PIN the card
+refuses (`wrong_pin`, `pin_blocked`), which ends it first. A balance, top-up or issue tap sends no
+PIN and settles nothing: until the card's next charge the signed notes of such a charge still
+count in `live_msat`, and a top-up load, which reads no slot state, may be offered its CHANGE
+slots.
 Notes the till's checks refuse (no denomination of the federation's, or a federation signature
 that does not verify) are skipped; when the rest do not pay, the charge is
 `offline_note_invalid` (403), not `insufficient`.
@@ -311,7 +325,7 @@ the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an e
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | the card cannot pay this price in one tap: the price needs more of its notes than one tap signs (`plan::MAX_INPUTS`, 3 today), or no exact layout of the change fits its free slots; `detail` says which and is meant for a log | decline; the POS says "Can't take this amount" (try a smaller amount, or take the sale another way) and does not show `detail` |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged; on ops also a repeat whose earlier attempt left a record the till could not settle now because the registry did not hand over that card's state (no answer, or a refusal such as `unknown_card`; nothing was charged again) | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next offline tap, or any online charge of that card, finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged; on ops also a repeat whose earlier attempt left a record the till could not settle now because the registry did not hand over that card's state (no answer, or a refusal such as `unknown_card`; nothing was charged again) | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
@@ -416,7 +430,9 @@ above) keeps its status, is marked `"stranded": true`, and counts in `stranded_m
 clock, or `null` when there is no date to wait for: none is held, the registry has not listed one
 yet (its grace starts with this tap's report), or every one is due (the notes come back within a
 tap or two). A held CHANGE slot is not in `free_slots`. A till from before these fields sends
-neither.
+neither. A balance tap carries no PIN, so it settles no charge a card left `signing` ("A card
+taken away mid-tap" above): until the card's next charge, the notes such a charge signed still
+count in `live_msat`.
 
 On ops the reply also has `short_id` and `unkeyed_slots`. A 32-slot card registered with keys
 for slots 0–7 only has slots with no key yet. `free_slots` lists keyed slots only, and

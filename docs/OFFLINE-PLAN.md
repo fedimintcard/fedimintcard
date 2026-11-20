@@ -193,6 +193,10 @@ tests.
   to 16,777 sat, one charge can use most of a 20,000 sat day. Owner decision pending.
 - **A note pending under another till's unresolved online charge** makes an offline report a
   `double_spend` even if that charge later fails.
+- **A charge a card left `signing`.** The till counted its own `signing` charge as known, so an
+  online sale on that card failed or planned change into its CHANGE slots. *Built (ENG-873):* an
+  online charge settles the card's `signing` charges first (`TILL-API.md`); a balance or top-up tap
+  cannot, it has no PIN.
 - **Production**: registry v11 needs its own `CERT_SIGNING_KEY` (set by the owner), then the
   registry, the zion till package and the apps. *Done:* `ROLLOUT-OFFLINE.md`, which reached step 6
   on 2026-11-07.
