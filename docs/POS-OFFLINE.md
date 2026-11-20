@@ -9,7 +9,7 @@ on the holders' cards, the inputs of the sales it had not synced, and the caps d
 
 Online, the hosted till does the charge exactly as before (`docs/TILL-API.md`); nothing in the
 online path changes but for a sale the till's own offline queue holds `signing` (below), any
-other charge a card left `signing` on the till, settled at the start of an online charge, and the
+other charge a card left `signing` on the till, settled at the start of a `POST /v1/charge`, and the
 apps' reading of an answer that does not say whether the till took the sale, which leaves the sale
 unresolved as a lost reply does (ENG-859, `docs/TILL-API.md`). This page is how the offline path is
 built (ENG-841; slice 1 is ENG-842: the shared core and the till's routes; the apps are ENG-843,
@@ -70,9 +70,9 @@ first) is not for such a sale. A `charge` that throws is retried locally too, wi
 `client_ref`. The till keeps the same rule for its own offline queue: a tap whose `client_ref`
 it holds `signing` goes the offline way even while the registry and the federation answer: the
 card that began the charge finishes it (answered as the sale, `offline: true`; the sender's
-next pass, every 30 s, reports it), and another card is `undecided` with nothing signed. An
-online charge of that card under another `client_ref` settles such a charge before anything else:
-finished and reported in the same tap, or dropped or set aside as at an offline tap
+next pass, every 30 s, reports it), and another card is `undecided` with nothing signed. A
+`POST /v1/charge` of that card under another `client_ref` settles such a charge before anything
+else: finished and reported in the same tap, or dropped or set aside as at an offline tap
 (`docs/TILL-API.md`).
 
 **Caps and the attacker.** The kit's caps are enforced by the core; an expired kit stops offline
@@ -82,7 +82,7 @@ Settings on both apps.
 
 **What does not change.** Applet 3.0, the online charge path (but for a sale the till's own
 offline queue holds `signing`, taken the offline way as above, any other charge a card left
-`signing` on the till, settled at the start of an online charge, and an answer that does not say
+`signing` on the till, settled at the start of a `POST /v1/charge`, and an answer that does not say
 whether the till took the sale, which the apps leave unresolved: ENG-859), the registry API and
 the Setup app.
 
@@ -104,8 +104,8 @@ spends no PIN try:
    finished (an input slot since spent by another transaction, or re-keyed) is set aside as
    `abandoned`, nothing charged for it and its pool entries never taken again (its inputs the
    card never signed leave the spent list and pay again), and the tap goes on as a new charge,
-   for the same `client_ref` too. A till also runs this step at the start of every online charge
-   of the card (`docs/TILL-API.md`);
+   for the same `client_ref` too. A till also runs this step at the start of every
+   `POST /v1/charge` of the card (not a pay's charge; `docs/TILL-API.md`);
 6. the card's notes (skipping those taken offline here already, and those that do not check),
    the plan, the value cap, the card's day (`card_limit`), then `signing`, `SET_CHANGE`, `SIGN` and
    `queued`.
@@ -541,8 +541,8 @@ run in step 7's staging pass (`ROLLOUT-OFFLINE.md` § Afterwards).
    certificate key or note keys let the phone accept clones; the till re-checks every charge, so
    the loss stays within the phone's caps. Per-phone pairing tokens are ENG-848.
 5. A card pulled between `SET_CHANGE` and `SIGN` that never returns strands its CHANGE slots. On a
-   till the charge is settled at the card's next online charge; a card that never returns for one
-   leaves its CHANGE slots explained by the entry, never held or reported.
+   till the charge is settled at the card's next `POST /v1/charge`; a card that never returns for
+   one leaves its CHANGE slots explained by the entry, never held or reported.
 6. A lost phone loses its unsynced queue, as a lost till does; the caps bound the merchant's loss
    (drill (d): 48 sat, the three prices). The holder waits (drill (d): 65,536 msat stranded for
    48 sat of sales; the caps count what the till is owed, not the inputs): the inputs and the

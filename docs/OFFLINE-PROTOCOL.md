@@ -98,8 +98,8 @@ ops (the certificate key and the report route are the registry's). `offline` in 
 counts `double_spent` and `refused` (reports the registry refused for another reason). The queue is
 `<data_dir>/offline_queue.json`; it is written before `SET_CHANGE`, with every secret, so an entry
 cut off before the card's answer is finished from the card's stored signatures at its next tap,
-offline or an online charge (§ 7). Change goes only to KEYED slots the till's copy of the card does
-not know to hold a note.
+offline or a `POST /v1/charge` (§ 7). Change goes only to KEYED slots the till's copy of the card
+does not know to hold a note.
 Online, a 3.0 card's `SIGN` counts against its daily limit too, so the till checks the limit
 (`GET_STATE`) before an intent and answers `card_limit` instead of leaving a half-signed charge.
 
@@ -167,16 +167,16 @@ phone's caps bound.
   key is not the registry's, or whose transaction the till knows (a charge it holds or the
   registry lists open, a live or pending note's txid, its own offline queue), is not held, and a
   slot it could not read is held anyway. A charge the queue holds `signing` is settled before this
-  check at an online charge tap, which carries the PIN: finished, dropped or set aside as at an
-  offline tap (`TILL-API.md`). A balance, top-up or issue tap sends no PIN and leaves it, so at
-  such a tap it still explains its slots. A slot the registry lists in `stranded` is held as
-  listed. A held slot is out of the planner and out of the payable balance: `live_msat` counts
-  payable notes only, with `stranded_msat` and `stranded_until_ms` beside it. After the job the
-  till posts its holds when one is not listed or is listed `due`. For a due spent slot it first
-  asks the federation, under one short timeout, whether the note's nonce is spent: unspent sends
-  `unspent: true`, spent sends `spent: true`, no answer sends no flag and is asked again at the
-  next tap. Reporting never fails the tap; releases arrive in the card's state and are sent at its
-  next online tap (§ 6).
+  check at a `POST /v1/charge` tap, which carries the PIN: finished, dropped or set aside as at an
+  offline tap (`TILL-API.md`). A balance, top-up or issue tap sends no PIN, and a pay's charge is
+  taken online only; each leaves it, so at such a tap it still explains its slots. A slot the
+  registry lists in `stranded` is held as listed. A held slot is out of the planner and out of the
+  payable balance: `live_msat` counts payable notes only, with `stranded_msat` and
+  `stranded_until_ms` beside it. After the job the till posts its holds when one is not listed or
+  is listed `due`. For a due spent slot it first asks the federation, under one short timeout,
+  whether the note's nonce is spent: unspent sends `unspent: true`, spent sends `spent: true`, no
+  answer sends no flag and is asked again at the next tap. Reporting never fails the tap; releases
+  arrive in the card's state and are sent at its next online tap (§ 6).
 - **Route.** `POST /cards/:short_id/stranded`, till token (403 for an operator):
   `{slots: [{slot, kind, txid, unspent?, spent?}]}`, 1 to 32 slots, each named once; `kind` is
   `spent` or `change`, `txid` 32 bytes hex, the flags booleans (null reads as absent), meaningful on

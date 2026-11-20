@@ -3149,3 +3149,83 @@ async fn a_balance_tap_leaves_a_charge_a_card_left_signing_alone() -> anyhow::Re
     assert_eq!(spent_slots(&card), 1, "nothing signed");
     Ok(())
 }
+
+/// A wrong PIN at an online sale of a card that left a charge `signing`: the settle's VERIFY_PIN
+/// is refused and the tap ends `wrong_pin` with one try spent, before anything is reported,
+/// attached or signed. A tap that went on would verify the same PIN again to top up the card's
+/// spare reserve or to sign (two tries for one mistyped PIN), or plan from the note the card
+/// signed for the charge (500 `internal`). The charge is left as it was; the right PIN then
+/// settles it and takes the sale.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_pin_at_an_online_sale_settles_nothing_and_spends_one_try() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
+    t.tap(&card);
+    t.cw.pin = Some(b"9999".to_vec());
+    let r = charge_job_with(&mut t.cw, Some(&t.ops), Some(&t.off), 20_000, Some("next".into()), &t.sales).await;
+    t.cw.pin = None;
+    assert_eq!((r.status, r.body["error"].as_str()), (403, Some("wrong_pin")), "{}", r.body);
+    assert!(r.body["detail"].as_str().is_some_and(|d| d.contains("2 tries left")), "one try spent: {}", r.body);
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "left as it was");
+    assert!(t.reg.reports.lock().unwrap().is_empty(), "nothing reported");
+    assert_eq!(t.stranded_posts(), 0, "nothing held");
+    assert_eq!(spent_slots(&card), 1, "nothing signed");
+    let (status, body) = t.charge(&card, 20_000, "next").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(t.sale("pulled").txid, left.txid);
+    Ok(())
+}
+
+/// The settle talks to the card in the field only for that card's own charges left `signing`,
+/// and only with the holder's PIN: a job with no PIN settles nothing (`CARD_PIN` is never
+/// tried), another card hears no VERIFY_PIN (a wrong PIN typed for it is not refused, because it
+/// is not sent), and another card's online sale leaves this card's `signing` charge as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_settle_needs_the_pin_and_leaves_another_cards_charge_alone() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
+    t.tap(&card);
+    t.cw.pin = None;
+    let r = fedimint_card_sidecar::offline::settle_left_signing(&mut t.cw, &t.off);
+    assert!(r.finished.is_empty() && r.error.is_none(), "{r:?}");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "no PIN: nothing settled");
+
+    let other = v3_card();
+    provision(&t.reg, &other);
+    t.load(&other, &[1 << 16, 1 << 16]).await?;
+    t.tap(&other);
+    t.cw.pin = Some(b"9999".to_vec());
+    let r = fedimint_card_sidecar::offline::settle_left_signing(&mut t.cw, &t.off);
+    t.cw.pin = None;
+    assert!(r.finished.is_empty() && r.error.is_none(), "another card: no VERIFY_PIN sent: {r:?}");
+    let (status, body) = t.charge(&other, 20_000, "other").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "another card: untouched");
+    assert_eq!(spent_slots(&card), 1);
+    Ok(())
+}
+
+/// The holder mistypes the PIN at the settle until the card blocks: each wrong PIN ends its tap
+/// with one try spent (`wrong_pin`, `wrong_pin`, then `pin_blocked` at the third), and none of the
+/// taps reports, holds or signs anything. The charge stays `signing`: a blocked card cannot settle
+/// it, and the right PIN is refused as blocked too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_blocked_at_the_settle_ends_each_tap_and_leaves_the_charge() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
+    let wrong: &[u8] = b"9999";
+    for (pin, want) in
+        [(wrong, (403, "wrong_pin")), (wrong, (403, "wrong_pin")), (wrong, (423, "pin_blocked")), (TEST_PIN, (423, "pin_blocked"))]
+    {
+        t.tap(&card);
+        t.cw.pin = Some(pin.to_vec());
+        let r = charge_job_with(&mut t.cw, Some(&t.ops), Some(&t.off), 20_000, Some("next".into()), &t.sales).await;
+        t.cw.pin = None;
+        assert_eq!((r.status, r.body["error"].as_str()), (want.0, Some(want.1)), "{}", r.body);
+    }
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left], "left as it was");
+    assert!(t.reg.reports.lock().unwrap().is_empty(), "nothing reported");
+    assert_eq!(t.stranded_posts(), 0, "nothing held");
+    assert_eq!(spent_slots(&card), 1, "nothing signed");
+    Ok(())
+}
