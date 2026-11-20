@@ -99,12 +99,14 @@ these that fails, before anything slow runs:
 Then it removes the installed copy of cardkit, runs `yarn install --frozen-lockfile --check-files`
 (yarn copies `tools/cardkit` at install time, and a stale copy ships the old applet) and checks the
 new copy matches `tools/cardkit` file for file. It runs `yarn test` and `pod install`, then stops if
-`git status` shows any change: a file the preparation rewrote belongs in a commit on `main` first.
-It archives the workspace with automatic signing and checks the archive: the bundle id is
-`org.fedimintcard.provisioner`, the version and build are `package.json`'s, and the app's
-`main.jsbundle` holds every registry origin the configuration gate printed and the load file hash,
-and no `LOCAL SESSION`. It writes the commit to the archive's `.commit` file and prints a summary:
-bundle id, version and build, commit and team. Its last line is the archive's path.
+`git status` shows any change (a file the preparation rewrote belongs in a commit on `main` first)
+or HEAD is no longer the commit it printed. It archives the workspace with automatic signing and
+checks the archive: the bundle id is `org.fedimintcard.provisioner`, the version and build are
+`package.json`'s, and the app's `main.jsbundle` holds every registry origin the configuration gate
+printed and the load file hash. The archive holds whatever the tree held while xcodebuild ran, so
+it checks `git status` and HEAD once more: a change or a commit in the worktree during the archive
+stops it, with no `.commit` written. Then it writes the commit to the `.commit` file and prints a
+summary: bundle id, version and build, commit and team. Its last line is the archive's path.
 
 Read the summary. The upload is the release itself, so it waits for the decision to release; then
 upload that archive in a second run:

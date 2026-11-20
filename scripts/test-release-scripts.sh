@@ -300,7 +300,8 @@ expect "builds nothing" empty "$c/log"
 # stand-ins: node answers --version and runs the two release gates; yarn copies tools/cardkit on
 # install, as yarn copies a file: dependency, and leaves a copy that is already there alone; pod
 # writes the files pod writes, which git ignores; xcodebuild writes an archive in Xcode's layout, or
-# exports and prints a marker in place of an upload.
+# exports and prints a marker in place of an upload. pod and xcodebuild can also change a tracked
+# file or make a commit while they run, as other work in the same checkout could.
 
 setup_id=org.fedimintcard.provisioner
 setup_version=9.8.7 setup_build=65 # what the fixture's package.json says
@@ -351,6 +352,9 @@ fixture_git() { # git in the scratch checkout, with no user or system configurat
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$c/repo" -c commit.gpgsign=false \
     -c user.name=fixture -c user.email=fixture@example.invalid "$@"
 }
+# An empty commit from inside a stand-in, where fixture_git is not defined, with the same
+# configuration: other work in the checkout while the build runs.
+fixture_commit='GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c commit.gpgsign=false -c user.name=fixture -c user.email=fixture@example.invalid commit -q --allow-empty -m "a commit while the build runs"'
 # shellcheck disable=SC2016 # the stand-ins' bodies expand their variables when they run
 new_setup_case() { # name: a scratch git checkout in $c with the Setup script, its inputs and stand-ins
   cases=$((cases + 1))
@@ -405,13 +409,16 @@ case $1 in
   test) exit "${FAKE_YARN_TEST_STATUS:-0}" ;;
 esac
 echo "yarn stand-in: unexpected yarn $*" >&2; exit 99'
-  # pod: writes its ignored files; FAKE_POD_REWRITES names a tracked file it rewrites as well.
+  # pod: writes its ignored files; FAKE_POD_REWRITES names a tracked file it rewrites as well, and
+  # FAKE_POD_COMMITS makes a commit while it runs.
   stand_in "$c/bin/pod" 'echo "pod $* (in $PWD)" >>"$FAKE_LOG"
 mkdir -p Pods && echo pods >Pods/Manifest.lock && echo pods >Podfile.lock
 if [[ -n ${FAKE_POD_REWRITES:-} ]]; then echo "// pod install" >>"$FAKE_POD_REWRITES"; fi
+if [[ -n ${FAKE_POD_COMMITS:-} ]]; then '"$fixture_commit"'; fi
 exit "${FAKE_POD_STATUS:-0}"'
-  # xcodebuild: archive writes the archive FAKE_* describe; -exportArchive prints a marker where the
-  # real one uploads.
+  # xcodebuild: archive writes the archive FAKE_* describe, and FAKE_ARCHIVE_TOUCHES (a tracked file
+  # it appends to) or FAKE_ARCHIVE_COMMITS changes the checkout while it runs; -exportArchive prints
+  # a marker where the real one uploads, or fails with FAKE_EXPORT_STATUS.
   stand_in "$c/bin/xcodebuild" 'echo "xcodebuild $* (in $PWD)" >>"$FAKE_LOG"
 archive= export_path=
 while (($#)); do
@@ -419,6 +426,7 @@ while (($#)); do
   shift
 done
 if [[ -n $export_path ]]; then
+  if [[ -n ${FAKE_EXPORT_STATUS:-} ]]; then exit "$FAKE_EXPORT_STATUS"; fi
   mkdir -p "$export_path"
   echo "xcodebuild stand-in: EXPORTED AND UPLOADED"
   exit 0
@@ -428,7 +436,9 @@ if [[ -n ${FAKE_NO_ARCHIVE:-} ]]; then exit 0; fi
 "$FAKE_ARCHIVE_TOOL" "$archive" "$FAKE_BUNDLE_ID" "$FAKE_ARCHIVE_VERSION" "$FAKE_ARCHIVE_BUILD"
 if [[ -z ${FAKE_NO_JSBUNDLE:-} ]]; then
   printf "HBC\0%s\0" "$FAKE_JSBUNDLE" >"$archive/Products/Applications/FedimintProvisioner.app/main.jsbundle"
-fi'
+fi
+if [[ -n ${FAKE_ARCHIVE_TOUCHES:-} ]]; then echo "// changed while archiving" >>"$FAKE_ARCHIVE_TOUCHES"; fi
+if [[ -n ${FAKE_ARCHIVE_COMMITS:-} ]]; then '"$fixture_commit"'; fi'
   echo "not a key" >"$c/keys/AuthKey_TEST.p8"
   fixture_git -c init.defaultBranch=main init -q
   fixture_git add -A
@@ -623,6 +633,8 @@ expect "prints the bundle id" has "$c/out" "bundle id: $setup_id"
 expect "prints the version and build" has "$c/out" "version: 9.8.7 (65)"
 expect "prints the commit" has "$c/out" "commit: $head_commit"
 expect "prints the team" has "$c/out" "team: H7UAM79QQP"
+expect "prints what the bundle holds" is "$(grep '^main.jsbundle holds ' "$c/out")" \
+  "main.jsbundle holds $origin_staging, $origin_production and the load file hash $load_short"
 expect "prints the upload step" has "$c/out" "next: apps/provisioner/scripts/release-ios.sh upload $c/repo/$setup_archive"
 expect "last line is the archive's path" is "$(last_line "$c/out")" "$c/repo/$setup_archive"
 expect "the tree is still clean" is "$(fixture_git status --porcelain --untracked-files=normal)" ""
@@ -656,6 +668,14 @@ expect "says the tree changed" has "$c/err" "the tree changed while preparing"
 expect "names the file" has "$c/err" "apps/provisioner/ios/FedimintProvisioner.xcodeproj/project.pbxproj"
 expect "archives nothing" lacks "$c/log" "xcodebuild"
 
+new_setup_case "setup ios build: a commit made while preparing stops it before xcodebuild"
+head_commit=$(fixture_git rev-parse HEAD)
+setup_ios "${asc[@]}" FAKE_POD_COMMITS=1 -- build
+expect "fails" is "$status" 1
+expect "says HEAD moved" has "$c/err" "HEAD moved while preparing: the archive would not be $head_commit"
+expect "the commit was made" test "$(fixture_git rev-parse HEAD)" != "$head_commit"
+expect "archives nothing" lacks "$c/log" "xcodebuild"
+
 new_setup_case "setup ios build: a failing pod install stops it with pod's status"
 setup_ios "${asc[@]}" FAKE_POD_STATUS=7 -- build
 expect "fails with pod's status" is "$status" 7
@@ -681,7 +701,6 @@ archive_refusals=(
   "a bundle without the production registry|FAKE_JSBUNDLE=$(bundle_with "$origin_staging" "$load_hash")|main.jsbundle does not hold the registry origin $origin_production"
   "a bundle without the staging registry|FAKE_JSBUNDLE=$(bundle_with "$origin_production" "$load_hash")|main.jsbundle does not hold the registry origin $origin_staging"
   "a bundle without the load file hash|FAKE_JSBUNDLE=$(bundle_with "$origin_production" "$origin_staging")|main.jsbundle does not hold the load file hash $load_short"
-  "a bundle with the local session|FAKE_JSBUNDLE=$(bundle_with "$origin_production" "$origin_staging" "$load_hash" "LOCAL SESSION")|main.jsbundle holds LOCAL SESSION"
 )
 for entry in "${archive_refusals[@]}"; do
   what=${entry%%|*} rest=${entry#*|}
@@ -692,6 +711,38 @@ for entry in "${archive_refusals[@]}"; do
   expect "archived once" is "$(grep -c '^xcodebuild ' "$c/log")" 1
   expect "records no commit" test ! -e "$c/repo/$setup_commit"
 done
+
+new_setup_case "setup ios build: a tracked file changed while archiving stops it, with no commit recorded"
+head_commit=$(fixture_git rev-parse HEAD)
+setup_ios "${asc[@]}" FAKE_ARCHIVE_TOUCHES=apps/provisioner/package.json -- build
+expect "fails" is "$status" 1
+expect "says the archive may not be the commit" \
+  has "$c/err" "the tree or HEAD changed while archiving: the archive may not be $head_commit"
+expect "names the file" has "$c/err" "apps/provisioner/package.json"
+expect "archived once" is "$(grep -c '^xcodebuild ' "$c/log")" 1
+expect "records no commit" test ! -e "$c/repo/$setup_commit"
+expect "prints no upload step" lacks "$c/out" "next: "
+
+new_setup_case "setup ios build: a commit made while archiving stops it, with no commit recorded"
+head_commit=$(fixture_git rev-parse HEAD)
+setup_ios "${asc[@]}" FAKE_ARCHIVE_COMMITS=1 -- build
+expect "fails" is "$status" 1
+expect "says the archive may not be the commit" \
+  has "$c/err" "the tree or HEAD changed while archiving: the archive may not be $head_commit"
+expect "says where HEAD is now" has "$c/err" "HEAD is $(fixture_git rev-parse HEAD) now"
+expect "records no commit" test ! -e "$c/repo/$setup_commit"
+expect "prints no upload step" lacks "$c/out" "next: "
+
+# SignInScreen imports the local session's label, so every Release bundle holds it whatever
+# LOCAL_SESSION_ENABLED says: Hermes stores it as UTF-16 for its em-dash, and as plain bytes without
+# one. The configuration gate keeps the session out of a release, so no bundle check looks for it.
+new_setup_case "setup ios build: a bundle holding the local session's label, as every bundle does, is accepted"
+setup_ios "${asc[@]}" \
+  FAKE_JSBUNDLE="$(bundle_with "$origin_production" "$origin_staging" "$load_hash" "LOCAL SESSION - nothing is sent to a registry")" \
+  -- build
+expect "succeeds" is "$status" 0
+expect "records the commit" test -f "$c/repo/$setup_commit"
+expect "claims nothing about the local session" lacks "$c/out" "LOCAL SESSION"
 
 new_setup_case "setup ios upload: a path with nothing there is refused before xcodebuild"
 setup_ios "${asc[@]}" -- upload repo/dist/ios/FedimintProvisioner-9.8.7-66.xcarchive
@@ -751,6 +802,14 @@ expect "exports and uploads that archive with the API key, and runs nothing else
   "xcodebuild -exportArchive -archivePath $c/repo/$setup_archive -exportOptionsPlist apps/provisioner/ios/ExportOptions.plist -exportPath dist/ios/export-FedimintProvisioner-9.8.7-65 -allowProvisioningUpdates -authenticationKeyPath $c/keys/AuthKey_TEST.p8 -authenticationKeyID TESTKEYID -authenticationKeyIssuerID test-issuer-id (in $c/repo)"
 expect "last line is the export directory" is "$(last_line "$c/out")" "$c/repo/dist/ios/export-FedimintProvisioner-9.8.7-65"
 prints_no_asc_value
+
+new_setup_case "setup ios upload: a failed export passes xcodebuild's status on and prints no export directory"
+setup_built
+setup_ios "${asc[@]}" FAKE_EXPORT_STATUS=70 -- upload "repo/$setup_archive"
+expect "fails with xcodebuild's status" is "$status" 70
+expect "said what it would upload" has "$c/out" "will upload $setup_id 9.8.7 (65)"
+expect "prints no export directory" lacks "$c/out" "$c/repo/dist/ios/export-FedimintProvisioner-9.8.7-65"
+expect "uploads nothing" lacks "$c/out" "EXPORTED AND UPLOADED"
 
 cases=$((cases + 1))
 echo "# setup ios: ExportOptions.plist uploads to App Store Connect for the team, with the archive's numbers"

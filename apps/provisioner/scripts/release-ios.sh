@@ -21,11 +21,13 @@
 # Then it removes the installed copy of cardkit and runs yarn install --frozen-lockfile --check-files,
 # which copies tools/cardkit again: yarn copies a file: dependency at install time, and a stale copy
 # ships the old applet with every test green. The copy must match tools/cardkit file for file, as
-# src/cardkitCopy.test.ts checks. Then yarn test, pod install, and git status must still show
-# nothing. xcodebuild archives the workspace with automatic signing, and the archive must be this
-# app at package.json's version and build, with a main.jsbundle that holds every registry origin and
-# the load file hash (its first 16 hex digits) and no LOCAL SESSION. The commit goes to the archive's
-# .commit file, a summary follows, and the last line printed is the archive's path.
+# src/cardkitCopy.test.ts checks. Then yarn test and pod install, after which git status must still
+# show nothing and HEAD must still be the commit printed. xcodebuild archives the workspace with
+# automatic signing, and the archive must be this app at package.json's version and build, with a
+# main.jsbundle that holds every registry origin and the load file hash (its first 16 hex digits).
+# The archive holds whatever the tree held while xcodebuild ran, so git status and HEAD are checked
+# once more. Only then does the commit go to the archive's .commit file; a summary follows, and the
+# last line printed is the archive's path.
 #
 # upload takes an archive build made (the .commit beside it says so) of this app that records no
 # upload of its build, prints what it will upload and from which commit, then runs xcodebuild
@@ -111,6 +113,15 @@ clean() { # message: stops the script unless git status shows nothing, untracked
 	if [[ -n $changes ]]; then
 		echo "$1" >&2
 		echo "$changes" >&2
+		exit 1
+	fi
+}
+same_head() { # message: stops the script unless HEAD is still the commit it printed
+	local head
+	head=$(git rev-parse HEAD)
+	if [[ $head != "$commit" ]]; then
+		echo "$1" >&2
+		echo "HEAD is $head now" >&2
 		exit 1
 	fi
 }
@@ -201,6 +212,7 @@ if ! (cd "$app" && yarn test); then
 	exit 1
 fi
 (cd "$app/ios" && pod install)
+same_head "HEAD moved while preparing: the archive would not be $commit"
 clean "the tree changed while preparing (yarn or pod install rewrote a tracked file):"
 
 mkdir -p dist/ios
@@ -238,10 +250,12 @@ if ! grep -aqF -- "$load_hash" "$bundle"; then
 	echo "main.jsbundle does not hold the load file hash $load_hash" >&2
 	exit 1
 fi
-if grep -aqF 'LOCAL SESSION' "$bundle"; then
-	echo "main.jsbundle holds LOCAL SESSION" >&2
-	exit 1
-fi
+# No LOCAL SESSION check: every bundle holds that label (SignInScreen imports it). The configuration
+# gate refuses LOCAL_SESSION_ENABLED = true, and App.tsx takes the session only under __DEV__.
+
+archived="the tree or HEAD changed while archiving: the archive may not be $commit"
+same_head "$archived"
+clean "$archived"
 
 echo "$commit" >"$commit_file"
 team=$(plist_values Team "$info")
@@ -249,6 +263,6 @@ echo "bundle id: $id"
 echo "version: $version ($build)"
 echo "commit: $commit"
 echo "team: ${team:-none recorded}"
-echo "main.jsbundle holds ${origins//$'\n'/, }, the load file hash $load_hash and no LOCAL SESSION"
+echo "main.jsbundle holds ${origins//$'\n'/, } and the load file hash $load_hash"
 echo "next: apps/provisioner/scripts/release-ios.sh upload $root/$archive"
 echo "$root/$archive"

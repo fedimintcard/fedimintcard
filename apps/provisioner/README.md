@@ -72,7 +72,7 @@ rm -rf node_modules/@fedimintcard/cardkit && yarn install --frozen-lockfile --ch
 `src/cardkitCopy.test.ts` fails while the copy differs from `tools/cardkit`, so
 `yarn test` before a build catches it.
 
-Store builds: `docs/RELEASING.md` (`scripts/release-ios.sh` for iOS).
+Store builds: `docs/RELEASING.md` (`apps/provisioner/scripts/release-ios.sh` for iOS).
 
 ## Identity
 
