@@ -53,7 +53,9 @@ skipped, and the till's caps are checked (`--offline-cap-msat`, default 100,000,
 card's KEYED slots (`SET_CHANGE`, the opening kept on the card), the card signs, and the signed
 transaction is saved in `<data_dir>/offline_queue.json` (0600, fsync) before the answer: `200`
 with `"offline": true` and `collection_pending: true`. The sale is in `sales.json` with
-`offline: true`.
+`offline: true`. A repeat of a `client_ref` is answered from the till's own records before the
+probe (`POST /v1/charge`, below), so a sale an earlier attempt left unresolved is never charged
+again, online or offline.
 
 **Fee margin.** An offline charge is signed at the federation's fees of that moment and sent
 later. On a federation at core consensus 2.1 or later (read from its client config; logged at
@@ -275,18 +277,22 @@ starts a second spend while the first may still count:
 * the earlier attempt is still unresolved, or still in flight (the service is busy with it), or
   its card was taken away while it signed an offline charge (that card's next tap finishes it):
   `undecided` 202, never `busy`, never a second spend. The service resolves it on the next job
-  and records the sale;
+  and records the sale. On ops this holds with the card gone and with the registry down: the till
+  answers from its record before it reads the card or probes the registry, and while the registry
+  does not answer for that card the answer is `undecided`, never an offline charge;
 * the earlier attempt is proven to have left nothing behind (`insufficient`, `no_card`,
   `declined`, a crash before submission, ...): the repeat is a fresh attempt with the same ref;
 * the same `client_ref` with a different `price_msat` is `conflict` 409.
 
 With `pin`: a finished sale replays without a PIN, but every other repeat on a till that requires
 one (unresolved, in flight, or a fresh attempt) needs `pin` again, since `pin_required` is
-answered before the till looks at the earlier attempt. A `wrong_pin` or `pin_blocked` comes from
-inside the spend, after any earlier attempt with that ref was settled, so it proves nothing moved:
-the POS asks the holder again and resends the **same** `client_ref` with the new PIN.
-`pin_required` and the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an
-earlier attempt.
+answered before the till looks at the earlier attempt. A `no_card`, `card_error`, `wrong_pin` or
+`pin_blocked` on a repeat comes after the till looked at the earlier attempt with that ref (on ops
+too: a repeat is answered from the till's records before the card is read or the PIN tried), so it
+proves nothing moved: the POS asks the holder again and resends the **same** `client_ref` (with
+the new PIN after a `wrong_pin`). The exception is an offline sale whose card was taken away while
+it signed: only that card can finish it, so its card checks come first (above). `pin_required` and
+the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an earlier attempt.
 
 | error | HTTP | meaning | app action |
 |---|---|---|---|
@@ -299,7 +305,7 @@ earlier attempt.
 | `insufficient` | 402 | the card's notes do not cover the price | decline the sale |
 | `no_exact_plan` | 422 | the card cannot pay this price in one tap: the price needs more of its notes than one tap signs (`plan::MAX_INPUTS`, 3 today), or no exact layout of the change fits its free slots; `detail` says which and is meant for a log | decline; the POS says "Can't take this amount" (try a smaller amount, or take the sale another way) and does not show `detail` |
 | `declined` | 402 | the federation rejected the spend; nothing moved | retry once, then decline |
-| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
+| `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next tap finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged; on ops also a repeat whose earlier attempt left a record the till could not settle now because the registry did not answer (nothing was charged again) | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
