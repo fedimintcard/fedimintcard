@@ -25,7 +25,7 @@ use fedimint_card_sidecar::offline::{ChargeState, Offline, OfflineCharge, Offlin
 use fedimint_card_sidecar::ops::{MAX_KEY_PER_TAP, Ops, OpsConfig, SPARE_TARGET, SpareConfig, short_id_of};
 use fedimint_card_sidecar::pool::{self, TillKeys};
 use fedimint_card_sidecar::sales::SalesStore;
-use fedimint_card_sidecar::state::StateStore;
+use fedimint_card_sidecar::state::{NoteStatus, StateStore};
 use fedimint_card_sidecar::till::{self, Conn, OpsState, card_balance_job, charge_job_with, send_offline_job};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
@@ -813,6 +813,11 @@ async fn an_offline_charge_is_queued_then_sent_and_its_change_lands_on_the_card(
     for n in t.reg.cards.lock().unwrap()[&id].notes.iter().filter(|n| n["txid"] == txid) {
         assert!(n["status"] == "live" || n["status"] == "spent", "{n}");
     }
+    // Nothing is left pending under it in the card's file either: its inputs, which the report had
+    // the registry mark `pending` under it, are spent once it is settled.
+    let file = StateStore::open(t.ops.card_path(&id))?.state;
+    let notes: Vec<(u8, NoteStatus)> = file.notes.iter().filter(|n| n.txid.as_deref() == Some(txid)).map(|n| (n.slot, n.status)).collect();
+    assert!(!notes.is_empty() && notes.iter().all(|(_, s)| *s != NoteStatus::Pending), "{notes:?}");
     assert_eq!(t.reg.reports.lock().unwrap().len(), 1);
 
     // The next tap writes the change to the card.
