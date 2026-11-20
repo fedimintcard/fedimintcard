@@ -52,6 +52,7 @@ enum ErrorKind: Equatable {
         case .offlineNoChangeRoom: return .offlineNoChangeRoom
         case .cardLinkGone: return .cardLinkGone
         case .unauthorized: return .unauthorized
+        case .forbidden: return .unknown // the till's own words, as before it was listed
         case .internal: return .internal
         case .offlineKitExpired: return .offlineKitExpired
         case .offlinePoolExhausted: return .offlinePoolExhausted

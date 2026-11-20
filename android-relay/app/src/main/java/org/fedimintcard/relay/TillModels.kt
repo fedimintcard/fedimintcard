@@ -97,6 +97,12 @@ enum class ChargeErrorCode(val wire: String) {
     UNKNOWN_CARD("unknown_card"),
     OPS_UNREACHABLE("ops_unreachable"),
     OPS_REFUSED("ops_refused"),
+    /** The till is on a registry and has no token yet; nothing ran (docs/TILL-API.md). */
+    OPS_NOT_CONNECTED("ops_not_connected"),
+    /** No bearer the till takes; nothing ran (docs/TILL-API.md). */
+    UNAUTHORIZED("unauthorized"),
+    /** A token with the pay scope; nothing ran (docs/TILL-API.md). */
+    FORBIDDEN("forbidden"),
     /** Offline, the price needs change and the card has no slot for it; `suggested_msat` may say what it can pay. */
     OFFLINE_NO_CHANGE_ROOM("offline_no_change_room"),
     // The phone's own offline charge answers these (docs/POS-OFFLINE.md § Refusals). Some come from

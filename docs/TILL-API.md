@@ -323,7 +323,7 @@ earlier attempt.
 An answer that does not say whether the till took the sale is `undecided` for an app: a 500
 `internal`, a 5xx whose body is not this JSON (a gateway or proxy answering for the till), no
 answer in time or a connection cut after the request was sent, and an `error` that is neither in
-this table nor `unauthorized` or `card_link_gone` (both above). The POS apps show
+this table nor `unauthorized`, `forbidden` or `card_link_gone` (all above). The POS apps show
 "Outcome unknown" with Try again (the same `client_ref`, which never charges twice), Check sales
 and Abandon sale, and no Back.
 

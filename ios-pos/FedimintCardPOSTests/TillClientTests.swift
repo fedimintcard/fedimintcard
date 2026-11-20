@@ -163,9 +163,10 @@ final class ErrorMappingTests: XCTestCase {
         for c in ChargeErrorCode.allCases where c != .unknown {
             let r = TillParse.charge(status: 409, body: Data(#"{"ok":false,"error":"\#(c.rawValue)","detail":"x"}"#.utf8))
             XCTAssertEqual(r, .declined(code: c, detail: "x", httpStatus: 409))
-            // `ops_not_connected` is listed so that it stays a refusal (a code the app does not know
-            // leaves the sale unresolved), and reads in the till's own words, as before it was listed.
-            XCTAssertEqual(ErrorKind.from(c) == .unknown, c == .opsNotConnected, c.rawValue)
+            // `ops_not_connected` and `forbidden` are listed so that they stay refusals (a code the app
+            // does not know leaves the sale unresolved), and read in the till's own words, as before
+            // they were listed.
+            XCTAssertEqual(ErrorKind.from(c) == .unknown, c == .opsNotConnected || c == .forbidden, c.rawValue)
         }
         XCTAssertEqual(ChargeErrorCode.fromWire("nonsense"), .unknown)
         XCTAssertEqual(ChargeErrorCode.fromWire(nil), .unknown)
@@ -206,10 +207,10 @@ final class ErrorMappingTests: XCTestCase {
                        .declined(code: .recovering, detail: "d", httpStatus: 503))
     }
 
-    /// Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone` and
-    /// `unauthorized` above it) is one the app knows. An `error` the app does not know leaves the
-    /// sale unresolved, so a documented refusal missing from `ChargeErrorCode` would read as
-    /// "Outcome unknown". The list is copied from the doc.
+    /// Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone`,
+    /// `unauthorized` and `forbidden` above it) is one the app knows. An `error` the app does not
+    /// know leaves the sale unresolved, so a documented refusal missing from `ChargeErrorCode` would
+    /// read as "Outcome unknown". The list is copied from the doc.
     func testEveryDocumentedChargeCodeIsKnown() {
         let documented = [
             "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
@@ -218,7 +219,7 @@ final class ErrorMappingTests: XCTestCase {
             "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
             "offline_pool_exhausted", "internal",
             // § Auth and the card link.
-            "card_link_gone", "unauthorized",
+            "card_link_gone", "unauthorized", "forbidden",
         ]
         for code in documented { XCTAssertNotEqual(ChargeErrorCode.fromWire(code), .unknown, code) }
     }

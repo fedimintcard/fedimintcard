@@ -251,6 +251,36 @@ final class PosFlowTests: XCTestCase {
         }
     }
 
+    /// `forbidden` answers a token with the pay scope (docs/TILL-API.md): nothing ran, so it reads
+    /// as before, "Something went wrong" in the till's own words with Back, and leaves no sale
+    /// unresolved.
+    func testATillsForbiddenIsAPlainRefusal() {
+        let f = flow()
+        let (id, _, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: ChargeErrorCode.fromWire("forbidden"), detail: "the till's words", httpStatus: 403)))
+        guard case .error(let e) = f.state else { return XCTFail("\(f.state)") }
+        XCTAssertEqual(e.kind, .unknown)
+        XCTAssertNil(e.unresolvedRef); XCTAssertNil(f.unresolvedRef)
+        XCTAssertEqual(errorCopy(e.kind, e.detail).0, "Something went wrong")
+        XCTAssertEqual(errorCopy(e.kind, e.detail).1, "the till's words")
+        f.dispatch(.backPressed)
+        XCTAssertEqual(f.state, .entering)
+    }
+
+    /// Nor does `forbidden` settle an unresolved sale: it comes before the till looks at the earlier
+    /// attempt with the same `client_ref`, so it proves nothing about it.
+    func testAForbiddenRetryLeavesAnUnresolvedSaleUnresolved() {
+        let f = flow()
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .failed(.timeout)))
+        f.dispatch(.retryPressed)
+        let (id2, _, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id2, result: .declined(code: ChargeErrorCode.fromWire("forbidden"), detail: "d", httpStatus: 403)))
+        XCTAssertEqual(f.unresolvedRef, ref)
+        f.dispatch(.backPressed)
+        guard case .error = f.state else { return XCTFail("no Back while the sale is unresolved: \(f.state)") }
+    }
+
     func testLinkFailureBeforeChargeKeepsUnresolvedState() {
         let f = flow()
         f.dispatch(.chargePressed); typePin(f); f.dispatch(.pinConfirmed)

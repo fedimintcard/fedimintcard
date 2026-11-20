@@ -303,7 +303,7 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
 } catch (e: JSONException) {
     when (httpStatus) {
         202 -> ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "", httpStatus)
-        in 200..299 -> ChargeResult.Failed(TillError.Interrupted) // accepted but unreadable: outcome unknown
+        in 200..299, in 500..599 -> ChargeResult.Failed(TillError.Interrupted) // unreadable: a 2xx was accepted, a 5xx may have been; outcome unknown
         else -> ChargeResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
     }
 }
