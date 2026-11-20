@@ -323,8 +323,9 @@ earlier attempt.
 An answer that does not say whether the till took the sale is `undecided` for an app: a 500
 `internal`, a 5xx whose body is not this JSON (a gateway or proxy answering for the till), no
 answer in time or a connection cut after the request was sent, and an `error` that is neither in
-this table nor `unauthorized` (above). The POS apps show "Outcome unknown" with Try again (the
-same `client_ref`, which never charges twice), Check sales and Abandon sale, and no Back.
+this table nor `unauthorized` or `card_link_gone` (both above). The POS apps show
+"Outcome unknown" with Try again (the same `client_ref`, which never charges twice), Check sales
+and Abandon sale, and no Back.
 
 ## GET /v1/sales
 `200 {"count":N,"total_price_msat":N,"total_received_msat":N,"sales":[{"id":N,"ts_unix_ms":N,"price_msat":N,"received_msat":N,"overpaid_msat":N,"fees_msat":N,"txid":"<hex>","inputs":[...],"change":[...],"client_ref":"<string|null>","offline":bool,"double_spent":bool,"rejected":bool,"collection_pending":bool}]}`
