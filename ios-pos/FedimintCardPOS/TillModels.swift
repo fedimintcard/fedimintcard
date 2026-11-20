@@ -93,6 +93,8 @@ enum ChargeErrorCode: String, CaseIterable {
     case offlineNoChangeRoom = "offline_no_change_room"
     case cardLinkGone = "card_link_gone"
     case unauthorized
+    /// A token with the pay scope; nothing ran (docs/TILL-API.md).
+    case forbidden
     case `internal`
     // The offline charge's codes (docs/POS-OFFLINE.md § Refusals): the phone's own, and the till's
     // offline path's.
