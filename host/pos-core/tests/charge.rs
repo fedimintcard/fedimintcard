@@ -754,3 +754,61 @@ fn a_clock_set_ahead_at_a_sync_does_not_expire_the_kits() {
     let after = take(&s, &card, &json, 20_000, "after").unwrap_or_else(|e| panic!("the kit expired: {e:#}"));
     assert_eq!(after.charge.state, ChargeState::Queued);
 }
+
+// ------------------------------------------------------------------ a till's online charge (ENG-873)
+
+/// What a till runs at an online charge for the charges a card left `signing`
+/// (`resume_signing`, with only the decoders and the time, no `Env`): the charge is finished from
+/// the card's stored signature and a fresh one for the input that still held its note, and a
+/// second run finds nothing to do. The queue holds that one charge: nothing was charged twice.
+#[test]
+fn a_charge_left_signing_is_resumed_with_no_env_and_no_second_charge() {
+    let fx = Fx::new(true);
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Mutex::new(Queue::open(dir.path()).unwrap());
+    let phone = "ab".repeat(16);
+    let now = now_ms();
+    let kit = fx.kit(&phone, 8, now, DAY_MS);
+    let keys = kit.decode(&phone).unwrap();
+    let env = Env {
+        mint_id: kit.mint_instance_id,
+        tbs_pks: &keys.tbs_pks,
+        fee: &keys.fee,
+        surplus_allowed: kit.surplus_allowed,
+        decoders: &keys.decoders,
+        cert_key: Some(&kit.cert_key),
+        cfg: keys.cfg,
+        header: None,
+        pin: Pin::Verify(TEST_PIN.to_vec()),
+        till_outs: TillOuts::Pool(&keys.pool),
+        keyed_ok: None,
+        now_ms: now,
+        expires_at_ms: Some(now + DAY_MS),
+    };
+    let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]);
+    // 90,000 msat takes two notes; the card leaves at the second SIGN, the sale undecided.
+    let r = charge(&mut client(PullAtSign::new(&card, 1)), &queue, &env, 90_000, Some("left"));
+    assert_eq!(code(&r), "undecided", "{:?}", r.err());
+    let left = queue.lock().unwrap().file.charges.clone();
+    assert_eq!((left.len(), left[0].state), (1, ChargeState::Signing));
+    assert_eq!(spent_hashes(&card), vec![(left[0].inputs[0].slot, digest(&left[0].txid))], "one input signed");
+
+    // The till's tap: the card's short id, the holder's PIN, then the finisher.
+    let mut c = client(card.clone());
+    let short_id = fedimint_card_pos_core::short_id_of(&c.get_pub(0).unwrap());
+    c.verify_pin(TEST_PIN).unwrap();
+    let done = fedimint_card_pos_core::charge::resume_signing(&mut c, &queue, &keys.decoders, now, &short_id).unwrap();
+    assert_eq!(
+        done.iter().map(|d| (d.txid.as_str(), d.state)).collect::<Vec<_>>(),
+        vec![(left[0].txid.as_str(), ChargeState::Queued)],
+        "the charge the card began"
+    );
+    check_signed(&done[0], &kit);
+    let mut both: Vec<(u8, [u8; 32])> = left[0].inputs.iter().map(|i| (i.slot, digest(&left[0].txid))).collect();
+    both.sort();
+    assert_eq!(spent_hashes(&card), both, "each input spent once, for it");
+    assert_eq!(queue.lock().unwrap().file.charges, done, "one charge, queued");
+    let again = fedimint_card_pos_core::charge::resume_signing(&mut c, &queue, &keys.decoders, now, &short_id).unwrap();
+    assert!(again.is_empty(), "nothing left to finish: {again:?}");
+    assert_eq!(spent_hashes(&card), both, "nothing signed again");
+}
