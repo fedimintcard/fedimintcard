@@ -721,7 +721,8 @@ async fn actor(
                         }
                     }
                     Err(e) => {
-                        // A repeat of an earlier attempt can be answered without a card.
+                        // A repeat of an earlier attempt is answered from the till's records without a
+                        // card; `undecided` while the registry is out of reach.
                         let settled = match client_ref.as_deref() {
                             Some(c) => {
                                 cw.card = Box::new(NoCard);
@@ -1042,7 +1043,9 @@ pub async fn charge_job_with(
 }
 
 /// [`charge_job_with`] for the card `short_id`, read from the card in the field before the charge:
-/// its sale records it in the same append (a pay's refund goes back to that card).
+/// its sale records it in the same append (a pay's refund goes back to that card). On ops, a
+/// repeated `client_ref` is answered first, from the ledger or from the card file that holds the
+/// earlier attempt, before any card command or offline probe.
 pub async fn charge_job_for(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -1055,6 +1058,19 @@ pub async fn charge_job_for(
     let Some(ops) = ops else { return charge_with_card(cw, price, client_ref, sales, short_id).await };
     if let Some(bad) = validate_price(price) {
         return bad;
+    }
+    if let Some(c) = client_ref.as_deref() {
+        if let Some(r) = replay(sales, Some(c), price) {
+            return r;
+        }
+        // The record of an earlier attempt may belong to another card than the one in the field:
+        // nothing here may reach the card.
+        let card = std::mem::replace(&mut cw.card, Box::new(NoCard));
+        let settled = settle_without_card(cw, Some(ops), c, price, sales).await;
+        cw.card = card;
+        if let Some(r) = settled {
+            return r;
+        }
     }
     if let Some(off) = off {
         let (reg, fed) = off.reach.probe(Some(ops), &cw.wallet, &off.dir).await;
@@ -1254,8 +1270,10 @@ pub async fn card_balance_job(cw: &mut CardWallet, ops: Option<&Ops>, sales: &Ar
     r
 }
 
-/// A repeated `client_ref` while no card is in the field. On ops, the card is the one whose file
-/// holds the ref; its state is loaded from the registry by short id.
+/// A repeated `client_ref`, answered without the card. On ops, the card is the one whose file
+/// holds the ref; its state is loaded from the registry by short id. `None` is no record of the
+/// ref (or one [`settle`] proved left nothing behind); a record the registry will not hand over is
+/// `undecided`.
 async fn settle_without_card(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -1273,7 +1291,8 @@ async fn settle_without_card(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("settling {client_ref} without the card: {e:#}");
-            return None;
+            // The ref is on record in this file, so with the file out of reach nothing is proven.
+            return Some(undecided_reply(None));
         }
     };
     let r = settle(cw, client_ref, price, sales).await;
