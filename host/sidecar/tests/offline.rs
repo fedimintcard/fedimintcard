@@ -2571,3 +2571,300 @@ async fn past_the_taps_checks_slots_are_held_on_doubt_and_reported_at_the_next_t
     assert!(b["stranded_until_ms"].as_u64().is_some(), "{b}");
     Ok(())
 }
+
+// ------------------------------------------------------------------ a repeated client_ref on ops (ENG-858)
+
+use std::cell::Cell;
+
+use fedimint_card_host_card::TEST_PIN;
+use fedimint_card_sidecar::glue::CrashPoint;
+use fedimint_card_sidecar::state::PendingTx;
+
+/// The card in the field, with every command sent to it counted. A card that is `gone` has left
+/// the field: each command fails as a phone's card link reports a lost card.
+struct Watched {
+    card: Shared,
+    gone: bool,
+    calls: Rc<Cell<usize>>,
+}
+
+impl Watched {
+    /// The card, and the count of the commands it is sent.
+    fn new(card: &Rc<RefCell<SoftCard>>, gone: bool) -> (Self, Rc<Cell<usize>>) {
+        let calls = Rc::new(Cell::new(0));
+        (Self { card: Shared(card.clone()), gone, calls: calls.clone() }, calls)
+    }
+
+    fn count(&self) -> anyhow::Result<()> {
+        self.calls.set(self.calls.get() + 1);
+        if self.gone {
+            anyhow::bail!(BridgeError::NoCard("POST /apdu: HTTP 503: the card left the field".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Card for Watched {
+    fn gen_key(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.count()?;
+        self.card.gen_key(slot)
+    }
+    fn gen_key_overwrite(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.count()?;
+        self.card.gen_key_overwrite(slot)
+    }
+    fn get_pub(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.count()?;
+        self.card.get_pub(slot)
+    }
+    fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> anyhow::Result<Signature> {
+        self.count()?;
+        self.card.sign(slot, msg32)
+    }
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.count()?;
+        self.card.apdu(apdu)
+    }
+}
+
+impl Till {
+    /// [`Till::charge`] with the card in the field watched.
+    async fn charge_watched(&mut self, w: Watched, price: u64, cref: &str) -> (u16, Value) {
+        self.cw.card = Box::new(w);
+        self.cw.pin = Some(TEST_PIN.to_vec());
+        let r = charge_job_with(&mut self.cw, Some(&self.ops), Some(&self.off), price, Some(cref.into()), &self.sales).await;
+        self.cw.pin = None;
+        (r.status, r.body)
+    }
+
+    /// The unresolved charges in card `id`'s file.
+    fn pending(&self, id: &str) -> Vec<PendingTx> {
+        StateStore::open(self.ops.card_path(id)).unwrap().state.pending_txs
+    }
+
+    /// The charges the registry holds open for card `id`.
+    fn open_charges(&self, id: &str) -> usize {
+        self.reg.cards.lock().unwrap()[id].txs.iter().filter(|x| x["status"] == "open").count()
+    }
+
+    fn sales_count(&self) -> usize {
+        self.sales.lock().unwrap().file.sales.len()
+    }
+}
+
+/// `POST /v1/charge` with `body` through the till's router, its actor polled beside the request
+/// (the actor is not `Send`).
+async fn post_charge<A: std::future::Future<Output = ()>>(
+    app: &axum::Router,
+    actor: &mut std::pin::Pin<Box<A>>,
+    body: &Value,
+) -> (u16, Value) {
+    let req = axum::http::Request::post("/v1/charge")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let call = async {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    };
+    tokio::select! {
+        r = call => r,
+        _ = actor.as_mut() => panic!("the till's actor ended early"),
+    }
+}
+
+/// A repeat of a sale already in the ledger is that sale, answered before the card is asked
+/// anything: the same 200 with the card gone, and `conflict` at another price. Before ENG-858 a
+/// till on ops read the card's slot 0 key first, and the repeat of a finished sale whose card had
+/// left the field was `no_card`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_of_a_recorded_sale_is_answered_before_the_card_is_asked_anything() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    let (status, first) = t.charge(&card, 20_000, "r1").await;
+    assert_eq!(status, 200, "{first}");
+
+    let (gone, calls) = Watched::new(&card, true);
+    let (status, body) = t.charge_watched(gone, 20_000, "r1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((&body["sale_id"], &body["txid"]), (&first["sale_id"], &first["txid"]), "the same sale: {body}");
+    assert_eq!(calls.get(), 0, "the card was asked nothing");
+    assert_eq!(t.sales_count(), 1);
+
+    let (gone, calls) = Watched::new(&card, true);
+    let (status, body) = t.charge_watched(gone, 30_000, "r1").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("conflict")), "{body}");
+    assert_eq!(calls.get(), 0, "the card was asked nothing");
+    assert_eq!(t.sales_count(), 1);
+    Ok(())
+}
+
+/// A charge the till died on after the registry took its signed bytes (`submitted`, never sent to
+/// the federation): its repeat, with the card gone, is settled from the card's file and answered as
+/// that charge, with no command to the card and nothing signed again. Before ENG-858 the repeat
+/// read the card first and was `no_card`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_of_a_charge_the_till_died_on_is_settled_with_the_card_gone_and_charged_once() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    t.cw.crash_point = Some(CrashPoint::BeforeSubmit);
+    let (status, body) = t.charge(&card, 20_000, "r2").await;
+    t.cw.crash_point = None;
+    assert_eq!(status, 500, "{body}");
+    let pending = t.pending(&id);
+    assert!(pending.len() == 1 && pending[0].submitted && pending[0].client_ref.as_deref() == Some("r2"), "{pending:?}");
+    assert_eq!(t.sales_count(), 0);
+    let spent = spent_slots(&card);
+    assert!(spent > 0, "the card signed the charge");
+
+    let (gone, calls) = Watched::new(&card, true);
+    let (status, body) = t.charge_watched(gone, 20_000, "r2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["txid"], json!(pending[0].txid), "the charge the till died on: {body}");
+    assert_eq!(calls.get(), 0, "the card was asked nothing");
+    assert_eq!(t.sales_count(), 1);
+    assert_eq!(t.open_charges(&id), 0, "the outcome reached the registry");
+    assert_eq!(spent_slots(&card), spent, "nothing signed again");
+    Ok(())
+}
+
+/// A charge whose signed bytes the registry never answered for (`ops_unconfirmed`, not sent):
+/// while the registry is down, its repeat is `undecided`, with the card gone or in the field, and
+/// nothing is taken offline; once the registry answers, the repeat sends that charge and is answered
+/// as it. Before ENG-858 the probe sent the repeat the offline way first: a card gone was
+/// `no_card`, and a card in the field paid the sale a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_with_the_registry_down_is_undecided_and_never_taken_offline() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16]).await?;
+    t.cw.crash_point = Some(CrashPoint::SubmittedUnreachable);
+    let (status, body) = t.charge(&card, 20_000, "r3").await;
+    t.cw.crash_point = None;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let pending = t.pending(&id);
+    assert!(pending.len() == 1 && pending[0].ops_unconfirmed && !pending[0].submitted, "{pending:?}");
+    let spent = spent_slots(&card);
+
+    t.set_down(true);
+    for gone in [true, false] {
+        let (w, calls) = Watched::new(&card, gone);
+        let (status, body) = t.charge_watched(w, 20_000, "r3").await;
+        assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "card gone: {gone}: {body}");
+        assert_eq!(calls.get(), 0, "card gone: {gone}: the card was asked nothing");
+    }
+    assert!(t.off.queue.lock().unwrap().file.charges.is_empty(), "nothing taken offline");
+    assert_eq!(spent_slots(&card), spent, "nothing signed again");
+    assert_eq!(t.sales_count(), 0);
+
+    t.set_down(false);
+    let (w, calls) = Watched::new(&card, false);
+    let (status, body) = t.charge_watched(w, 20_000, "r3").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["txid"], json!(pending[0].txid), "the charge the registry had no answer for: {body}");
+    assert_eq!(calls.get(), 0, "the card was asked nothing");
+    assert_eq!(t.sales_count(), 1);
+    assert_eq!(spent_slots(&card), spent, "nothing signed again");
+    Ok(())
+}
+
+/// Another card tapped for a sale whose first card's charge the till died on (`submitted`, never
+/// sent) is not charged: the repeat is settled from the first card's file and answered as that
+/// charge. Before ENG-858 the second card was attached, its own file had no charge for the ref,
+/// and it paid the sale a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_card_for_a_sale_with_an_unresolved_charge_is_not_charged() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (a, b) = (v3_card(), v3_card());
+    let id_a = provision(&t.reg, &a);
+    provision(&t.reg, &b);
+    t.load(&a, &[1 << 16, 1 << 14]).await?;
+    t.load(&b, &[1 << 16, 1 << 14]).await?;
+    t.cw.crash_point = Some(CrashPoint::BeforeSubmit);
+    let (status, body) = t.charge(&a, 20_000, "r4").await;
+    t.cw.crash_point = None;
+    assert_eq!(status, 500, "{body}");
+    let txid = t.pending(&id_a)[0].txid.clone();
+
+    let (w, calls) = Watched::new(&b, false);
+    let (status, body) = t.charge_watched(w, 20_000, "r4").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["txid"], json!(txid), "card A's charge, not a second one: {body}");
+    assert_eq!(calls.get(), 0, "card B was asked nothing");
+    assert_eq!(spent_slots(&b), 0, "nothing signed on card B");
+    assert_eq!(t.sales_count(), 1);
+    assert!(t.pending(&id_a).is_empty());
+    Ok(())
+}
+
+/// Over HTTP, with no card in the field (the opener fails as the relay's 503 does) and the
+/// registry down, a repeat of a charge whose signed bytes the registry never answered for is
+/// `undecided`, never `no_card`, which the POS apps read as a definitive refusal. With the registry
+/// back, the same request settles the charge and answers its sale. Before ENG-858 the till could
+/// not load the card's file and answered the failed open, `no_card`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_over_http_with_no_card_and_the_registry_down_is_undecided() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    t.cw.crash_point = Some(CrashPoint::SubmittedUnreachable);
+    let (status, body) = t.charge(&card, 20_000, "r5").await;
+    t.cw.crash_point = None;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let txid = t.pending(&id)[0].txid.clone();
+
+    let (reg, off) = (t.reg.clone(), t.off.clone());
+    let conn = Conn::new(OpsState::Connected { url: t.ops.client.url().to_owned() }, Some(t.ops.clone()));
+    let sales = SalesStore::open(t.dir.path().join("sales.json"))?;
+    let no_card: till::CardOpener = Box::new(|| anyhow::bail!(BridgeError::NoCard("GET DATA FF21: HTTP 503: no card in the field".into())));
+    let (handle, actor) = till::new_with_conn(t.cw, "http://127.0.0.1:1".into(), sales, no_card, conn).await;
+    let app = till::router(handle.with_offline(off.clone()));
+    let mut actor = Box::pin(actor);
+    let body = json!({"price_msat": 20_000, "client_ref": "r5", "pin": std::str::from_utf8(TEST_PIN)?});
+
+    reg.down.store(true, Ordering::SeqCst);
+    off.reach.reset();
+    let (status, v) = post_charge(&app, &mut actor, &body).await;
+    assert_eq!((status, v["error"].as_str()), (202, Some("undecided")), "{v}");
+
+    reg.down.store(false, Ordering::SeqCst);
+    off.reach.reset();
+    let (status, v) = post_charge(&app, &mut actor, &body).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["txid"], json!(txid), "the charge the registry had no answer for: {v}");
+    let sales = SalesStore::open(t.dir.path().join("sales.json"))?.file.sales;
+    let recorded: Vec<(Option<&str>, &str)> = sales.iter().map(|s| (s.client_ref.as_deref(), s.txid.as_str())).collect();
+    assert_eq!(recorded, vec![(Some("r5"), txid.as_str())], "one sale in sales.json");
+    Ok(())
+}
+
+/// A first attempt that proved nothing moved (the card left before it signed: `no_card`, and no
+/// record of the charge is left) leaves nothing for a repeat to answer: the repeat is a fresh
+/// attempt with the same ref, and pays. It passed before ENG-858 and passes after: it guards
+/// against an answer from the till's records that would hold such a repeat back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_after_a_charge_that_left_nothing_is_a_fresh_attempt() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    let (status, body) = t.charge_pulled(&card, 0, 20_000, "f1").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("no_card")), "{body}");
+    assert!(t.pending(&id).is_empty(), "no record of the charge");
+    assert!(t.off.queue.lock().unwrap().file.charges.is_empty(), "nothing queued");
+    assert_eq!(spent_slots(&card), 0, "nothing signed");
+
+    let (status, body) = t.charge(&card, 20_000, "f1").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("offline").is_none(), "{body}");
+    assert_eq!(json!(t.sale("f1").txid), body["txid"], "{body}");
+    Ok(())
+}
