@@ -307,10 +307,13 @@ timeout is 3 s to connect, then 5 s each for the upgrade's whole answer and for 
 the 130 s a job's APDUs may take start only once the link is open. A 401 or 403 at link open never
 falls back: the pairing is dead and the kit could not be renewed either. A sale that was posted
 once and whose retry cannot open the link stays on "Till service unreachable" ("The last reply was
-lost"). A sale the core lists in `signing_refs()`, or one this phone charged and still holds (or
-whose charge threw), goes to the core only, with the same `client_ref`, whether the till answers
-or not, "Try again" included. Balance reads and top-ups never go offline. While the core drives
-the card, the USB relay answers "no card".
+lost"). An answer to `POST /v1/charge` that does not say whether the till took the sale (a 500
+`internal`, a 5xx the app cannot read, a code the app does not know) leaves the sale unresolved
+("Outcome unknown"), as a lost reply does (ENG-859, `docs/TILL-API.md`). A sale the core lists in
+`signing_refs()`, or one this phone charged and still holds (or whose charge threw), goes to the
+core only, with the same `client_ref`, whether the till answers or not, "Try again" included.
+Balance reads and top-ups never go offline. While the core drives the card, the USB relay answers
+"no card".
 
 **A held sale.** A card taken away while it signed leaves "Payment not finished": no Back, no
 Check sales (the till has no record of it), Try again (the PIN, then the core with the same
