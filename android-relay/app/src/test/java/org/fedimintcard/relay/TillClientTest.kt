@@ -84,14 +84,40 @@ class TillClientTest {
     @Test fun unparsable2xxIsOutcomeUnknown() {
         assertEquals(ChargeResult.Failed(TillError.Interrupted), parseCharge(200, "<html>"))
         assertEquals(ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "", 202), parseCharge(202, "oops"))
-        assertTrue((parseCharge(502, "<html>") as ChargeResult.Failed).error is TillError.BadResponse)
+        assertEquals(ChargeResult.Failed(TillError.Interrupted), parseCharge(502, "<html>"))
     }
     @Test fun postConnectFailureIsInterrupted() {
         assertEquals(ChargeResult.Failed(TillError.Interrupted), client(Fake(ex = PostConnectException(IOException("reset")))).charge(1, "r"))
     }
     @Test fun nonJsonIsBadResponse() {
-        val r = client(Fake(raw(502, "<html>"))).charge(1, "r")
+        val r = client(Fake(raw(404, "<html>"))).charge(1, "r")
         assertTrue((r as ChargeResult.Failed).error is TillError.BadResponse)
+        // At a 5xx the till may still take the sale: outcome unknown (unreadable5xxIsOutcomeUnknown).
+        assertEquals(ChargeResult.Failed(TillError.Interrupted), client(Fake(raw(502, "<html>"))).charge(1, "r"))
+    }
+    /**
+     * A 5xx whose body is not the till's JSON comes from something in front of the till (a
+     * gateway, a proxy that gave up first) while the till may still take the sale: outcome unknown,
+     * as a connection cut after the request was sent. The till's own JSON at a 5xx is its answer,
+     * as before.
+     */
+    @Test fun unreadable5xxIsOutcomeUnknown() {
+        val html = "<html><body><h1>502 Bad Gateway</h1></body></html>"
+        for (body in listOf(html, "", """{"message":"upstream timed out"}""")) {
+            for (status in listOf(500, 502, 503, 504)) {
+                assertEquals("$status $body", ChargeResult.Failed(TillError.Interrupted), parseCharge(status, body))
+            }
+        }
+        assertEquals(ChargeResult.Failed(TillError.Interrupted), client(Fake(raw(504, html))).charge(1, "r"))
+        assertEquals(ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "", 202), parseCharge(202, html))
+        assertEquals(ChargeResult.Declined(ChargeErrorCode.RECOVERING, "d", 503), parseCharge(503, """{"ok":false,"error":"recovering","detail":"d"}"""))
+    }
+    /** An unreadable 3xx or 4xx stays a plain error, as before: the till's own 4xx answers are JSON. */
+    @Test fun unreadable4xxIsStillABadResponse() {
+        for (status in listOf(302, 400, 404, 413)) {
+            val r = parseCharge(status, "<html><body><h1>$status</h1></body></html>")
+            assertTrue("$status", (r as ChargeResult.Failed).error is TillError.BadResponse)
+        }
     }
     @Test fun http500WithOkFalseIsDeclined() {
         val r = client(Fake(raw(500, """{"ok":false,"error":"internal","detail":"boom"}"""))).charge(1, "r") as ChargeResult.Declined

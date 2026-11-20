@@ -76,7 +76,7 @@ class PosFlowTest {
             declined(ChargeErrorCode.NO_EXACT_PLAN) to ErrorKind.NO_EXACT_PLAN,
             declined(ChargeErrorCode.OFFLINE_NO_CHANGE_ROOM) to ErrorKind.OFFLINE_NO_CHANGE_ROOM,
             declined(ChargeErrorCode.UNDECIDED) to ErrorKind.UNDECIDED,
-            declined(ChargeErrorCode.UNKNOWN) to ErrorKind.UNKNOWN,
+            declined(ChargeErrorCode.UNKNOWN) to ErrorKind.TIMEOUT_UNKNOWN, // the till may have taken the sale
             declined(ChargeErrorCode.RECOVERING) to ErrorKind.RECOVERING,
             ChargeResult.Failed(TillError.Unreachable) to ErrorKind.TILL_UNREACHABLE,
             ChargeResult.Failed(TillError.Timeout) to ErrorKind.TIMEOUT_UNKNOWN,
@@ -223,6 +223,46 @@ class PosFlowTest {
         val (f, _) = unresolved(declined(ChargeErrorCode.DECLINED))
         f.dispatch(PosEvent.AbandonPressed); assertTrue(f.state is PosState.Error)
     }
+
+    /**
+     * An answer from the till that does not say whether it took the sale leaves the sale
+     * unresolved, as a lost reply does: "Outcome unknown", no Back, Try again asks the PIN for the
+     * same sale (the same client_ref), and Abandon clears the sale and the amount.
+     */
+    private fun assertUnresolvedSale(answer: ChargeResult) {
+        val (f, fx) = unresolved(answer)
+        val e = f.state as PosState.Error
+        assertEquals("$answer", ErrorKind.TIMEOUT_UNKNOWN, e.kind)
+        assertEquals("$answer", fx.clientRef, e.unresolvedRef); assertFalse("$answer", e.held)
+        assertEquals("$answer", "Outcome unknown", errorCopy(e.kind, e.detail, e.suggestedMsat, unresolved = true).first)
+        f.dispatch(PosEvent.BackPressed); assertEquals("$answer: no Back while the outcome is unknown", e, f.state)
+        assertNull("$answer", f.systemBack())
+        f.dispatch(PosEvent.RetryPressed)
+        assertEquals("$answer", PosState.EnteringPin(5000, fx.clientRef, returnTo = e), f.state)
+        f.typePin()
+        val again = f.dispatch(PosEvent.PinConfirmed).single() as PosEffect.StartCharge
+        assertEquals("$answer: Try again sends the same client_ref", fx.clientRef, again.clientRef)
+        f.dispatch(PosEvent.ChargeDone(again.chargeId, answer))
+        assertEquals("$answer", fx.clientRef, f.unresolvedRef)
+        f.dispatch(PosEvent.AbandonPressed)
+        assertEquals("$answer", PosState.Entering, f.state); assertNull("$answer", f.unresolvedRef)
+        assertEquals("$answer: Abandon clears the amount", 0L, f.pad.sats)
+    }
+
+    /**
+     * A 500 `internal`: the till may have taken the sale (an error after the federation accepted
+     * it, or the till service stopping before it answered).
+     */
+    @Test fun anInternalAnswerFromTheTillIsAnUnresolvedSale() {
+        assertUnresolvedSale(ChargeResult.Declined(ChargeErrorCode.INTERNAL, "the till service stopped before answering", 500))
+    }
+
+    /** A code the app does not know (a newer till, or JSON from something in front of the till), whatever its status. */
+    @Test fun aCodeTheAppDoesNotKnowIsAnUnresolvedSale() {
+        assertUnresolvedSale(ChargeResult.Declined(ChargeErrorCode.UNKNOWN, "", 500))
+        assertUnresolvedSale(ChargeResult.Declined(ChargeErrorCode.fromWire("a_code_from_a_newer_till"), "something new", 409))
+    }
+
     @Test fun pollGenerationSupersedes() {
         val g = PollGeneration()
         val a = g.next(); val b = g.next()
@@ -234,6 +274,20 @@ class PosFlowTest {
 
     private fun local(c: ChargeErrorCode, held: Boolean = false, detail: String = "d", suggested: Long? = null) =
         ChargeResult.Declined(c, detail, 0, suggested, held = held, local = true)
+
+    /**
+     * The rule for an unclear answer is the till's only. A sale the phone's own core may have
+     * signed is held on the phone, so its `internal`, or a code the app does not know, with nothing
+     * held means nothing was signed: a plain error with Back, as before.
+     */
+    @Test fun aLocalInternalRefusalIsNotAnUnclearTillAnswer() {
+        for (c in listOf(ChargeErrorCode.INTERNAL, ChargeErrorCode.UNKNOWN)) {
+            val (f, _) = unresolved(local(c))
+            val e = f.state as PosState.Error
+            assertEquals(c.name, ErrorKind.from(c), e.kind); assertNull(c.name, e.unresolvedRef); assertFalse(c.name, e.held)
+            f.dispatch(PosEvent.BackPressed); assertEquals(c.name, PosState.Entering, f.state)
+        }
+    }
 
     @Test fun aSaleHeldOnThePhoneIsUnresolvedWithoutBackAndTryAgainSendsTheSameRef() {
         val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))

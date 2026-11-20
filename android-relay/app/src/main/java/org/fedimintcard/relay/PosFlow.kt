@@ -11,7 +11,10 @@ enum class ErrorKind {
     /** The phone holds the sale signing: only that card's next tap on this phone finishes it. */
     HELD_ON_PHONE;
 
-    /** Outcome may already have happened: starts an unresolved sale. */
+    /**
+     * The outcome may already have happened (`undecided`, an answer from the till that does not say
+     * whether it took the sale, a sale held on this phone): starts an unresolved sale.
+     */
     val needsSalesCheck: Boolean get() = this == UNDECIDED || this == TIMEOUT_UNKNOWN || this == HELD_ON_PHONE
 
     /**
@@ -406,7 +409,14 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
             state = held
             return
         }
-        val kind = ErrorKind.from(r.code).let { if (it.phoneOnly && !r.local) ErrorKind.UNKNOWN else it }
+        val kind = ErrorKind.from(r.code).let {
+            when {
+                // From the till, a 500 and a code outside its documented list do not say whether it took the sale.
+                !r.local && (r.code == ChargeErrorCode.INTERNAL || r.code == ChargeErrorCode.UNKNOWN) -> ErrorKind.TIMEOUT_UNKNOWN
+                it.phoneOnly && !r.local -> ErrorKind.UNKNOWN
+                else -> it
+            }
+        }
         state = error(s, kind, r.detail, r.suggestedMsat)
     }
 
