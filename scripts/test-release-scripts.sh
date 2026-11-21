@@ -824,11 +824,14 @@ expect "keeps the archive's version and build" is "$(plist_value manageAppVersio
 
 # --- the version numbers in this checkout ----------------------------------------------------
 #
-# No script runs and no scratch tree is made: this case reads this checkout's own project files
-# with the release scripts' own sed expressions. Each app's projects must name one version and one
-# build, and each build number must be above the newest one its store holds (docs/RELEASING.md,
-# Versions). The floors are build numbers uploaded already. A floor is a lower bound, so it stays
-# true after every later upload, and raising it only tightens the check.
+# No script runs and no scratch tree is made: this case reads this checkout's own project files,
+# with the release scripts' own sed expressions where a script reads the file. Each app's projects
+# must name one version and one build, and each build number must be above the newest one its
+# store holds (docs/RELEASING.md, Versions). The floors are those newest builds, as TestFlight and
+# Play's App bundle explorer showed them for the last bump, and they move only with the numbers:
+# each bump sets every floor to the newest build its store holds and every build above it, in one
+# change. A floor raised alone, to the build this checkout names, fails this case; a floor left
+# behind after an upload passes a build its store already holds.
 floor_setup=12      # Setup, on both stores
 floor_pos_ios=4     # POS, App Store Connect
 floor_pos_android=3 # POS, Play
@@ -869,6 +872,11 @@ expect "POS Android: versionCode $pos_android_code is above the floor ($floor_po
   above "$pos_android_code" "$floor_pos_android"
 expect "POS: Android's versionName ($pos_android_version) is the iOS version" \
   is "$pos_android_version" "$pos_version"
+pos_plist=$repo/ios-pos/FedimintCardPOS/Info.plist
+# shellcheck disable=SC2016 # the Info.plist names the build settings, not their values
+expect "POS iOS: Info.plist takes its version and build from the build settings" \
+  is "$(plist_value CFBundleShortVersionString "$pos_plist") $(plist_value CFBundleVersion "$pos_plist")" \
+  '$(MARKETING_VERSION) $(CURRENT_PROJECT_VERSION)'
 provisioner=$repo/apps/provisioner
 provisioner_pbx=$provisioner/ios/FedimintProvisioner.xcodeproj/project.pbxproj
 provisioner_version=$(package_field version) provisioner_build=$(package_field provisionerBuild)
@@ -882,6 +890,9 @@ expect "Setup: every configuration in the Xcode project has that build" \
   pbx_agrees "$provisioner_pbx" CURRENT_PROJECT_VERSION "$provisioner_build"
 expect "Setup: Info.plist states that version" \
   is "$(plist_value CFBundleShortVersionString "$provisioner/ios/FedimintProvisioner/Info.plist")" "$provisioner_version"
+# shellcheck disable=SC2016 # the Info.plist names the build setting, not its value
+expect "Setup: Info.plist takes its build from the build settings" \
+  is "$(plist_value CFBundleVersion "$provisioner/ios/FedimintProvisioner/Info.plist")" '$(CURRENT_PROJECT_VERSION)'
 expect "Setup: build $provisioner_build is above the floor ($floor_setup)" \
   above "$provisioner_build" "$floor_setup"
 
