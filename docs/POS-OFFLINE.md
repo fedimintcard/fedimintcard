@@ -71,9 +71,9 @@ first) is not for such a sale. A `charge` that throws is retried locally too, wi
 it holds `signing` goes the offline way even while the registry and the federation answer: the
 card that began the charge finishes it (answered as the sale, `offline: true`; the sender's
 next pass, every 30 s, reports it), and another card is `undecided` with nothing signed. A
-`POST /v1/charge` of that card under another `client_ref` settles such a charge before anything
-else: finished and reported in the same tap, or dropped or set aside as at an offline tap
-(`docs/TILL-API.md`).
+`POST /v1/charge` of that card under another `client_ref`, or none, settles such a charge
+before anything else: finished and reported in the same tap, or dropped or set aside as at an
+offline tap (`docs/TILL-API.md`).
 
 **Caps and the attacker.** The kit's caps are enforced by the core; an expired kit stops offline
 acceptance; the card's own daily limit applies as with any till. Double spends across phones and

@@ -161,20 +161,21 @@ path (`abandoned` in the queue, kept for the operator: the notes the card signed
 spent on the card, and those it never signed pay again); nothing was charged for it, and the tap
 goes on as a new charge, for the same `client_ref` too. It is never sent, so the slots the card
 spent or opened for it are stranded slots (above): held, reported, and released after the grace.
-At a `POST /v1/charge` of that card under another `client_ref`, the till first settles every
-charge of that card left `signing`, before it reports, attaches or plans. It reads each input slot
-(`GET_SLOT`). A charge the card signed in part or in whole is finished as at an offline tap (SIGN
-answers the stored signature of a spent slot and signs a slot still holding its note, so the tap
-needs the holder's PIN), queued, reported in the same tap and recorded as an `offline` sale. A
-charge none of whose inputs the card signed is dropped. One that can never be finished is set
-aside as above. The slots of a dropped or set aside charge are stranded slots, held and reported
-in the same tap. A failure of this step is logged and the tap goes on, except a PIN the card
-refuses (`wrong_pin`, `pin_blocked`), which ends it first. A pay's charge (`POST /v1/pay`) is
-taken online only and settles nothing: until the card's next `POST /v1/charge`, a pay on that
-card can still plan from a note such a charge signed, or put change into its CHANGE slots, as
-before. A balance, top-up or issue tap sends no PIN and settles nothing: until the card's next
-`POST /v1/charge` the signed notes of such a charge still count in `live_msat`, and a top-up load,
-which reads no slot state, may be offered its CHANGE slots.
+At a `POST /v1/charge` of that card under another `client_ref`, or none, the till first settles
+every charge of that card left `signing`, before it reports, attaches or plans. It reads each
+input slot (`GET_SLOT`). A charge the card signed in part or in whole is finished as at an offline
+tap (SIGN answers the stored signature of a spent slot and signs a slot still holding its note, so
+the tap needs the holder's PIN), queued, reported in the same tap and recorded as an `offline`
+sale. A charge none of whose inputs the card signed is dropped. One that can never be finished is
+set aside as above. The slots of a dropped or set aside charge are stranded slots, held and
+reported in the same tap. A failure of this step is logged and the tap goes on, except a PIN the
+card refuses (`wrong_pin`, `pin_blocked`), which ends it first. A pay's charge (`POST /v1/pay`) is
+taken online only and settles nothing: until the card's next `POST /v1/charge`, a pay on that card
+can still plan from a note such a charge signed, which the card will not sign again (that pay is
+refused 500 `internal` with `state: "not_charged"`, nothing charged), or put change into its
+CHANGE slots. A balance, top-up or issue tap sends no PIN and settles nothing: until the card's
+next `POST /v1/charge` the signed notes of such a charge still count in `live_msat`, and a top-up
+load, which reads no slot state, may be offered its CHANGE slots.
 Notes the till's checks refuse (no denomination of the federation's, or a federation signature
 that does not verify) are skipped; when the rest do not pay, the charge is
 `offline_note_invalid` (403), not `insufficient`.
