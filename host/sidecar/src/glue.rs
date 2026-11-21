@@ -753,12 +753,21 @@ impl CardWallet {
 
     /// The federation accepted `txid`: wait for the global confirmation and mark the card notes it
     /// spent. Notes stay live (and are re-checked by `balance`) if the confirmation does not come.
+    /// An offline charge's inputs are `pending` under it here, as the registry marked them at its
+    /// report: they are spent too, or the collection of outputs takes them for outputs of `txid`
+    /// once its record is gone, and waits out its timeout on each.
     async fn confirm_inputs_spent(&mut self, txid: TransactionId, inputs: &[String], timeout: Duration) -> Result<()> {
         let confirmed = tokio::time::timeout(timeout, self.wallet.client.api().await_transaction(txid)).await.is_ok();
         for nonce_h in inputs {
             let spent = confirmed || self.is_spent(nonce_from_hex(nonce_h)?).await.unwrap_or(false);
             if spent {
-                for r in self.store.state.notes.iter_mut().filter(|r| &r.nonce == nonce_h && r.status == NoteStatus::Live) {
+                for r in self
+                    .store
+                    .state
+                    .notes
+                    .iter_mut()
+                    .filter(|r| &r.nonce == nonce_h && matches!(r.status, NoteStatus::Live | NoteStatus::Pending))
+                {
                     r.status = NoteStatus::Spent;
                 }
             }

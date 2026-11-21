@@ -1030,7 +1030,9 @@ pub async fn charge_job(
 /// ([`crate::offline::charge`]); while both answer, charges taken offline for any card are reported
 /// first, so the registry knows which notes they spent. A sale whose offline charge a card left
 /// signing here goes the offline way even while both answer ([`finish_left_signing`]): that
-/// card's tap finishes the charge it began, and another card is `undecided`.
+/// card's tap finishes the charge it began, and another card is `undecided`. A charge the card in
+/// the field left signing here under another `client_ref` is settled first, with the holder's PIN
+/// ([`crate::offline::settle_left_signing`]).
 pub async fn charge_job_with(
     cw: &mut CardWallet,
     ops: Option<&Ops>,
@@ -1079,6 +1081,16 @@ pub async fn charge_job_for(
         }
         if let Some(held) = left_signing(off, client_ref.as_deref()) {
             return finish_left_signing(cw, ops, off, price, client_ref, sales, held).await;
+        }
+        // Before the report, so a charge finished here goes out in this tap, and before the
+        // attach, whose hold of stranded slots must not find this card's charge still `signing`.
+        let left = crate::offline::settle_left_signing(cw, off);
+        record_finished_sales(sales, &left.finished);
+        if let Some(e) = left.error {
+            if crate::ops::pin_refused(&e) {
+                return error_reply(&e);
+            }
+            tracing::warn!("a charge a card left signing was not settled at this tap: {e:#}");
         }
         let mut sent = crate::offline::Sent::default();
         crate::offline::report(off, ops, None, &mut sent).await;
@@ -1198,6 +1210,39 @@ async fn offline_charge(
     let mut body = charge_body(&rec, &rec.warnings, rec.duration_ms);
     body["fee_margin_msat"] = json!(taken.fee_margin_msat);
     Reply::ok(body)
+}
+
+/// Record the sale of each charge a card left `signing` that this online charge finished
+/// ([`crate::offline::settle_left_signing`]), as [`offline_charge`] records the sale of a charge it
+/// takes (`offline`, its notes still to collect), before the charge is reported or the tap's own
+/// sale is planned: a repeat of its `client_ref` is then answered from the ledger ([`replay`]),
+/// never charged again, and the charge's resolution only brings the sale up to date. `append`
+/// answers a sale already recorded. A failure is logged: the charge is queued either way.
+fn record_finished_sales(sales: &Mutex<SalesStore>, finished: &[crate::offline::OfflineCharge]) {
+    for c in finished {
+        let rec = SaleRec {
+            id: 0,
+            ts_unix_ms: c.ts_unix_ms,
+            price_msat: c.price_msat,
+            received_msat: 0,
+            overpaid_msat: c.overpay_msat,
+            fees_msat: c.fees_msat,
+            txid: c.txid.clone(),
+            inputs: c.inputs.iter().map(|i| SlotMsat { slot: i.slot, msat: i.amount_msat }).collect(),
+            change: c.change.iter().map(|ch| SlotMsat { slot: ch.slot, msat: ch.amount_msat }).collect(),
+            collection_pending: true,
+            client_ref: c.client_ref.clone(),
+            duration_ms: 0,
+            warnings: vec![],
+            offline: true,
+            double_spent: false,
+            rejected: false,
+            short_id: Some(c.short_id.clone()),
+        };
+        if let Err(e) = sales.lock().unwrap().append(rec) {
+            tracing::warn!("charge {}, finished at an online charge, not recorded in sales.json: {e:#}", c.txid);
+        }
+    }
 }
 
 /// Bring the sales of offline charges in line with what the sender found.

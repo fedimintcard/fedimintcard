@@ -110,7 +110,8 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
   registry's certificate key is kept as `cert_key` in `till-ops.json`. Back up both with the
   wallet: the queue is the merchant's money until it is sent. At an online tap of a 3.0 card the
   till first sends the registry's releases (§ 6) for charges the federation rejected or the
-  registry refused as double spends, logging any the card does not take.
+  registry refused as double spends, logging any the card does not take, and, at a
+  `POST /v1/charge`, finishes, drops or sets aside the charges a pulled card left `signing`.
 
 ## Findings (step 5 transaction)
 

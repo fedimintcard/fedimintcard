@@ -13,19 +13,20 @@
 //! Write order: the queue entry with every secret (blinding keys, the till notes' keys) is saved
 //! (`signing`) before the card is told of change (`SET_CHANGE`) or signs; the signed bytes are saved
 //! (`queued`) before the point of sale is answered. Nothing the card signed is ever lost: an entry
-//! left `signing` by a crash is finished at the card's next offline tap from the card's own answer
-//! (a SPENT slot repeats its stored signature for the same hash).
+//! left `signing` by a crash is finished at the card's next offline tap, or at its next online
+//! charge ([`settle_left_signing`]), from the card's own answer (a SPENT slot repeats its stored
+//! signature for the same hash).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use fedimint_card_pos_core::charge::{Env, Pin, TillOuts, mint_decoders};
+use fedimint_card_pos_core::charge::{Env, Pin, TillOuts, mint_decoders, resume_signing};
 use serde_json::{Value, json};
 
 use crate::glue::{CardWallet, on_card};
-use crate::ops::{OfflineAnswer, Ops, OpsError};
+use crate::ops::{OfflineAnswer, Ops, OpsError, short_id_of};
 use crate::state::{NoteRec, NoteStatus, PendingTx, StateStore};
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old paths.
@@ -194,6 +195,81 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
     };
     let card = cw.card.as_mut();
     on_card(|| fedimint_card_pos_core::charge::charge(card, &off.queue, &env, price, client_ref))
+}
+
+/// What [`settle_left_signing`] did.
+#[derive(Debug, Default)]
+pub struct LeftSigning {
+    /// The charges it finished: `queued` now, for the [`report`] that follows.
+    pub finished: Vec<OfflineCharge>,
+    /// What stopped it, if anything did: [`crate::ops::pin_refused`] tells a PIN the card refused.
+    pub error: Option<anyhow::Error>,
+}
+
+/// At an online charge, before the till reports, attaches the card or plans: settle the charges
+/// the card in `cw.card` left `signing` here, as its next offline tap would ([`resume_signing`]).
+/// One the card signed in part or in whole is finished (SIGN answers a spent slot's stored
+/// signature and signs a slot that still holds its note) and queued. One none of whose inputs the
+/// card signed is dropped, and one that can never be finished is `abandoned`: the slots of either
+/// are stranded slots, which [`Ops::attach`] holds and the tap reports. Left `signing`, the charge
+/// would count as known there and none of its slots would be held, so a sale could plan from the
+/// note the card signed for it, which the card will not sign again, or put change into its CHANGE
+/// slots.
+///
+/// SIGN needs the holder's PIN, even for a stored signature: with none in the job (`cw.pin`)
+/// nothing is sent to the card, and `CARD_PIN` is never tried. Another card's charges are left
+/// alone. The card hears `GET_PUB` only while the queue holds a `signing` charge, and
+/// `VERIFY_PIN`, `GET_SLOT` and `SIGN` only when one is this card's.
+pub fn settle_left_signing(cw: &mut CardWallet, off: &Offline) -> LeftSigning {
+    let mut out = LeftSigning::default();
+    let any_signing = off.queue.lock().unwrap().file.charges.iter().any(|c| c.state == ChargeState::Signing);
+    if !any_signing || cw.pin.is_none() {
+        return out;
+    }
+    let short_id = match on_card(|| cw.card.get_pub(0)) {
+        Ok(pk) => short_id_of(&pk),
+        Err(e) => {
+            out.error = Some(e.context("reading the card's slot 0 key"));
+            return out;
+        }
+    };
+    let left: Vec<String> = off
+        .queue
+        .lock()
+        .unwrap()
+        .file
+        .charges
+        .iter()
+        .filter(|c| c.state == ChargeState::Signing && c.short_id == short_id)
+        .map(|c| c.txid.clone())
+        .collect();
+    if left.is_empty() {
+        return out;
+    }
+    if let Err(e) = cw.verify_pin_session() {
+        out.error = Some(e);
+        return out;
+    }
+    let decoders = mint_decoders(cw.wallet.mint_id);
+    let card = cw.card.as_mut();
+    if let Err(e) = on_card(|| resume_signing(card, &off.queue, &decoders, now_ms(), &short_id)) {
+        out.error = Some(e);
+    }
+    // Read back from the queue: a charge finished before a failure is queued all the same.
+    out.finished = off
+        .queue
+        .lock()
+        .unwrap()
+        .file
+        .charges
+        .iter()
+        .filter(|c| c.state == ChargeState::Queued && left.contains(&c.txid))
+        .cloned()
+        .collect();
+    for c in &out.finished {
+        tracing::info!("charge {} of card {short_id}, left signing, finished at an online charge", c.txid);
+    }
+    out
 }
 
 // ------------------------------------------------------------------ the sender

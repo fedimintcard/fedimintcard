@@ -195,7 +195,7 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
 
     // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
     // stored signatures, never a second transaction. Another card for it waits for the first.
-    let resumed = match resume_signing(card, queue, env, &short_id) {
+    let resumed = match resume_signing(card, queue, env.decoders, env.now_ms, &short_id) {
         Ok(r) => r,
         Err(e) => return Err(undecided_if_held(e, queue, client_ref)),
     };
@@ -666,8 +666,16 @@ fn settle_failed_signing(card: &mut dyn Card, queue: &Mutex<Queue>, entry: &Offl
 /// neither spent for it nor still holding its note (spent by another transaction since, or
 /// re-keyed), is [`ChargeState::Abandoned`] and the charge goes on; its inputs the card never
 /// signed still hold their notes, which leave the spent list and pay again. Needs the PIN
-/// session. Answers the entries finished.
-fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id: &str) -> Result<Vec<OfflineCharge>> {
+/// session. Answers the entries finished. `decoders` decode the queued transactions
+/// ([`mint_decoders`]); `now_ms` is when a finished one was signed. A till also calls it at an
+/// online charge.
+pub fn resume_signing(
+    card: &mut dyn Card,
+    queue: &Mutex<Queue>,
+    decoders: &ModuleDecoderRegistry,
+    now_ms: u64,
+    short_id: &str,
+) -> Result<Vec<OfflineCharge>> {
     let left: Vec<OfflineCharge> =
         lock(queue).file.charges.iter().filter(|c| c.state == ChargeState::Signing && c.short_id == short_id).cloned().collect();
     let mut done = vec![];
@@ -710,14 +718,14 @@ fn resume_signing(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, short_id
         }
         let sigs = sign_inputs(card, &keys, digest)?;
         let mut tx =
-            Transaction::consensus_decode_hex(&e.unsigned_hex, env.decoders).map_err(|x| anyhow!("decoding a queued transaction: {x}"))?;
+            Transaction::consensus_decode_hex(&e.unsigned_hex, decoders).map_err(|x| anyhow!("decoding a queued transaction: {x}"))?;
         tx.signatures = TransactionSignature::NaiveMultisig(sigs);
         let hex_tx = tx.consensus_encode_to_hex();
         let c = lock(queue).commit(|f| {
             let c = f.charges.iter_mut().find(|c| c.txid == e.txid)?;
             c.state = ChargeState::Queued;
             c.signed_hex = Some(hex_tx);
-            c.signed_at = env.now_ms.max(1);
+            c.signed_at = now_ms.max(1);
             Some(c.clone())
         })?;
         tracing::info!("offline charge {} finished from the card's stored signatures", e.txid);
