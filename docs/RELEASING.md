@@ -46,6 +46,13 @@ Each store refuses a build number it already has, so each new number must be abo
 the store holds: look in TestFlight (App Store Connect) and in Play Console's App bundle explorer
 before the bump merges.
 
+The bump also sets the floors in `scripts/test-release-scripts.sh` (`floor_setup`, `floor_pos_ios`
+and `floor_pos_android`) to those newest builds, in the same change as the numbers. `floor_setup` is
+the higher of the two stores' newest Setup builds, because one build number goes to both. The
+suite's last case checks each build against its floor (Tests): a floor left behind lets it pass a
+build number the store already holds, and a floor raised without the numbers fails it, because the
+floor then equals the build the checkout names.
+
 ## iOS: POS app, TestFlight
 
 ```sh
@@ -70,9 +77,13 @@ certificate from the login keychain. The script needs Xcode and the Rust targets
 
 Artifacts:
 
-- `dist/ios/FedimintCardPOS-<version>-<build>.xcarchive`, the archive; its path is the script's
-  last line.
-- `dist/ios/export-<version>-<build>/`, the export's summary and logs.
+- `dist/ios/FedimintCardPOS-<version>-<build>.xcarchive`, the archive; its path is the script's last
+  line. After the upload its `Info.plist` records the build (`uploadedBuildNumber`).
+
+The upload leaves no export folder. xcodebuild gets `dist/ios/export-<version>-<build>` as its
+export path and writes nothing there when the export's destination is `upload`: the 1.0.0 uploads,
+made with Xcode 26.6, created no folder. The export's logs are in a `.xcdistributionlogs` folder in
+the temporary directory, and xcodebuild prints its path when the export starts.
 
 ## iOS: Setup app, TestFlight
 
@@ -124,11 +135,14 @@ App Store Connect. The script needs Xcode, CocoaPods, yarn and Node 22 or newer.
 
 Artifacts:
 
-- `dist/ios/FedimintProvisioner-<version>-<build>.xcarchive`, the archive; its path is the last
-  line of `build`.
+- `dist/ios/FedimintProvisioner-<version>-<build>.xcarchive`, the archive; its path is the last line
+  of `build`. After the upload its `Info.plist` records the build (`uploadedBuildNumber`); that
+  record is what a second `upload` refuses.
 - `dist/ios/FedimintProvisioner-<version>-<build>.commit`, the commit it was built from.
-- `dist/ios/export-FedimintProvisioner-<version>-<build>/`, the export's summary and logs; its path
-  is the last line of `upload`.
+
+As with the POS app, the upload leaves no export folder. The last line of `upload` is the export
+path it gave xcodebuild, `dist/ios/export-FedimintProvisioner-<version>-<build>`; no folder exists
+there afterwards.
 
 App Store Connect processes an upload before TestFlight offers it. Each app's `Info.plist` answers
 export compliance. What to Test and the external testing groups are set in App Store Connect; the
@@ -198,6 +212,7 @@ Where the bump changes an app's version, the first iOS build of that version goe
 `scripts/test-release-scripts.sh` runs the three scripts (`scripts/release-android.sh`,
 `ios-pos/scripts/release-ios.sh` and `apps/provisioner/scripts/release-ios.sh`) against stand-ins
 for Gradle, xcodebuild, the core build, the Keychain, node, yarn and CocoaPods, so it builds, signs
-and uploads nothing. The Setup cases run in a scratch git checkout. CI runs the suite on macOS,
-where the scripts get `/bin/bash` 3.2 and the BSD tools as on the release Mac, and on Linux after
-`shellcheck`.
+and uploads nothing. The Setup cases run in a scratch git checkout. The suite's last case runs no
+script: it reads this checkout's own version files, and checks that they agree with each other and
+that each build is above its floor (Versions). CI runs the suite on macOS, where the scripts get
+`/bin/bash` 3.2 and the BSD tools as on the release Mac, and on Linux after `shellcheck`.

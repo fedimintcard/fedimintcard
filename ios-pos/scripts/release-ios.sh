@@ -10,7 +10,9 @@
 #      ios-pos/project.yml; the Xcode project must carry the same values (xcodegen generate), or
 #      the script stops first.
 #   3. xcodebuild -exportArchive signs the archive for the App Store with ios-pos/ExportOptions.plist
-#      and uploads it. Its summary and logs go to dist/ios/export-<version>-<build>.
+#      and uploads it. dist/ios/export-<version>-<build> is its export path, where an upload writes
+#      nothing: the archive's Info.plist records the upload, and xcodebuild names the folder of its
+#      logs when the export starts.
 #
 # Both xcodebuild runs authenticate with an App Store Connect API key: ASC_KEY_PATH (the key's .p8
 # file), ASC_KEY_ID and ASC_ISSUER_ID. With the key, automatic signing fetches the archive's
