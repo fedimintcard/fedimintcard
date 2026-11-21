@@ -822,6 +822,80 @@ expect "destination upload" is "$(plist_value destination "$export_options")" up
 expect "team H7UAM79QQP" is "$(plist_value teamID "$export_options")" H7UAM79QQP
 expect "keeps the archive's version and build" is "$(plist_value manageAppVersionAndBuildNumber "$export_options")" false
 
+# --- the version numbers in this checkout ----------------------------------------------------
+#
+# No script runs and no scratch tree is made: this case reads this checkout's own project files,
+# with the release scripts' own sed expressions where a script reads the file. Each app's projects
+# must name one version and one build, and each build number must be above the newest one its
+# store holds (docs/RELEASING.md, Versions). The floors are those newest builds, as TestFlight and
+# Play's App bundle explorer showed them for the last bump, and they move only with the numbers:
+# each bump sets every floor to the newest build its store holds and every build above it, in one
+# change. A floor raised alone, to the build this checkout names, fails this case; a floor left
+# behind after an upload passes a build its store already holds.
+floor_setup=12      # Setup, on both stores
+floor_pos_ios=4     # POS, App Store Connect
+floor_pos_android=3 # POS, Play
+yml_setting() { # name: its values in ios-pos/project.yml, read as the POS iOS script reads them
+  sed -nE 's/^[[:space:]]+'"$1"':[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' "$repo/ios-pos/project.yml"
+}
+pbx_agrees() { # pbxproj name value: every configuration sets name to value, as the POS iOS script checks
+  local lines
+  lines=$(sed -nE 's/^[[:space:]]+('"$2"' = .*)$/\1/p' "$1")
+  [[ -n $lines && -z $(grep -vxF "$2 = $3;" <<<"$lines" || true) ]]
+}
+gradle_version() { # gradle file: "versionName versionCode", read as scripts/release-android.sh reads them
+  sed -nE 's/.*versionName[ =]+"([^"]+)".*/\1/p; s/.*versionCode[ =]+([0-9]+).*/\1/p' "$1" |
+    paste -sd' ' - | awk '{print $2, $1}'
+}
+package_field() { # name: its values in apps/provisioner/package.json, read as the Setup iOS script reads them
+  sed -nE 's/^[[:space:]]*"'"$1"'":[[:space:]]*"?([^",[:space:]]+)"?,?[[:space:]]*$/\1/p' \
+    "$repo/apps/provisioner/package.json"
+}
+once_each() { # values...: each is one line, and not empty
+  local value
+  for value in "$@"; do [[ -n $value && $value != *$'\n'* ]] || return 1; done
+}
+above() { [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 > $2)); } # number floor
+cases=$((cases + 1))
+echo "# versions: each app's project files name one version and build, and each build is above its floor"
+pos_version=$(yml_setting MARKETING_VERSION) pos_build=$(yml_setting CURRENT_PROJECT_VERSION)
+pos_pbx=$repo/ios-pos/FedimintCardPOS.xcodeproj/project.pbxproj
+read -r pos_android_version pos_android_code <<<"$(gradle_version "$repo/android-relay/app/build.gradle.kts")"
+expect "POS iOS: project.yml sets one version ($pos_version) and one build ($pos_build)" \
+  once_each "$pos_version" "$pos_build"
+expect "POS iOS: every configuration in the Xcode project has that version" \
+  pbx_agrees "$pos_pbx" MARKETING_VERSION "$pos_version"
+expect "POS iOS: every configuration in the Xcode project has that build" \
+  pbx_agrees "$pos_pbx" CURRENT_PROJECT_VERSION "$pos_build"
+expect "POS iOS: build $pos_build is above the floor ($floor_pos_ios)" above "$pos_build" "$floor_pos_ios"
+expect "POS Android: versionCode $pos_android_code is above the floor ($floor_pos_android)" \
+  above "$pos_android_code" "$floor_pos_android"
+expect "POS: Android's versionName ($pos_android_version) is the iOS version" \
+  is "$pos_android_version" "$pos_version"
+pos_plist=$repo/ios-pos/FedimintCardPOS/Info.plist
+# shellcheck disable=SC2016 # the Info.plist names the build settings, not their values
+expect "POS iOS: Info.plist takes its version and build from the build settings" \
+  is "$(plist_value CFBundleShortVersionString "$pos_plist") $(plist_value CFBundleVersion "$pos_plist")" \
+  '$(MARKETING_VERSION) $(CURRENT_PROJECT_VERSION)'
+provisioner=$repo/apps/provisioner
+provisioner_pbx=$provisioner/ios/FedimintProvisioner.xcodeproj/project.pbxproj
+provisioner_version=$(package_field version) provisioner_build=$(package_field provisionerBuild)
+expect "Setup: package.json sets one version ($provisioner_version) and one build ($provisioner_build)" \
+  once_each "$provisioner_version" "$provisioner_build"
+expect "Setup: Gradle has that version and build" \
+  is "$(gradle_version "$provisioner/android/app/build.gradle")" "$provisioner_version $provisioner_build"
+expect "Setup: every configuration in the Xcode project has that version" \
+  pbx_agrees "$provisioner_pbx" MARKETING_VERSION "$provisioner_version"
+expect "Setup: every configuration in the Xcode project has that build" \
+  pbx_agrees "$provisioner_pbx" CURRENT_PROJECT_VERSION "$provisioner_build"
+expect "Setup: Info.plist states that version" \
+  is "$(plist_value CFBundleShortVersionString "$provisioner/ios/FedimintProvisioner/Info.plist")" "$provisioner_version"
+# shellcheck disable=SC2016 # the Info.plist names the build setting, not its value
+expect "Setup: Info.plist takes its build from the build settings" \
+  is "$(plist_value CFBundleVersion "$provisioner/ios/FedimintProvisioner/Info.plist")" '$(CURRENT_PROJECT_VERSION)'
+expect "Setup: build $provisioner_build is above the floor ($floor_setup)" \
+  above "$provisioner_build" "$floor_setup"
+
 echo
 if ((failed)); then
   echo "$failed failed, in $cases cases" >&2
