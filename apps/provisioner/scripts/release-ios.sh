@@ -32,8 +32,10 @@
 # upload takes an archive build made (the .commit beside it says so) of this app that records no
 # upload of its build, prints what it will upload and from which commit, then runs xcodebuild
 # -exportArchive with apps/provisioner/ios/ExportOptions.plist, which signs the archive for the App
-# Store and uploads it. The last line printed is the export's directory,
-# dist/ios/export-FedimintProvisioner-<version>-<build>, with its summary and logs.
+# Store and uploads it. The last line printed is the export path xcodebuild was given,
+# dist/ios/export-FedimintProvisioner-<version>-<build>. An upload writes nothing there: the
+# archive's Info.plist records the upload, and xcodebuild names the folder of its logs when the
+# export starts.
 #
 # Both runs authenticate xcodebuild with an App Store Connect API key: ASC_KEY_PATH (the key's .p8
 # file), ASC_KEY_ID and ASC_ISSUER_ID. The script never opens the key file; its path and the two IDs
