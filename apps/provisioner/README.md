@@ -122,7 +122,7 @@ the engine in the bundle.
 
 ## Status
 
-Experimental. The app programs a card and loads value onto it; the card refuses
+Experimental. The app programs a card, which leaves it empty; the card refuses
 to sign without the PIN set here and enforces the offline limit set here; it has no
 owner key. The app makes no claim to custody.
 

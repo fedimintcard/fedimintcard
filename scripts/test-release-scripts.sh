@@ -834,7 +834,7 @@ expect "keeps the archive's version and build" is "$(plist_value manageAppVersio
 # each bump sets every floor to the newest build its store holds and every build above it, in one
 # change. A floor raised alone, to the build this checkout names, fails this case; a floor left
 # behind after an upload passes a build its store already holds.
-floor_setup=12      # Setup, on both stores
+floor_setup=13      # Setup, on both stores
 floor_pos_ios=4     # POS, App Store Connect
 floor_pos_android=3 # POS, Play
 yml_setting() { # name: its values in ios-pos/project.yml, read as the POS iOS script reads them
