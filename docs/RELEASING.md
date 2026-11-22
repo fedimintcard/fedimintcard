@@ -131,18 +131,18 @@ apps/provisioner/scripts/release-ios.sh upload dist/ios/FedimintProvisioner-<ver
 It refuses an archive without the `.commit` a build writes, an archive of another app, and an
 archive that records an upload of its build. It prints the bundle id, version, build and commit it
 will upload, then exports with `apps/provisioner/ios/ExportOptions.plist` and uploads the build to
-App Store Connect. The script needs Xcode, CocoaPods, yarn and Node 22 or newer.
+App Store Connect. Its last line is the path of the archive it uploaded. The script needs Xcode,
+CocoaPods, yarn and Node 22 or newer.
 
 Artifacts:
 
 - `dist/ios/FedimintProvisioner-<version>-<build>.xcarchive`, the archive; its path is the last line
-  of `build`. After the upload its `Info.plist` records the build (`uploadedBuildNumber`); that
-  record is what a second `upload` refuses.
+  of `build`, and of `upload` once the upload is done. After the upload its `Info.plist` records the
+  build (`uploadedBuildNumber`); that record is what a second `upload` refuses.
 - `dist/ios/FedimintProvisioner-<version>-<build>.commit`, the commit it was built from.
 
-As with the POS app, the upload leaves no export folder. The last line of `upload` is the export
-path it gave xcodebuild, `dist/ios/export-FedimintProvisioner-<version>-<build>`; no folder exists
-there afterwards.
+As with the POS app, the upload leaves no export folder. xcodebuild gets
+`dist/ios/export-FedimintProvisioner-<version>-<build>` as its export path and writes nothing there.
 
 App Store Connect processes an upload before TestFlight offers it. Each app's `Info.plist` answers
 export compliance. What to Test and the external testing groups are set in App Store Connect; the
