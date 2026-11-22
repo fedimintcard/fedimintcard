@@ -98,14 +98,14 @@ export const LOAD_LINE = `${LOAD_FILE_SHA256.slice(0, 8)} · ${LOAD_FILE_SIZE} b
 
 /**
  * These bytes are not a custody claim. The README's warning, repeated in About
- * (Guideline 2.3.3): the app programs a card and loads value; it does not store
- * or secure funds beyond that.
+ * (Guideline 2.3.3): the app programs a card and sets its PIN and daily limit;
+ * a card leaves it empty, and the app stores and secures no funds.
  */
 export const EXPERIMENTAL_WARNING =
-  'Experimental software. This app installs card software and loads value ' +
-  'onto a card. The card refuses to sign without the PIN set here; it has no ' +
-  'spending limits, no owner key and no note list, and this app makes no claim ' +
-  'to custody.';
+  'Experimental software. This app installs card software on a card and sets ' +
+  'its PIN and optional daily spending limit. Cards leave this app empty: a ' +
+  'holder loads a card later from a wallet or at a till. The card signs a ' +
+  'payment only after the PIN set here.';
 
 /* ------------------------------------------------------------------------- */
 /* Runtime settings. Persisted, editable in Settings.                         */
