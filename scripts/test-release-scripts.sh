@@ -418,7 +418,8 @@ if [[ -n ${FAKE_POD_COMMITS:-} ]]; then '"$fixture_commit"'; fi
 exit "${FAKE_POD_STATUS:-0}"'
   # xcodebuild: archive writes the archive FAKE_* describe, and FAKE_ARCHIVE_TOUCHES (a tracked file
   # it appends to) or FAKE_ARCHIVE_COMMITS changes the checkout while it runs; -exportArchive prints
-  # a marker where the real one uploads, or fails with FAKE_EXPORT_STATUS.
+  # a marker where the real one uploads and writes nothing, as an upload leaves no export folder, or
+  # fails with FAKE_EXPORT_STATUS.
   stand_in "$c/bin/xcodebuild" 'echo "xcodebuild $* (in $PWD)" >>"$FAKE_LOG"
 archive= export_path=
 while (($#)); do
@@ -427,7 +428,6 @@ while (($#)); do
 done
 if [[ -n $export_path ]]; then
   if [[ -n ${FAKE_EXPORT_STATUS:-} ]]; then exit "$FAKE_EXPORT_STATUS"; fi
-  mkdir -p "$export_path"
   echo "xcodebuild stand-in: EXPORTED AND UPLOADED"
   exit 0
 fi
@@ -800,15 +800,17 @@ expect "says what it will upload" test -n "$will"
 expect "says it before the upload" test "${will:-999}" -lt "${uploaded:-0}"
 expect "exports and uploads that archive with the API key, and runs nothing else" is "$(cat "$c/log")" \
   "xcodebuild -exportArchive -archivePath $c/repo/$setup_archive -exportOptionsPlist apps/provisioner/ios/ExportOptions.plist -exportPath dist/ios/export-FedimintProvisioner-9.8.7-65 -allowProvisioningUpdates -authenticationKeyPath $c/keys/AuthKey_TEST.p8 -authenticationKeyID TESTKEYID -authenticationKeyIssuerID test-issuer-id (in $c/repo)"
-expect "last line is the export directory" is "$(last_line "$c/out")" "$c/repo/dist/ios/export-FedimintProvisioner-9.8.7-65"
+expect "last line is the archive it uploaded" is "$(last_line "$c/out")" "$c/repo/$setup_archive"
+expect "leaves nothing at the export path" \
+  test ! -e "$c/repo/dist/ios/export-FedimintProvisioner-9.8.7-65"
 prints_no_asc_value
 
-new_setup_case "setup ios upload: a failed export passes xcodebuild's status on and prints no export directory"
+new_setup_case "setup ios upload: a failed export passes xcodebuild's status on and prints no archive path"
 setup_built
 setup_ios "${asc[@]}" FAKE_EXPORT_STATUS=70 -- upload "repo/$setup_archive"
 expect "fails with xcodebuild's status" is "$status" 70
 expect "said what it would upload" has "$c/out" "will upload $setup_id 9.8.7 (65)"
-expect "prints no export directory" lacks "$c/out" "$c/repo/dist/ios/export-FedimintProvisioner-9.8.7-65"
+expect "prints no archive path" lacks "$c/out" "$c/repo/$setup_archive"
 expect "uploads nothing" lacks "$c/out" "EXPORTED AND UPLOADED"
 
 cases=$((cases + 1))
