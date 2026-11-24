@@ -58,17 +58,21 @@ class BridgeHttpTest {
         String gen = apdu("b0100000");
         assertEquals(68, gen.length());
         assertTrue(gen.endsWith("9000"));
-        // 3.0 signs only a slot holding a note: 1000 msat, then 48 bytes standing for its signature
-        assertEquals("9000", apdu("b0140000" + "38" + "00000000000003e8" + "aa".repeat(48)));
         byte[] pub = Bip340.hex(gen.substring(0, 64));
         byte[] msg = new byte[32];
         for (int i = 0; i < 32; i++) msg[i] = (byte) (i * 5);
         String sign = "b0120000" + "20" + Bip340.hex(msg);
-        // The applet gates SIGN on a same-session VERIFY_PIN: no PIN set is 6984, set but unverified 6A94.
+        // The applet gates SIGN on the PIN in this selection: no PIN set is 6984, set but not given 6A94.
         assertEquals("6984", apdu(sign));
+        // SET_PIN takes a card with the registry key (here P-256's generator, a stand-in) and no value
+        assertEquals("9000", apdu("b0340000" + "41" + "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+            + "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"));
         assertEquals("9000", apdu("b04100000431323334"));
+        assertEquals("03009000", apdu("00a4040008f0464d4341524401")); // a new selection: the PIN is not given
         assertEquals("6a94", apdu(sign));
         assertEquals("9000", apdu("b04000000431323334"));
+        // the card signs only a slot holding a note: 1000 msat, then 48 bytes standing for its signature
+        assertEquals("9000", apdu("b0140000" + "38" + "00000000000003e8" + "aa".repeat(48)));
         String sig = apdu(sign);
         assertEquals(64 * 2 + 4, sig.length());
         assertTrue(sig.endsWith("9000"));

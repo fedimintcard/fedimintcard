@@ -14,6 +14,7 @@ import javacard.framework.AID;
 import javacard.framework.Applet;
 import javax.smartcardio.CommandAPDU;
 import javax.smartcardio.ResponseAPDU;
+import javacard.security.KeyPair;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -79,6 +80,7 @@ class TearHarnessTest {
 
         void powerCycle() {
             if (TearHook.tornInTx) TearHook.rollback();
+            TearHook.dead = false;
             TearHook.depth = 0;
             sim.reset();
             rt.clearTx();
@@ -96,6 +98,15 @@ class TearHarnessTest {
         byte[] storedSig() throws ReflectiveOperationException { return Arrays.copyOf((byte[]) field("spentSig"), 64); }
     }
 
+    /** P-256's generator: a registry key for tests that never check a registry signature. */
+    static final byte[] TEST_REGISTRY_KEY = CardTestSupport.TEST_REGISTRY_KEY;
+
+    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), then the PIN. */
+    static void setPin(Card c) {
+        assertEquals(0x9000, c.tx(0x34, 0, TEST_REGISTRY_KEY).getSW());
+        assertEquals(0x9000, c.tx(SET_PIN, 0, PIN).getSW());
+    }
+
     /** A keyed note under the PIN, in a session that has the PIN: SIGN's set-up. Returns the slot's x-only key. */
     static byte[] readyNote(Card c) {
         ResponseAPDU k = c.tx(GEN_KEY, 0, null);
@@ -103,9 +114,9 @@ class TearHarnessTest {
         byte[] note = new byte[56];
         note[7] = 0x40;
         for (int i = 8; i < 56; i++) note[i] = (byte) (0xA0 + i);
-        assertEquals(0x9000, c.tx(SET_NOTE, 0, note).getSW());
-        assertEquals(0x9000, c.tx(SET_PIN, 0, PIN).getSW());
+        setPin(c);
         assertEquals(0x9000, c.tx(VERIFY_PIN, 0, PIN).getSW());
+        assertEquals(0x9000, c.tx(SET_NOTE, 0, note).getSW());
         return k.getData();
     }
 
@@ -183,29 +194,72 @@ class TearHarnessTest {
     }
 
     @Test
+    void afterATearNoKeyWriteNorFieldStoreLands() throws Exception {
+        // GEN_KEY, untorn and traced: where its key generation comes
+        Card c = new Card();
+        setPin(c);
+        TearHook.count = 0;
+        TearHook.target = 0;
+        TearHook.trace = new ArrayList<>();
+        assertEquals(0x9000, c.tx(GEN_KEY, 0, null).getSW());
+        List<String> trace = TearHook.trace;
+        TearHook.trace = null;
+        int k = 0;
+        for (int i = 0; i < trace.size() && k == 0; i++) if (trace.get(i).contains(" genKeyPair")) k = i + 1;
+        assertTrue(k > 0, "GEN_KEY generates its key:\n" + String.join("\n", trace));
+        assertFalse(((KeyPair) c.field("gen")).getPrivate().isInitialized(), "untorn, GEN_KEY's finally clears the generated key");
+
+        // torn there: the power is gone, so the finally's clearKey and domain parameters never reach the key object
+        Card t = new Card();
+        setPin(t);
+        TearHook.count = 0;
+        TearHook.target = k;
+        t.tx(GEN_KEY, 0, null);
+        TearHook.target = 0;
+        assertNotNull(TearHook.tornAt);
+        assertTrue(TearHook.tornAt.startsWith("genKeyPair"), TearHook.tornAt);
+        assertTrue(TearHook.dead);
+        assertTrue(((KeyPair) t.field("gen")).getPrivate().isInitialized(), "the generated key is as the tear left it");
+
+        // nor does a store into one of the applet's fields, until the power comes back
+        byte before = (byte) t.field("pinState");
+        TearHook.putField(t.applet, before ^ 0x7F, "pinState");
+        assertEquals(before, (byte) t.field("pinState"));
+        t.powerCycle();
+        assertFalse(TearHook.dead);
+        TearHook.putField(t.applet, before, "pinState");
+        assertEquals(before, (byte) t.field("pinState"));
+    }
+
+    @Test
     void aTearInsideTheTransactionRollsItAllBack() throws Exception {
-        // Anti-vacuity: torn on the transaction's first write, every array it wrote is as it was before the SIGN.
+        // Torn on the transaction's last write, after it has written the hash, the signature, the state and the
+        // clock: every one of them is as it was before the SIGN. With rollback switched off this fails.
         Card c = new Card();
         readyNote(c);
-        byte[] state = ((byte[]) c.field("state")).clone(), clock = ((byte[]) c.field("clock")).clone();
         TearHook.count = 0;
         TearHook.trace = new ArrayList<>();
         c.tx(SIGN, 0, MSG);
-        int first = 0;
-        for (int i = 0; i < TearHook.trace.size(); i++) if (TearHook.trace.get(i).contains(" [tx] ")) { first = i + 1; break; }
+        int last = 0;
+        for (int i = 0; i < TearHook.trace.size(); i++) if (TearHook.trace.get(i).contains(" [tx] ")) last = i + 1;
+        String lastWrite = last > 0 ? TearHook.trace.get(last - 1) : "";
         TearHook.trace = null;
-        assertTrue(first > 0, "SIGN writes inside a transaction");
+        assertTrue(last > 1, "SIGN writes inside a transaction");
+        assertTrue(lastWrite.contains("clock"), "the last write in the transaction is the clock: " + lastWrite);
 
         Card t = new Card();
         readyNote(t);
+        byte[] state = ((byte[]) t.field("state")).clone(), clock = ((byte[]) t.field("clock")).clone();
+        byte[] hash = ((byte[]) t.field("spentHash")).clone();
         TearHook.count = 0;
-        TearHook.target = first;
+        TearHook.target = last;
         t.tx(SIGN, 0, MSG);
         TearHook.target = 0;
         assertTrue(TearHook.tornInTx, "torn inside the transaction: " + TearHook.tornAt);
         t.powerCycle();
         assertArrayEquals(state, (byte[]) t.field("state"));
         assertArrayEquals(clock, (byte[]) t.field("clock"));
+        assertArrayEquals(hash, (byte[]) t.field("spentHash"));
         assertArrayEquals(new byte[64], t.storedSig());
     }
 }

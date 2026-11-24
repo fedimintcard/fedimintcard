@@ -21,8 +21,8 @@ class SignCheckTest {
     void aSignatureThatFailsTheCheckLeavesTheSlotANote() throws Exception {
         SimCard c = new SimCard();
         byte[] pubX = c.tx(GEN_KEY, 0, null).getData();
+        assertEquals(0x9000, c.setPin());
         assertEquals(0x9000, c.sw(SET_NOTE, 0, noteData(1_000_000L)));
-        assertEquals(0x9000, c.sw(SET_PIN, 0, PIN));
         assertEquals(0x9000, c.sw(VERIFY_PIN, 0, PIN));
         byte[] stateBefore = c.state();
         byte[] spentSig = ((byte[]) c.field("spentSig")).clone();
@@ -66,8 +66,8 @@ class SignCheckTest {
     void aFaultOnEveryTryNeverSpendsTheSlot() throws Exception {
         SimCard c = new SimCard();
         c.tx(GEN_KEY, 0, null);
+        assertEquals(0x9000, c.setPin());
         assertEquals(0x9000, c.sw(SET_NOTE, 0, noteData(1_000_000L)));
-        assertEquals(0x9000, c.sw(SET_PIN, 0, PIN));
         assertEquals(0x9000, c.sw(VERIFY_PIN, 0, PIN));
         ECPrivateKey k = ((ECPrivateKey[]) c.field("privs"))[0];
         byte[] buf = new byte[64];

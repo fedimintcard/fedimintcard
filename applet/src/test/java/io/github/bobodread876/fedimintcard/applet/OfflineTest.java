@@ -42,12 +42,12 @@ class OfflineTest {
     static CardTestSupport card(int n, long msat, long limit) {
         CardTestSupport c = new CardTestSupport();
         if (limit != 0) assertSw(0x9000, c.tx(SET_LIMIT, 0, longBytes(limit)));
+        c.setPin(DEFAULT_PIN);
+        c.verifyPin(DEFAULT_PIN);
         for (int s = 0; s < n; s++) {
             c.genKey(s);
             assertSw(0x9000, c.tx(SET_NOTE, s, noteData(msat)));
         }
-        c.setPin(DEFAULT_PIN);
-        c.verifyPin(DEFAULT_PIN);
         return c;
     }
 
@@ -88,9 +88,9 @@ class OfflineTest {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.genKey(1);
-        assertSw(0x9000, c.tx(SET_CHANGE, 1, changeData(4096)));
         c.setPin(DEFAULT_PIN);
         c.verifyPin(DEFAULT_PIN);
+        assertSw(0x9000, c.tx(SET_CHANGE, 1, changeData(4096)));
         assertSw(0x6985, c.tx(SIGN, 0, h(1)), "a key with no note");
         assertSw(0x6985, c.tx(SIGN, 1, h(1)), "a key owed change");
         assertSw(0x6985, c.tx(SIGN, 2, h(1)), "an empty slot");
@@ -178,7 +178,7 @@ class OfflineTest {
         c.verifyPin(DEFAULT_PIN);
         assertSw(0x6985, c.tx(SET_LIMIT, 0, longBytes(1L << 40)));
         byte[] st = c.tx(GET_STATE, 0, null).getData();
-        assertEquals(59, st.length);
+        assertEquals(65, st.length);
         assertEquals(5000, u64(st, 40));
     }
 

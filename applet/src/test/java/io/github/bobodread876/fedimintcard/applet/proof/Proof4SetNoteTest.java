@@ -17,7 +17,7 @@ class Proof4SetNoteTest {
         SimCard c = new SimCard();
         assertEquals(0x9000, c.sw(SET_LIMIT, 0, be64(LIMIT)));
         assertEquals(0x9000, c.sw(GEN_KEY, 3, null), "the till keys slot 3 and asks the federation for its note");
-        assertEquals(0x9000, c.sw(SET_PIN, 0, PIN));
+        assertEquals(0x9000, c.setPin());
         return c;
     }
 

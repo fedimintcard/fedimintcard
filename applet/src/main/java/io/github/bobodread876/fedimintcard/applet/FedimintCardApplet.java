@@ -2,6 +2,7 @@ package io.github.bobodread876.fedimintcard.applet;
 
 import javacard.framework.APDU;
 import javacard.framework.Applet;
+import javacard.framework.CardRuntimeException;
 import javacard.framework.ISO7816;
 import javacard.framework.ISOException;
 import javacard.framework.SystemException;
@@ -45,7 +46,9 @@ import javacard.security.Signature;
  * 15 GET_SLOT    P1=slot              -> state (1) || x-only pubkey (32) || amount and signature (56) || spent hash (32)
  *                                        || opening (66)
  * 16 GET_STATE                        -> slot states (32) || now (4) || window (4) || limit (8) || spent today (8)
- *                                        || certificate length (1) || attestation key present (1) || registry key set (1)
+ *                                        || cert length (1) || attest made (1) || registry key set (1) || PIN state (1)
+ *                                        || wrong tries in a row (1) || askings owed (2) || anchored in this selection (1)
+ *                                        || signer (1: bit 0 the chip's RSA path, bit 1 the nonce key in RAM)
  * 17 SET_CHANGE  P1=slot Lc=74        amount (8) || txid (32) || output index (2) || blinding key (32). A KEYED slot becomes CHANGE
  * 18 SET_LIMIT   Lc=8                 the day's limit in msat (0: none). Only before SET_PIN
  * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work (6A93)
@@ -59,9 +62,12 @@ import javacard.security.Signature;
  *                                        back to NOTE; a CHANGE slot owed by txid goes back to KEYED. -> the new state (1).
  *                                        The registry signs one only for a transaction the federation refused, or whose
  *                                        report it refused as a double spend (docs/OFFLINE-PROTOCOL.md § 6)
- * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN
- * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card; does not open a session
- * 42 CHANGE_PIN  P1=P2=0 Lc=8..16     -> after VERIFY_PIN; closes the session
+ * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN. After wrong tries the next try first owes a wait,
+ *                                        served by sending the same VERIFY_PIN again while it answers 6A98
+ * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card, on a card with the registry key and no value (6985); the
+ *                                        selection that sent it counts as having the PIN
+ * 42 CHANGE_PIN  P1=old length P2=0   old PIN (4..8) || new PIN (4..8); P1=0: two halves of the same length. After
+ *                                        VERIFY_PIN; closes the session. A wrong old PIN counts as a try
  * </pre>
  *
  * <p>Slot states: EMPTY 0, KEYED 1 (a key, no note), NOTE 2, CHANGE 3 (a key owed change), SPENT 4.
@@ -70,11 +76,19 @@ import javacard.security.Signature;
  * change output). Amounts are the terminal's word, as in cashucard: the card cannot check a BLS
  * signature, the till does.
  *
- * <p>PIN status words: {@code 69 83} blocked, {@code 69 84} no PIN set yet,
- * {@code 6A 94} a PIN is set and this session has not verified it, {@code 63 CX}
- * a mismatch with X tries left. {@code SET_PIN} on a card that already has a PIN
- * answers {@code 69 85}. A blocked card answers {@code 69 83} to every PIN
- * command, whatever the frame: the state is checked before P1/P2 and Lc there.
+ * <p>PIN status words: {@code 69 84} no PIN set yet, {@code 6A 94} a PIN is set and this
+ * session has not verified it, {@code 63 CX} a wrong PIN, X the wrong tries in a row (F for 15
+ * or more), {@code 6A 98} keep holding: a wait is owed before the next try. {@code SET_PIN} on a
+ * card that already has a PIN answers {@code 69 85}. The PIN never blocks: no command answers
+ * {@code 69 83}.
+ *
+ * <p>The wait: after the n-th wrong try in a row the next try first owes 2^(n-1) askings, at most
+ * {@link #PIN_OWED_MOST}. An asking is a VERIFY_PIN sent while a wait is owed: the card does a
+ * signature's work with {@code workKeys}, a key that holds no value, and answers {@code 6A98}.
+ * Askings come in stretches of {@link #PIN_STRETCH}; the asking after a stretch writes what is
+ * still owed. Any other command, SELECT included, starts the stretch again. The count and the
+ * wait ({@code pinMarks}) are written before the PIN is compared, so a try torn anywhere was
+ * either counted with its wait or never made.
  *
  * <p>{@code SELECT} answers two data bytes with {@code 90 00}: major version, then
  * minor. This is the applet's version alone — no card-manager status byte, no
@@ -82,10 +96,8 @@ import javacard.security.Signature;
  *
  * <p>The verified flag is {@code CLEAR_ON_DESELECT} transient: a session is one
  * applet selection, and a card reset or a SELECT of another AID ends it. The PIN
- * itself and its retry counter live in {@link OwnerPIN}, which spends one try in
- * {@code check()} even on success and puts it back — that is what {@code 63CX}
- * reports, and why a wrong picture of the counter is a security bug rather than
- * a cosmetic one.
+ * itself lives in {@link OwnerPIN}, whose own counter is filled again before every try, so it
+ * never runs out: the wrong tries are counted in {@code pinMarks}.
  */
 public final class FedimintCardApplet extends Applet {
 
@@ -103,12 +115,25 @@ public final class FedimintCardApplet extends Applet {
     static final byte VERSION_MAJOR = 0x03;
     static final byte VERSION_MINOR = 0x00;
 
-    /** PIN size bounds (bytes; the applet never interprets them) and the retry limit. */
+    /** PIN size bounds (bytes; the applet never interprets them), and OwnerPIN's own counter, filled again before every try. */
     static final byte PIN_MIN = 4;
     static final byte PIN_MAX = 8;
     static final byte PIN_TRIES = 3;
 
-    static final short SW_PIN_BLOCKED = 0x6983;
+    /** Keep holding: a wait is owed before the next PIN try; send the same VERIFY_PIN again. */
+    static final short SW_KEEP_HOLDING = 0x6A98;
+    /** The askings of one stretch of the PIN's wait (about 8 s on a J3R180). */
+    static final short PIN_STRETCH = 16;
+    /** The most askings owed before one try: the wait after the fifteenth wrong try in a row and every later one. */
+    static final short PIN_OWED_MOST = 0x4000;
+    /** The wrong tries in a row stop counting here; 63CF reports 15 or more. */
+    static final byte PIN_WRONG_MOST = 15;
+    /**
+     * SHA-256 rounds over 32 bytes in RAM that stand for one asking's signature on a chip whose
+     * signer keeps its nonce key in persistent memory (so a signature would write flash). C1
+     * times both on the chips and sets this to match the signature's half second.
+     */
+    static final short WORK_HASHES = 512;
     static final short SW_PIN_NOT_SET = 0x6984;
     static final short SW_PIN_NEEDED = 0x6A94;
     static final short SW_OVER_LIMIT = 0x6A95;
@@ -139,6 +164,7 @@ public final class FedimintCardApplet extends Applet {
     static final short OPEN_LEN = 66;
     static final short CERT_MAX = 160;
     static final short HEADER_LEN = 80;
+    static final short STATE_LEN = 65;
 
     /** The clock record: now (4), the day's window start (4), the hardest bits taken (4), limit (8), spent in the window (8). */
     static final short CK_NOW = 0;
@@ -194,12 +220,21 @@ public final class FedimintCardApplet extends Applet {
 
     /**
      * The persistent PIN state, and the commit point that makes a torn PIN write harmless: the
-     * byte is written after the PIN it describes, so a tear reads as not set (or blocked), never
-     * as set with a PIN nobody knows.
+     * byte is written after the PIN it describes, so a tear reads as not set, never as set with a
+     * PIN nobody knows. There is no blocked state.
      */
     static final byte PIN_STATE_NOT_SET = 0;
     static final byte PIN_STATE_SET = 1;
-    static final byte PIN_STATE_BLOCKED = 2;
+
+    // offsets in pinMarks (persistent): the wrong tries in a row, then the askings owed (2)
+    static final short PM_WRONG = 0;
+    static final short PM_OWED = 1;
+    private static final byte[] MARKS_CLEAR = { 0, 0, 0 };
+    // offsets in held (transient, CLEAR_ON_DESELECT): this selection has the PIN, this selection
+    // anchored the clock, the askings of the PIN's wait in this stretch
+    static final short H_PIN_GIVEN = 0;
+    static final short H_ANCHORED = 1;
+    static final short H_ASKED = 2;
 
     private final ECPrivateKey[] privs = new ECPrivateKey[SLOTS];
     private final ECPublicKey[] pubs = new ECPublicKey[SLOTS];
@@ -235,13 +270,22 @@ public final class FedimintCardApplet extends Applet {
     private final byte[] tmp;
     /**
      * CHANGE_PIN's new half, persistent (not cleared on deselect: it is zeroed at the end of every
-     * call that writes it). A transient array would be wiped by {@link #checkPin}'s cleanup, which
+     * call that writes it). A transient array would be wiped by {@link #tryPin}'s cleanup, which
      * clears {@link #tmp} along with the APDU buffer before the new PIN is written.
      */
     private final byte[] newPin;
     private final SchnorrHW schnorr;
     private final OwnerPIN pin;
     private byte pinState;
+    /** The wrong tries in a row and the askings owed before the next try (PM_*). */
+    private final byte[] pinMarks;
+    /** What this selection holds (H_*); cleared on deselect and at power loss. */
+    private final byte[] held;
+    /**
+     * A secp256k1 key pair that holds no value, made at the first SET_PIN: the PIN's wait signs
+     * with it, so no slot key ever does anything but SIGN.
+     */
+    private KeyPair workKeys;
     /**
      * The card secret behind STATE_KEY: 32 random bytes made at install, kept in a key object so
      * the chip protects it at rest like the slot keys. It never leaves the card; only the HMAC
@@ -264,6 +308,8 @@ public final class FedimintCardApplet extends Applet {
         // A new instance starts on the not-set path, as the check in set() expects.
         pin = new OwnerPIN(PIN_TRIES, PIN_MAX);
         pinState = PIN_STATE_NOT_SET;
+        pinMarks = new byte[3];
+        held = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
         attest = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         p256((javacard.security.ECKey) attest.getPrivate());
         p256((javacard.security.ECKey) attest.getPublic());
@@ -296,18 +342,62 @@ public final class FedimintCardApplet extends Applet {
      */
     @Override
     public boolean select() {
-        pin.reset();
+        newSelection();
         return true;
     }
 
     @Override
     public void deselect() {
+        newSelection();
+    }
+
+    /**
+     * What a selection begins and ends with: no PIN given, no anchor, no stretch of the wait under
+     * way, and nothing in the working arrays. They are CLEAR_ON_DESELECT, and are zeroed here as
+     * well for a chip that keeps a same-package applet's transient memory across a SELECT.
+     * {@link #newPin} is persistent and zeroed at the end of every call that writes it; a PIN
+     * write torn inside the call can leave it, so it is zeroed here too, only when it is not
+     * already zero (a check costs no write).
+     */
+    private void newSelection() {
         pin.reset();
+        Util.arrayFillNonAtomic(held, (short) 0, (short) held.length, (byte) 0);
+        Util.arrayFillNonAtomic(x, (short) 0, X_LEN, (byte) 0);
+        Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+        for (short i = 0; i < PIN_MAX; i++) {
+            if (newPin[i] != 0) {
+                Util.arrayFillNonAtomic(newPin, (short) 0, PIN_MAX, (byte) 0);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Whether this selection has the PIN: a right VERIFY_PIN (OwnerPIN's validated flag), or the
+     * first SET_PIN, which counts as given for the selection that sent it.
+     */
+    private boolean pinGiven() {
+        return pin.isValidated() || held[H_PIN_GIVEN] != 0;
+    }
+
+    /** Whether a slot holds value: a note, or change owed to it. */
+    private boolean holdsValue() {
+        for (short s = 0; s < SLOTS; s++) {
+            if (state[s] == ST_NOTE || state[s] == ST_CHANGE) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
     public void process(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        // The PIN's wait is the same VERIFY_PIN asked again and again: anything else, a SELECT
+        // among it, begins the stretch again.
+        if (selectingApplet() || buf[ISO7816.OFFSET_INS] != INS_VERIFY_PIN) {
+            held[H_ASKED] = 0;
+        }
         if (selectingApplet()) {
             buf[0] = VERSION_MAJOR;
             buf[1] = VERSION_MINOR;
@@ -386,70 +476,121 @@ public final class FedimintCardApplet extends Applet {
      * cannot probe which slots are keyed.
      */
     private void checkPinReady() {
-        if (pinState == PIN_STATE_BLOCKED) {
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
         if (pinState != PIN_STATE_SET) {
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
-        if (!pin.isValidated()) {
+        if (!pinGiven()) {
             ISOException.throwIt(SW_PIN_NEEDED);
         }
     }
 
     /**
-     * One PIN attempt: P1 and P2 must be 0 and the data field {@code len} bytes with
-     * {@code PIN_MIN <= len <= PIN_MAX}, else {@code 6700} without spending a try. A blocked PIN
-     * answers {@code 6983} whatever is sent. A mismatch spends a try and answers {@code 63C0|left};
-     * the third spends none and leaves the card blocked with {@code 6983}.
-     *
-     * <p>A success returns with the PIN validated for this session and the retry counter restored.
-     * Every path wipes the APDU buffer and {@link #tmp}, so no PIN byte outlives the call.
-     *
-     * <p>{@code len} is the Lc that {@link #lcOf} read. Only the {@code len} bytes of the old PIN
-     * are checked, whichever is longer: CHANGE_PIN sends its new PIN after them and that half is
-     * not part of the check.
-     *
-     * <p>The data must already be in the buffer: {@code setIncomingAndReceive} may be called only
-     * once per {@code process()}, so the caller receives it and this only compares.
+     * One PIN try, the data already received: {@code len} bytes at the data offset, bounded by
+     * the caller. The try is counted, with the wait the next try would owe, before the compare
+     * ({@link #countTry}); a right PIN then sets both to nothing in one atomic copy and returns with
+     * this session validated. A wrong one answers {@code 63CX}, X the wrong tries in a row. Every
+     * path wipes the APDU buffer and {@link #tmp}, so no PIN byte outlives the call. Only the
+     * {@code len} bytes are compared: CHANGE_PIN's new PIN follows them and is not part of it.
      */
-    private void checkPinReceived(byte[] buf, short len) {
-        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
-            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
-        }
-        if (pinState == PIN_STATE_BLOCKED || pin.getTriesRemaining() == 0) {
-            // The try the counter already spent on the previous call: commit the block, then refuse.
-            pinState = PIN_STATE_BLOCKED;
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
-        // Checked before the data is read, so a wrong length costs neither a try nor a read.
-        if (len < PIN_MIN || len > PIN_MAX) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
+    private void tryPin(byte[] buf, short len) {
+        // A try begins a fresh session: only a right PIN opens it again.
+        held[H_PIN_GIVEN] = 0;
         try {
+            countTry();
             if (pin.check(buf, ISO7816.OFFSET_CDATA, (byte) len)) {
+                Util.arrayCopy(MARKS_CLEAR, (short) 0, pinMarks, PM_WRONG, (short) 3);
                 return;
             }
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
             Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
         }
-        short left = pin.getTriesRemaining();
-        if (left == 0) {
-            pinState = PIN_STATE_BLOCKED;
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
-        ISOException.throwIt((short) (0x63C0 | left));
+        ISOException.throwIt((short) (0x63C0 | pinMarks[PM_WRONG]));
     }
 
-    /** Opens this session for SIGN. Also starts a fresh one, so a wrong PIN leaves nothing open. */
+    /**
+     * Before the PIN is compared: the try counted as wrong and the wait the next try would owe
+     * after it (2^w askings, w the wrong tries in a row before it, at most PIN_OWED_MOST), both in
+     * one transaction; then OwnerPIN's own counter is filled again, so it never runs out. Torn
+     * anywhere, the try was counted with its wait or never made.
+     */
+    private void countTry() {
+        short w = pinMarks[PM_WRONG];
+        JCSystem.beginTransaction();
+        pinMarks[PM_WRONG] = (byte) (w < PIN_WRONG_MOST ? w + 1 : PIN_WRONG_MOST);
+        Util.setShort(pinMarks, PM_OWED, w < 14 ? (short) (1 << w) : PIN_OWED_MOST);
+        JCSystem.commitTransaction();
+        if (pin.getTriesRemaining() != PIN_TRIES) {
+            pin.resetAndUnblock();
+        }
+    }
+
+    /**
+     * The wait before a try: the askings owed, served PIN_STRETCH at a time. Each asking of a
+     * stretch is a signature's work answered {@code 6A98}; the asking after a stretch writes what
+     * is still owed, less the stretch, in one transaction, and answers {@code 6A98} again while
+     * anything is owed, or returns, and the caller goes on to the try. A card taken out of the
+     * field loses no more than the stretch it was in. The count of a stretch is in RAM ({@link
+     * #held}): an asking writes nothing persistent.
+     */
+    private void waitOwed(byte[] buf) {
+        short owed = Util.getShort(pinMarks, PM_OWED);
+        if (owed == 0) {
+            return;
+        }
+        short stretch = owed < PIN_STRETCH ? owed : PIN_STRETCH;
+        short asked = (short) (held[H_ASKED] + 1);
+        if (asked <= stretch) {
+            work(buf);
+            // Counted after the work: an asking whose work ends early counts for nothing.
+            held[H_ASKED] = (byte) asked;
+            ISOException.throwIt(SW_KEEP_HOLDING);
+        }
+        held[H_ASKED] = 0;
+        owed -= stretch;
+        JCSystem.beginTransaction();
+        Util.setShort(pinMarks, PM_OWED, owed);
+        JCSystem.commitTransaction();
+        if (owed != 0) {
+            ISOException.throwIt(SW_KEEP_HOLDING);
+        }
+    }
+
+    /**
+     * One asking's work, thrown away: a BIP-340 signature with the work keys over random bytes,
+     * where the signer keeps its nonce key in RAM; elsewhere its signature would write flash, so
+     * SHA-256 rounds in RAM stand for it. A signature the signer refuses falls back to the rounds,
+     * so a fault can make an asking neither free nor endless. Never with a slot key.
+     */
+    private void work(byte[] buf) {
+        try {
+            schnorr.random(tmp, (short) 0, (short) 32);
+            if (workKeys != null && schnorr.keyInRam()) {
+                try {
+                    schnorr.sign((ECPrivateKey) workKeys.getPrivate(), (ECPublicKey) workKeys.getPublic(),
+                        tmp, (short) 0, buf, (short) 0);
+                    return;
+                } catch (CardRuntimeException e) {
+                    // the rounds below
+                }
+            }
+            sha.reset();
+            for (short i = 0; i < WORK_HASHES; i++) {
+                sha.doFinal(tmp, (short) 0, (short) 32, tmp, (short) 0);
+            }
+        } finally {
+            Util.arrayFillNonAtomic(buf, (short) 0, (short) 64, (byte) 0);
+            Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+        }
+    }
+
+    /**
+     * Opens this session for SIGN. Also starts a fresh one, so a wrong PIN leaves nothing open.
+     * The frame is checked first and costs nothing; then the wait owed, before the data is read;
+     * then the try.
+     */
     private void verifyPin(APDU apdu, byte[] buf) {
         short len = lcOf(buf);
-        if (pinState == PIN_STATE_BLOCKED) {
-            // Blocked outranks not-set: a card that ran out of tries must say so, or the holder
-            // would be told no PIN exists when the truth is that the card is dead.
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
         if (pinState != PIN_STATE_SET) {
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
@@ -457,24 +598,30 @@ public final class FedimintCardApplet extends Applet {
             // Refused before any receive, so a wrong length costs neither a try nor a read.
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        if (apdu.setIncomingAndReceive() < len) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
-        checkPinReceived(buf, len);
+        try {
+            waitOwed(buf);
+            if (apdu.setIncomingAndReceive() < len) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            tryPin(buf, len);
+        } finally {
+            Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
+        }
     }
 
     /**
-     * The one-time PIN write. Does not open a session: the terminal verifies to prove it took.
+     * The one-time PIN write, on a card with the registry key and no value. The selection that
+     * sends it counts as having the PIN, so the host need not send VERIFY_PIN after it.
      *
-     * <p>A blocked PIN answers {@code 6983} whether or not the frame is well formed: the counter
-     * has nothing left to protect, and the state is the answer the terminal needs. So the state
-     * is checked before P1/P2 and Lc, unlike on a usable PIN, where the frame comes first.
+     * Before anything is written, the signer's check of the chip's engines (6F00 for a chip that
+     * answers otherwise: such a card never takes a PIN, so never takes value). Just before the
+     * commit point, the signer's one-time set-up and the work keys the PIN's wait signs with.
      */
     private void setPin(APDU apdu, byte[] buf) {
         short len = lcOf(buf);
-        if (pinState == PIN_STATE_BLOCKED) {
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
         if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
@@ -484,7 +631,15 @@ public final class FedimintCardApplet extends Applet {
         if (len < PIN_MIN || len > PIN_MAX) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
+        // The anchor rule goes here (the clock's slice): 6A96 unless this selection anchored the
+        // clock (held[H_ANCHORED]). Until then SET_PIN does not ask for an anchor.
+        if (!registryKeySet || holdsValue()) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
         try {
+            // The signer's engine check: the chip's key agreement and point addition answer
+            // known points, or 6F00 before the receive and before any write.
+            schnorr.checkFraming(tmp, (short) 0);
             if (apdu.setIncomingAndReceive() < len) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
@@ -494,43 +649,58 @@ public final class FedimintCardApplet extends Applet {
             // (a PIN set is never unset), and this is chipMul's one writer. Before the commit
             // point, so a SET_PIN torn after it runs it again and none is set without it.
             schnorr.chipMul = schnorr.chipMulInit();
+            // The work keys, after the signer's RSA objects (so a chip short of room for them
+            // fails here, loudly, not inside chipMulInit), and before the commit point: a SET_PIN
+            // torn after this makes them again, and no PIN is set without them. Built once.
+            if (workKeys == null) {
+                workKeys = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+            }
+            setParams((ECPrivateKey) workKeys.getPrivate(), (ECPublicKey) workKeys.getPublic());
+            workKeys.genKeyPair();
             // The PIN write first, the state byte second: the state byte is the commit point, so
             // a tear before it leaves the card reading as not set and SET_PIN can run again.
             pin.update(newPin, (short) 0, (byte) len);
             pinState = PIN_STATE_SET;
+            held[H_PIN_GIVEN] = 1;
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
             Util.arrayFillNonAtomic(newPin, (short) 0, (short) newPin.length, (byte) 0);
         }
     }
 
-    /** Lc = old PIN || new PIN, each 4..8 bytes. Requires this session's VERIFY_PIN, and ends it. */
+    /**
+     * Lc = old PIN || new PIN, each 4..8 bytes; P1 = the old PIN's length, or 0 for two halves of
+     * the same length. Requires this session's PIN, and ends it.
+     */
     private void changePin(APDU apdu, byte[] buf) {
         short lc = lcOf(buf);
-        if (pinState == PIN_STATE_BLOCKED) {
-            // Blocked outranks everything, as in VERIFY_PIN.
-            ISOException.throwIt(SW_PIN_BLOCKED);
-        }
         if (pinState != PIN_STATE_SET) {
             // And not-set outranks a bad frame, as in VERIFY_PIN: there is no old PIN to change.
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
-        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
+        short old = buf[ISO7816.OFFSET_P1];
+        if ((old != 0 && (old < PIN_MIN || old > PIN_MAX)) || buf[ISO7816.OFFSET_P2] != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
-        if (!pin.isValidated()) {
+        if (!pinGiven()) {
             ISOException.throwIt(SW_PIN_NEEDED);
         }
-        // An odd Lc cannot be two PINs of the same length, and neither half is bounded otherwise.
-        if (lc < 2 * PIN_MIN || lc > 2 * PIN_MAX || (lc & 1) != 0) {
+        if (old == 0) {
+            // An odd Lc cannot be two PINs of the same length.
+            if ((lc & 1) != 0) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            old = (short) (lc / 2);
+        }
+        short young = (short) (lc - old);
+        if (lc > 2 * PIN_MAX || old > lc || young < PIN_MIN || young > PIN_MAX || old < PIN_MIN) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        short half = (short) (lc / 2);
         try {
             // The whole data field is received here, before anything reads or wipes the buffer:
             // `setIncomingAndReceive` may be called only once per process() (APDU spec), and on
             // T=0 it "may return less than a full buffer of bytes". Reading only the new half
-            // below would copy bytes the card has not received yet — stale buffer content — and
+            // below would copy bytes the card has not received yet (stale buffer content) and
             // make it the new PIN. So take all `lc` bytes first, then split them in newPin.
             //
             // Not covered by a test: jCardSim is T=1 and always delivers the full field, and it
@@ -539,20 +709,19 @@ public final class FedimintCardApplet extends Applet {
             if (apdu.setIncomingAndReceive() < lc) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
-            // The new half is copied before the old half's check wipes the APDU buffer and tmp.
-            // Into newPin, not tmp, because checkPinReceived wipes tmp on its way out.
-            Util.arrayCopyNonAtomic(buf, (short) (ISO7816.OFFSET_CDATA + half), newPin,
-                (short) 0, half);
-            // The old half goes through the same checks as VERIFY_PIN, comparing exactly the first
-            // `half` bytes: the new half that follows is not part of the check. A mismatch spends
-            // a try, and a call that finds no try left commits the block and answers 6983.
-            checkPinReceived(buf, half);
+            // The new PIN is copied before the old PIN's check wipes the APDU buffer and tmp.
+            // Into newPin, not tmp, because tryPin wipes tmp on its way out.
+            Util.arrayCopyNonAtomic(buf, (short) (ISO7816.OFFSET_CDATA + old), newPin,
+                (short) 0, young);
+            // The old PIN is a try like VERIFY_PIN's, comparing exactly its `old` bytes: counted
+            // before the compare, and a wrong one answers 63CX, ends the session and leaves the
+            // next try its wait (none is served here: a session with the PIN has nothing owed).
+            tryPin(buf, old);
             // A change ends the session, so the next CHANGE_PIN needs its own VERIFY_PIN.
             pin.reset();
-            // The new PIN, then the commit point again: with no transaction primitive on 3.0.5,
-            // writing the state byte after the PIN is what makes a tear read as not set.
-            pin.update(newPin, (short) 0, (byte) half);
-            pinState = PIN_STATE_SET;
+            // OwnerPIN's update is atomic: a tear before it leaves the old PIN, after it the new
+            // one, each with the marks the right old PIN cleared. The state byte is already set.
+            pin.update(newPin, (short) 0, (byte) young);
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
             Util.arrayFillNonAtomic(newPin, (short) 0, (short) newPin.length, (byte) 0);
@@ -563,12 +732,12 @@ public final class FedimintCardApplet extends Applet {
      * Lc from the header in the APDU buffer. Deliberately not {@code APDU.getIncomingLength()}:
      * jCardSim (and the JC 3.0.5 spec) throw {@code APDUException} if incoming data has not been
      * received yet, and every PIN path needs the length to validate the frame before receiving.
-     * Only short APDUs are accepted; an extended Lc reads as more than {@code PIN_MAX}, which
-     * every caller rejects.
+     * Only short APDUs of up to 127 bytes are taken; a longer or extended Lc reads as more than
+     * two PINs, which every caller rejects.
      */
     private static short lcOf(byte[] buf) {
         if (buf[ISO7816.OFFSET_LC] < 0) {
-            return (short) (PIN_MAX + 1);
+            return (short) (2 * PIN_MAX + 1);
         }
         return (short) (buf[ISO7816.OFFSET_LC] & 0xFF);
     }
@@ -662,8 +831,8 @@ public final class FedimintCardApplet extends Applet {
             // Replacing a key destroys whatever notes were issued to it, so once the card has a PIN it
             // takes the same PIN as spending them: without this, any reader in range could wipe a slot
             // with one APDU. Before the first SET_PIN nothing can be spent, so provisioning may still
-            // re-key freely; a blocked card refuses (69 83).
-            if (pinState == PIN_STATE_SET || pinState == PIN_STATE_BLOCKED) {
+            // re-key freely.
+            if (pinState == PIN_STATE_SET) {
                 checkPinReady();
             }
             // The state byte is the commit point, written alone (a single-byte write is atomic):
@@ -687,6 +856,13 @@ public final class FedimintCardApplet extends Applet {
             // Re-assert domain parameters first: a tear after clearKey must not leave a parameterless key.
             setParams(privs[s], pubs[s]);
             privs[s].setS(tmp, (short) 0, (short) 32);
+            // Read back: the signer refuses a scalar of more than 32 bytes, so a key the chip
+            // gives back longer is refused here and the slot stays EMPTY, never a note's key that
+            // SIGN cannot use.
+            short sl = privs[s].getS(tmp, (short) 0);
+            if (sl < 1 || sl > 32) {
+                ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+            }
             short wl = ((ECPublicKey) gen.getPublic()).getW(tmp, (short) 0);
             pubs[s].setW(tmp, (short) 0, wl);
             ok = true;
@@ -945,7 +1121,15 @@ public final class FedimintCardApplet extends Applet {
         buf[56] = cert[0];
         buf[57] = attestMade ? (byte) 1 : (byte) 0;
         buf[58] = registryKeySet ? (byte) 1 : (byte) 0;
-        apdu.setOutgoingAndSend((short) 0, (short) 59);
+        // The PIN: its state, the wrong tries in a row and the askings owed before the next try,
+        // so a till can say how long to hold before it sends the PIN.
+        buf[59] = pinState;
+        Util.arrayCopyNonAtomic(pinMarks, PM_WRONG, buf, (short) 60, (short) 3);
+        // Whether this selection anchored the clock, and the signer: bit 0 the chip's RSA path
+        // for the product, bit 1 a nonce key in RAM (the PIN's wait then writes nothing).
+        buf[63] = held[H_ANCHORED];
+        buf[64] = (byte) ((schnorr.chipMul ? 1 : 0) | (schnorr.keyInRam() ? 2 : 0));
+        apdu.setOutgoingAndSend((short) 0, STATE_LEN);
     }
 
     /** SET_LIMIT: the day's limit in msat, set at provisioning, before the PIN; 0 for none. */

@@ -62,6 +62,16 @@ final class SimCard {
 
     int sw(int ins, int p1, byte[] data) { return tx(ins, p1, data).getSW(); }
 
+    /** P-256's generator: a registry key for tests that never check a registry signature. */
+    static final byte[] TEST_REGISTRY_KEY = Bip340.hex("046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
+
+    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), then the PIN. */
+    int setPin() {
+        int r = sw(0x34, 0, TEST_REGISTRY_KEY);
+        if (r != 0x9000) return r;
+        return sw(SET_PIN, 0, PIN);
+    }
+
     Applet applet() { return runtime.appletAt(aid); }
 
     Object field(String name) throws ReflectiveOperationException {

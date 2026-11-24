@@ -54,10 +54,10 @@ class ReleaseTest {
         c.genKey(0);
         c.genKey(1);
         c.genKey(2);
-        assertSw(0x9000, c.tx(SET_NOTE, 1, noteData(2048)));
         assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, point(kp)));
         c.setPin(DEFAULT_PIN);
         c.verifyPin(DEFAULT_PIN);
+        assertSw(0x9000, c.tx(SET_NOTE, 1, noteData(2048)));
         return c;
     }
 
@@ -122,16 +122,17 @@ class ReleaseTest {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.genKey(1);
-        assertSw(0x9000, c.tx(SET_NOTE, 1, noteData(2048)));
         assertEquals(0, c.tx(GET_STATE, 0, null).getData()[58]);
+        assertSw(0x6985, c.tx(SET_PIN, 0, DEFAULT_PIN), "no registry key: no PIN, so no value");
+        assertEquals(0, c.pinState());
+        byte[] t = fill(32, 0x66);
+        assertSw(0x6985, c.tx(RELEASE, 1, release(kp, c.getPub(0), 1, t)), "no registry key");
+        assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, point(kp)));
         c.setPin(DEFAULT_PIN);
         c.verifyPin(DEFAULT_PIN);
         assertSw(0x6985, c.tx(SET_REGISTRY_KEY, 0, point(kp)), "only before the PIN");
-        byte[] t = fill(32, 0x66);
-        assertSw(0x9000, c.tx(SIGN, 1, t));
-        assertSw(0x6985, c.tx(RELEASE, 1, release(kp, c.getPub(0), 1, t)), "no registry key");
         byte[] st = c.tx(GET_STATE, 0, null).getData();
-        assertEquals(59, st.length);
+        assertEquals(65, st.length);
     }
 
     @Test

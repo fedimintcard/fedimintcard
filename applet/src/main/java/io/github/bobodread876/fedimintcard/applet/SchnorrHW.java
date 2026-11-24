@@ -1504,6 +1504,11 @@ final class SchnorrHW {
     // card secret (install), STATE_KEY's HMAC and GEN_KEY's scalar alignment use the signer's
     // RNG and SHA-256 rather than objects of their own.
 
+    /** Whether the temporary key is in RAM, so a signature writes no persistent memory. */
+    boolean keyInRam() {
+        return keyInRam;
+    }
+
     /** Fills {@code len} bytes of {@code buf} from the secure RNG. */
     void random(byte[] buf, short off, short len) {
         rng.generateData(buf, off, len);

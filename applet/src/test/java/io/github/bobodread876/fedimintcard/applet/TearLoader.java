@@ -78,6 +78,7 @@ final class TearLoader extends ClassLoader {
             public MethodVisitor visitMethod(int access, String name, String desc, String sig, String[] ex) {
                 if (wrap && name.equals("process") && desc.equals("(Ljavacard/framework/APDU;)V")) name = "process$orig";
                 MethodVisitor mv = super.visitMethod(access, name, desc, sig, ex);
+                final String mName = name;
                 return new MethodVisitor(Opcodes.ASM9, mv) {
                     @Override
                     public void visitInsn(int op) {
@@ -88,6 +89,20 @@ final class TearLoader extends ClassLoader {
                         } else {
                             super.visitInsn(op);
                         }
+                    }
+
+                    // the applet's own byte and boolean fields (pinState, SET_PIN's commit point, among them):
+                    // persistent, so each store is a write the harness can tear after; the constructor's are not
+                    @Override
+                    public void visitFieldInsn(int op, String owner, String fname, String fdesc) {
+                        if (wrap && op == Opcodes.PUTFIELD && owner.equals(cname) && !mName.equals("<init>")
+                            && (fdesc.equals("B") || fdesc.equals("Z"))) {
+                            // the store itself goes through the hook, which drops it after a tear
+                            super.visitLdcInsn(fname);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "putField", "(Ljava/lang/Object;ILjava/lang/String;)V", false);
+                            return;
+                        }
+                        super.visitFieldInsn(op, owner, fname, fdesc);
                     }
 
                     @Override
@@ -104,6 +119,11 @@ final class TearLoader extends ClassLoader {
                             return;
                         }
                         if (op == Opcodes.INVOKEVIRTUAL && owner.equals("javacard/framework/OwnerPIN")
+                            && mname.equals("reset") && mdesc.equals("()V")) {
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "pinReset", "(Ljavacard/framework/OwnerPIN;)V", false);
+                            return;
+                        }
+                        if (op == Opcodes.INVOKEVIRTUAL && owner.equals("javacard/framework/OwnerPIN")
                             && (mname.equals("check") || mname.equals("update") || mname.equals("resetAndUnblock"))) {
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, mname,
                                 "(Ljavacard/framework/OwnerPIN;" + mdesc.substring(1), false);
@@ -117,6 +137,26 @@ final class TearLoader extends ClassLoader {
                         if (owner.equals("javacard/security/ECPrivateKey") && (mname.equals("setS") || mname.equals("setG"))) {
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "priv" + mname, "(Ljavacard/security/ECPrivateKey;" + mdesc.substring(1), false);
                             return;
+                        }
+                        // every other write into a key object: dropped after a tear
+                        if (owner.startsWith("javacard/security/") && !owner.equals("javacard/security/KeyPair")) {
+                            if (mname.equals("clearKey") && mdesc.equals("()V")) {
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "keyClear", "(Ljava/lang/Object;)V", false);
+                                return;
+                            }
+                            if (mdesc.equals("([BSS)V") && java.util.Set.of("setFieldFP", "setA", "setB", "setG", "setR", "setModulus", "setExponent").contains(mname)) {
+                                super.visitLdcInsn(mname);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "keyWrite", "(Ljava/lang/Object;[BSSLjava/lang/String;)V", false);
+                                return;
+                            }
+                            if (mname.equals("setK") && mdesc.equals("(S)V")) {
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "keySetK", "(Ljava/lang/Object;S)V", false);
+                                return;
+                            }
+                            if (mname.equals("setKey") && mdesc.equals("([BS)V")) {
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "keySetKey", "(Ljava/lang/Object;[BS)V", false);
+                                return;
+                            }
                         }
                         if (owner.equals("javacard/security/KeyPair") && mname.equals("genKeyPair")) {
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "genKeyPair", "(Ljavacard/security/KeyPair;)V", false);

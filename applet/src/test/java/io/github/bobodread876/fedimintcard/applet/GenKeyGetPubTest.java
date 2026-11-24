@@ -192,6 +192,7 @@ class GenKeyGetPubTest {
         CardTestSupport c = new CardTestSupport();
         byte[] pub = c.genKey(3);
         c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.select();   // the selection that set the PIN counts as having it; a new one does not
         assertSw(0x6A94, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 3, 1, null));
         assertArrayEquals(pub, c.getPub(3));
         c.verifyPin(CardTestSupport.DEFAULT_PIN);
@@ -200,15 +201,52 @@ class GenKeyGetPubTest {
         assertFalse(java.util.Arrays.equals(pub, r.getData()));
     }
 
-    /** A blocked card cannot be re-keyed: its keys, and the notes issued to them, stay. */
+    /** Wrong tries never let a reader re-key a slot: without this session's PIN, its keys stay. */
     @Test
-    void overwriteOnABlockedCardIsRefused() {
+    void overwriteAfterWrongTriesIsRefused() {
         CardTestSupport c = new CardTestSupport();
         byte[] pub = c.genKey(2);
         c.setPin(CardTestSupport.DEFAULT_PIN);
         byte[] wrong = { '9', '9', '9', '9' };
-        for (int i = 0; i < 3; i++) c.verifyPinRaw(wrong);
-        assertSw(0x6983, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 2, 1, null));
+        for (int i = 0; i < 3; i++) c.verifyPinHeld(wrong);
+        assertSw(0x6A94, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 2, 1, null));
         assertArrayEquals(pub, c.getPub(2));
+    }
+
+    /**
+     * A chip that gives a slot's scalar back as 33 bytes (a sign byte before it): the signer refuses such a key at every
+     * SIGN, so GEN_KEY reads the key back and refuses it, 6F00, and the slot stays EMPTY. No note can reach it.
+     */
+    @Test
+    void aKeyTheChipGivesBackLongerThan32BytesIsRefused() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        javacard.security.ECPrivateKey[] privs = (javacard.security.ECPrivateKey[]) c.field("privs");
+        // REFLECTION: the slot's key objects built as GEN_KEY builds them, then one in front of the private key
+        c.tx(CardTestSupport.GEN_KEY, 3, null);
+        javacard.security.ECPrivateKey real = privs[3];
+        assertNotNull(real);
+        privs[3] = (javacard.security.ECPrivateKey) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[] { javacard.security.ECPrivateKey.class }, (proxy, m, args) -> {
+                if (m.getName().equals("getS")) {
+                    byte[] out = (byte[]) args[0];
+                    short o = (Short) args[1];
+                    byte[] s32 = new byte[32];
+                    real.getS(s32, (short) 0);
+                    out[o] = 0;
+                    System.arraycopy(s32, 0, out, o + 1, 32);
+                    return (short) 33;
+                }
+                try {
+                    return m.invoke(real, args);
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        ((byte[]) c.field("state"))[3] = (byte) CardTestSupport.ST_EMPTY;
+        assertSw(0x6F00, c.tx(CardTestSupport.GEN_KEY, 3, null));
+        assertEquals(CardTestSupport.ST_EMPTY, c.slotState(3), "the slot stays EMPTY");
+        assertSw(0x6985, c.tx(CardTestSupport.SET_NOTE, 3, CardTestSupport.noteData(1000)), "and takes no note");
+        privs[3] = real;
+        c.genKey(3);
     }
 }

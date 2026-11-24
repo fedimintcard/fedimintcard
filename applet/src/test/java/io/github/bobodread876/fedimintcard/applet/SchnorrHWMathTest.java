@@ -293,9 +293,11 @@ class SchnorrHWMathTest {
     /**
      * The allocations that are not install-time and are let through all the same (1.20), each by its file, by the method it is
      * in and by the whole statement it is, so that nothing else in that method, or anywhere else, goes through with it:
-     * { file, the method's declaration, the statement }. None is registered here.
+     * { file, the method's declaration, the statement }. The PIN's work keys, made at the first SET_PIN behind a null
+     * check, are the one registered here.
      */
     private static final String[][] ONCE_ONLY_ALLOCATIONS = {
+        { "FedimintCardApplet.java", "private void setPin(", "workKeys = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);" },
     };
 
     /**

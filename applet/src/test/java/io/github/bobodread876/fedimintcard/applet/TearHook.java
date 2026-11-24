@@ -40,6 +40,8 @@ public final class TearHook {
     public static List<String> trace;
     public static boolean tornInTx;
     public static String tornAt;
+    /** Set at a tear, until the card's next power-up: the power is gone, so nothing after it (a finally block's wipe among it) reaches persistent memory. */
+    public static boolean dead;
     /** Commands that left process() by an exception with a transaction open: rolled back here as a chip would. */
     public static final List<String> leftOpen = new ArrayList<>();
     /** NonAtomic writes made inside a transaction (they survive a rollback on a chip). */
@@ -62,7 +64,7 @@ public final class TearHook {
     public static String beganAt;
 
     /** The applet's CLEAR_ON_DESELECT arrays: RAM on a chip, never torn and never rolled back. */
-    static final String[] TRANSIENT = { "tmp", "x" };
+    static final String[] TRANSIENT = { "tmp", "x", "held" };
 
     /** The last exception, not an ISOException, that left process(): what jCardSim answers 6F00 for. */
     public static Throwable lastThrown;
@@ -109,6 +111,7 @@ public final class TearHook {
         target = 0;
         tornInTx = false;
         tornAt = null;
+        dead = false;
         depth = 0;
         snapArrays = null;
         nonAtomicLog.clear();
@@ -185,6 +188,7 @@ public final class TearHook {
         if (target > 0 && count == target) {
             tornInTx = depth > 0;
             tornAt = what + " @" + where() + (tornInTx ? " (in a transaction)" : "");
+            dead = true;
             throw new Tear();
         }
     }
@@ -193,17 +197,20 @@ public final class TearHook {
 
     // ---- array stores ----
     public static void bastore(Object a, int i, int v) {
+        if (dead && p(a)) return;
         if (a instanceof byte[]) ((byte[]) a)[i] = (byte) v; else ((boolean[]) a)[i] = v != 0;
         if (p(a)) ev(names.get(a) + "[" + i + "]=" + v);
     }
 
     public static void sastore(Object a, int i, int v) {
+        if (dead && p(a)) return;
         ((short[]) a)[i] = (short) v;
         if (p(a)) ev(names.get(a) + "[" + i + "]=" + v);
     }
 
     // ---- Util ----
     public static short arrayCopy(byte[] s, short so, byte[] d, short dO, short len) {
+        if (dead && p(d)) return (short) (dO + len);
         short r = Util.arrayCopy(s, so, d, dO, len);
         if (p(d)) ev("arrayCopy " + names.get(d) + "[" + dO + "+" + len + "]");
         return r;
@@ -211,6 +218,7 @@ public final class TearHook {
 
     public static short arrayCopyNonAtomic(byte[] s, short so, byte[] d, short dO, short len) {
         if (!p(d)) return Util.arrayCopyNonAtomic(s, so, d, dO, len);
+        if (dead) return (short) (dO + len);
         if (depth > 0) {
             short r = Util.arrayCopyNonAtomic(s, so, d, dO, len);
             logNonAtomic(d, dO, len, "arrayCopyNonAtomic");
@@ -233,6 +241,7 @@ public final class TearHook {
 
     public static short arrayFillNonAtomic(byte[] d, short o, short len, byte v) {
         if (!p(d)) return Util.arrayFillNonAtomic(d, o, len, v);
+        if (dead) return (short) (o + len);
         if (depth > 0) {
             short r = Util.arrayFillNonAtomic(d, o, len, v);
             logNonAtomic(d, o, len, "arrayFillNonAtomic");
@@ -252,6 +261,7 @@ public final class TearHook {
     }
 
     public static short setShort(byte[] d, short o, short v) {
+        if (dead && p(d)) return (short) (o + 2);
         short r = Util.setShort(d, o, v);
         if (p(d)) ev("setShort " + names.get(d) + "[" + o + "]");
         return r;
@@ -285,6 +295,7 @@ public final class TearHook {
             tearAfterCommit = null;
             tornInTx = false;
             tornAt = "after the commit @" + beganAt;
+            dead = true;
             throw new Tear();
         }
     }
@@ -380,38 +391,96 @@ public final class TearHook {
 
     // ---- OwnerPIN ----
     public static boolean check(OwnerPIN pin, byte[] b, short o, byte l) {
+        if (dead) return false;
         boolean r = pin.check(b, o, l);
         ev("pin.check -> " + r);
         return r;
     }
 
     public static void update(OwnerPIN pin, byte[] b, short o, byte l) {
+        if (dead) return;
         pin.update(b, o, l);
         ev("pin.update");
     }
 
+    public static void pinReset(OwnerPIN pin) {
+        if (dead) return;
+        pin.reset();
+    }
+
     public static void resetAndUnblock(OwnerPIN pin) {
+        if (dead) return;
         pin.resetAndUnblock();
         ev("pin.resetAndUnblock");
     }
 
     // ---- keys ----
     public static void setW(ECPublicKey k, byte[] b, short o, short l) {
+        if (dead) return;
         k.setW(b, o, l);
         if (k == registryKeyObj) ev("registryKey.setW" + (depth > 0 ? " (key data: on a chip it may not take part in the transaction)" : ""));
     }
 
     /** Bytes written into private key objects (key data that lasts on a chip, unless the key is transient) since the count was last set to 0. */
     public static int keyBytes, keyCalls;
-    public static void privsetS(javacard.security.ECPrivateKey k, byte[] b, short o, short l) { k.setS(b, o, l); lasting(k, l); }
-    public static void privsetG(javacard.security.ECPrivateKey k, byte[] b, short o, short l) { k.setG(b, o, l); lasting(k, l); }
+    public static void privsetS(javacard.security.ECPrivateKey k, byte[] b, short o, short l) { if (dead) return; k.setS(b, o, l); lasting(k, l); }
+    public static void privsetG(javacard.security.ECPrivateKey k, byte[] b, short o, short l) { if (dead) return; k.setG(b, o, l); lasting(k, l); }
+
+    /** Every other write into a key object (domain parameters, an RSA key's data): dropped after a tear, like the rest. */
+    public static void keyWrite(Object k, byte[] b, short o, short l, String m) {
+        if (dead) return;
+        switch (m) {
+            case "setFieldFP": ((javacard.security.ECKey) k).setFieldFP(b, o, l); break;
+            case "setA": ((javacard.security.ECKey) k).setA(b, o, l); break;
+            case "setB": ((javacard.security.ECKey) k).setB(b, o, l); break;
+            case "setG": ((javacard.security.ECKey) k).setG(b, o, l); break;
+            case "setR": ((javacard.security.ECKey) k).setR(b, o, l); break;
+            case "setModulus":
+                if (k instanceof javacard.security.RSAPrivateKey) ((javacard.security.RSAPrivateKey) k).setModulus(b, o, l);
+                else ((javacard.security.RSAPublicKey) k).setModulus(b, o, l);
+                break;
+            case "setExponent":
+                if (k instanceof javacard.security.RSAPrivateKey) ((javacard.security.RSAPrivateKey) k).setExponent(b, o, l);
+                else ((javacard.security.RSAPublicKey) k).setExponent(b, o, l);
+                break;
+            default: throw new IllegalArgumentException(m);
+        }
+    }
+
+    public static void keySetK(Object k, short v) { if (dead) return; ((javacard.security.ECKey) k).setK(v); }
+
+    public static void keySetKey(Object k, byte[] b, short o) { if (dead) return; ((javacard.security.AESKey) k).setKey(b, o); }
+
+    public static void keyClear(Object k) { if (dead) return; ((javacard.security.Key) k).clearKey(); }
+
+    /** A store into one of the applet's byte or boolean fields, made here so that none lands after a tear. */
+    public static void putField(Object owner, int v, String field) {
+        if (dead) return;
+        try {
+            java.lang.reflect.Field f = owner.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            if (f.getType() == boolean.class) f.setBoolean(owner, v != 0);
+            else f.setByte(owner, (byte) v);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        stored(field);
+    }
     /** A write of `l` bytes into a key object, counted where the key's data lasts (a key built persistent; a transient one's is RAM). */
     static void lasting(javacard.security.ECPrivateKey k, short l) {
         if (k.getType() == javacard.security.KeyBuilder.TYPE_EC_FP_PRIVATE) { keyBytes += l; keyCalls++; }
     }
 
+    /** A store into one of the applet's byte or boolean fields (persistent memory): a write, after which a tear may come. */
+    public static void stored(String field) {
+        ev(field + " stored");
+    }
+
     public static void genKeyPair(KeyPair kp) {
+        if (dead) return;
         kp.genKeyPair();
+        // a pair the applet built in this command (the work keys, at the first SET_PIN) is one of its fields now
+        if (!keyPairs.contains(kp) && applet != null) refresh();
         if (keyPairs.contains(kp)) ev("genKeyPair" + (depth > 0 ? " (key data: on a chip it may not take part in the transaction)" : ""));
     }
 }

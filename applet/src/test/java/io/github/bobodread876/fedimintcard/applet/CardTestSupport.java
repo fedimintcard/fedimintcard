@@ -81,7 +81,21 @@ final class CardTestSupport {
 
     ResponseAPDU tx(int ins, int p1, byte[] data) { return tx(CLA, ins, p1, 0, data); }
 
-    ResponseAPDU setPinRaw(byte[] pin) { return tx(SET_PIN, 0, pin); }
+    /**
+     * A registry key for tests that need one and never check a registry signature: P-256's generator. SET_PIN takes
+     * only a card with a registry key.
+     */
+    static final byte[] TEST_REGISTRY_KEY = Bip340.hex("046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
+
+    /** SET_PIN as provisioning sends it: on a card with no PIN and no registry key, the test registry key first. */
+    ResponseAPDU setPinRaw(byte[] pin) {
+        try {
+            if (pinState() == 0 && !(Boolean) field("registryKeySet")) assertSw(0x9000, tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        return tx(SET_PIN, 0, pin);
+    }
 
     ResponseAPDU verifyPinRaw(byte[] pin) { return tx(VERIFY_PIN, 0, pin); }
 
@@ -89,7 +103,17 @@ final class CardTestSupport {
 
     void setPin(byte[] pin) { assertSw(0x9000, setPinRaw(pin)); }
 
-    void verifyPin(byte[] pin) { assertSw(0x9000, verifyPinRaw(pin)); }
+    void verifyPin(byte[] pin) { assertSw(0x9000, verifyPinHeld(pin)); }
+
+    /** VERIFY_PIN as a host sends it: the same command again while the card answers 6A98 (a wait owed), then its answer. */
+    ResponseAPDU verifyPinHeld(byte[] pin) {
+        ResponseAPDU r;
+        int n = 0;
+        while ((r = verifyPinRaw(pin)).getSW() == 0x6A98) {
+            if (++n > 200) throw new AssertionError("a wait that does not go down");
+        }
+        return r;
+    }
 
     /**
      * The ordinary provisioning path in one call: SET_PIN (only if no PIN is set yet), VERIFY_PIN,
@@ -115,7 +139,7 @@ final class CardTestSupport {
         return (Byte) isTransient.invoke(tm, (Object) field(name));
     }
 
-    /** The persistent PIN state byte: 0 not set, 1 set, 2 blocked. */
+    /** The persistent PIN state byte: 0 not set, 1 set. */
     int pinState() {
         try {
             return (Byte) field("pinState");
@@ -186,6 +210,13 @@ final class CardTestSupport {
         Field f = FedimintCardApplet.class.getDeclaredField(name);
         f.setAccessible(true);
         return f.get(applet());
+    }
+
+    /** Puts `v` in the applet's field `name` (test-only reflection). */
+    void setField(String name, Object v) throws ReflectiveOperationException {
+        Field f = FedimintCardApplet.class.getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(applet(), v);
     }
 
     /** The private scalar in a slot (test-only reflection; the applet has no such command). */

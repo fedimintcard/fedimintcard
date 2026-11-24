@@ -41,11 +41,11 @@ class Proof2HeaderClockTest {
     static SimCard card() throws Exception {
         SimCard c = new SimCard();
         assertEquals(0x9000, c.sw(SET_LIMIT, 0, be64(LIMIT)));
+        assertEquals(0x9000, c.setPin());
         for (int s = 0; s < 4; s++) {
             assertEquals(0x9000, c.sw(GEN_KEY, s, null));
             assertEquals(0x9000, c.sw(SET_NOTE, s, noteData(NOTE)));
         }
-        assertEquals(0x9000, c.sw(SET_PIN, 0, PIN));
         return c;
     }
 

@@ -37,6 +37,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.select();   // the selection that set the PIN counts as having it; a new one does not
         ResponseAPDU r = c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 3));
         assertSw(0x6A94, r);
         assertEquals(0, r.getData().length, "a refused SIGN returns no bytes");
@@ -80,7 +81,7 @@ class PinTest {
         c.setPin(pin("1111"));
         for (int i = 0; i < 5; i++) c.verifyPin(pin("1111"));
         assertEquals(3, c.triesRemaining());
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        assertSw(0x63C1, c.verifyPinRaw(pin("9999")), "one wrong try in a row");
     }
 
     /**
@@ -111,7 +112,7 @@ class PinTest {
         c.genKey(0);
         c.setPin(pin("1111"));
         c.verifyPin(pin("1111"));
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        assertSw(0x63C1, c.verifyPinRaw(pin("9999")));
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
     }
 
@@ -131,7 +132,7 @@ class PinTest {
         assertSw(0x6984, c.verifyPinRaw(pin("1111")));
         c.setPin(pin("2222"));                               // and SET_PIN is allowed again
         c.verifyPin(pin("2222"));
-        assertSw(0x63C2, c.verifyPinRaw(pin("1111")));
+        assertSw(0x63C1, c.verifyPinRaw(pin("1111")));
     }
 
     /** The PIN buffer is cleared after every outcome, so no later command's buffer holds PIN bytes. */
@@ -143,8 +144,8 @@ class PinTest {
             c.verifyPinRaw(sent);
             for (byte b : (byte[]) c.field("tmp")) assertEquals(0, b, "tmp must be zero");
         }
-        // The sweep did block the card (three misses); that is the expected outcome, not the point.
-        assertEquals(2, c.pinState());
+        // Three misses (and the askings of their waits) never block the card.
+        assertEquals(1, c.pinState());
     }
 
     @Test
@@ -162,6 +163,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.select();   // the selection that set the PIN counts as having it; a new one does not
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 7, new byte[32]));   // empty slot
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, new byte[31]));   // bad length
     }
@@ -169,20 +171,21 @@ class PinTest {
     // ── retry counter ────────────────────────────────────────────────────────
 
     @Test
-    void threeWrongPinsBlock() throws ReflectiveOperationException {
+    void wrongPinsNeverBlock() throws ReflectiveOperationException {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.setPin(pin("1111"));
-        // Two mismatches report the tries left; the third spends the last one and is therefore
-        // the block itself, which answers 6983 rather than 63C0: there is nothing left to report.
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        // Each mismatch reports the wrong tries in a row; each after the first owes a wait first.
         assertSw(0x63C1, c.verifyPinRaw(pin("9999")));
-        assertSw(0x6983, c.verifyPinRaw(pin("9999")));
-        // Blocked is terminal: it is also the first thing the next command sees.
-        assertSw(0x6983, c.verifyPinRaw(pin("9999")));
-        assertSw(0x6983, c.verifyPinRaw(pin("1111")));
-        assertSw(0x6983, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
-        assertEquals(2, c.pinState(), "pinState says blocked");
+        assertSw(0x6A98, c.verifyPinRaw(pin("9999")), "the second try waits");
+        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        assertSw(0x63C3, c.verifyPinHeld(pin("9999")));
+        assertSw(0x63C4, c.verifyPinHeld(pin("9999")));
+        assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)), "no session");
+        // The right PIN, once its wait is served, opens the card.
+        assertSw(0x9000, c.verifyPinHeld(pin("1111")));
+        assertEquals(1, c.pinState(), "set, never blocked");
+        assertEquals(3, c.triesRemaining());
     }
 
     @Test
@@ -194,43 +197,42 @@ class PinTest {
             assertSw(0x6700, c.verifyPinRaw(new byte[0]));
             assertSw(0x6700, c.verifyPinRaw(pin("111111111")));
         }
-        // Still three tries: the first mismatch reports 2 left.
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        // Nothing counted: the first mismatch is the first wrong try.
+        assertSw(0x63C1, c.verifyPinRaw(pin("9999")));
     }
 
     @Test
     void correctPinResetsTheCounter() {
         CardTestSupport c = new CardTestSupport();
         c.setPin(pin("1111"));
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
         assertSw(0x63C1, c.verifyPinRaw(pin("9999")));
+        assertSw(0x63C2, c.verifyPinHeld(pin("9999")));
         c.verifyPin(pin("1111"));
-        // A correct try restores all three attempts: mismatch reports 2 left again.
-        assertSw(0x63C2, c.verifyPinRaw(pin("9999")));
+        // A right PIN clears the count and the wait: the next mismatch is the first again, with no wait.
+        assertSw(0x63C1, c.verifyPinRaw(pin("9999")));
     }
 
     @Test
-    void blockedSurvivesReset() {
+    void wrongTriesSurviveResetAndNeverBlock() {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         c.setPin(pin("1111"));
-        // Two mismatches spend two tries and say how many are left; the third is the block.
-        for (int i = 0; i < 2; i++) assertSw(0x63C2 - i, c.verifyPinRaw(pin("9999")));
-        assertSw(0x6983, c.verifyPinRaw(pin("9999")));
+        for (int i = 1; i <= 3; i++) assertSw(0x63C0 | i, c.verifyPinHeld(pin("9999")));
         c.powerCycle();
-        assertSw(0x6983, c.verifyPinRaw(pin("1111")));
-        assertSw(0x6983, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
+        // The count outlasts the power: the wait after the third is owed still, then the right PIN opens.
+        assertSw(0x6A98, c.verifyPinRaw(pin("1111")));
+        assertSw(0x9000, c.verifyPinHeld(pin("1111")));
     }
 
     @Test
-    void setPinOnBlockedCardIsRefused() throws ReflectiveOperationException {
+    void wrongTriesDoNotReopenSetPin() throws ReflectiveOperationException {
         CardTestSupport c = new CardTestSupport();
         c.setPin(pin("1111"));
-        for (int i = 0; i < 3; i++) c.verifyPinRaw(pin("9999"));
-        // A blocked PIN cannot be replaced: the counter is not a reset button.
-        assertSw(0x6983, c.setPinRaw(pin("2222")));
-        assertSw(0x6983, c.changePinRaw(cat(pin("1111"), pin("2222"))));
-        assertEquals(2, c.pinState());
+        for (int i = 0; i < 3; i++) c.verifyPinHeld(pin("9999"));
+        // A forgotten PIN has no way back on the card: wrong tries are not a reset button.
+        assertSw(0x6985, c.setPinRaw(pin("2222")));
+        assertSw(0x6A94, c.changePinRaw(cat(pin("1111"), pin("2222"))));
+        assertEquals(1, c.pinState());
     }
 
     // ── SET_PIN ──────────────────────────────────────────────────────────────
@@ -241,22 +243,25 @@ class PinTest {
         c.setPin(pin("1111"));
         assertSw(0x6985, c.setPinRaw(pin("2222")));
         assertSw(0x6985, c.setPinRaw(pin("1111")));
-        // The first PIN is still the one, and SET_PIN never verified the session.
+        // The first PIN is still the one, and a new selection does not have it.
         assertEquals(1, c.pinState());
+        c.select();
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
         c.verifyPin(pin("1111"));
         c.powerCycle();
         c.verifyPin(pin("1111"));
-        assertSw(0x63C2, c.verifyPinRaw(pin("2222")));
+        assertSw(0x63C1, c.verifyPinRaw(pin("2222")));
     }
 
     @Test
-    void setPinMakesStateSetButNotVerified() throws ReflectiveOperationException {
+    void setPinCountsAsGivenForItsSelectionOnly() throws ReflectiveOperationException {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
         assertEquals(0, c.pinState());
         c.setPin(pin("1111"));
         assertEquals(1, c.pinState());
+        assertSw(0x6985, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)), "past the PIN gate: a key with no note");
+        c.select();
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
     }
 
@@ -319,8 +324,8 @@ class PinTest {
         assertEquals(javacard.framework.JCSystem.CLEAR_ON_DESELECT, c.transientClass("tmp"),
             "the session's buffer is CLEAR_ON_DESELECT, so a deselect drops it");
         c.genKey(0);
-        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
         byte[] tmp = (byte[]) c.field("tmp");
@@ -338,6 +343,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         byte[] oldPin = { 0x11, 0x22, 0x33, 0x44 }, newPin = { 0x55, 0x66, 0x77, (byte) 0x88 };
         c.setPin(oldPin);
+        c.select();   // the selection that set the PIN counts as having it; a new one does not
         assertSw(0x6A94, c.changePinRaw(cat(oldPin, newPin)));
         c.verifyPin(oldPin);
         assertSw(0x9000, c.changePinRaw(cat(oldPin, newPin)));
@@ -345,7 +351,7 @@ class PinTest {
         c.powerCycle();
         assertSw(0x6A94, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
         c.verifyPin(newPin);
-        assertSw(0x63C2, c.verifyPinRaw(oldPin), "the old PIN no longer matches");
+        assertSw(0x63C1, c.verifyPinRaw(oldPin), "the old PIN no longer matches");
     }
 
     /**
@@ -374,7 +380,7 @@ class PinTest {
         CardTestSupport c = new CardTestSupport();
         c.setPin(pin("1111"));
         c.verifyPin(pin("1111"));
-        assertSw(0x63C2, c.changePinRaw(cat(pin("9999"), pin("2222"))));
+        assertSw(0x63C1, c.changePinRaw(cat(pin("9999"), pin("2222"))));
         // The change session is over after the failure, even though VERIFY_PIN had succeeded.
         assertSw(0x6A94, c.changePinRaw(cat(pin("1111"), pin("2222"))));
         c.verifyPin(pin("1111"));
@@ -401,7 +407,7 @@ class PinTest {
         assertSw(0x9000, c.changePinRaw(cat(pin("1111"), pin("2222"))));
         c.powerCycle();
         assertSw(0x9000, c.verifyPinRaw(pin("2222")), "the new PIN verifies after a change");
-        assertSw(0x63C2, c.verifyPinRaw(pin("1111")), "the old PIN no longer matches");
+        assertSw(0x63C1, c.verifyPinRaw(pin("1111")), "the old PIN no longer matches");
     }
 
     @Test
@@ -559,8 +565,8 @@ class PinTest {
         javacard.framework.AID other = com.licel.jcardsim.utils.AIDUtil.create("F0464D4341524402");
         c.sim.installApplet(other, FedimintCardApplet.class);
         c.genKey(0);
-        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
         c.sim.selectApplet(other);
@@ -575,8 +581,8 @@ class PinTest {
     void sessionEndsOnReselect() {
         CardTestSupport c = new CardTestSupport();
         c.genKey(0);
-        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.setPin(pin("1111"));
+        assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
         c.verifyPin(pin("1111"));
         assertSw(0x9000, c.tx(CardTestSupport.SIGN, 0, CardTestSupport.fill(32, 1)));
         assertSw(0x9000, c.select());

@@ -292,7 +292,12 @@ class SignatureCheckTest {
                 "schnorr.sign(privs[s], pubs[s], x, X_HASH, buf, (short) 0);" }) {
             assertEquals(1, code.split(java.util.regex.Pattern.quote(site), -1).length - 1, site);
         }
-        assertEquals(1, code.split("schnorr\\.sign\\(", -1).length - 1, "the signature that leaves the card is sign()");
+        assertEquals(2, code.split("schnorr\\.sign\\(", -1).length - 1, "SIGN's, and the PIN wait's");
+        // the PIN wait's signature is made with the work keys into the buffer and wiped there: it never leaves
+        String work = code.substring(code.indexOf("private void work("), code.indexOf("private void verifyPin("));
+        assertTrue(work.contains("schnorr.sign((ECPrivateKey) workKeys.getPrivate()"), "the wait signs with the work keys");
+        assertTrue(work.contains("arrayFillNonAtomic(buf, (short) 0, (short) 64"), "and wipes what it made");
+        assertFalse(work.contains("setOutgoing"), "and sends nothing");
     }
 
     @Test
