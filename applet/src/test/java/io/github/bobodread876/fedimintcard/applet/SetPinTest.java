@@ -47,7 +47,7 @@ class SetPinTest {
         // no VERIFY_PIN: SIGN and STATE_KEY pass the PIN gate
         assertSw(0x9000, c.tx(STATE_KEY, 0, null));
         byte[] pub = c.genKey(0);
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         byte[] msg = fill(32, 7);
         ResponseAPDU r = c.tx(SIGN, 0, msg);
         assertSw(0x9000, r);
@@ -90,10 +90,11 @@ class SetPinTest {
     @Test
     void refusedWhenAPinIsSetASlotHoldsValueOrNoRegistryKeyIsSet() throws Exception {
         CardTestSupport c = new CardTestSupport();
+        c.anchor();
         assertSw(0x6985, c.tx(SET_PIN, 0, PIN), "no registry key");
         assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
         c.genKey(0);
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         assertSw(0x6985, c.tx(SET_PIN, 0, PIN), "a note");
         ((byte[]) c.field("state"))[0] = ST_CHANGE;   // REFLECTION: change owed to the slot
         assertSw(0x6985, c.tx(SET_PIN, 0, PIN), "change owed");
@@ -109,6 +110,7 @@ class SetPinTest {
     void theEngineCheckRunsBeforeAnyWrite() throws Exception {
         CardTestSupport c = new CardTestSupport();
         assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
+        c.anchor();
         SchnorrHW s = signer(c);
         Object ecdh = get(s, SchnorrHW.class, "ecdh");
         Lying lying = new Lying(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY);
@@ -128,6 +130,7 @@ class SetPinTest {
             String which = alg == KeyAgreement.ALG_EC_PACE_GM ? "gm" : "ecdh";
             CardTestSupport c = new CardTestSupport();
             assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
+            c.anchor();
             SchnorrHW s = signer(c);
             Engine eng = new Engine(Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false));
             FakeKey sq = new FakeKey();
@@ -174,7 +177,7 @@ class SetPinTest {
         assertEquals(N, ((FakeKey) get(s, SchnorrHW.class, "sqKey")).mod, "the squaring's key has modulus n");
         assertEquals(1, c.tx(GET_STATE, 0, null).getData()[64] & 1, "GET_STATE says so");
         byte[] pub = c.genKey(0);
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         int before = eng.powers;
         byte[] msg = fill(32, 9);
         ResponseAPDU r = c.tx(SIGN, 0, msg);
@@ -191,7 +194,7 @@ class SetPinTest {
         assertFalse(signer(c).chipMul);
         assertEquals(0, c.tx(GET_STATE, 0, null).getData()[64] & 1);
         byte[] pub = c.genKey(0);
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         int before = eng.powers;
         byte[] msg = fill(32, 9);
         ResponseAPDU r = c.tx(SIGN, 0, msg);

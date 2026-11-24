@@ -41,7 +41,7 @@
  * none of them; a DELETE that named one would remove it, as on the chip.
  *
  * The applet under this card is FedimintCardApplet, as it answers on the wire:
- * SELECT sends the two version bytes `03 00` and no FCI; GET_PUB (B0 11) on a
+ * SELECT sends the two version bytes `04 00` and no FCI; GET_PUB (B0 11) on a
  * slot with no key answers 6985; SIGN (B0 12) is refused before the PIN. The
  * fake dispatches on the **module** the selected instance was made from, not
  * on INS, because SELECT is global: the opener is a real instance of this
@@ -356,7 +356,7 @@ export class FakeCard {
     const inst = this.instances.get(target)!;
     if (inst.module === CARD_MODULE) {
       // FedimintCardApplet: selectingApplet() sends VERSION_MAJOR, VERSION_MINOR and nothing else
-      return sw(0x9000, [0x03, 0x00]);
+      return sw(0x9000, [0x04, 0x00]);
     }
     // the opener: an Applet with no process(), so the toolkit answers 9000 with no data
     return sw(0x9000);

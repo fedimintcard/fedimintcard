@@ -101,9 +101,10 @@ class TearHarnessTest {
     /** P-256's generator: a registry key for tests that never check a registry signature. */
     static final byte[] TEST_REGISTRY_KEY = CardTestSupport.TEST_REGISTRY_KEY;
 
-    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), then the PIN. */
+    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), the anchor, then the PIN. */
     static void setPin(Card c) {
         assertEquals(0x9000, c.tx(0x34, 0, TEST_REGISTRY_KEY).getSW());
+        assertEquals(0x9000, c.tx(0x19, 0, Headers.anchor()).getSW(), "the set-up's anchor");
         assertEquals(0x9000, c.tx(SET_PIN, 0, PIN).getSW());
     }
 
@@ -116,7 +117,7 @@ class TearHarnessTest {
         for (int i = 8; i < 56; i++) note[i] = (byte) (0xA0 + i);
         setPin(c);
         assertEquals(0x9000, c.tx(VERIFY_PIN, 0, PIN).getSW());
-        assertEquals(0x9000, c.tx(SET_NOTE, 0, note).getSW());
+        assertEquals(0x9000, c.tx(SET_NOTE, 0, Registry.signed(k.getData(), note)).getSW());
         return k.getData();
     }
 

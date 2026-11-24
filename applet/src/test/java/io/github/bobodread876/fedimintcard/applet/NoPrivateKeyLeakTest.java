@@ -133,7 +133,7 @@ class NoPrivateKeyLeakTest {
         CardTestSupport c = new CardTestSupport();
         c.installKeyAndPin(0, SWEEP_KEY, CardTestSupport.DEFAULT_PIN);
         // 3.0 signs only a slot that holds a note
-        CardTestSupport.assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, CardTestSupport.noteData(1000)));
+        CardTestSupport.assertSw(0x9000, c.tx(CardTestSupport.SET_NOTE, 0, c.note(0, 1000)));
         List<byte[]> secrets = new ArrayList<>();
         addKeySecrets(secrets, SWEEP_KEY);
         int signed = 0, refused = 0;

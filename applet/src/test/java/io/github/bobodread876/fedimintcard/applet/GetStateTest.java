@@ -21,6 +21,10 @@ class GetStateTest {
         assertEquals(0, st[59], "no PIN");
         assertEquals(0, st[63], "not anchored");
         assertEquals(0, st[64], "the simulator: no chip product, no nonce key in RAM");
+        c.anchor();
+        assertEquals(1, state(c)[63], "anchored in this selection");
+        c.select();
+        assertEquals(0, state(c)[63], "and not in the next");
         c.setPin(DEFAULT_PIN);
         c.select();
         assertSw(0x63C1, c.verifyPinRaw(fill(4, '9')));
@@ -30,11 +34,10 @@ class GetStateTest {
         assertEquals(1, st[60], "one wrong try");
         assertEquals(0, st[61]);
         assertEquals(1, st[62], "one asking owed (the stretch has not ended)");
-        // REFLECTION: the anchor (the clock's slice sets it) and the signer's two bits
-        ((byte[]) c.field("held"))[FedimintCardApplet.H_ANCHORED] = 1;
+        assertEquals(0, st[63], "a selection after the set-up has not anchored");
+        // REFLECTION: the signer's two bits
         SchnorrHW s = (SchnorrHW) c.field("schnorr");
         s.chipMul = true;
-        assertEquals(1, state(c)[63]);
         assertEquals(1, state(c)[64]);
         ChipEnginesTest.set(s, SchnorrHW.class, "keyInRam", true);
         assertEquals(3, state(c)[64]);

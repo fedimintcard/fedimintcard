@@ -57,7 +57,7 @@ class ReleaseTest {
         assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, point(kp)));
         c.setPin(DEFAULT_PIN);
         c.verifyPin(DEFAULT_PIN);
-        assertSw(0x9000, c.tx(SET_NOTE, 1, noteData(2048)));
+        assertSw(0x9000, c.tx(SET_NOTE, 1, Registry.signed(kp.getPrivate(), c.slotX(1), noteData(2048))));
         return c;
     }
 
@@ -96,7 +96,7 @@ class ReleaseTest {
         assertEquals(ST_KEYED, r.getData()[0]);
         byte[] slot = c.tx(GET_SLOT, 2, null).getData();
         assertArrayEquals(new byte[66], java.util.Arrays.copyOfRange(slot, 121, 187), "the opening is gone");
-        assertSw(0x9000, c.tx(SET_NOTE, 2, noteData(4096)), "the slot takes a new note");
+        assertSw(0x9000, c.tx(SET_NOTE, 2, Registry.signed(kp.getPrivate(), c.slotX(2), noteData(4096))), "the slot takes a new note");
     }
 
     @Test
@@ -123,6 +123,7 @@ class ReleaseTest {
         c.genKey(0);
         c.genKey(1);
         assertEquals(0, c.tx(GET_STATE, 0, null).getData()[58]);
+        c.anchor();
         assertSw(0x6985, c.tx(SET_PIN, 0, DEFAULT_PIN), "no registry key: no PIN, so no value");
         assertEquals(0, c.pinState());
         byte[] t = fill(32, 0x66);

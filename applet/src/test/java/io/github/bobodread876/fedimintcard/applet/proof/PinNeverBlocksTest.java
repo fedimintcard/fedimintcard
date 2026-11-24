@@ -21,7 +21,7 @@ class PinNeverBlocksTest {
         SimCard c = new SimCard();
         assertEquals(0x9000, c.sw(GEN_KEY, 0, null));
         assertEquals(0x9000, c.setPin());
-        assertEquals(0x9000, c.sw(SET_NOTE, 0, noteData(50_000_000L)));
+        assertEquals(0x9000, c.sw(SET_NOTE, 0, c.note(0, 50_000_000L)));
         c.powerCycle();   // the stranger's tap: a new session, no PIN given
         assertEquals(0x63C1, c.sw(VERIFY_PIN, 0, WRONG));
         assertEquals(0x63C2, held(c, WRONG));

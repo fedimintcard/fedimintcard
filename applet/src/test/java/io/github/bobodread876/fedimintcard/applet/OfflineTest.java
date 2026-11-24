@@ -46,7 +46,7 @@ class OfflineTest {
         c.verifyPin(DEFAULT_PIN);
         for (int s = 0; s < n; s++) {
             c.genKey(s);
-            assertSw(0x9000, c.tx(SET_NOTE, s, noteData(msat)));
+            assertSw(0x9000, c.tx(SET_NOTE, s, c.note(s, msat)));
         }
         return c;
     }
@@ -102,7 +102,7 @@ class OfflineTest {
         c.genKey(0);
         c.genKey(1);
         c.genKey(2);
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         assertSw(0x9000, c.tx(SET_CHANGE, 1, changeData(2048)));
         assertSw(0x6985, c.tx(CLA, GEN_KEY, 0, 1, null), "a note");
         assertSw(0x6985, c.tx(CLA, GEN_KEY, 1, 1, null), "change owed");
@@ -122,7 +122,7 @@ class OfflineTest {
         assertFalse(Arrays.equals(before, c.getPub(0)));
         byte[] slot = c.tx(GET_SLOT, 0, null).getData();
         assertArrayEquals(new byte[32], Arrays.copyOfRange(slot, 89, 121), "the spent hash is gone");
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
         assertSw(0x9000, c.tx(SIGN, 0, h(2)), "the new note signs its own transaction");
     }
 
@@ -138,12 +138,12 @@ class OfflineTest {
     @Test
     void setNoteTakesOnlyAKeyedOrChangeSlot() {
         CardTestSupport c = new CardTestSupport();
-        assertSw(0x6985, c.tx(SET_NOTE, 0, noteData(1000)), "empty");
+        assertSw(0x6985, c.tx(SET_NOTE, 0, c.note(0, 1000)), "empty");
         c.genKey(0);
-        assertSw(0x6A80, c.tx(SET_NOTE, 0, noteData(0)), "no amount");
+        assertSw(0x6A80, c.tx(SET_NOTE, 0, c.note(0, 0)), "no amount");
         assertSw(0x6700, c.tx(SET_NOTE, 0, new byte[55]));
-        assertSw(0x9000, c.tx(SET_NOTE, 0, noteData(1000)));
-        assertSw(0x6985, c.tx(SET_NOTE, 0, noteData(2000)), "a note is not overwritten");
+        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
+        assertSw(0x6985, c.tx(SET_NOTE, 0, c.note(0, 2000)), "a note is not overwritten");
         byte[] slot = c.tx(GET_SLOT, 0, null).getData();
         assertEquals(ST_NOTE, slot[0]);
         assertArrayEquals(c.getPub(0), Arrays.copyOfRange(slot, 1, 33));
@@ -161,8 +161,8 @@ class OfflineTest {
         assertEquals(4096, u64(slot, 33));
         assertArrayEquals(Arrays.copyOfRange(open, 8, 74), Arrays.copyOfRange(slot, 121, 187), "the opening");
         assertSw(0x6985, c.tx(SET_CHANGE, 3, open), "only a keyed slot");
-        assertSw(0x6A80, c.tx(SET_NOTE, 3, noteData(2048)), "not the amount it is owed");
-        assertSw(0x9000, c.tx(SET_NOTE, 3, noteData(4096)));
+        assertSw(0x6A80, c.tx(SET_NOTE, 3, c.note(3, 2048)), "not the amount it is owed");
+        assertSw(0x9000, c.tx(SET_NOTE, 3, c.note(3, 4096)));
         slot = c.tx(GET_SLOT, 3, null).getData();
         assertEquals(ST_NOTE, slot[0]);
         assertArrayEquals(new byte[66], Arrays.copyOfRange(slot, 121, 187), "the opening is let go");
@@ -218,6 +218,7 @@ class OfflineTest {
     @Test
     void headersWithoutTheWorkAreRefusedAndAnOlderOneMovesNothing() {
         CardTestSupport c = new CardTestSupport();
+        c.setPin(DEFAULT_PIN);   // after the set-up: on a card with no PIN and no value, a header is an anchor (FirstAnchorTest)
         assertSw(0x6A93, c.tx(SET_HEADER, 0, GENESIS), "under the floor");
         byte[] forged = H900200.clone();
         forged[79] ^= 1;   // another nonce: the hash no longer meets the target

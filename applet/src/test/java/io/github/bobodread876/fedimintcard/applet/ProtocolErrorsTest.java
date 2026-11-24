@@ -42,7 +42,7 @@ class ProtocolErrorsTest {
             0x00, 0xA4, 0x04, 0x00, Bip340.hex(CardTestSupport.AID_HEX)));
         assertSw(0x9000, r);
         // P1b: SELECT answers the applet version, 2 bytes, instead of a bare 9000.
-        assertArrayEquals(new byte[] { 0x03, 0x00 }, r.getData());
+        assertArrayEquals(new byte[] { 0x04, 0x00 }, r.getData());
     }
 
     @Test

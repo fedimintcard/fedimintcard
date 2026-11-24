@@ -245,7 +245,7 @@ class GenKeyGetPubTest {
         ((byte[]) c.field("state"))[3] = (byte) CardTestSupport.ST_EMPTY;
         assertSw(0x6F00, c.tx(CardTestSupport.GEN_KEY, 3, null));
         assertEquals(CardTestSupport.ST_EMPTY, c.slotState(3), "the slot stays EMPTY");
-        assertSw(0x6985, c.tx(CardTestSupport.SET_NOTE, 3, CardTestSupport.noteData(1000)), "and takes no note");
+        assertSw(0x6985, c.tx(CardTestSupport.SET_NOTE, 3, c.note(3, 1000)), "and takes no note");
         privs[3] = real;
         c.genKey(3);
     }

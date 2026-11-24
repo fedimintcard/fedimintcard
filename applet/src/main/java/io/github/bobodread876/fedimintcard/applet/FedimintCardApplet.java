@@ -41,17 +41,22 @@ import javacard.security.Signature;
  *                                        then spent. A SPENT slot: the same hash only, answered with the signature it
  *                                        gave. Else 6985; over the limit 6A95
  * 13 STATE_KEY   P1=P2=0              -> 32 bytes (after VERIFY_PIN)
- * 14 SET_NOTE    P1=slot Lc=56        amount (8, msat, big-endian) || federation signature (48). A KEYED slot, or a CHANGE
- *                                        slot finished (same amount); the slot becomes NOTE
+ * 14 SET_NOTE    P1=slot Lc=56+8..72  amount (8, msat, big-endian) || federation signature (48) || the registry's
+ *                                        ECDSA-SHA256 (DER) over "fedimintcard/note1" || the slot's x-only key || the
+ *                                        56 bytes. A KEYED slot, or a CHANGE slot finished (same amount); the slot
+ *                                        becomes NOTE. A bad signature 6982, no registry key 6985: nothing written
  * 15 GET_SLOT    P1=slot              -> state (1) || x-only pubkey (32) || amount and signature (56) || spent hash (32)
  *                                        || opening (66)
  * 16 GET_STATE                        -> slot states (32) || now (4) || window (4) || limit (8) || spent today (8)
  *                                        || cert length (1) || attest made (1) || registry key set (1) || PIN state (1)
  *                                        || wrong tries in a row (1) || askings owed (2) || anchored in this selection (1)
  *                                        || signer (1: bit 0 the chip's RSA path, bit 1 the nonce key in RAM)
- * 17 SET_CHANGE  P1=slot Lc=74        amount (8) || txid (32) || output index (2) || blinding key (32). A KEYED slot becomes CHANGE
+ * 17 SET_CHANGE  P1=slot Lc=74        amount (8) || txid (32) || output index (2) || blinding key (32). A KEYED slot becomes CHANGE.
+ *                                        After SET_PIN, only with this selection's PIN (6A94)
  * 18 SET_LIMIT   Lc=8                 the day's limit in msat (0: none). Only before SET_PIN
- * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work (6A93)
+ * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work and
+ *                                        not weak (6A93, nothing written). Before SET_PIN on a card with no value it is
+ *                                        an anchor: the clock at its time, the day's window and spent cleared
  * 30 ATTEST_INIT                      -> P-256 public key (65). Makes the attestation key; only before SET_PIN and the certificate
  * 31 SET_CERT    Lc=1..160            the registry's certificate over this card; once, before SET_PIN
  * 32 GET_CERT                         -> the certificate
@@ -64,8 +69,9 @@ import javacard.security.Signature;
  *                                        report it refused as a double spend (docs/OFFLINE-PROTOCOL.md § 6)
  * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN. After wrong tries the next try first owes a wait,
  *                                        served by sending the same VERIFY_PIN again while it answers 6A98
- * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card, on a card with the registry key and no value (6985); the
- *                                        selection that sent it counts as having the PIN
+ * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card, after an anchor in the same selection (6A96), on a card with
+ *                                        the registry key and no value (6985); the selection that sent it counts as
+ *                                        having the PIN
  * 42 CHANGE_PIN  P1=old length P2=0   old PIN (4..8) || new PIN (4..8); P1=0: two halves of the same length. After
  *                                        VERIFY_PIN; closes the session. A wrong old PIN counts as a try
  * </pre>
@@ -112,7 +118,7 @@ public final class FedimintCardApplet extends Applet {
     static final short SLOTS = 32;
 
     /** SELECT answers this major and {@link #VERSION_MINOR}; see the class javadoc. */
-    static final byte VERSION_MAJOR = 0x03;
+    static final byte VERSION_MAJOR = 0x04;
     static final byte VERSION_MINOR = 0x00;
 
     /** PIN size bounds (bytes; the applet never interprets them), and OwnerPIN's own counter, filled again before every try. */
@@ -138,6 +144,7 @@ public final class FedimintCardApplet extends Applet {
     static final short SW_PIN_NEEDED = 0x6A94;
     static final short SW_OVER_LIMIT = 0x6A95;
     static final short SW_LITTLE_WORK = 0x6A93;
+    static final short SW_NOT_ANCHORED = 0x6A96;
 
     static final byte INS_SET_NOTE = (byte) 0x14;
     static final byte INS_GET_SLOT = (byte) 0x15;
@@ -162,6 +169,8 @@ public final class FedimintCardApplet extends Applet {
     static final short NOTE_LEN = 56;
     /** Change owed to a slot: the transaction (32), the output's index (2), its blinding key (32). */
     static final short OPEN_LEN = 66;
+    /** Where SET_NOTE builds its 106-byte message in the APDU buffer: past its longest data (133). */
+    static final short NOTE_MSG = 134;
     static final short CERT_MAX = 160;
     static final short HEADER_LEN = 80;
     static final short STATE_LEN = 65;
@@ -184,6 +193,9 @@ public final class FedimintCardApplet extends Applet {
     /** RELEASE's label: ASCII "fedimintcard/rel1", 17 bytes. */
     private static final byte[] RELEASE_LABEL = {
         'f','e','d','i','m','i','n','t','c','a','r','d','/','r','e','l','1' };
+    /** SET_NOTE's label: ASCII "fedimintcard/note1", 18 bytes. */
+    private static final byte[] NOTE_LABEL = {
+        'f','e','d','i','m','i','n','t','c','a','r','d','/','n','o','t','e','1' };
     /** ATTEST's label: ASCII "fedimintcard/at1", 16 bytes. */
     private static final byte[] ATTEST_LABEL = {
         'f','e','d','i','m','i','n','t','c','a','r','d','/','a','t','1' };
@@ -266,6 +278,7 @@ public final class FedimintCardApplet extends Applet {
     private static final short X_OUT = 48;     // 64: a header's hash, then its target
     private static final short X_FLOOR = 112;  // 32
     private static final short X_LEN = 144;
+    private static final short X_REC = 0;      // 28, SET_HEADER's new clock record (an anchor)
     private final KeyPair gen;
     private final byte[] tmp;
     /**
@@ -613,8 +626,9 @@ public final class FedimintCardApplet extends Applet {
     }
 
     /**
-     * The one-time PIN write, on a card with the registry key and no value. The selection that
-     * sends it counts as having the PIN, so the host need not send VERIFY_PIN after it.
+     * The one-time PIN write, on a card with the registry key and no value, in a selection whose
+     * SET_HEADER anchored the clock (an anchor made in an earlier selection does not count). The
+     * selection that sends it counts as having the PIN, so the host need not send VERIFY_PIN after it.
      *
      * Before anything is written, the signer's check of the chip's engines (6F00 for a chip that
      * answers otherwise: such a card never takes a PIN, so never takes value). Just before the
@@ -631,8 +645,9 @@ public final class FedimintCardApplet extends Applet {
         if (len < PIN_MIN || len > PIN_MAX) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        // The anchor rule goes here (the clock's slice): 6A96 unless this selection anchored the
-        // clock (held[H_ANCHORED]). Until then SET_PIN does not ask for an anchor.
+        if (held[H_ANCHORED] == 0) {
+            ISOException.throwIt(SW_NOT_ANCHORED);
+        }
         if (!registryKeySet || holdsValue()) {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
@@ -1036,12 +1051,18 @@ public final class FedimintCardApplet extends Applet {
 
     /**
      * SET_NOTE: the note on a KEYED slot, or the finished change on a CHANGE slot (whose amount
-     * must match). No PIN: loading spends nothing, as for a holder's load. The note's data and its
-     * state are one commit; a CHANGE slot's opening is let go after it.
+     * must match), with the registry's signature over the slot's own key and the note, checked
+     * under the registry key as RELEASE's is. No PIN: loading spends nothing, as for a holder's
+     * load. The check writes nothing; the note's data and its state are one commit, and a CHANGE
+     * slot's opening is let go after it.
      */
     private void setNote(APDU apdu, byte[] buf) {
         short s = slot(buf, false);
-        receiveExactly(apdu, NOTE_LEN);
+        short len = receiveAll(apdu);
+        short sigLen = (short) (len - NOTE_LEN);
+        if (len != apdu.getIncomingLength() || sigLen < 8 || sigLen > 72) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
         byte st = state[s];
         short n = (short) (s * NOTE_LEN);
         if (st == ST_CHANGE) {
@@ -1051,8 +1072,32 @@ public final class FedimintCardApplet extends Applet {
         } else if (st != ST_KEYED) {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
+        if (!registryKeySet) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
         if (isZero(buf, ISO7816.OFFSET_CDATA, (short) 8)) {
             ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        // label (18) || the slot's x (32) || the note (56), built from byte 134 of the buffer: past
+        // the longest data (5 + 56 + 72 = 133), so the signature it is checked against stays whole
+        short m = NOTE_MSG;
+        Util.arrayCopyNonAtomic(NOTE_LABEL, (short) 0, buf, m, (short) 18);
+        short k = pubs[s].getW(tmp, (short) 0);
+        if (!((k == 65 && tmp[0] == 0x04) || (k == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03)))) {
+            ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+        }
+        Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) (m + 18), (short) 32);
+        Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+        Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, buf, (short) (m + 50), NOTE_LEN);
+        ecdsa.init(registryKey, Signature.MODE_VERIFY);
+        boolean ok;
+        try {
+            ok = ecdsa.verify(buf, m, (short) 106, buf, (short) (ISO7816.OFFSET_CDATA + NOTE_LEN), sigLen);
+        } catch (javacard.security.CryptoException e) {
+            ok = false;
+        }
+        if (!ok) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
         JCSystem.beginTransaction();
         Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, notes, n, NOTE_LEN);
@@ -1065,10 +1110,14 @@ public final class FedimintCardApplet extends Applet {
      * SET_CHANGE: a KEYED slot is owed change from an offline payment. The card keeps what an
      * online till needs to finish the note later: the amount, the transaction and output, and the
      * blinding key (the till blinds; the card cannot hash to BLS12-381). The key never leaves
-     * the card, so only this card can spend the change, as in cashucard's GET_CHANGE.
+     * the card, so only this card can spend the change, as in cashucard's GET_CHANGE. After
+     * SET_PIN it needs this selection's PIN (its one sender, the offline POS, holds a PIN session).
      */
     private void setChange(APDU apdu, byte[] buf) {
         short s = slot(buf, false);
+        if (pinState == PIN_STATE_SET && !pinGiven()) {
+            ISOException.throwIt(SW_PIN_NEEDED);
+        }
         receiveExactly(apdu, (short) (8 + OPEN_LEN));
         if (state[s] != ST_KEYED) {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
@@ -1142,10 +1191,18 @@ public final class FedimintCardApplet extends Applet {
     }
 
     /**
-     * SET_HEADER, as cashucard's: a Bitcoin block header moves the card's clock to its time when
-     * that is later, if the header has its own bits' work, at least the floor's, and at least a
-     * quarter of the hardest the card has taken. A real header exists only once the world has
-     * mined it, so no terminal can make the day turn early. Anyone may send one. Answers now (4).
+     * SET_HEADER, after cashucard's: a Bitcoin block header moves the card's clock to its time when
+     * that is later, if the header has its own bits' work, at least the floor's, at least a quarter
+     * of the hardest the card has taken, and is not weak. Weak: its target is over twice the
+     * hardest's, or, before any hardest, its work is under twice the floor's. A header that fails
+     * any of these answers 6A93 and writes nothing. A header taken raises the hardest only where it
+     * is harder. A real header exists only once the world has mined it, so no terminal can make the
+     * day turn early. Anyone may send one. Answers now (4).
+     *
+     * While no PIN is set and no slot holds value, a header taken is an anchor: in one transaction
+     * the clock goes to its time, even an earlier one, the hardest is raised where it is harder
+     * (never lowered), and the day's window and its spent count are cleared. This selection then
+     * counts as anchored, which SET_PIN asks for.
      */
     private void setHeader(APDU apdu, byte[] buf) {
         receiveExactly(apdu, HEADER_LEN);
@@ -1175,17 +1232,40 @@ public final class FedimintCardApplet extends Applet {
                 ISOException.throwIt(SW_LITTLE_WORK);
             }
         }
+        // whether it is harder than the hardest taken, and whether it is weak (R's checkHeader)
+        boolean harder = true;
+        if (seen) {
+            targetOf(clock, CK_BITS, x, X_FLOOR);
+            harder = cmp(x, (short) (X_OUT + 32), x, X_FLOOR, (short) 32) < 0;
+            // the weak bar: twice the hardest's target
+            twice(x, X_FLOOR);
+        } else {
+            // before any hardest: the header's target doubled (nothing reads it after) against the
+            // floor's, which X_FLOOR still holds, so work under twice the floor's is weak
+            twice(x, (short) (X_OUT + 32));
+        }
+        if (cmp(x, (short) (X_OUT + 32), x, X_FLOOR, (short) 32) > 0) {
+            ISOException.throwIt(SW_LITTLE_WORK);
+        }
         // the block's time, big-endian
         x[X_NUM] = buf[(short) (at + 71)];
         x[(short) (X_NUM + 1)] = buf[(short) (at + 70)];
         x[(short) (X_NUM + 2)] = buf[(short) (at + 69)];
         x[(short) (X_NUM + 3)] = buf[(short) (at + 68)];
-        if (cmp(x, X_NUM, clock, CK_NOW, (short) 4) > 0) {
-            boolean harder = !seen;
-            if (seen) {
-                targetOf(clock, CK_BITS, x, X_FLOOR);
-                harder = cmp(x, (short) (X_OUT + 32), x, X_FLOOR, (short) 32) < 0;
+        if (pinState != PIN_STATE_SET && !holdsValue()) {
+            // the anchor: the new record built in scratch, then written in one transaction
+            Util.arrayCopyNonAtomic(clock, (short) 0, x, X_REC, CK_LEN);
+            Util.arrayCopyNonAtomic(x, X_NUM, x, (short) (X_REC + CK_NOW), (short) 4);
+            Util.arrayFillNonAtomic(x, (short) (X_REC + CK_WINDOW), (short) 4, (byte) 0);
+            if (harder) {
+                Util.arrayCopyNonAtomic(buf, (short) (at + 72), x, (short) (X_REC + CK_BITS), (short) 4);
             }
+            Util.arrayFillNonAtomic(x, (short) (X_REC + CK_SPENT), (short) 8, (byte) 0);
+            JCSystem.beginTransaction();
+            Util.arrayCopy(x, X_REC, clock, (short) 0, CK_LEN);
+            JCSystem.commitTransaction();
+            held[H_ANCHORED] = 1;
+        } else if (cmp(x, X_NUM, clock, CK_NOW, (short) 4) > 0) {
             JCSystem.beginTransaction();
             Util.arrayCopy(x, X_NUM, clock, CK_NOW, (short) 4);
             if (harder) {
@@ -1213,6 +1293,19 @@ public final class FedimintCardApplet extends Applet {
             if (idx < 32) {
                 out[(short) (outOff + idx)] = src[(short) (off + 2 - k)];
             }
+        }
+    }
+
+    /** Twice a 32-byte big-endian number, in place; too large to hold becomes the largest there is. */
+    private static void twice(byte[] a, short off) {
+        short carry = 0;
+        for (short i = 31; i >= 0; i--) {
+            short v = (short) (((a[(short) (off + i)] & 0xFF) << 1) | carry);
+            a[(short) (off + i)] = (byte) v;
+            carry = (short) ((v >> 8) & 0x01);
+        }
+        if (carry != 0) {
+            Util.arrayFillNonAtomic(a, off, (short) 32, (byte) 0xFF);
         }
     }
 

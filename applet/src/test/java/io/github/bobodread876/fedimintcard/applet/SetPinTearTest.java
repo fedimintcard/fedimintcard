@@ -18,6 +18,7 @@ class SetPinTearTest {
     static Card blank() throws Exception {
         Card c = new Card();
         assertEquals(0x9000, c.tx(0x34, 0, TEST_REGISTRY_KEY).getSW());
+        assertEquals(0x9000, c.tx(0x19, 0, Headers.anchor()).getSW(), "the set-up's anchor");
         return c;
     }
 
@@ -63,6 +64,7 @@ class SetPinTearTest {
             if (pinState(t) == 0) {
                 unset++;
                 if (k >= commit) wrong.add("write " + k + ": torn after the commit point, and not set");
+                if (t.tx(0x19, 0, Headers.anchor()).getSW() != 0x9000) wrong.add("write " + k + ": no anchor after the tear");
                 if (t.tx(SET_PIN, 0, PIN).getSW() != 0x9000) wrong.add("write " + k + ": SET_PIN does not run again");
                 t.select();
             } else {

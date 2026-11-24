@@ -147,9 +147,10 @@ const GET_PUB = [0xb0, 0x11, 0x00, 0x00, 0x00];
  * gated from the card side (see the header).
  *
  * The checks prove an install the only ways this applet allows:
- * - SELECT answers `03 00` (FedimintCardApplet.VERSION_MAJOR/MINOR), so a
- *   selection that lands on the opener, which answers `90 00` with no data,
- *   fails here rather than at the first real command;
+ * - SELECT answers `04 00` (FedimintCardApplet.VERSION_MAJOR/MINOR), exactly:
+ *   a selection that lands on the opener, which answers `90 00` with no data,
+ *   fails here rather than at the first real command, and an older applet
+ *   (major 2 or 3) that is still on the card fails the run, never passes it;
  * - GET_PUB of every slot answers `6985`: mint-fresh, no slot has a key.
  */
 export function fedimintPlan(loadFile: LoadFileAsset): Plan {
@@ -163,7 +164,7 @@ export function fedimintPlan(loadFile: LoadFileAsset): Plan {
     ],
     sweep: [CARD_AID, OPENER_AID, FEDIMINT_PACKAGE_AID],
     checks: [
-      {apdu: selectAid(CARD_AID), data: [0x03, 0x00]},
+      {apdu: selectAid(CARD_AID), data: [0x04, 0x00]},
       // The slots the install tap keys, and the last one, so an applet that kept a key across a
       // reinstall is seen. Not all 32: each GET_PUB is a round trip in the install tap, and a
       // fresh instance builds every slot's key objects anew at its first GEN_KEY.

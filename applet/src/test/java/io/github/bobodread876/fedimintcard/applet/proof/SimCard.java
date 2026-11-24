@@ -65,9 +65,11 @@ final class SimCard {
     /** P-256's generator: a registry key for tests that never check a registry signature. */
     static final byte[] TEST_REGISTRY_KEY = Bip340.hex("046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
 
-    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), then the PIN. */
+    /** SET_PIN as provisioning sends it: the registry key first (SET_PIN takes only a card with one), the anchor, then the PIN. */
     int setPin() {
         int r = sw(0x34, 0, TEST_REGISTRY_KEY);
+        if (r != 0x9000) return r;
+        r = sw(SET_HEADER, 0, io.github.bobodread876.fedimintcard.applet.Headers.anchor());
         if (r != 0x9000) return r;
         return sw(SET_PIN, 0, PIN);
     }
@@ -116,6 +118,24 @@ final class SimCard {
         for (int i = 0; i < 8; i++) d[7 - i] = (byte) (msat >>> (8 * i));
         for (int i = 8; i < 56; i++) d[i] = (byte) (0xA0 + i);
         return d;
+    }
+
+    /**
+     * SET_NOTE's data for this card's slot as the registry sends it: noteData(msat), then the test registry key's
+     * signature over the slot's own x-only key. A card with no PIN and no registry key gets the test key first.
+     */
+    byte[] note(int slot, long msat) throws ReflectiveOperationException {
+        if (pinState() == 0 && !(Boolean) field("registryKeySet")) {
+            if (sw(0x34, 0, TEST_REGISTRY_KEY) != 0x9000) throw new IllegalStateException("registry key");
+        }
+        return io.github.bobodread876.fedimintcard.applet.Registry.signed(slotX(slot), noteData(msat));
+    }
+
+    /** The slot's x-only key as GET_SLOT answers it (zeros for an empty slot). */
+    byte[] slotX(int slot) {
+        ResponseAPDU r = tx(GET_SLOT, slot, null);
+        if (r.getSW() != 0x9000) throw new IllegalStateException(Integer.toHexString(r.getSW()));
+        return java.util.Arrays.copyOfRange(r.getData(), 1, 33);
     }
 
     static byte[] be64(long v) {

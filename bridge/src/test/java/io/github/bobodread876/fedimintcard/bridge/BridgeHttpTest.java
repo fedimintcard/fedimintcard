@@ -3,6 +3,7 @@ package io.github.bobodread876.fedimintcard.bridge;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.bobodread876.fedimintcard.applet.Bip340;
+import io.github.bobodread876.fedimintcard.applet.Registry;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -54,7 +55,7 @@ class BridgeHttpTest {
 
     @Test
     void selectGenKeySetPinVerifySignVerifiesOverHttp() throws Exception {
-        assertEquals("03009000", apdu("00a4040008f0464d4341524401")); // applet 3.0
+        assertEquals("04009000", apdu("00a4040008f0464d4341524401")); // applet 4.0
         String gen = apdu("b0100000");
         assertEquals(68, gen.length());
         assertTrue(gen.endsWith("9000"));
@@ -67,12 +68,18 @@ class BridgeHttpTest {
         // SET_PIN takes a card with the registry key (here P-256's generator, a stand-in) and no value
         assertEquals("9000", apdu("b0340000" + "41" + "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
             + "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"));
+        // SET_PIN asks for an anchor in its selection: a real header (block 900 000); the card answers its time
+        assertEquals("68427f939000", apdu("b0190000" + "50"
+            + "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e5951"
+            + "18ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92"));
         assertEquals("9000", apdu("b04100000431323334"));
-        assertEquals("03009000", apdu("00a4040008f0464d4341524401")); // a new selection: the PIN is not given
+        assertEquals("04009000", apdu("00a4040008f0464d4341524401")); // a new selection: the PIN is not given
         assertEquals("6a94", apdu(sign));
         assertEquals("9000", apdu("b04000000431323334"));
-        // the card signs only a slot holding a note: 1000 msat, then 48 bytes standing for its signature
-        assertEquals("9000", apdu("b0140000" + "38" + "00000000000003e8" + "aa".repeat(48)));
+        // the card signs only a slot holding a note: 1000 msat, 48 bytes standing for its federation signature, and
+        // the registry's signature over the slot's key and the note (the generator's private key, 1, a stand-in)
+        byte[] note = Registry.signed(pub, Bip340.hex("00000000000003e8" + "aa".repeat(48)));
+        assertEquals("9000", apdu("b0140000" + String.format("%02x", note.length) + Bip340.hex(note)));
         String sig = apdu(sign);
         assertEquals(64 * 2 + 4, sig.length());
         assertTrue(sig.endsWith("9000"));

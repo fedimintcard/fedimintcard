@@ -32,6 +32,27 @@ final class CardTestSupport {
         return d;
     }
 
+    /**
+     * SET_NOTE's data for this card's slot as the registry sends it: noteData(msat), then the test registry key's
+     * signature over the slot's own x-only key (Registry). A card with no PIN and no registry key gets the test key
+     * first, as provisioning sets it.
+     */
+    byte[] note(int slot, long msat) {
+        try {
+            if (pinState() == 0 && !(Boolean) field("registryKeySet")) assertSw(0x9000, tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        return Registry.signed(slotX(slot), noteData(msat));
+    }
+
+    /** The slot's x-only key as GET_SLOT answers it (zeros for an empty slot). */
+    byte[] slotX(int slot) {
+        ResponseAPDU r = tx(GET_SLOT, slot, null);
+        assertSw(0x9000, r);
+        return Arrays.copyOfRange(r.getData(), 1, 33);
+    }
+
     /** The slot's state byte (test-only reflection). */
     int slotState(int slot) {
         try {
@@ -87,15 +108,22 @@ final class CardTestSupport {
      */
     static final byte[] TEST_REGISTRY_KEY = Bip340.hex("046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
 
-    /** SET_PIN as provisioning sends it: on a card with no PIN and no registry key, the test registry key first. */
+    /**
+     * SET_PIN as provisioning sends it: on a card with no PIN, the test registry key first if none is set, and the
+     * set-up's anchor (a header, in SET_PIN's selection), then the PIN.
+     */
     ResponseAPDU setPinRaw(byte[] pin) {
         try {
             if (pinState() == 0 && !(Boolean) field("registryKeySet")) assertSw(0x9000, tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(e);
         }
+        if (pinState() == 0) anchor();
         return tx(SET_PIN, 0, pin);
     }
+
+    /** SET_HEADER with the set-up's anchor (Headers.anchor), answered 9000. */
+    void anchor() { assertSw(0x9000, tx(SET_HEADER, 0, Headers.anchor()), "the set-up's anchor"); }
 
     ResponseAPDU verifyPinRaw(byte[] pin) { return tx(VERIFY_PIN, 0, pin); }
 
@@ -176,7 +204,7 @@ final class CardTestSupport {
      * and these tests are about the signatures, not the burn.
      */
     byte[] sign(int slot, byte[] msg) {
-        if (slotState(slot) == ST_KEYED) assertSw(0x9000, tx(SET_NOTE, slot, noteData(1000)));
+        if (slotState(slot) == ST_KEYED) assertSw(0x9000, tx(SET_NOTE, slot, note(slot, 1000)));
         if (slotState(slot) == ST_SPENT) {
             try {
                 byte[] spent = (byte[]) field("spentHash");
@@ -210,6 +238,25 @@ final class CardTestSupport {
         Field f = FedimintCardApplet.class.getDeclaredField(name);
         f.setAccessible(true);
         return f.get(applet());
+    }
+
+    /**
+     * Every persistent array and every byte, short and boolean field of the applet, copied, for a test that asserts a
+     * command wrote nothing (test-only reflection). Key objects are left out: no header command touches one.
+     */
+    java.util.Map<String, Object> persistent() throws ReflectiveOperationException {
+        java.util.Map<String, Object> m = new java.util.TreeMap<>();
+        for (Field f : FedimintCardApplet.class.getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+            f.setAccessible(true);
+            Object v = f.get(applet());
+            if (v instanceof byte[]) {
+                if (transientClass(f.getName()) == 0) m.put(f.getName(), Arrays.toString((byte[]) v));
+            } else if (v instanceof Byte || v instanceof Short || v instanceof Boolean) {
+                m.put(f.getName(), v);
+            }
+        }
+        return m;
     }
 
     /** Puts `v` in the applet's field `name` (test-only reflection). */
