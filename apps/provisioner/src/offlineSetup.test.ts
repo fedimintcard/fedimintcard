@@ -1,12 +1,13 @@
 import {fromHex, toHex} from './cardkit';
-import {limitApdu, DEFAULT_DAILY_LIMIT_SAT, type OfflineSetup} from './cardSetup';
+import {H900000, NOW_MS, T900000} from './testing/anchor';
+import {limitApdu, DEFAULT_DAILY_LIMIT_SAT, NEEDS_INTERNET, OLD_APPLET, type OfflineSetup} from './cardSetup';
 
 const VILLAGE_LIMIT_SAT = 10_000;
 
 test('a batch has no daily limit unless one is set', () => {
   expect(DEFAULT_DAILY_LIMIT_SAT).toBe(0);
 });
-import {LOOP, registryHeldWhat} from './strings';
+import {LOOP, registryHeldWhat, STATE, stopLines, WAIT} from './strings';
 import {holdsPlace, installTap, type TapOptions} from './installTap';
 import {shortIdOf} from './store';
 import {FakeGpCard, J3R180_CHIP} from './testing/fakeGpCard';
@@ -33,6 +34,7 @@ const ATTEST_INIT = 0x30;
 const SET_CERT = 0x31;
 const SET_REGISTRY_KEY = 0x34;
 const SET_PIN = 0x41;
+const SET_HEADER = 0x19;
 const GEN_KEY = 0x10;
 
 /** The registry's certificate for a key, in the protocol's shape: 01 ‖ slot 0 ‖ compressed attest ‖ r‖s. */
@@ -52,7 +54,14 @@ function setup(over: Partial<OfflineSetup> = {}) {
     certFor(attestPub, slot0),
   );
   // a village batch's limit; the default is none (DEFAULT_DAILY_LIMIT_SAT, checked below)
-  const offline: OfflineSetup = {limitMsat: VILLAGE_LIMIT_SAT * 1000, certify, registryKey: REGISTRY_KEY, ...over};
+  const offline: OfflineSetup = {
+    limitMsat: VILLAGE_LIMIT_SAT * 1000,
+    certify,
+    registryKey: REGISTRY_KEY,
+    header: H900000,
+    now: () => NOW_MS,
+    ...over,
+  };
   return {certify, offline};
 }
 
@@ -87,7 +96,7 @@ test('a blank card: keys, then limit, attestation, certificate, and only then th
   const r = await installTap(card.transceive, tapOptions(offline, {onSetupStep: s => steps.push(s)}));
   expect(r.installed).toEqual({ok: true});
   expect(r.setup?.ok).toBe(true);
-  expect(steps).toEqual(['select', 'keys', 'attest', 'setPin', 'verifyPin']);
+  expect(steps).toEqual(['select', 'keys', 'attest', 'anchor', 'setPin']);
   const a = card.applet!;
   expect(a.limit).toEqual([0, 0, 0, 0, 0, 0x98, 0x96, 0x80]);
   expect(a.attest).toHaveLength(65);
@@ -104,7 +113,12 @@ test('a blank card: keys, then limit, attestation, certificate, and only then th
   expect(at(SET_LIMIT)).toBeLessThan(at(ATTEST_INIT));
   expect(at(ATTEST_INIT)).toBeLessThan(at(SET_CERT));
   expect(at(SET_CERT)).toBeLessThan(at(SET_REGISTRY_KEY));
-  expect(at(SET_REGISTRY_KEY)).toBeLessThan(at(SET_PIN));
+  expect(at(SET_REGISTRY_KEY)).toBeLessThan(at(SET_HEADER));
+  // the anchor, then GET_STATE showing it, then SET_PIN; no VERIFY_PIN after it
+  expect(at(SET_HEADER)).toBeLessThan(ins.lastIndexOf(GET_STATE));
+  expect(ins.lastIndexOf(GET_STATE)).toBe(at(SET_PIN) - 1);
+  expect(ins).not.toContain(0x40);
+  expect(a.now).toBe(T900000);
   expect(a.registryKey).toEqual(REGISTRY_KEY);
 });
 
@@ -115,22 +129,51 @@ test('no limit is 0 msat', async () => {
   expect(card.applet!.limit).toEqual(new Array(8).fill(0));
 });
 
-test('a build with no offline setup, and a 2.0 card, get none of the new commands', async () => {
-  const plain = new FakeGpCard();
-  await installTap(plain.transceive, tapOptions(setup().offline, {offline: undefined}));
-  expect(b0(plain)).not.toContain(SET_LIMIT);
-  expect(b0(plain)).not.toContain(ATTEST_INIT);
-  expect(plain.applet!.cert ?? null).toBeNull();
+test('with no block header the tap touches no card at all, holds the place, and says so', async () => {
+  const noHeader = setup({header: null});
+  // A header the phone refuses: 8 days behind its clock.
+  const stale = setup({now: () => NOW_MS + 8 * 24 * 3600 * 1000});
+  for (const [offline, reason] of [
+    [undefined, NEEDS_INTERNET],
+    [noHeader.offline, NEEDS_INTERNET],
+    [stale.offline, `${NEEDS_INTERNET} (the block header is more than 7 days behind this phone’s clock)`],
+  ] as const) {
+    // A blank card, and one a lifted tap left keyed with no PIN.
+    for (const card of [new FakeGpCard(), new FakeGpCard({keys: ownKeys()}).withLiftedApplet(8)]) {
+      const managerKeys = jest.fn(async (chip: string) => ({...OWN, chip}));
+      const r = await installTap(card.transceive, tapOptions(stale.offline, {offline, managerKeys}));
+      expect(r).toEqual({
+        installed: {ok: false, kind: 'noManagerKeys', phase: 'probe', reason},
+        setup: null,
+        resumable: true,
+      });
+      // Not one APDU: no install, no key rotation, no SELECT.
+      expect(card.log).toEqual([]);
+      expect(managerKeys).not.toHaveBeenCalled();
+      expect(holdsPlace({lost: false, result: r})).toBe(true);
+      // The held panel shows the true reason, which says nothing was written.
+      expect(registryHeldWhat({reason})).toBe(reason);
+    }
+  }
+  expect(noHeader.certify).not.toHaveBeenCalled();
+});
 
-  // a lifted 8-slot applet answers SELECT 02 00: resumed and PINned the old way
-  const old = new FakeGpCard({keys: ownKeys()}).withLiftedApplet(8);
-  const {offline, certify} = setup();
-  const r = await installTap(old.transceive, tapOptions(offline));
-  expect(r.setup?.ok).toBe(true);
-  expect(certify).not.toHaveBeenCalled();
-  expect(b0(old)).not.toContain(SET_LIMIT);
-  expect(b0(old)).not.toContain(GET_STATE);
-  expect(old.applet!.pin).toBe(PIN);
+test('an older card is stopped with its reset offered, nothing written', async () => {
+
+  for (const version of [[0x02, 0x00], [0x03, 0x00]]) {
+    const old = new FakeGpCard({keys: ownKeys()}).withLiftedApplet(8);
+    old.appletVersion = version;
+    const strip = (a: unknown) => JSON.stringify({...(a as object), anchored: undefined, asked: undefined});
+    const before = strip(old.applet);
+    const {offline, certify} = setup();
+    const o = await installTap(old.transceive, tapOptions(offline));
+    expect(o.installed).toEqual({ok: false, kind: 'guarded', phase: 'probe', reason: OLD_APPLET});
+    expect(o.setup).toBeNull();
+    expect(certify).not.toHaveBeenCalled();
+    // the SELECT alone: no key, PIN or offline command, and the applet unchanged
+    expect(b0(old)).toEqual([]);
+    expect(strip(old.applet)).toBe(before);
+  }
 });
 
 describe('a tap lifted at each new APDU is finished by the next', () => {
@@ -289,14 +332,15 @@ describe('SET_REGISTRY_KEY', () => {
     expect(b0(card).filter(i => i === SET_REGISTRY_KEY)).toHaveLength(before);
   });
 
-  test('an older 3.0 card (58-byte GET_STATE) skips it and is finished', async () => {
-    const card = new FakeGpCard();
-    card.stateLength = 58;
-    const r = await installTap(card.transceive, tapOptions(setup().offline));
-    expect(r.setup?.ok).toBe(true);
-    expect(b0(card)).not.toContain(SET_REGISTRY_KEY);
-    expect(card.applet!.cert).not.toBeNull();
-    expect(card.applet!.pin).toBe(PIN);
+  test('a GET_STATE that is not 4.0’s 65 bytes stops at attest, with no PIN', async () => {
+    for (const len of [58, 59] as const) {
+      const card = new FakeGpCard();
+      card.stateLength = len;
+      const r = await installTap(card.transceive, tapOptions(setup().offline));
+      expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'attest'}));
+      expect(b0(card)).not.toContain(SET_PIN);
+      expect(card.applet!.pin).toBeNull();
+    }
   });
 
   test('a key that is not 04 and 64 bytes is never sent to the card', async () => {
@@ -338,4 +382,38 @@ describe('a registry failure is not reported as a lifted card', () => {
     expect(registryHeldWhat({reason: 'SET_LIMIT answered 6985'})).toBeNull();
     expect(LOOP.heldWhat).toMatch(/left the phone/);
   });
+});
+
+test('an older card is shown the old-card message and pointed to its reset, not the blank-card one', () => {
+  expect(stopLines('guarded', OLD_APPLET)).toEqual({what: OLD_APPLET, now: LOOP.oldAppletNow});
+  expect(LOOP.oldAppletNow).toMatch(/Settings → Reset a card/);
+  // Any other guarded card keeps the blank-card copy.
+  expect(stopLines('guarded', 'the card already has keys').now).toBe(STATE.guarded);
+  expect(stopLines('noManagerKeys', 'offline').what).toMatch(/Ops said: offline$/);
+});
+
+test('a card that refuses its anchor keeps its place, says so, and its next tap finishes it', async () => {
+  const card = new FakeGpCard();
+  card.refuseHeaders = true;
+  const {offline} = setup();
+  const r = await installTap(card.transceive, tapOptions(offline));
+  expect(r.installed).toEqual({ok: true});
+  expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'anchor', sw: 0x6a93}));
+  expect(holdsPlace({lost: false, result: r})).toBe(true);
+  const setupStop = r.setup as {reason: string; registry?: true; step: string};
+  const what = registryHeldWhat({reason: setupStop.reason, registry: setupStop.registry === true, anchor: true});
+  expect(what).toBe(LOOP.anchorHeld('the card refused the block header for its work'));
+  expect(card.applet!.pin).toBeNull();
+  expect(card.applet!.slots[0]).toBeTruthy();
+
+  // The next tap of the same card resumes it and sets the PIN.
+  card.refuseHeaders = false;
+  const again = await installTap(card.transceive, tapOptions(offline));
+  expect(again.setup).toEqual(expect.objectContaining({ok: true}));
+  expect(card.applet!.pin).toBe(PIN);
+});
+
+test('a lost card whose wait was being served is held with the wait copy', () => {
+  expect(registryHeldWhat({wait: true})).toBe(WAIT.lifted);
+  expect(WAIT.lifted).toMatch(/Tap it again to finish the wait/);
 });

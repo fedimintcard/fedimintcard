@@ -101,6 +101,15 @@ export interface AppletState {
   cert?: number[] | null;
   /** The registry's certificate key (65 bytes) once SET_REGISTRY_KEY took it. */
   registryKey?: number[] | null;
+  /** Applet 4.0: the clock (seconds), set by SET_HEADER. */
+  now?: number;
+  /** Applet 4.0: this selection anchored the clock (cleared by SELECT and a new tap). */
+  anchored?: boolean;
+  /** Applet 4.0: wrong PIN tries in a row, and askings owed before the next try. */
+  wrong?: number;
+  owed?: number;
+  /** Applet 4.0: askings of the current stretch, in this selection (held[H_ASKED]; SELECT and any other INS clear it). */
+  asked?: number;
 }
 
 interface Instance {
@@ -274,6 +283,8 @@ export class FakeGpCard {
     this.loading = null;
     if (this.applet) {
       this.applet.verified = false;
+      this.applet.anchored = false;
+      this.applet.asked = 0;
     }
   }
 
@@ -322,6 +333,8 @@ export class FakeGpCard {
     const aid = h(apdu.slice(5, 5 + apdu[4]));
     if (this.applet) {
       this.applet.verified = false; // CLEAR_ON_DESELECT
+      this.applet.anchored = false;
+      this.applet.asked = 0;
     }
     this.session = null;
     this.handshake = null;
@@ -336,9 +349,7 @@ export class FakeGpCard {
     if (aid !== CARD) {
       return ok();
     }
-    // The applet's version: 3.0 has 32 slots, 2.0 had 8.
-    const slots = this.instances.get(aid)?.applet?.slots.length ?? 8;
-    return ok(slots === 32 ? [0x03, 0x00] : [0x02, 0x00]);
+    return ok(this.appletVersion);
   }
 
   private derive(seq: number[]) {
@@ -675,6 +686,23 @@ export class FakeGpCard {
     return ok([this.kvn]);
   }
 
+  /**
+   * What the Fedimint applet answers SELECT with: 4.0, the load file the app
+   * carries. A test sets 03 00 or 02 00 for a card set up by an older build,
+   * which then answers as that applet did (6983 for a blocked PIN, no anchor).
+   */
+  appletVersion: number[] = [0x04, 0x00];
+
+  /** Applet 4.0: the askings that did a wait's work (6A98 within a stretch), over the card's life. */
+  askings = 0;
+
+  /** Applet 4.0's SET_HEADER answers 6A93 (too little work, or weak) while this is set. */
+  refuseHeaders = false;
+
+  private get v4(): boolean {
+    return this.appletVersion[0] >= 4;
+  }
+
   /** FedimintCardApplet's slot and PIN commands, as the applet answers them. */
   private cardApplet(a: AppletState, apdu: number[]): number[] {
     const [cla, ins, p1] = apdu;
@@ -683,6 +711,10 @@ export class FakeGpCard {
     }
     const lc = apdu.length > 5 ? apdu[4] : 0;
     const data = apdu.slice(5, 5 + lc);
+    // The askings of a stretch count only while VERIFY_PIN follows VERIFY_PIN (FedimintCardApplet.process).
+    if (ins !== 0x40) {
+      a.asked = 0;
+    }
     // A slot past the last answers 6B00 before anything else (FedimintCardApplet.slot).
     if ((ins === 0x10 || ins === 0x11) && p1 >= a.slots.length) {
       return sw(0x6b00);
@@ -713,6 +745,25 @@ export class FakeGpCard {
         return ok(a.slots[p1]!);
       }
       case 0x41:
+        if (this.v4) {
+          // 4.0: a PIN once; only in a selection that anchored the clock; only
+          // with the registry key. The selection that set it has the PIN.
+          if (a.pin !== null) {
+            return sw(0x6985);
+          }
+          if (lc < 4 || lc > 8) {
+            return sw(0x6700);
+          }
+          if (!a.anchored) {
+            return sw(0x6a96);
+          }
+          if (!a.registryKey) {
+            return sw(0x6985);
+          }
+          a.pin = String.fromCharCode(...data);
+          a.verified = true;
+          return ok();
+        }
         if (a.blocked) {
           return sw(0x6983);
         }
@@ -722,6 +773,48 @@ export class FakeGpCard {
         a.pin = String.fromCharCode(...data);
         return ok();
       case 0x40: {
+        if (this.v4) {
+          // 4.0, in FedimintCardApplet.verifyPin's order: no PIN, the
+          // length, P1/P2, then the wait owed (waitOwed), then the try. No
+          // blocked state. A wait is served in stretches of at most 16
+          // askings within one selection, each answered 6A98; the asking
+          // after a stretch writes what is left, and answers 6A98 again or
+          // goes on to the try. A wrong try owes 2^(wrong tries before it)
+          // askings and answers 63CX with the wrong tries in a row.
+          if (a.pin === null) {
+            return sw(0x6984);
+          }
+          if (lc < 4 || lc > 8) {
+            return sw(0x6700);
+          }
+          if (p1 !== 0 || apdu[3] !== 0) {
+            return sw(0x6b00);
+          }
+          const owed = a.owed ?? 0;
+          if (owed > 0) {
+            const stretch = Math.min(owed, 16);
+            const asked = (a.asked ?? 0) + 1;
+            if (asked <= stretch) {
+              a.asked = asked;
+              this.askings += 1;
+              return sw(0x6a98);
+            }
+            a.asked = 0;
+            a.owed = owed - stretch;
+            if (a.owed !== 0) {
+              return sw(0x6a98);
+            }
+          }
+          if (String.fromCharCode(...data) === a.pin) {
+            a.wrong = 0;
+            a.verified = true;
+            return ok();
+          }
+          const w = a.wrong ?? 0;
+          a.owed = w < 14 ? 1 << w : 0x4000;
+          a.wrong = Math.min(15, w + 1);
+          return sw(0x63c0 | a.wrong);
+        }
         if (a.blocked) {
           return sw(0x6983);
         }
@@ -744,7 +837,7 @@ export class FakeGpCard {
         return sw(0x63c0 | a.tries);
       }
       default:
-        return a.slots.length === 32 ? this.offlineApplet(a, ins, data) : sw(0x6d00);
+        return this.v4 || a.slots.length === 32 ? this.offlineApplet(a, ins, data) : sw(0x6d00);
     }
   }
 
@@ -754,7 +847,7 @@ export class FakeGpCard {
    * GET_STATE's length: 59 from the applet that has SET_REGISTRY_KEY, 58 before
    * it (an older 3.0 build, which answers INS 34 with `6D 00`).
    */
-  stateLength: 58 | 59 = 59;
+  stateLength: 58 | 59 | 65 = 65;
 
   /** Applet 3.0's GET_STATE, SET_LIMIT, ATTEST_INIT, SET_CERT and GET_CERT (FedimintCardApplet). */
   private offlineApplet(a: AppletState, ins: number, data: number[]): number[] {
@@ -762,10 +855,21 @@ export class FakeGpCard {
     switch (ins) {
       case 0x16: {
         const out: number[] = a.slots.map(s => (s ? 1 : 0));
-        out.push(0, 0, 0, 0, 0, 0, 0, 0, ...(a.limit ?? new Array(8).fill(0)));
+        if (this.v4) {
+          while (out.length < 32) {
+            out.push(0);
+          }
+        }
+        const t = a.now ?? 0;
+        out.push((t >>> 24) & 0xff, (t >>> 16) & 0xff, (t >>> 8) & 0xff, t & 0xff, 0, 0, 0, 0);
+        out.push(...(a.limit ?? new Array(8).fill(0)));
         out.push(...new Array(8).fill(0), a.cert ? a.cert.length : 0, a.attest ? 1 : 0);
-        if (this.stateLength === 59) {
+        if (this.stateLength >= 59) {
           out.push(a.registryKey ? 1 : 0);
+        }
+        if (this.stateLength === 65) {
+          const owed = a.owed ?? 0;
+          out.push(a.pin === null ? 0 : 1, a.wrong ?? 0, owed >> 8, owed & 0xff, a.anchored ? 1 : 0, 0);
         }
         return ok(out);
       }
@@ -799,8 +903,27 @@ export class FakeGpCard {
         return ok();
       case 0x32:
         return a.cert ? ok(a.cert) : sw(0x6a83);
+      case 0x19: {
+        // SET_HEADER: on a card with no PIN (this fake holds no value) any
+        // header it takes is an anchor; after the PIN only a later one moves the clock.
+        if (data.length !== 80) {
+          return sw(0x6700);
+        }
+        if (this.refuseHeaders) {
+          return sw(0x6a93);
+        }
+        const time = (data[68] | (data[69] << 8) | (data[70] << 16) | (data[71] << 24)) >>> 0;
+        if (a.pin === null) {
+          a.now = time;
+          a.anchored = true;
+        } else if (time > (a.now ?? 0)) {
+          a.now = time;
+        }
+        const n = a.now ?? 0;
+        return ok([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+      }
       case 0x34:
-        if (this.stateLength !== 59) {
+        if (this.stateLength < 59) {
           return sw(0x6d00);
         }
         if (data.length !== 65 || data[0] !== 0x04) {

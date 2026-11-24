@@ -104,6 +104,11 @@ export interface CardOps {
    * hex chars (uncompressed P-256, starting 04). Public.
    */
   registryCertKey(): Promise<string>;
+  /**
+   * `GET /v1/chain/tip`: the latest Bitcoin block header, 160 lower-case hex
+   * chars, checked to hash to the tip the registry names. Public.
+   */
+  chainTip(): Promise<string>;
 }
 
 /** `GET /tills`: one of the operator's tills. Epoch ms; `revoked_at` null while it may charge. */

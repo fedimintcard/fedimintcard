@@ -36,7 +36,7 @@ import {
 } from '../reset';
 import {secureRandomBytes} from '../secureRandom';
 import {CANCELLED, createCardSession} from '../session';
-import {RESET} from '../strings';
+import {RESET, WAIT} from '../strings';
 import {formatShortId, useStore} from '../store';
 import {
   Card,
@@ -69,6 +69,8 @@ function stopLine(stop: ResetStop): string {
   switch (stop.kind) {
     case 'wrongPin':
       return RESET.stops.wrongPin(stop.triesLeft);
+    case 'wrongTries':
+      return RESET.stops.wrongTries(stop.inARow);
     case 'notResettable':
       return `${RESET.stops.notResettable}: ${stop.reasons.join('; ')}`;
     case 'differentCard':
@@ -208,6 +210,8 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
     setBusy(true);
     setProblem(null);
     setLine(RESET.resetting);
+    // Set once a wait the card owes before the holder's PIN is being served.
+    let waited = false;
     try {
       const {value: r} = await card.run(RESET.resetting, tx =>
         resetTap(tx, {
@@ -228,6 +232,10 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
           random: secureRandomBytes,
           now: Date.now,
           onPhase: (p: ResetPhase) => setLine(RESET.phase[p]),
+          onPinWait: (seconds: number) => {
+            waited = true;
+            setLine(WAIT.hold(seconds));
+          },
         }),
       );
       holderPin.wipe();
@@ -253,7 +261,9 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
       holderPin.wipe();
       setProblem(
         e instanceof Error && e.message !== CANCELLED
-          ? `${RESET.stops.pulled}. ${RESET.untouched}`
+          ? waited
+            ? WAIT.lifted
+            : `${RESET.stops.pulled}. ${RESET.untouched}`
           : RESET.noCard,
       );
       await reload();

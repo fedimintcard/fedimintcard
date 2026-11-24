@@ -1,4 +1,5 @@
 import {FACTORY_KEYS, fromHex, toHex, type KeySet} from './cardkit';
+import {testOffline} from './testing/anchor';
 import {
   holdsPlace,
   installTap,
@@ -46,6 +47,7 @@ function options(over: Partial<TapOptions> = {}) {
       random: (n: number) =>
         Array.from({length: n}, (_, i) => (i * 37 + 11) & 0xff),
       now: () => (t += 5),
+      offline: testOffline(),
       ...over,
     } as TapOptions,
   };
@@ -266,7 +268,8 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
     const finish = clean.log.slice(put).filter(a => a[0] === 0xb0).length;
     // The slot-count probe (GET_PUB past slot 7, and past 31 on a 32-slot card),
     // GET_PUB + GEN_KEY per slot the install tap keys (0-7), SET_PIN, VERIFY_PIN.
-    expect(finish).toBe((slots === 8 ? 1 : 2) + 8 * 2 + 2);
+    // ... then SET_LIMIT, GET_STATE, ATTEST_INIT, SET_CERT, SET_REGISTRY_KEY, SET_HEADER, GET_STATE, SET_PIN.
+    expect(finish).toBe((slots === 8 ? 1 : 2) + 8 * 2 + 8);
 
     for (let k = 0; k < finish; k++) {
       for (const when of ['before', 'after'] as const) {
@@ -287,6 +290,7 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
         const oldSlots = card.applet!.slots.map(s => (s ? toHex(s) : null));
         const oldId = keyedBefore ? shortIdOfSlot0(card) : null;
         const pinBefore = card.applet!.pin;
+        const certBefore = !!card.applet!.cert;
 
         card.reset();
         const from = card.log.length;
@@ -306,6 +310,13 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
         if (!keyedBefore) {
           // Lost before slot 0 had a key: an unkeyed applet, keyed as on any first tap.
           expect([label, r.resumedFrom]).toEqual([label, undefined]);
+          expect(card.applet!.pin).toBe('730194');
+        } else if (pinBefore === null && certBefore) {
+          // No PIN, and the certificate already over slot 0: the keys are kept
+          // (re-keying would orphan it), and a fresh PIN set.
+          expect([label, r.resumedFrom]).toEqual([label, oldId]);
+          expect(r.setup).toEqual(expect.objectContaining({generated: [], slotCount: slots}));
+          expect(card.applet!.slots.map(s => (s ? toHex(s) : null))).toEqual(oldSlots);
           expect(card.applet!.pin).toBe('730194');
         } else if (pinBefore === null) {
           // No PIN: every slot made again, a fresh PIN, a new short id.
@@ -378,7 +389,7 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
     const r = await installTap(card.transceive, opts);
     expect(r.installed).toEqual(expect.objectContaining({ok: false, kind: 'needsReset', phase: 'verifyPin'}));
     expect(pinTries(card)).toBe(1);
-    expect(card.applet!.tries).toBe(2);
+    expect(card.applet!.wrong).toBe(1);
   });
 
   test('a finished card ops knows is guarded: no PIN tried, no keys asked, nothing written', async () => {

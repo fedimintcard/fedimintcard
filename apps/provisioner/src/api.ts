@@ -1,5 +1,6 @@
 import {LOAD_FILE_SHA256} from './cardkit';
 import {SLOT_COUNTS} from './cardSetup';
+import {headerHashHex} from './header';
 import {decodeInvite} from './federation';
 import type {
   CardOps,
@@ -51,6 +52,7 @@ export type ServiceOperation =
   | 'create-batch'
   | 'attestation'
   | 'cert-key'
+  | 'chain-tip'
   | 'post-card'
   | 'list-cards'
   | 'list-federations'
@@ -567,6 +569,27 @@ export class RegistryClient extends HttpTransport {
   }
 
   /**
+   * GET /v1/chain/tip — the latest Bitcoin block header (public, no token):
+   * `{ok, hash, header, sources}`, `header` 160 hex chars, `hash` in display
+   * order. Passed on only when the header hashes to `hash`; the set-up then
+   * checks its work and time itself (header.ts) before a card sees it.
+   */
+  async chainTip(): Promise<string> {
+    const json = await this.get('/v1/chain/tip', {operation: 'chain-tip'});
+    const header = typeof json.header === 'string' ? json.header.toLowerCase() : null;
+    const hash = typeof json.hash === 'string' ? json.hash.toLowerCase() : null;
+    if (
+      header === null ||
+      hash === null ||
+      !/^[0-9a-f]{160}$/.test(header) ||
+      headerHashHex(header.match(/../g)!.map(b => parseInt(b, 16))) !== hash
+    ) {
+      throw new ApiServiceError('the chain tip is malformed', 200, undefined, 'chain-tip');
+    }
+    return header;
+  }
+
+  /**
    * GET /registry/cards/:id/reset-check?chip= — what ops holds for the card.
    * The chip lets ops find a card it knows only by its chip (a `needsReset`
    * install), and say whether the holder's PIN is needed at all.
@@ -913,6 +936,10 @@ export class RegistryStoreApi implements CardOps, TillOps {
 
   registryCertKey(): Promise<string> {
     return this.client.registryCertKey();
+  }
+
+  chainTip(): Promise<string> {
+    return this.client.chainTip();
   }
 
   completeReset(completion: ResetCompletion): Promise<ResetRecorded> {

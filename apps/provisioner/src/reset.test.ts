@@ -1,4 +1,5 @@
 import {FACTORY_KEYS, fromHex} from './cardkit';
+import {testOffline} from './testing/anchor';
 import type {ManagerKeysReply, ResetCheck, ResetCompletion} from './ops';
 import {
   flushOutbox,
@@ -13,6 +14,7 @@ import {
 } from './reset';
 import {installTap} from './installTap';
 import {shortIdOf} from './store';
+import {RESET, WAIT} from './strings';
 import {
   CASHU_APPLET,
   CASHU_PACKAGE,
@@ -144,6 +146,8 @@ describe('identify', () => {
       chip: J3R180_CHIP,
     });
     expect(card.applet!.tries).toBe(3);
+    // A blocked PIN exists only on an applet before 4.0, whose reset this app still offers.
+    card.appletVersion = [0x03, 0x00];
     card.applet!.blocked = true;
     expect(await identifyCard(card.transceive)).toEqual(
       expect.objectContaining({ok: true, pin: 'blocked'}),
@@ -250,6 +254,8 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
 
     it('a wrong PIN stops with the tries left, once, and touches nothing', async () => {
       const card = ownCard(scp);
+      // Tries left, from 63CX, is an applet before 4.0's answer.
+      card.appletVersion = [0x03, 0x00];
       const {journal, options} = setup(card, {holderPin: '1111'});
       const r = await resetTap(card.transceive, options);
       expect(r).toEqual({
@@ -278,6 +284,7 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
 
     it('a blocked PIN: refused until the operator confirms, then reset to factory when ops shows the card empty', async () => {
       const card = ownCard(scp);
+      card.appletVersion = [0x03, 0x00];
       card.applet!.blocked = true;
       const first = setup(card, {holderPin: null});
       expect(await resetTap(card.transceive, first.options)).toEqual({
@@ -656,6 +663,7 @@ describe('a J3R452 that went through the install tap’s first contact', () => {
       managerKeys: async chip => ({...OWN, chip}),
       random: n => Array.from({length: n}, (_, i) => (i * 37 + 11) & 0xff),
       now: () => (t += 5),
+      offline: testOffline(),
     });
     expect(tap.installed).toEqual({ok: true});
     expect(tap.chip).toBe(J3R452_CHIP);
@@ -685,5 +693,77 @@ describe('a J3R452 that went through the install tap’s first contact', () => {
       [0x84, 0xd8, 0x00, 0x81, 0x4e, 0x01],
       [0x84, 0xd8, 0x01, 0x81, 0x4e, 0x01],
     ]);
+  });
+});
+
+describe('applet 4.0: the holder’s PIN with its wait', () => {
+  const GET_STATE = 0x16;
+  /** A finished 4.0 card that owes `owed` askings after `wrong` wrong tries in a row. */
+  const owing = (wrong: number, owed: number) => {
+    const card = ownCard();
+    card.applet!.wrong = wrong;
+    card.applet!.owed = owed;
+    return card;
+  };
+
+  it('identifies the PIN from GET_STATE, never the three-byte VERIFY_PIN', async () => {
+    const card = owing(1, 1);
+    const id = await identifyCard(card.transceive);
+    expect(id).toEqual(expect.objectContaining({ok: true, pin: 'set'}));
+    expect(card.ins()).toContain(GET_STATE);
+    expect(card.ins()).not.toContain(VERIFY);
+  });
+
+  it('a wrong PIN stops with the wrong tries in a row, never tries left or blocked', async () => {
+    const card = ownCard();
+    const {journal, options} = setup(card, {holderPin: '1111'});
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual({ok: false, stop: {kind: 'wrongTries', inARow: 1}, resumable: false});
+    expect(card.ins().filter(i => i === VERIFY)).toHaveLength(1);
+    expect(card.ins()).not.toContain(DELETE);
+    expect(journal.map.size).toBe(0);
+    expect(RESET.stops.wrongTries(1)).toBe('Wrong PIN · 1 wrong try in a row');
+    expect(RESET.stops.wrongTries(3)).not.toMatch(/left|block/i);
+  });
+
+  it('after a wrong PIN, the next tap serves the wait within the tap, shows it, and resets the card', async () => {
+    const card = owing(6, 32);
+    const waits: number[] = [];
+    const {options} = setup(card, {onPinWait: s => waits.push(s)});
+    const r = await resetTap(card.transceive, options);
+    expect(r.ok).toBe(true);
+    expectFactory(card);
+    // 16 askings and the one that writes them down, then 16 and the one that tries the PIN.
+    expect(card.ins().filter(i => i === VERIFY)).toHaveLength(34);
+    expect(waits[0]).toBe(16);
+    expect(waits[waits.length - 1]).toBe(0);
+    expect([...waits].sort((a, b) => b - a)).toEqual(waits);
+    expect(WAIT.hold(16)).toBe('Hold the card, about 16 s');
+  });
+
+  it('a tap lifted during the wait keeps the stretches it finished, and the next tap finishes the wait and the reset', async () => {
+    const card = owing(6, 32);
+    let verifies = 0;
+    const lifting = async (apdu: number[]) => {
+      if (apdu[0] === 0xb0 && apdu[1] === VERIFY && ++verifies > 20) {
+        throw new Error('TagLost');
+      }
+      return card.transceive(apdu);
+    };
+    const first = setup(card);
+    await expect(resetTap(lifting, first.options)).rejects.toThrow('TagLost');
+    expect(card.applet!.owed).toBe(16);
+    expect(card.ins()).not.toContain(DELETE);
+    const r = await resetTap(card.transceive, setup(card).options);
+    expect(r.ok).toBe(true);
+    expectFactory(card);
+  });
+
+  it('with no PIN typed, a card whose PIN is set asks for it', async () => {
+    const card = ownCard();
+    const {options} = setup(card, {holderPin: null}, {needs_holder_pin: true});
+    const r = await resetTap(card.transceive, options);
+    expect(r).toEqual({ok: false, stop: {kind: 'pinRequired'}, resumable: false});
+    expect(card.ins()).not.toContain(VERIFY);
   });
 });

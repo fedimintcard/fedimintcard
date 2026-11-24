@@ -41,6 +41,27 @@ jobs:
       # applet/target/fedimint-card-0.1.cap, and a hosted runner has no JavaCard
       # SDK to build one. The load file is pinned by size and sha256 in the
       # script, and the provisioner re-checks that hash before it sends a byte.
+  # The Setup app's own suite and type check. cardkit is a file: dependency
+  # consumed through its dist/, so it is installed and built first.
+  provisioner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults: { run: { working-directory: apps/provisioner } }
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: yarn
+          cache-dependency-path: |
+            apps/provisioner/yarn.lock
+            tools/cardkit/yarn.lock
+      - run: yarn --cwd ../../tools/cardkit install --frozen-lockfile
+      - run: yarn --cwd ../../tools/cardkit build
+      - run: yarn install --frozen-lockfile
+      - run: npx tsc --noEmit
+      - run: yarn test --ci
   # The registry is the one service that ships without a device in the loop,
   # so it can be gated here. Its `.dev.vars` is gitignored; the password comes
   # from the test config's `miniflare.bindings`, not from a repository secret.

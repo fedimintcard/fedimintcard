@@ -1,4 +1,6 @@
-import {RegistryClient, RegistryStoreApi} from './api';
+import {ApiServiceError, RegistryClient, RegistryStoreApi} from './api';
+import {headerHashHex} from './header';
+import {H900000, H900000_HEX} from './testing/anchor';
 
 const post = (body: unknown, status = 200) =>
   ({ok: status < 400, status, json: async () => body, text: async () => ''} as unknown as Response);
@@ -271,4 +273,41 @@ test('the registry certificate key is fetched with no session and checked: 130 l
     key = bad;
     await expect(api.registryCertKey()).rejects.toThrow(/malformed/);
   }
+});
+
+describe('the chain tip', () => {
+  const origin = 'https://registry.test';
+  const tipFrom = (answer: () => Promise<Response>) =>
+    new RegistryClient({baseUrl: origin, fetcher: async () => answer()}).chainTip();
+  const HASH = headerHashHex([...H900000]);
+
+  test('a header that hashes to the answer’s hash is returned, in lower case', async () => {
+    await expect(tipFrom(async () => post({header: H900000_HEX, hash: HASH}))).resolves.toBe(H900000_HEX.toLowerCase());
+    await expect(tipFrom(async () => post({header: H900000_HEX.toUpperCase(), hash: HASH.toUpperCase()}))).resolves.toBe(
+      H900000_HEX.toLowerCase(),
+    );
+  });
+
+  test.each([
+    ['no header', {hash: HASH}],
+    ['no hash', {header: H900000_HEX}],
+    ['a header that is not a string', {header: 7, hash: HASH}],
+    ['a header one byte short', {header: H900000_HEX.slice(2), hash: HASH}],
+    ['a header one byte long', {header: H900000_HEX + '00', hash: HASH}],
+    ['a header that is not hex', {header: 'zz' + H900000_HEX.slice(2), hash: HASH}],
+    ['a hash the header does not hash to', {header: H900000_HEX, hash: '00'.repeat(32)}],
+    ['an answer that is not an object', 'tip'],
+  ])('%s is malformed', async (_name, body) => {
+    const failed = tipFrom(async () => post(body));
+    await expect(failed).rejects.toBeInstanceOf(ApiServiceError);
+    await expect(tipFrom(async () => post(body))).rejects.toMatchObject({reason: 'the chain tip is malformed', status: 200});
+  });
+
+  test.each([400, 401, 404, 429, 500, 502, 503])('the registry’s %i is an error with its status, never a header', async status => {
+    await expect(tipFrom(async () => post({reason: 'no tip yet'}, status))).rejects.toMatchObject({status});
+  });
+
+  test('an unreachable registry is an error', async () => {
+    await expect(tipFrom(async () => { throw new TypeError('Network request failed'); })).rejects.toThrow();
+  });
 });

@@ -2,8 +2,9 @@
  * Finishing a card on the phone, in the tap that installed it (docs/OPS-PLAN.md
  * § 4). The install leaves an applet with empty slots (8 before applet 2.1,
  * 32 from 2.1 on) and no PIN; this reads how many slots the card has, asks it
- * to generate its keys, reads them back, sets the PIN and
- * proves it took. It is the sidecar's `key_setup` (`host/sidecar/src/cards.rs`)
+ * to generate its keys, reads them back, gives it the registry's certificate
+ * and key, anchors its clock to a Bitcoin block header and sets the PIN, all
+ * in one selection (applet 4.0, DESIGN § 4). It is the sidecar's `key_setup` (`host/sidecar/src/cards.rs`)
  * and `card_setup` (`glue.rs`) moved here, over the same NFC session, so a
  * card is finished with no laptop and no relay, on iOS as on Android.
  *
@@ -15,10 +16,12 @@
  * allows only while no PIN is set (FedimintCardApplet.genKey). Nothing here
  * sends P2 = 01 to a card with a PIN.
  *
- * The PIN is a parameter and nothing else: it goes to the card in two APDUs and
- * is not kept, logged or returned.
+ * The PIN is a parameter and nothing else: it goes to the card in one APDU
+ * (SET_PIN, whose selection counts as having the PIN, so no VERIFY_PIN
+ * follows) and is not kept, logged or returned.
  */
 import {CARD_AID, type Transceiver} from './cardkit';
+import {checkHeader, HEADER_LEN} from './header';
 
 /**
  * The slot counts an applet can have: 8 before applet 2.1, 32 from 2.1 on.
@@ -52,6 +55,18 @@ export const INS_SET_CERT = 0x31;
 export const INS_GET_CERT = 0x32;
 /** SET_REGISTRY_KEY: the registry's certificate key, 65 bytes; only before SET_PIN. */
 export const INS_SET_REGISTRY_KEY = 0x34;
+/** SET_HEADER: an 80-byte Bitcoin block header; answers the card's clock (4 bytes, big-endian). */
+export const INS_SET_HEADER = 0x19;
+
+/** The applet major this build sets up and reads (SELECT answers major, minor). */
+export const APPLET_MAJOR = 4;
+/** GET_STATE's length on applet 4.0. */
+export const STATE_LEN = 65;
+/** What the person is told about a card whose applet is older than 4.0. */
+export const OLD_APPLET = 'This card has an older applet. Reset it and set it up again.';
+/** What the person is told when there is no block header to anchor the card's clock to. */
+export const NEEDS_INTERNET =
+  'Setting up a card needs the internet: the latest Bitcoin block could not be fetched. Nothing was written to the card.';
 
 /** The most a certificate can be (FedimintCardApplet.CERT_MAX). */
 export const CERT_MAX = 160;
@@ -62,8 +77,14 @@ export const DEFAULT_DAILY_LIMIT_SAT = 0;
 export const SW_OK = 0x9000;
 /** GET_PUB: the slot is empty. SET_PIN: a PIN is already set. */
 export const SW_CONDITIONS = 0x6985;
-/** VERIFY_PIN or SET_PIN on a blocked card. */
+/** VERIFY_PIN or SET_PIN on a blocked card: applets before 4.0 only, read by the reset of an old card. */
 export const SW_BLOCKED = 0x6983;
+/** VERIFY_PIN on applet 4.0: a wait is owed before the next try; the same VERIFY_PIN is sent again. */
+export const SW_KEEP_HOLDING = 0x6a98;
+/** SET_HEADER: too little work, or weak; nothing written. */
+export const SW_LITTLE_WORK = 0x6a93;
+/** SET_PIN: this selection did not anchor the clock. */
+export const SW_NOT_ANCHORED = 0x6a96;
 /** VERIFY_PIN: no PIN was ever set on this applet. */
 export const SW_PIN_NOT_SET = 0x6984;
 /** VERIFY_PIN refused for its length, before any try is spent: a PIN is set and not blocked. */
@@ -71,11 +92,144 @@ export const SW_WRONG_LENGTH = 0x6700;
 /** GEN_KEY, GET_PUB or SIGN for a slot past the card's last (FedimintCardApplet.slot). */
 export const SW_WRONG_P1P2 = 0x6b00;
 
-/** What the applet's PIN is, read without spending a try. */
+/** What the applet's PIN is, read without spending a try. `blocked` comes only from an applet before 4.0. */
 export type PinStatus = 'set' | 'blocked' | 'notSet';
 
+/** True when SELECT answered 9000 with exactly two bytes, major 4: the only applet this build sends a PIN command. */
+export function isCurrentApplet(selected: {readonly body: readonly number[]; readonly sw: number | null}): boolean {
+  return selected.sw === SW_OK && selected.body.length === 2 && selected.body[0] === APPLET_MAJOR;
+}
+
 /**
- * VERIFY_PIN with three bytes, shorter than any PIN. The applet answers a
+ * The anchor set-up needs, checked on the phone: the offline setup's block
+ * header, passing `checkHeader` at the setup's clock. Checked before a tap
+ * touches the card, and again before `finishCard`'s first APDU.
+ */
+export function checkedAnchor(
+  offline: OfflineSetup | undefined,
+): {readonly ok: true; readonly header: readonly number[]; readonly time: number} | {readonly ok: false; readonly reason: string} {
+  const header = offline?.header ?? null;
+  if (!offline || header === null) {
+    return {ok: false, reason: NEEDS_INTERNET};
+  }
+  const checked = checkHeader(header, (offline.now ?? Date.now)());
+  return checked.ok
+    ? {ok: true, header, time: checked.time}
+    : {ok: false, reason: `${NEEDS_INTERNET} (${checked.reason})`};
+}
+
+export function stateApdu(): number[] {
+  return [CLA, INS_GET_STATE, 0x00, 0x00, 0x00];
+}
+
+/** Applet 4.0's GET_STATE, the parts this app reads. */
+export interface CardState {
+  /** The card's clock, seconds (bytes 32-35, big-endian). */
+  readonly now: number;
+  readonly certLength: number;
+  readonly registryKeySet: boolean;
+  /** Byte 59: 0 no PIN, 1 set. */
+  readonly pinSet: boolean;
+  /** Byte 60: wrong tries in a row (15 or more reads 15). */
+  readonly wrongTries: number;
+  /** Bytes 61-62: askings owed before the next try. */
+  readonly owed: number;
+  /** Byte 63: this selection anchored the clock. */
+  readonly anchored: boolean;
+}
+
+/** GET_STATE's body read as applet 4.0's 65 bytes; null for any other length or an unknown PIN state. */
+export function parseState(body: readonly number[]): CardState | null {
+  if (body.length !== STATE_LEN || (body[59] !== 0 && body[59] !== 1)) {
+    return null;
+  }
+  return {
+    now: ((body[32] << 24) | (body[33] << 16) | (body[34] << 8) | body[35]) >>> 0,
+    certLength: body[56],
+    registryKeySet: body[58] === 1,
+    pinSet: body[59] === 1,
+    wrongTries: body[60],
+    owed: (body[61] << 8) | body[62],
+    anchored: body[63] === 1,
+  };
+}
+
+/** About how long the wait owed lasts: an asking is about half a second (16 are about 8 s on a J3R180). */
+export function waitSeconds(owed: number): number {
+  return Math.ceil(owed / 2);
+}
+
+/** Applet 4.0: the most askings the card serves before it writes down what is left (FedimintCardApplet.PIN_STRETCH). */
+export const PIN_STRETCH = 16;
+/** The longest wait a PIN can owe (0x4000 askings) with each stretch's closing asking, and one more. */
+const MOST_KEEP_HOLDING = 0x4000 + 0x4000 / PIN_STRETCH + 1;
+
+/**
+ * Applet 4.0's VERIFY_PIN with its wait served in this selection: the same
+ * VERIFY_PIN is sent again, with nothing in between, while the card answers
+ * `6A98`. `owed` is GET_STATE's count, read in this selection before the first
+ * VERIFY_PIN. The card counts the askings of a stretch only within one
+ * selection, so a stretch cut by lifting the card starts again on the next
+ * tap; only finished stretches stay served. `onWait` gets about how many
+ * seconds are left, before the first asking and after each one. Returns the
+ * first answer that is not `6A98`, or `6A98` when the card asks past its own
+ * count. The library's `verify_pin_held` does the same.
+ */
+export async function verifyPinHeld(
+  tx: Transceiver,
+  pin: string,
+  owed: number,
+  onWait: (seconds: number) => void = () => undefined,
+): Promise<{body: number[]; sw: number | null}> {
+  let left = owed;
+  let asked = 0;
+  if (left > 0) {
+    onWait(waitSeconds(left));
+  }
+  for (let i = 0; i <= MOST_KEEP_HOLDING; i++) {
+    const reply = await exchange(tx, pinApdu(INS_VERIFY_PIN, pin));
+    if (reply.sw !== SW_KEEP_HOLDING) {
+      return reply;
+    }
+    // The card's waitOwed, mirrored: askings 1..stretch, then the one that writes what is left.
+    const stretch = Math.min(left, PIN_STRETCH);
+    if (asked < stretch) {
+      asked += 1;
+    } else if (left > stretch) {
+      asked = 0;
+      left -= stretch;
+    } else {
+      // The card would have tried the PIN at this asking.
+      return reply;
+    }
+    onWait(waitSeconds(left - asked));
+  }
+  return {body: [], sw: SW_KEEP_HOLDING};
+}
+
+/**
+ * The PIN's state of the selected applet, spending no try: GET_STATE's PIN
+ * byte on applet 4.0 (whose VERIFY_PIN may answer a wait before it looks at
+ * the length), the three-byte VERIFY_PIN probe on an older applet, which the
+ * reset of an old card still needs.
+ */
+export async function readPinStatus(
+  tx: Transceiver,
+  selected: {readonly body: readonly number[]; readonly sw: number | null},
+): Promise<{pin: PinStatus | null; sw: number | null; state?: CardState}> {
+  if (isCurrentApplet(selected)) {
+    const reply = await exchange(tx, stateApdu());
+    const state = reply.sw === SW_OK ? parseState(reply.body) : null;
+    return state === null
+      ? {pin: null, sw: reply.sw}
+      : {pin: state.pinSet ? 'set' : 'notSet', sw: reply.sw, state};
+  }
+  const status = await exchange(tx, pinStatusApdu());
+  return {pin: pinStatusOf(status.sw), sw: status.sw};
+}
+
+/**
+ * Applets before 4.0 only. VERIFY_PIN with three bytes, shorter than any PIN. The applet answers a
  * blocked card `69 83` and an unset PIN `69 84` before it reads the data, and
  * refuses the length (`67 00`) before it spends a try
  * (FedimintCardApplet.verifyPin), so this tells the three apart for free.
@@ -96,7 +250,7 @@ export function pinStatusOf(sw: number | null): PinStatus | null {
 }
 
 /** Where a failed setup stopped, for the batch row. */
-export type SetupStep = 'select' | 'keys' | 'attest' | 'setPin' | 'verifyPin';
+export type SetupStep = 'select' | 'keys' | 'attest' | 'anchor' | 'setPin' | 'verifyPin';
 
 export type SetupResult =
   | {
@@ -123,6 +277,8 @@ export type SetupResult =
        * registry's own words and the card is only waiting.
        */
       readonly registry?: true;
+      /** Set when the card's applet is older than 4.0: `reason` is `OLD_APPLET`, and its reset is offered. */
+      readonly oldApplet?: true;
     };
 
 export function selectApdu(): number[] {
@@ -224,7 +380,8 @@ export async function probeApplet(tx: Transceiver): Promise<AppletProbe> {
  * treated as one that may hold value.
  */
 export type CardProbe =
-  | {readonly kind: 'none' | 'unkeyed'}
+  /** `old`: an applet before 4.0, which this build never installs over, keys or sets up. */
+  | {readonly kind: 'none' | 'unkeyed' | 'old'}
   | {
       readonly kind: 'keyed';
       readonly slot0: readonly number[] | null;
@@ -236,6 +393,9 @@ export async function probeCard(tx: Transceiver): Promise<CardProbe> {
   if (selected.sw !== SW_OK) {
     return {kind: 'none'};
   }
+  if (!isCurrentApplet(selected)) {
+    return {kind: 'old'};
+  }
   const slot0 = await exchange(tx, keyApdu(INS_GET_PUB, 0));
   if (slot0.sw === SW_CONDITIONS) {
     return {kind: 'unkeyed'};
@@ -243,8 +403,8 @@ export async function probeCard(tx: Transceiver): Promise<CardProbe> {
   if (slot0.sw !== SW_OK || slot0.body.length !== 32) {
     return {kind: 'keyed', slot0: null, pin: null};
   }
-  const status = await exchange(tx, pinStatusApdu());
-  return {kind: 'keyed', slot0: slot0.body, pin: pinStatusOf(status.sw)};
+  const status = await readPinStatus(tx, selected);
+  return {kind: 'keyed', slot0: slot0.body, pin: status.pin};
 }
 
 /**
@@ -292,6 +452,15 @@ export interface OfflineSetup {
    * and is never sent it.
    */
   readonly registryKey: readonly number[];
+  /**
+   * The latest Bitcoin block header from the registry (`GET /v1/chain/tip`),
+   * 80 bytes, fetched before the tap; null when it could not be fetched.
+   * Checked here again (`checkHeader`) before any APDU: without a header
+   * that passes, nothing is sent to the card.
+   */
+  readonly header: readonly number[] | null;
+  /** The phone's clock in ms, for the header's time window; `Date.now` when absent. */
+  readonly now?: () => number;
 }
 
 /**
@@ -313,9 +482,10 @@ export async function finishCard(
     /** Slots to key from 0, capped at the card's count; `INSTALL_TAP_KEY_SLOTS` when absent. */
     readonly keySlots?: number;
     /**
-     * The offline steps of an applet 3.0 card, between the keys and SET_PIN:
-     * SET_LIMIT, ATTEST_INIT, the registry's certificate, SET_CERT. Absent,
-     * or on a card that answers SELECT below 3.0, none is sent.
+     * The offline steps, between the keys and SET_PIN: SET_LIMIT,
+     * ATTEST_INIT, the registry's certificate, SET_CERT, SET_REGISTRY_KEY,
+     * then the anchor (SET_HEADER and GET_STATE). Applet 4.0 takes no PIN
+     * without them, so without them (or without a header) nothing is sent.
      */
     readonly offline?: OfflineSetup;
   } = {},
@@ -324,6 +494,22 @@ export async function finishCard(
     // Not a card's answer: the caller passed a PIN the applet would refuse.
     throw new Error('finishCard: the PIN must be 4 to 8 digits');
   }
+
+  // The anchor is checked before the first APDU: with no header that passes
+  // the phone's own checks, nothing at all goes to the card. (`installTap`
+  // checks it before the tap touches the card; this is the second check.)
+  const offline = options.offline;
+  const checked = checkedAnchor(offline);
+  if (!offline || !checked.ok) {
+    return {
+      ok: false,
+      step: 'anchor',
+      sw: null,
+      reason: checked.ok ? NEEDS_INTERNET : checked.reason,
+      registry: true,
+    };
+  }
+  const header = checked.header;
 
   // The install leaves the card manager selected; the applet answers only
   // once it is selected itself, and a PIN session lasts one selection.
@@ -337,20 +523,22 @@ export async function finishCard(
       reason: `SELECT of the applet answered ${hex(selected.sw)}`,
     };
   }
+  // Before any PIN command, and before anything is written: applet 4.0 only.
+  if (!isCurrentApplet(selected)) {
+    return {ok: false, step: 'select', sw: selected.sw, reason: OLD_APPLET, oldApplet: true};
+  }
 
   onStep('keys');
   const counted = await probeSlotCount(tx);
   if (!counted.ok) {
     return {ok: false, step: 'keys', sw: counted.sw, reason: counted.reason};
   }
-  // SELECT answers the applet's version; 3.0 and later have the offline steps.
-  const offline = selected.body.length >= 2 && selected.body[0] >= 3 ? options.offline : undefined;
   // A certificate already on the card is over slot 0's key and cannot be
   // replaced, so a card that has one keeps the keys it has: re-keying would
   // orphan the certificate.
   let rekey = options.rekey === true;
-  if (rekey && offline) {
-    const state = await exchange(tx, [CLA, INS_GET_STATE, 0x00, 0x00, 0x00]);
+  if (rekey) {
+    const state = await exchange(tx, stateApdu());
     if (state.sw === SW_OK && state.body.length >= 58 && state.body[56] !== 0) {
       rekey = false;
     }
@@ -387,14 +575,21 @@ export async function finishCard(
     keys.push(reply.body);
   }
 
-  if (offline) {
-    onStep('attest');
-    const failed = await offlineSteps(tx, offline, keys[0]);
-    if (failed) {
-      return failed;
-    }
+  onStep('attest');
+  const failed = await offlineSteps(tx, offline, keys[0]);
+  if (failed) {
+    return failed;
   }
 
+  // The anchor, in the selection that sends SET_PIN: the card takes a PIN only
+  // after this selection anchored its clock (6A96 otherwise).
+  onStep('anchor');
+  const unanchored = await anchorStep(tx, header, checked.time);
+  if (unanchored) {
+    return unanchored;
+  }
+
+  // SET_PIN's selection counts as having the PIN, so no VERIFY_PIN follows.
   onStep('setPin');
   const set = await exchange(tx, pinApdu(INS_SET_PIN, pin));
   if (set.sw !== SW_OK) {
@@ -405,24 +600,53 @@ export async function finishCard(
       reason:
         set.sw === SW_CONDITIONS
           ? 'the card already has a PIN'
-          : set.sw === SW_BLOCKED
-            ? 'the card is blocked'
+          : set.sw === SW_NOT_ANCHORED
+            ? 'the card did not keep the block header as its anchor'
             : `SET_PIN answered ${hex(set.sw)}`,
     };
   }
 
-  onStep('verifyPin');
-  const verified = await exchange(tx, pinApdu(INS_VERIFY_PIN, pin));
-  if (verified.sw !== SW_OK) {
-    return {
-      ok: false,
-      step: 'verifyPin',
-      sw: verified.sw,
-      reason: `VERIFY_PIN answered ${hex(verified.sw)}`,
-    };
-  }
-
   return {ok: true, keys, generated, slotCount: counted.count};
+}
+
+const anchorFailed = (sw: number | null, reason: string): SetupResult => ({
+  ok: false,
+  step: 'anchor',
+  sw,
+  reason,
+});
+
+/**
+ * SET_HEADER with the checked header, which on a card with no PIN and no value
+ * anchors the clock to its time; then GET_STATE must show that time and this
+ * selection anchored. Returns the failure, or null when SET_PIN may follow.
+ */
+async function anchorStep(
+  tx: Transceiver,
+  header: readonly number[],
+  time: number,
+): Promise<SetupResult | null> {
+  const sent = await exchange(tx, [CLA, INS_SET_HEADER, 0x00, 0x00, HEADER_LEN, ...header]);
+  if (sent.sw !== SW_OK) {
+    return anchorFailed(
+      sent.sw,
+      sent.sw === SW_LITTLE_WORK
+        ? 'the card refused the block header for its work'
+        : `SET_HEADER answered ${hex(sent.sw)}`,
+    );
+  }
+  const read = await exchange(tx, stateApdu());
+  const state = read.sw === SW_OK ? parseState(read.body) : null;
+  if (state === null) {
+    return anchorFailed(read.sw, `GET_STATE answered ${hex(read.sw)} with ${read.body.length} bytes, not ${STATE_LEN}`);
+  }
+  if (state.pinSet) {
+    return anchorFailed(read.sw, 'the card already has a PIN');
+  }
+  if (!state.anchored || state.now !== time) {
+    return anchorFailed(read.sw, 'the card did not take the block header as its anchor');
+  }
+  return null;
 }
 
 const attestFailed = (sw: number | null, reason: string, registry?: true): SetupResult => ({
@@ -452,17 +676,16 @@ async function offlineSteps(
   if (limit.sw !== SW_OK) {
     return attestFailed(limit.sw, `SET_LIMIT answered ${hex(limit.sw)}`);
   }
-  const state = await exchange(tx, [CLA, INS_GET_STATE, 0x00, 0x00, 0x00]);
-  if (state.sw !== SW_OK || state.body.length < 58) {
-    return attestFailed(state.sw, `GET_STATE answered ${hex(state.sw)}`);
+  const state = await exchange(tx, stateApdu());
+  if (state.sw !== SW_OK || parseState(state.body) === null) {
+    return attestFailed(state.sw, `GET_STATE answered ${hex(state.sw)} with ${state.body.length} bytes, not ${STATE_LEN}`);
   }
   const certified = await certificateStep(tx, offline, slot0, state.body[56] !== 0);
   if (certified) {
     return certified;
   }
-  // GET_STATE of a build before SET_REGISTRY_KEY is 58 bytes: nothing to set.
   // Byte 58 is 1 once the key is set; the step is then done and not repeated.
-  if (state.body.length >= 59 && state.body[58] !== 1) {
+  if (state.body[58] !== 1) {
     const key = offline.registryKey;
     if (key.length !== 65 || key[0] !== 0x04) {
       return attestFailed(null, `the registry's certificate key is ${key.length} bytes, not 65 starting 04`, true);
@@ -524,15 +747,17 @@ async function certificateStep(
 
 /**
  * A card whose PIN a lifted tap set and whose answer was lost: one VERIFY_PIN
- * with the PIN that tap sent, and, only if the card takes it, the keys read
- * back. SET_PIN is sent only after every keyed slot answered a key in the
- * same selection, so a card with a PIN has its whole key set; nothing is
- * generated here. A wrong PIN spends that one try and is never retried.
+ * with the PIN that tap sent (any wait the card owes served first, in this
+ * selection, with `onWait` told the seconds left), and, only if the card takes
+ * it, the keys read back. SET_PIN is sent only after every keyed slot answered
+ * a key in the same selection, so a card with a PIN has its whole key set;
+ * nothing is generated here. A wrong PIN spends that one try and is never retried.
  */
 export async function finishVerified(
   tx: Transceiver,
   pin: string,
   onStep: (step: SetupStep) => void = () => undefined,
+  onWait?: (seconds: number) => void,
 ): Promise<SetupResult> {
   onStep('select');
   const selected = await exchange(tx, selectApdu());
@@ -544,8 +769,21 @@ export async function finishVerified(
       reason: `SELECT of the applet answered ${hex(selected.sw)}`,
     };
   }
+  if (!isCurrentApplet(selected)) {
+    return {ok: false, step: 'select', sw: selected.sw, reason: OLD_APPLET, oldApplet: true};
+  }
   onStep('verifyPin');
-  const verified = await exchange(tx, pinApdu(INS_VERIFY_PIN, pin));
+  const read = await exchange(tx, stateApdu());
+  const state = read.sw === SW_OK ? parseState(read.body) : null;
+  if (state === null) {
+    return {
+      ok: false,
+      step: 'verifyPin',
+      sw: read.sw,
+      reason: `GET_STATE answered ${hex(read.sw)} with ${read.body.length} bytes, not ${STATE_LEN}`,
+    };
+  }
+  const verified = await verifyPinHeld(tx, pin, state.owed, onWait);
   if (verified.sw !== SW_OK) {
     return {
       ok: false,
@@ -553,8 +791,10 @@ export async function finishVerified(
       sw: verified.sw,
       reason:
         verified.sw !== null && verified.sw >> 4 === 0x63c
-          ? `the PIN this phone sent was not the card's; ${verified.sw & 0x0f} tries left`
-          : `VERIFY_PIN answered ${hex(verified.sw)}`,
+          ? `the PIN this phone sent was not the card's; ${verified.sw & 0x0f} wrong tries in a row`
+          : verified.sw === SW_KEEP_HOLDING
+            ? 'the card asked for a longer wait than it owes'
+            : `VERIFY_PIN answered ${hex(verified.sw)}`,
     };
   }
   onStep('keys');
