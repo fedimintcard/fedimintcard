@@ -42,8 +42,21 @@ pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 /// before the card sees it, so a malformed one cannot spend a try.
 pub const PIN_MIN: usize = 4;
 pub const PIN_MAX: usize = 8;
-/// Blocked after three wrong PINs; terminal.
+/// Blocked after three wrong PINs; terminal. Applets 2.x and 3.0 only: a 4.0 card never answers
+/// it (a wrong try makes the next one wait). Kept until the sidecar and pos-core read the wait.
 pub const SW_PIN_BLOCKED: u16 = 0x6983;
+/// A frame's P1 or P2 is not one the command takes (the same word as [`SW_SLOT_OUT_OF_RANGE`]).
+pub const SW_WRONG_P1P2: u16 = 0x6B00;
+/// Applet 4.0's PIN wait (`FedimintCardApplet.java` `countTry`, `waitOwed`): askings come in
+/// stretches of this many, and the asking after a stretch writes what is still owed.
+pub const PIN_STRETCH: u16 = 16;
+/// The most askings a try can owe: from the fifteenth wrong try in a row on.
+pub const PIN_OWED_MOST: u16 = 0x4000;
+/// The wrong tries in a row stop counting here.
+pub const PIN_WRONG_MOST: u8 = 15;
+/// The most `6A98` answers one held VERIFY_PIN can draw: the cap's askings and the asking after
+/// each of its stretches, the last of which is the try itself.
+const MOST_KEEP_HOLDING: u32 = PIN_OWED_MOST as u32 + PIN_OWED_MOST as u32 / PIN_STRETCH as u32;
 /// No PIN set on this card yet.
 pub const SW_NO_PIN_SET: u16 = 0x6984;
 /// A PIN is set and this session has not verified it.
@@ -91,6 +104,82 @@ impl std::fmt::Display for NoRawApdu {
 }
 impl std::error::Error for NoRawApdu {}
 
+/// What the old-card error tells the holder (DESIGN § 7, the Setup app's copy).
+pub const OLD_CARD_MESSAGE: &str = "This card has an older applet. Reset it and set it up again.";
+
+/// SELECT answered `9000` but not as applet 4.0 does: two bytes, major 4. Nothing after such a
+/// SELECT reaches the card's PIN commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedApplet {
+    /// A 2.x card (no version bytes), a 3.x one, or an answer that is not a version.
+    Old { answer: Vec<u8> },
+    /// A later major than this library knows.
+    Newer(AppletVersion),
+}
+
+impl std::fmt::Display for UnsupportedApplet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Old { answer } => write!(f, "{OLD_CARD_MESSAGE} (SELECT answered {})", hex::encode(answer)),
+            Self::Newer(v) => write!(f, "this card's applet is {v}, newer than this app knows (4.x); update the app"),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedApplet {}
+
+impl UnsupportedApplet {
+    /// The rule for every reader: `answer` is what a `9000` SELECT gave. Applet 4.x passes.
+    pub fn check(answer: &[u8]) -> std::result::Result<AppletVersion, Self> {
+        match AppletVersion::from_select(answer) {
+            Some(v) if v.is_current() => Ok(v),
+            Some(v) if v.major > AppletVersion::V4_0.major => Err(Self::Newer(v)),
+            _ => Err(Self::Old { answer: answer.to_vec() }),
+        }
+    }
+}
+
+/// Whether `err` is the old-card error: the card's applet is older than 4.0.
+pub fn is_old_card(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<UnsupportedApplet>(), Some(UnsupportedApplet::Old { .. }))
+}
+
+/// A PIN command on a [`CardClient`] that has not had a SELECT pass the rule for every reader.
+/// Nothing was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotSelected;
+
+impl std::fmt::Display for NotSelected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no PIN command before a SELECT that answers applet 4.x")
+    }
+}
+
+impl std::error::Error for NotSelected {}
+
+/// SIGN answered `6F00`: no signature passed the card's own check, so the card stored none and
+/// the slot still holds its note. Nothing was spent; the holder can tap again. The error also
+/// carries the status word ([`status_word`] gives `6F00`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignCheckFailed;
+
+impl std::fmt::Display for SignCheckFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the card's signature failed its own check; nothing was spent, tap again")
+    }
+}
+
+impl std::error::Error for SignCheckFailed {}
+
+fn sign_check_failed() -> anyhow::Error {
+    anyhow::Error::from(StatusWord(v3::SW_CRYPTO_ERROR)).context(SignCheckFailed)
+}
+
+/// Whether `err` is SIGN's `6F00`: the card refused its own signature and nothing was spent.
+pub fn is_sign_check_failed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SignCheckFailed>().is_some()
+}
+
 /// Returns the status word if `err` came from the card refusing a command.
 pub fn status_word(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<StatusWord>().map(|s| s.0)
@@ -135,21 +224,70 @@ pub fn pin_from_env() -> Vec<u8> {
     }
 }
 
-/// Provision the PIN if the card has none, then open this selection's session with it.
+/// VERIFY_PIN with its wait served (DESIGN § 3, what a host does). On applet 4.0 a try after
+/// wrong ones first owes askings: the card answers `6A98` ([`v3::SW_KEEP_HOLDING`]) to each, and
+/// this resends the same VERIFY_PIN, with nothing between, until it answers anything else, which
+/// it returns: `Ok` for the right PIN, `63CX` for a wrong one (X the wrong tries in a row), or the
+/// error that ended it (a pulled card: tap again to finish the wait).
+///
+/// `progress` is called before the first asking and after each `6A98` with the askings still
+/// owed (about 0.5 s each on a J3R180), so a caller can show "hold the card". The count is read
+/// from GET_STATE once, before any asking: a GET_STATE between askings would begin the stretch
+/// again.
+pub fn verify_pin_held(card: &mut dyn Card, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
+    let mut owed = if card.applet_version()?.is_current() { card.get_state()?.owed } else { 0 };
+    let mut asked = 0u16;
+    progress(owed);
+    for _ in 0..=MOST_KEEP_HOLDING {
+        match card.verify_pin(pin) {
+            Err(e) if status_word(&e) == Some(v3::SW_KEEP_HOLDING) => {
+                // The card's `waitOwed`, mirrored: askings 1..stretch, then the one that writes
+                // what is left.
+                let stretch = owed.min(PIN_STRETCH);
+                if asked < stretch {
+                    asked += 1;
+                } else if owed > stretch {
+                    asked = 0;
+                    owed -= stretch;
+                } else {
+                    // The card would have tried the PIN at this asking.
+                    bail!("the card answered 6A98 with no wait owed");
+                }
+                progress(owed - asked);
+            }
+            r => return r,
+        }
+    }
+    bail!("the card kept answering 6A98 past the longest wait a PIN can owe")
+}
+
+/// Provision the PIN if the card has none, then open this selection's session with it, the wait
+/// served by [`verify_pin_held`] with `progress`.
 ///
 /// `SIGN` refuses until both are true, so anything that spends must call this after `SELECT` and
-/// after the keys are in place. A card that already holds a different PIN answers `63 CX` and
-/// spends a try, so only call it on a card whose PIN you own.
-pub fn open_pin_session_with(card: &mut dyn Card, pin: &[u8]) -> Result<()> {
-    match card.verify_pin(pin) {
+/// after the keys are in place. On applet 4.0 the first SET_PIN needs this selection's anchor, the
+/// registry key and an empty card, and it gives the PIN to the selection that sent it, so no
+/// VERIFY_PIN follows it. A card that already holds a different PIN answers `63 CX` and counts a
+/// wrong try, so only call it on a card whose PIN you own.
+pub fn open_pin_session_held(card: &mut dyn Card, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
+    match verify_pin_held(card, pin, progress) {
         // Already verified: the session is open.
         Ok(()) => Ok(()),
         Err(e) if status_word(&e) == Some(SW_NO_PIN_SET) => {
             card.set_pin(pin).context("SET_PIN on a fresh card")?;
+            if card.applet_version()?.is_current() {
+                return Ok(());
+            }
+            // An old card's SET_PIN opens nothing.
             card.verify_pin(pin).context("VERIFY_PIN after SET_PIN")
         }
         Err(e) => Err(e).context("VERIFY_PIN"),
     }
+}
+
+/// [`open_pin_session_held`] without progress.
+pub fn open_pin_session_with(card: &mut dyn Card, pin: &[u8]) -> Result<()> {
+    open_pin_session_held(card, pin, &mut |_| {})
 }
 
 /// [`open_pin_session_with`] using [`pin_from_env`].
@@ -214,15 +352,25 @@ pub trait Card {
         self.apdu(&[CLA_ISO, 0xCA, 0xFF, 0x21, 0x00])
     }
 
-    /// `SET_PIN` (once per card). `6985` when a PIN is already set, `6983` when blocked.
+    /// `SET_PIN` (once per card). `6985` when a PIN is already set. On applet 4.0: `6A96` without
+    /// this selection's anchor, `6985` without the registry key or on a card holding value; once
+    /// set, this selection has the PIN.
     fn set_pin(&mut self, pin: &[u8]) -> Result<()> {
         self.apdu(&pin_apdu(INS_SET_PIN, pin)?).map(|_| ())
     }
 
-    /// `VERIFY_PIN` for this session. `6984` when no PIN is set, `63 CX` with X tries left,
-    /// `6983` when blocked. `6A94` is what `SIGN` answers once the session has no verified PIN.
+    /// One `VERIFY_PIN` for this session. `6984` when no PIN is set. On applet 4.0 `6A98` while a
+    /// wait is owed (send it again: [`verify_pin_held`] does) and `63CX` for a wrong PIN, X the
+    /// wrong tries in a row; it never blocks. A 2.x card answers `63CX` with X tries left and
+    /// `6983` when blocked. `6A94` is what `SIGN` answers once the session has no PIN.
     fn verify_pin(&mut self, pin: &[u8]) -> Result<()> {
         self.apdu(&pin_apdu(INS_VERIFY_PIN, pin)?).map(|_| ())
+    }
+
+    /// `CHANGE_PIN` (applet 4.0): P1 the old PIN's length, data old ‖ new. Needs this session's
+    /// PIN and ends it. The old PIN is a try like VERIFY_PIN's: a wrong one answers `63CX`.
+    fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<()> {
+        self.apdu(&change_pin_apdu(old, new)?).map(|_| ())
     }
 
     // ------------------------------------------------------------ applet 3.0 (v3.rs)
@@ -233,7 +381,7 @@ pub trait Card {
     /// 2.x: it then gets none of 3.0's commands.
     fn applet_version(&mut self) -> Result<AppletVersion> {
         match self.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])) {
-            Ok(_) => Ok(AppletVersion::V3_0),
+            Ok(st) => Ok(state_version(&st)),
             Err(e) if matches!(status_word(&e), Some(SW_INS_NOT_SUPPORTED) | Some(SW_CLA_NOT_SUPPORTED)) => Ok(AppletVersion::V2_1),
             Err(e) if e.downcast_ref::<NoRawApdu>().is_some() => Ok(AppletVersion::V2_1),
             Err(e) => Err(e).context("asking the card for its version (GET_STATE)"),
@@ -241,10 +389,18 @@ pub trait Card {
     }
 
     /// `SET_NOTE`: the note on a KEYED slot, or the finished change on a CHANGE slot (same amount,
-    /// else `6A80`). No PIN.
-    fn set_note(&mut self, slot: u8, amount_msat: u64, sig48: &[u8; 48]) -> Result<()> {
-        let mut d = amount_msat.to_be_bytes().to_vec();
-        d.extend_from_slice(sig48);
+    /// else `6A80`), with the registry's signature over it (`reg_sig`, DER; [`v3::note_message`]).
+    /// No PIN. `6982`: the signature does not verify under the card's registry key; `6985`: the
+    /// card has no registry key, or the slot takes no note. Nothing is written on any refusal.
+    fn set_note(&mut self, slot: u8, amount_msat: u64, sig48: &[u8; 48], reg_sig: &[u8]) -> Result<()> {
+        ensure!(
+            (v3::NOTE_SIG_MIN..=v3::NOTE_SIG_MAX).contains(&reg_sig.len()),
+            "a note's registry signature is {} to {} bytes of DER",
+            v3::NOTE_SIG_MIN,
+            v3::NOTE_SIG_MAX
+        );
+        let mut d = v3::note_bytes(amount_msat, sig48).to_vec();
+        d.extend_from_slice(reg_sig);
         self.apdu(&v3_apdu(v3::INS_SET_NOTE, slot, &d)).map(|_| ())
     }
 
@@ -325,6 +481,11 @@ pub trait Card {
     }
 }
 
+/// The version a GET_STATE answer shows: 65 bytes is 4.0, anything shorter 3.0.
+fn state_version(answer: &[u8]) -> AppletVersion {
+    if answer.len() == v3::GET_STATE_LEN { AppletVersion::V4_0 } else { AppletVersion::V3_0 }
+}
+
 /// A 3.0 command: the applet's CLA, `ins`, P1 = `p1`, P2 = 0, the data with its Lc when there is
 /// any, and Le = 0.
 pub fn v3_apdu(ins: u8, p1: u8, data: &[u8]) -> Vec<u8> {
@@ -354,28 +515,82 @@ pub fn pin_apdu(ins: u8, pin: &[u8]) -> Result<Vec<u8>> {
     Ok(apdu)
 }
 
+/// `CHANGE_PIN` APDU: P1 = the old PIN's length, P2 = 0, data old ‖ new, Le = 0. Both PINs are
+/// held to the applet's bounds here, so a malformed one never reaches the card.
+pub fn change_pin_apdu(old: &[u8], new: &[u8]) -> Result<Vec<u8>> {
+    for (what, p) in [("old", old), ("new", new)] {
+        ensure!((PIN_MIN..=PIN_MAX).contains(&p.len()), "{what} PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}", p.len());
+    }
+    let mut apdu = vec![CLA, INS_CHANGE_PIN, old.len() as u8, 0x00, (old.len() + new.len()) as u8];
+    apdu.extend_from_slice(old);
+    apdu.extend_from_slice(new);
+    apdu.push(0x00);
+    Ok(apdu)
+}
+
 /// Sends one APDU and returns `data || SW1 SW2`.
+/// What carries APDUs to one card. A transport that selects an applet by itself (an NFC stack's
+/// auto-select, a relay that re-selects), or that goes on across a card being swapped, leaves a
+/// [`CardClient`]'s SELECT state stale: call [`CardClient::select`] again after any of these.
 pub trait Transport {
     fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>>;
 }
 
 pub struct CardClient<T: Transport> {
     transport: T,
-    /// What the last `select` answered, when it was a version (two bytes).
+    /// The version the last SELECT answered, when it passed the rule for every reader (`9000`,
+    /// two bytes, major 4). `None` before any SELECT and after one that did not pass. The PIN
+    /// commands are sent only while it is `Some`.
     selected: Option<AppletVersion>,
+    /// Why the last SELECT did not pass, when it answered `9000`: what a PIN command then gives.
+    refused: Option<UnsupportedApplet>,
+    /// Whether any SELECT went out through this client. Until one does, the transport is taken to
+    /// select by itself and [`Card::applet_version`] asks GET_STATE.
+    sent_select: bool,
 }
 
 impl<T: Transport> CardClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport, selected: None }
+        Self { transport, selected: None, refused: None, sent_select: false }
     }
 
-    /// Select the applet. Needed on a real card; harmless on the bridge. The applet answers its
-    /// version, kept for [`Card::applet_version`].
+    /// Select the applet. Needed on a real card and before any PIN command. Passes only when the
+    /// card answers `9000` with exactly two bytes and major 4 (the rule for every reader); an older
+    /// card is [`UnsupportedApplet::Old`], the old-card error ([`is_old_card`]). The version is
+    /// kept for [`Card::applet_version`].
     pub fn select(&mut self) -> Result<()> {
+        self.forget_select();
         let out = self.exchange(&SELECT_APDU)?;
-        self.selected = AppletVersion::from_select(&out);
+        self.took_select(&out)?;
         Ok(())
+    }
+
+    /// Apply the rule for every reader to a `9000` SELECT's answer.
+    fn took_select(&mut self, out: &[u8]) -> std::result::Result<AppletVersion, UnsupportedApplet> {
+        let r = UnsupportedApplet::check(out);
+        self.selected = r.as_ref().ok().copied();
+        self.refused = r.as_ref().err().cloned();
+        r
+    }
+
+    /// A SELECT is about to go out: whatever the last one passed no longer holds.
+    fn forget_select(&mut self) {
+        self.selected = None;
+        self.refused = None;
+        self.sent_select = true;
+    }
+
+    /// Why no PIN command may go out now: the last SELECT's refusal, or [`NotSelected`].
+    fn not_selected(&self) -> anyhow::Error {
+        match &self.refused {
+            Some(why) => why.clone().into(),
+            None => NotSelected.into(),
+        }
+    }
+
+    /// Whether the last SELECT passed the rule for every reader.
+    pub fn selected(&self) -> Option<AppletVersion> {
+        self.selected
     }
 
     pub fn into_transport(self) -> T {
@@ -429,9 +644,22 @@ impl<T: Transport> Card for CardClient<T> {
     }
 
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        // Any ISO SELECT may select another application (another applet with the same CLA, the
+        // card manager, this one on another channel): it ends what the last SELECT passed, and only
+        // this applet's own SELECT, byte for byte, can pass again.
+        let selecting = apdu.len() >= 2 && apdu[0] & 0x80 == 0 && apdu[1] == 0xA4;
+        let ours = matches!(apdu.len(), 13 | 14) && apdu[..13] == SELECT_APDU[..13];
+        if selecting {
+            self.forget_select();
+        }
+        // The rule for every reader: no PIN command reaches a card whose SELECT did not pass.
+        let pin_cmd = apdu.len() >= 2 && apdu[0] == CLA && matches!(apdu[1], INS_VERIFY_PIN | INS_SET_PIN | INS_CHANGE_PIN);
+        if pin_cmd && self.selected.is_none() {
+            return Err(self.not_selected());
+        }
         let out = self.exchange(apdu)?;
-        if apdu.get(..SELECT_APDU.len() - 1) == Some(&SELECT_APDU[..SELECT_APDU.len() - 1]) {
-            self.selected = AppletVersion::from_select(&out);
+        if ours {
+            let _ = self.took_select(&out);
         }
         Ok(out)
     }
@@ -439,9 +667,12 @@ impl<T: Transport> Card for CardClient<T> {
     fn applet_version(&mut self) -> Result<AppletVersion> {
         match self.selected {
             Some(v) => Ok(v),
+            // A SELECT went out and did not pass: GET_STATE would reach an old card or another
+            // application.
+            None if self.sent_select => Err(self.not_selected()),
             None => {
                 let v = match self.exchange(&v3_apdu(v3::INS_GET_STATE, 0, &[])) {
-                    Ok(_) => AppletVersion::V3_0,
+                    Ok(st) => state_version(&st),
                     Err(e) if matches!(status_word(&e), Some(SW_INS_NOT_SUPPORTED) | Some(SW_CLA_NOT_SUPPORTED)) => AppletVersion::V2_1,
                     Err(e) => return Err(e).context("asking the card for its version (GET_STATE)"),
                 };
@@ -454,29 +685,47 @@ impl<T: Transport> Card for CardClient<T> {
         let mut apdu = vec![CLA, INS_SIGN, slot, 0x00, 0x20];
         apdu.extend_from_slice(msg32);
         apdu.push(0x00);
-        let out = self.exchange(&apdu)?;
+        let out = self.exchange(&apdu).map_err(|e| if status_word(&e) == Some(v3::SW_CRYPTO_ERROR) { sign_check_failed() } else { e })?;
         Signature::from_slice(&out).context("card returned an invalid signature")
     }
 }
 
 /// In-process stand-in for the applet, with the same slot semantics (including `6985`) and the
-/// same PIN state machine: `SET_PIN` once, three tries, `6984` before a PIN exists, `6983` after
-/// it is out of tries. [`SoftCard::new`] is a 2.1 card with [`SLOTS`] slots;
+/// same PIN state machine. [`SoftCard::new`] is a 2.1 card with [`SLOTS`] slots and 2.1's PIN:
+/// `SET_PIN` once, three tries, `6984` before a PIN exists, `6983` after it is out of tries;
 /// [`SoftCard::with_slots`] makes one of any size, such as a 2.0 card with [`MIN_SLOTS`].
 ///
-/// [`SoftCard::v3`] is an applet 3.0 card (`FedimintCardApplet.java`, docs/OFFLINE-PROTOCOL.md
+/// [`SoftCard::v4`] is an applet 4.0 card (`FedimintCardApplet.java`, docs/OFFLINE-PROTOCOL.md
 /// § 1), followed exactly: slot states, sign once per slot (the same hash may be signed again),
-/// notes and change, the day's limit on a clock that only a Bitcoin header with the work moves,
-/// and a P-256 attestation key with its certificate.
+/// notes signed by the registry and change behind the PIN, the day's limit on a clock that only a
+/// Bitcoin header with the work moves (the weak rule and the anchor), and a P-256 attestation key
+/// with its certificate. Its PIN is 4.0's: every try counted with its wait before the compare,
+/// the wait served by resending VERIFY_PIN (`6A98`), never blocked, and the first SET_PIN giving
+/// the PIN to its selection. [`SoftCard::v3`] is an old card for the hosts' refusal: SELECT
+/// answers `03 00`, and behind SELECT it follows the 4.0 rules, which no host that checks SELECT
+/// reaches.
 #[derive(Default)]
 pub struct SoftCard {
     /// One entry per slot the card has; a slot past the end answers `6B00`.
     slots: Vec<Option<Keypair>>,
     pin: Option<Vec<u8>>,
+    /// 2.x only: tries before the block. A 4.0 card keeps it at 3 and counts [`Self::wrong`].
     tries_left: u8,
     /// Whether this session has verified the PIN, which is what lets `SIGN` run. Cleared by
     /// `SELECT`, as on the applet: a session is a selected applet, not a card.
     validated: bool,
+    /// 4.0: this selection's first SET_PIN gave it the PIN (`held[H_PIN_GIVEN]`). SELECT and every
+    /// try clear it.
+    given_by_set: bool,
+    /// 4.0 `pinMarks`: the wrong tries in a row, at most [`PIN_WRONG_MOST`], and the askings the
+    /// next try owes, at most [`PIN_OWED_MOST`]. Persistent; a right PIN clears both.
+    wrong: u8,
+    owed: u16,
+    /// 4.0 `held[H_ASKED]`: the askings of the stretch under way. SELECT and any command but
+    /// VERIFY_PIN set it to 0.
+    asked: u16,
+    /// Tests: the next SIGN of a NOTE slot fails its signature check (`6F00`).
+    fail_sign_check: bool,
     /// Whether the applet is installed. A blank card answers `6A82` to SELECT.
     installed: bool,
     /// What SELECT answers. 3.0 and later get [`Self::v3`]'s rules.
@@ -486,8 +735,13 @@ pub struct SoftCard {
     clock: Clock,
     cert: Vec<u8>,
     attest: Option<p256::ecdsa::SigningKey>,
-    /// The registry's certificate key (SET_REGISTRY_KEY), which signs releases.
+    /// The registry's certificate key (SET_REGISTRY_KEY), which signs releases and notes.
     registry_key: Option<p256::ecdsa::VerifyingKey>,
+    /// This selection anchored the clock (the applet's transient `held[H_ANCHORED]`); SELECT
+    /// clears it.
+    anchored: bool,
+    /// Tests: the floor in place of [`v3::FLOOR_BITS`] ([`SoftCard::use_floor`]).
+    floor: Option<[u8; 4]>,
 }
 
 impl Default for AppletVersion {
@@ -525,6 +779,7 @@ struct Clock {
 }
 
 impl SoftCard {
+    /// An applet 2.1 card (SELECT answers no version): an old card for the hosts' refusal.
     pub fn new() -> Self {
         Self::with_slots(SLOTS)
     }
@@ -534,7 +789,12 @@ impl SoftCard {
         Self { slots: vec![None; n as usize], tries_left: 3, installed: true, v3: vec![V3Slot::empty(); n as usize], ..Default::default() }
     }
 
-    /// An applet 3.0 card: 32 slots and the 3.0 rules.
+    /// An applet 4.0 card: 32 slots and the 4.0 rules.
+    pub fn v4() -> Self {
+        Self { version: AppletVersion::V4_0, ..Self::with_slots(SLOTS) }
+    }
+
+    /// An old card: SELECT answers `03 00`. Behind SELECT it follows the 4.0 rules.
     pub fn v3() -> Self {
         Self { version: AppletVersion::V3_0, ..Self::with_slots(SLOTS) }
     }
@@ -580,6 +840,37 @@ impl SoftCard {
         }
     }
 
+    /// Tests: the card takes headers against `bits` as its floor instead of [`v3::FLOOR_BITS`], so
+    /// a test can mine them, as the applet's tests put their floor in place (`Headers.useFloor`).
+    pub fn use_floor(&mut self, bits: [u8; 4]) {
+        self.floor = Some(bits);
+    }
+
+    /// Tests: key an empty `slot` with `key`, a key the test knows (vectors whose slot key is a
+    /// known point). The slot is KEYED, as after GEN_KEY.
+    pub fn key_slot_with(&mut self, slot: u8, key: Keypair) -> Result<()> {
+        if self.slot(slot)?.is_some() {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
+        self.slots[slot as usize] = Some(key);
+        self.v3[slot as usize] = V3Slot { state: SlotState::Keyed, ..V3Slot::empty() };
+        Ok(())
+    }
+
+    /// Tests: write the PIN's marks, as the applet's tests do (`PinWaitTest.setMarks`): the wrong
+    /// tries in a row and the askings the next try owes.
+    pub fn set_pin_marks(&mut self, wrong: u8, owed: u16) {
+        self.wrong = wrong;
+        self.owed = owed;
+    }
+
+    /// Tests: the next SIGN that reaches a NOTE slot's signature answers `6F00`, as the applet
+    /// does when no signature passes its own check: the slot stays NOTE, and the clock and the
+    /// day's spend are unchanged. One SIGN only.
+    pub fn fail_next_sign_check(&mut self) {
+        self.fail_sign_check = true;
+    }
+
     /// Tests: the card's state of `slot` as GET_SLOT would answer it (3.0).
     pub fn slot_state(&self, slot: u8) -> Option<SlotState> {
         self.v3.get(slot as usize).map(|v| v.state)
@@ -593,6 +884,11 @@ impl SoftCard {
             pin: self.pin.clone(),
             tries_left: 3,
             validated: false,
+            given_by_set: false,
+            wrong: 0,
+            owed: 0,
+            asked: 0,
+            fail_sign_check: false,
             installed: true,
             version: self.version,
             v3: self
@@ -613,6 +909,8 @@ impl SoftCard {
             cert: self.cert.clone(),
             attest: Some(p256::ecdsa::SigningKey::random(&mut rand::thread_rng())),
             registry_key: self.registry_key,
+            anchored: false,
+            floor: self.floor,
         }
     }
 
@@ -627,6 +925,142 @@ impl SoftCard {
     /// The applet's `PIN_STATE_NOT_SET`.
     fn pin_not_set(&self) -> bool {
         self.pin.is_none() && self.tries_left > 0
+    }
+
+    /// The applet's `pinGiven`: this selection has the PIN, by a right try or by its SET_PIN.
+    fn pin_given(&self) -> bool {
+        self.validated || self.given_by_set
+    }
+
+    /// 4.0 `tryPin`: the try counted with the wait the next one would owe (`countTry`, before the
+    /// compare, right PINs included), then the compare; a right PIN clears both marks and opens
+    /// the session, a wrong one answers `63CX`, X the wrong tries in a row. A try first ends
+    /// whatever the session had.
+    fn try_pin(&mut self, candidate: &[u8]) -> Result<()> {
+        self.given_by_set = false;
+        let w = self.wrong;
+        self.wrong = (w + 1).min(PIN_WRONG_MOST);
+        self.owed = if w < 14 { 1 << w } else { PIN_OWED_MOST };
+        if self.pin.as_deref() == Some(candidate) {
+            self.wrong = 0;
+            self.owed = 0;
+            self.validated = true;
+            return Ok(());
+        }
+        self.validated = false;
+        Err(StatusWord(0x63C0 | u16::from(self.wrong)).into())
+    }
+
+    /// 4.0 `waitOwed`: the askings owed, served [`PIN_STRETCH`] at a time. Askings 1..stretch
+    /// answer `6A98`; the asking after a stretch writes what is still owed and answers `6A98`
+    /// again while anything is, or returns, and the try follows.
+    fn wait_owed(&mut self) -> Result<()> {
+        if self.owed == 0 {
+            return Ok(());
+        }
+        let stretch = self.owed.min(PIN_STRETCH);
+        if self.asked < stretch {
+            self.asked += 1;
+            return Err(StatusWord(v3::SW_KEEP_HOLDING).into());
+        }
+        self.asked = 0;
+        self.owed -= stretch;
+        if self.owed != 0 {
+            return Err(StatusWord(v3::SW_KEEP_HOLDING).into());
+        }
+        Ok(())
+    }
+
+    /// 4.0 VERIFY_PIN: the frame (no PIN 6984, length 6700, P1/P2 6B00), which costs nothing, then
+    /// the wait, then the data, then the try.
+    fn verify_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        let len = lc_of(apdu);
+        if self.pin.is_none() {
+            return Err(StatusWord(SW_NO_PIN_SET).into());
+        }
+        if !(PIN_MIN..=PIN_MAX).contains(&len) {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        if apdu[2] != 0 || apdu[3] != 0 {
+            return Err(StatusWord(SW_WRONG_P1P2).into());
+        }
+        self.wait_owed()?;
+        let got = received(apdu);
+        if got.len() < len {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        let candidate = got[..len].to_vec();
+        self.try_pin(&candidate).map(|()| vec![])
+    }
+
+    /// 4.0 SET_PIN, in the applet's order: P1/P2 6B00, a PIN set 6985, length 6700, no anchor in
+    /// this selection 6A96, no registry key or a slot holding value 6985. The selection that sets
+    /// the PIN has it.
+    fn set_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        let len = lc_of(apdu);
+        if apdu[2] != 0 || apdu[3] != 0 {
+            return Err(StatusWord(SW_WRONG_P1P2).into());
+        }
+        if self.pin.is_some() {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
+        if !(PIN_MIN..=PIN_MAX).contains(&len) {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        if !self.anchored {
+            return Err(StatusWord(v3::SW_NOT_ANCHORED).into());
+        }
+        if self.registry_key.is_none() || self.holds_value() {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
+        let got = received(apdu);
+        if got.len() < len {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        self.pin = Some(got[..len].to_vec());
+        self.given_by_set = true;
+        Ok(vec![])
+    }
+
+    /// 4.0 CHANGE_PIN: data old ‖ new, P1 the old length (4..8) or 0 for equal halves. No PIN
+    /// 6984; another P1 or P2 6B00; no PIN in this session 6A94; lengths 6700 at no try; then the
+    /// old PIN is a try, and a right one ends the session and sets the new PIN.
+    fn change_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        let lc = lc_of(apdu);
+        if self.pin.is_none() {
+            return Err(StatusWord(SW_NO_PIN_SET).into());
+        }
+        let mut old = apdu[2] as usize;
+        if (old != 0 && !(PIN_MIN..=PIN_MAX).contains(&old)) || apdu[3] != 0 {
+            return Err(StatusWord(SW_WRONG_P1P2).into());
+        }
+        if !self.pin_given() {
+            return Err(StatusWord(SW_PIN_REQUIRED).into());
+        }
+        if old == 0 {
+            if !lc.is_multiple_of(2) {
+                return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+            }
+            old = lc / 2;
+        }
+        if lc > 2 * PIN_MAX || old > lc || !(PIN_MIN..=PIN_MAX).contains(&(lc - old)) || old < PIN_MIN {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        let got = received(apdu);
+        if got.len() < lc {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        let (was, new) = (got[..old].to_vec(), got[old..lc].to_vec());
+        self.try_pin(&was)?;
+        // A change ends the session: the next CHANGE_PIN needs its own VERIFY_PIN.
+        self.validated = false;
+        self.pin = Some(new);
+        Ok(vec![])
+    }
+
+    /// The applet's `holdsValue`: a slot holds a note or change owed to it.
+    fn holds_value(&self) -> bool {
+        self.v3.iter().any(|v| matches!(v.state, SlotState::Note | SlotState::Change))
     }
 
     /// The applet's `dayAfter`: the window and amount after spending `amount`, or 6A95.
@@ -648,30 +1082,20 @@ impl SoftCard {
         Ok((window, s))
     }
 
+    /// SET_HEADER: the card's test ([`v3::check_header`]), then the anchor while no PIN is set and
+    /// no slot holds value, else a later header moves the clock. Either raises the hardest only
+    /// where harder.
     fn set_header_v3(&mut self, h: &[u8]) -> Result<Vec<u8>> {
         let h: &[u8; 80] = h.try_into().map_err(|_| StatusWord(v3::SW_WRONG_LENGTH))?;
-        let little_work = || -> anyhow::Error { StatusWord(v3::SW_LITTLE_WORK).into() };
-        let wrong_data = || -> anyhow::Error { StatusWord(v3::SW_WRONG_DATA).into() };
         let bits: [u8; 4] = h[72..76].try_into().expect("4");
-        let hash = v3::header_work_hash(h);
-        let target = v3::target_of(&bits).ok_or_else(wrong_data)?;
-        if hash > target {
-            return Err(little_work());
-        }
-        let floor = v3::target_of(&v3::FLOOR_BITS).expect("the floor parses");
-        if target > floor {
-            return Err(little_work());
-        }
-        let seen = self.clock.bits != [0; 4];
-        if seen {
-            let hardest = v3::target_of(&self.clock.bits).ok_or_else(wrong_data)?;
-            if target > v3::times_four(&hardest) {
-                return Err(little_work());
-            }
-        }
+        let hardest = (self.clock.bits != [0; 4]).then_some(self.clock.bits);
+        let floor = self.floor.unwrap_or(v3::FLOOR_BITS);
+        let harder = v3::check_header_at(h, hardest.as_ref(), &floor).map_err(StatusWord)?;
         let time = v3::header_time(h);
-        if time > self.clock.now {
-            let harder = !seen || target < v3::target_of(&self.clock.bits).ok_or_else(wrong_data)?;
+        if v3::anchors(!self.pin_not_set(), self.holds_value()) {
+            self.clock = Clock { now: time, window: 0, bits: if harder { bits } else { self.clock.bits }, spent: 0, ..self.clock };
+            self.anchored = true;
+        } else if time > self.clock.now {
             self.clock.now = time;
             if harder {
                 self.clock.bits = bits;
@@ -696,18 +1120,35 @@ impl SoftCard {
         let refuse = || -> anyhow::Error { StatusWord(SW_CONDITIONS_NOT_SATISFIED).into() };
         match ins {
             v3::INS_SET_NOTE => {
+                // The applet's order: length, the slot's state, the registry key, the amount, then
+                // the signature; nothing is written before the signature verifies.
                 let s = slot()?;
-                len_is(v3::NOTE_LEN)?;
-                let v = &mut self.v3[s];
-                match v.state {
-                    SlotState::Change if v.note[..8] != body[..8] => return Err(StatusWord(v3::SW_WRONG_DATA).into()),
+                let sig_len = body.len().wrapping_sub(v3::NOTE_LEN);
+                if body.len() < v3::NOTE_LEN || !(v3::NOTE_SIG_MIN..=v3::NOTE_SIG_MAX).contains(&sig_len) {
+                    return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+                }
+                let (note, der) = body.split_at(v3::NOTE_LEN);
+                match self.v3[s].state {
+                    SlotState::Change if self.v3[s].note[..8] != note[..8] => return Err(StatusWord(v3::SW_WRONG_DATA).into()),
                     SlotState::Change | SlotState::Keyed => {}
                     _ => return Err(refuse()),
                 }
-                if body[..8] == [0; 8] {
+                let Some(key) = &self.registry_key else {
+                    return Err(refuse());
+                };
+                if note[..8] == [0; 8] {
                     return Err(StatusWord(v3::SW_WRONG_DATA).into());
                 }
-                v.note.copy_from_slice(body);
+                let Some(kp) = &self.slots[s] else {
+                    return Err(refuse());
+                };
+                let amount = u64::from_be_bytes(note[..8].try_into().expect("8"));
+                let sig48: [u8; 48] = note[8..].try_into().expect("48");
+                if !v3::verify_note(key, &kp.x_only_public_key().0.serialize(), amount, &sig48, der) {
+                    return Err(StatusWord(v3::SW_SECURITY_STATUS_NOT_SATISFIED).into());
+                }
+                let v = &mut self.v3[s];
+                v.note.copy_from_slice(note);
                 v.state = SlotState::Note;
                 v.opening = [0; v3::OPEN_LEN];
                 Ok(vec![])
@@ -737,10 +1178,21 @@ impl SoftCard {
                 out.push(self.cert.len() as u8);
                 out.push(u8::from(self.attest.is_some()));
                 out.push(u8::from(self.registry_key.is_some()));
+                // The PIN: its state, the wrong tries in a row, the askings owed (big-endian).
+                out.push(u8::from(!self.pin_not_set()));
+                out.push(self.wrong);
+                out.extend_from_slice(&self.owed.to_be_bytes());
+                out.push(u8::from(self.anchored));
+                // The signer: neither the chip's RSA path nor a nonce key in RAM.
+                out.push(0);
                 Ok(out)
             }
             v3::INS_SET_CHANGE => {
                 let s = slot()?;
+                // After SET_PIN, change needs this selection's PIN (its one sender holds a session).
+                if !self.pin_not_set() && !self.pin_given() {
+                    return Err(StatusWord(SW_PIN_REQUIRED).into());
+                }
                 len_is(8 + v3::OPEN_LEN)?;
                 if self.v3[s].state != SlotState::Keyed {
                     return Err(refuse());
@@ -867,26 +1319,34 @@ impl SoftCard {
         if self.installed { Ok(()) } else { Err(StatusWord(SW_CLA_NOT_SUPPORTED).into()) }
     }
 
-    /// The applet's `checkPinReady`: blocked outranks no PIN, which outranks not verified in
-    /// this session. `SIGN` always calls it, so a card that has never been pinned cannot sign, and
-    /// a fresh `SELECT` needs its own `VERIFY_PIN`.
+    /// The applet's `checkPinReady`: no PIN outranks no PIN in this session (and on a 2.x card
+    /// blocked outranks both). `SIGN` always calls it, so a card that has never been pinned cannot
+    /// sign, and a fresh `SELECT` needs its own `VERIFY_PIN`.
     fn require_pin_session(&self) -> Result<()> {
-        if self.tries_left == 0 {
+        if !self.is_v3() && self.tries_left == 0 {
             return Err(StatusWord(SW_PIN_BLOCKED).into());
         }
         if self.pin.is_none() {
             return Err(StatusWord(SW_NO_PIN_SET).into());
         }
-        if !self.validated {
+        if !self.pin_given() {
             return Err(StatusWord(SW_PIN_REQUIRED).into());
         }
         Ok(())
+    }
+
+    /// The applet's `process` before its dispatch: any command but VERIFY_PIN, SELECT among them,
+    /// begins the PIN's stretch again. The trait's GEN_KEY, GET_PUB and SIGN skip [`Card::apdu`],
+    /// so they call it themselves.
+    fn not_an_asking(&mut self) {
+        self.asked = 0;
     }
 }
 
 impl Card for SoftCard {
     fn gen_key(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
         self.require_installed()?;
+        self.not_an_asking();
         if self.slot(slot)?.is_some() {
             return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
         }
@@ -898,6 +1358,7 @@ impl Card for SoftCard {
 
     fn gen_key_overwrite(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
         self.require_installed()?;
+        self.not_an_asking();
         let occupied = self.slot(slot)?.is_some();
         if self.is_v3() {
             // 3.0: a slot holding a note, or owed change, holds value and is never re-keyed; a
@@ -925,6 +1386,7 @@ impl Card for SoftCard {
 
     fn get_pub(&mut self, slot: u8) -> Result<XOnlyPublicKey> {
         self.require_installed()?;
+        self.not_an_asking();
         match self.slot(slot)? {
             Some(kp) => Ok(kp.x_only_public_key().0),
             None => Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into()),
@@ -933,6 +1395,7 @@ impl Card for SoftCard {
 
     fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> Result<Signature> {
         self.require_installed()?;
+        self.not_an_asking();
         // The gate comes first, as on the applet: without the PIN, a reader learns nothing
         // about the slots.
         self.require_pin_session()?;
@@ -951,6 +1414,11 @@ impl Card for SoftCard {
             SlotState::Note => {
                 let amount = u64::from_be_bytes(v.note[..8].try_into().expect("8"));
                 let (window, spent) = self.day_after(amount)?;
+                // The applet's signer checks its signature before anything is stored; one that
+                // fails is 6F00 with the slot still NOTE.
+                if std::mem::take(&mut self.fail_sign_check) {
+                    return Err(sign_check_failed());
+                }
                 let s = sig();
                 let v = &mut self.v3[slot as usize];
                 v.spent = *msg32;
@@ -975,6 +1443,9 @@ impl Card for SoftCard {
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         ensure!(apdu.len() >= 4, "APDU shorter than its header");
         let (cla, ins) = (apdu[0], apdu[1]);
+        if ins != INS_VERIFY_PIN {
+            self.not_an_asking();
+        }
         match (cla, ins) {
             // The applet refuses any CLA but its own before looking at the INS.
             (c, _) if c != CLA && c != CLA_ISO => Err(StatusWord(SW_CLA_NOT_SUPPORTED).into()),
@@ -984,16 +1455,22 @@ impl Card for SoftCard {
                 if !self.installed || &apdu[5..5 + lc] != SELECT_APDU_HEAD {
                     return Err(StatusWord(0x6A82).into());
                 }
-                // A session lives inside a selection: a fresh SELECT needs its own VERIFY_PIN.
+                // A session lives inside a selection: a fresh SELECT needs its own VERIFY_PIN, and
+                // its own anchor.
                 self.validated = false;
-                // A 3.0 applet answers its version. The 2.x stand-in has always answered no
-                // data, and the hosts take that for 2.x.
+                self.given_by_set = false;
+                self.anchored = false;
+                // A 3.0 or later applet answers its version. The 2.x stand-in has always answered
+                // no data, and the hosts take that for 2.x.
                 Ok(if self.is_v3() { vec![self.version.major, self.version.minor] } else { vec![] })
             }
             (CLA_ISO, 0xCA) if apdu[2] == 0xFF && apdu[3] == 0x21 => {
                 // TLV: 81 applications, 82 non-volatile, 83 volatile. One free slot's worth.
                 Ok(vec![0xFF, 0x21, 0x09, 0x81, 0x01, 0x01, 0x82, 0x02, 0x10, 0x00, 0x83, 0x00])
             }
+            (CLA, INS_SET_PIN) if self.is_v3() => self.set_pin_v4(apdu),
+            (CLA, INS_VERIFY_PIN) if self.is_v3() => self.verify_pin_v4(apdu),
+            (CLA, INS_CHANGE_PIN) if self.is_v3() => self.change_pin_v4(apdu),
             (CLA, INS_SET_PIN) => {
                 let pin = apdu_data(apdu)?;
                 ensure!((PIN_MIN..=PIN_MAX).contains(&pin.len()), "PIN must be {PIN_MIN} to {PIN_MAX} bytes");
@@ -1031,6 +1508,8 @@ impl Card for SoftCard {
                 Err(StatusWord(0x63C0 | u16::from(self.tries_left)).into())
             }
             (CLA, _) if self.is_v3() => self.apdu_v3(apdu),
+            // The 3.0 and 4.0 applets take only SELECT under the ISO class.
+            (CLA_ISO, _) if self.is_v3() => Err(StatusWord(SW_CLA_NOT_SUPPORTED).into()),
             _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }
     }
@@ -1047,6 +1526,23 @@ fn apdu_body(apdu: &[u8]) -> Result<&[u8]> {
         return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
     }
     Ok(&apdu[5..5 + lc])
+}
+
+/// The applet's `lcOf`: the Lc byte, or one past any PIN command's (17) for an Lc of 128 and up.
+fn lc_of(apdu: &[u8]) -> usize {
+    match apdu.get(4) {
+        None => 0,
+        Some(&b) if b >= 0x80 => 2 * PIN_MAX + 1,
+        Some(&b) => b as usize,
+    }
+}
+
+/// What the applet's receive gives: the data bytes present, at most Lc of them.
+fn received(apdu: &[u8]) -> &[u8] {
+    if apdu.len() <= 5 {
+        return &[];
+    }
+    &apdu[5..apdu.len().min(5 + apdu[4] as usize)]
 }
 
 /// The AID bytes `SELECT` names, without the header/Lc that precede them.

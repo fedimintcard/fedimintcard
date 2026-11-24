@@ -1,5 +1,7 @@
-//! Applet 3.0 (docs/OFFLINE-PROTOCOL.md § 1–2): the commands a till needs to pay offline, the
-//! shapes of their answers, the block-header clock, and the registry's certificate over a card.
+//! The applet's command set since 3.0 (docs/OFFLINE-PROTOCOL.md § 1–2), as applet 4.0 answers it:
+//! the commands a till needs to pay offline, the shapes of their answers, the block-header clock
+//! with its weak rule and anchor, the registry's signatures over notes, and its certificate over a
+//! card.
 //!
 //! The applet (`FedimintCardApplet.java`) is the source of truth; this module mirrors it byte for
 //! byte so [`crate::SoftCard`] can follow it and a till can read a real card's answers.
@@ -32,18 +34,24 @@ pub const SW_WRONG_DATA: u16 = 0x6A80;
 /// GET_CERT on a card with no certificate.
 pub const SW_RECORD_NOT_FOUND: u16 = 0x6A83;
 pub const SW_WRONG_LENGTH: u16 = 0x6700;
-/// RELEASE with a signature the registry key does not verify.
+/// RELEASE or SET_NOTE with a signature the registry key does not verify.
 pub const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6982;
+/// SET_PIN in a selection that has not anchored the clock (4.0).
+pub const SW_NOT_ANCHORED: u16 = 0x6A96;
+/// VERIFY_PIN while a wait is owed: the card served one asking and did not look at the PIN. Send
+/// the same command again, with nothing between, until it answers something else (4.0).
+pub const SW_KEEP_HOLDING: u16 = 0x6A98;
+/// The card's check of its own work failed (SIGN: the signature did not verify), so it wrote
+/// nothing: the slot keeps its note (4.0).
+pub const SW_CRYPTO_ERROR: u16 = 0x6F00;
 
 /// A note on the card: amount (8, big-endian msat) then the federation's signature (48).
 pub const NOTE_LEN: usize = 56;
 /// Change owed to a slot: txid (32), output index (2, big-endian), blinding key (32).
 pub const OPEN_LEN: usize = 66;
 pub const GET_SLOT_LEN: usize = 187;
-/// GET_STATE since releases (§ 6): byte 58 says whether the registry key is set.
-pub const GET_STATE_LEN: usize = 59;
-/// GET_STATE of a 3.0 card from before releases: no registry key byte.
-pub const GET_STATE_LEN_PRE_RELEASE: usize = 58;
+/// GET_STATE of applet 4.0: byte 58 the registry key, 59..63 the PIN, 63 the anchor, 64 the signer.
+pub const GET_STATE_LEN: usize = 65;
 pub const CERT_MAX: usize = 160;
 pub const HEADER_LEN: usize = 80;
 /// ATTEST's label, 16 ASCII bytes.
@@ -55,6 +63,11 @@ pub const RELEASE_LABEL: &[u8; 17] = b"fedimintcard/rel1";
 /// The shortest and longest DER signature RELEASE takes (the applet's bounds).
 pub const RELEASE_SIG_MIN: usize = 8;
 pub const RELEASE_SIG_MAX: usize = 72;
+/// The label of the registry's signature over a note, 18 ASCII bytes (4.0).
+pub const NOTE_LABEL: &[u8; 18] = b"fedimintcard/note1";
+/// The shortest and longest DER signature SET_NOTE takes after the note (the applet's bounds).
+pub const NOTE_SIG_MIN: usize = 8;
+pub const NOTE_SIG_MAX: usize = 72;
 /// The least work a header must show, as `bits` little-endian (0x17087BC0, cashucard's floor).
 pub const FLOOR_BITS: [u8; 4] = [0xC0, 0x7B, 0x08, 0x17];
 pub const DAY_SECONDS: u32 = 86_400;
@@ -70,6 +83,12 @@ impl AppletVersion {
     pub const V2_0: Self = Self { major: 2, minor: 0 };
     pub const V2_1: Self = Self { major: 2, minor: 1 };
     pub const V3_0: Self = Self { major: 3, minor: 0 };
+    pub const V4_0: Self = Self { major: 4, minor: 0 };
+
+    /// The only major this library speaks: 4. Anything else gets no PIN command.
+    pub fn is_current(&self) -> bool {
+        self.major == Self::V4_0.major
+    }
 
     /// 3.0 and later: each slot signs one transaction, ever, and only a slot holding its note
     /// (SET_NOTE) signs at all.
@@ -209,18 +228,27 @@ pub struct CardStatus {
     pub spent_msat: u64,
     pub cert_len: u8,
     pub attest_key: bool,
-    /// The registry's certificate key is set (SET_REGISTRY_KEY), so the card takes releases.
-    /// False on a 3.0 card from before releases (58 bytes).
+    /// The registry's certificate key is set (SET_REGISTRY_KEY), so the card takes releases and
+    /// notes.
     pub registry_key: bool,
+    /// A PIN is set (byte 59).
+    pub pin_set: bool,
+    /// Wrong PIN tries in a row (byte 60; the card stops counting at 15).
+    pub wrong_tries: u8,
+    /// Askings owed before the next PIN try (bytes 61..63, big-endian): each is one VERIFY_PIN
+    /// answered `6A98`.
+    pub owed: u16,
+    /// This selection anchored the clock (byte 63), which SET_PIN asks for.
+    pub anchored: bool,
+    /// The signer's product runs on the chip's RSA engine (byte 64, bit 0).
+    pub chip_mul: bool,
+    /// The signer's nonce key lives in RAM (byte 64, bit 1).
+    pub key_in_ram: bool,
 }
 
 impl CardStatus {
     pub fn parse(b: &[u8]) -> Result<Self> {
-        ensure!(
-            b.len() == GET_STATE_LEN || b.len() == GET_STATE_LEN_PRE_RELEASE,
-            "GET_STATE answered {} bytes, not {GET_STATE_LEN}",
-            b.len()
-        );
+        ensure!(b.len() == GET_STATE_LEN, "GET_STATE answered {} bytes, not {GET_STATE_LEN}", b.len());
         Ok(Self {
             states: b[..32].iter().map(|s| SlotState::from_byte(*s)).collect::<Result<_>>()?,
             now: u32::from_be_bytes(b[32..36].try_into().expect("4")),
@@ -229,8 +257,20 @@ impl CardStatus {
             spent_msat: u64::from_be_bytes(b[48..56].try_into().expect("8")),
             cert_len: b[56],
             attest_key: b[57] != 0,
-            registry_key: b.get(58).is_some_and(|k| *k != 0),
+            registry_key: b[58] != 0,
+            pin_set: b[59] != 0,
+            wrong_tries: b[60],
+            owed: u16::from_be_bytes([b[61], b[62]]),
+            anchored: b[63] != 0,
+            chip_mul: b[64] & 1 != 0,
+            key_in_ram: b[64] & 2 != 0,
         })
+    }
+
+    /// Whether a header the card takes now would anchor its clock: no PIN set and no slot holding
+    /// value (a note or change owed).
+    pub fn anchors(&self) -> bool {
+        anchors(self.pin_set, self.states.iter().any(|s| matches!(s, SlotState::Note | SlotState::Change)))
     }
 
     pub fn slots_in(&self, state: SlotState) -> Vec<u8> {
@@ -306,6 +346,77 @@ pub fn times_four(a: &[u8; 32]) -> [u8; 32] {
         carry = (v >> 8) & 0x03;
     }
     if carry != 0 { [0xFF; 32] } else { out }
+}
+
+/// Twice a 32-byte big-endian number; too large to hold is the largest there is (the applet's
+/// `twice`).
+pub fn twice(a: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut carry = 0u16;
+    for i in (0..32).rev() {
+        let v = ((a[i] as u16) << 1) | carry;
+        out[i] = v as u8;
+        carry = (v >> 8) & 0x01;
+    }
+    if carry != 0 { [0xFF; 32] } else { out }
+}
+
+/// The weak rule (4.0): with a hardest taken (its `bits`), a header is weak when its target is over
+/// twice the hardest's; before any hardest, when its target, doubled, is over the floor's (its
+/// work is under twice the floor's). `None` for bits no header can carry (the card answers 6A80).
+pub fn header_is_weak(h: &[u8; HEADER_LEN], hardest: Option<&[u8; 4]>) -> Option<bool> {
+    header_is_weak_at(h, hardest, &FLOOR_BITS)
+}
+
+/// [`header_is_weak`] against another floor (tests mine headers for an easy one, as the applet's
+/// tests do).
+pub fn header_is_weak_at(h: &[u8; HEADER_LEN], hardest: Option<&[u8; 4]>, floor: &[u8; 4]) -> Option<bool> {
+    let bits: [u8; 4] = h[72..76].try_into().expect("4");
+    let target = target_of(&bits)?;
+    Some(match hardest {
+        Some(hb) => target > twice(&target_of(hb)?),
+        None => twice(&target) > target_of(floor)?,
+    })
+}
+
+/// The card's whole test of a header (SET_HEADER), in its order: bits it can read (6A80), its own
+/// work, the floor, a quarter of the hardest, then the weak rule (each 6A93). `hardest` is the
+/// card's hardest `bits`, `None` before any. `Ok(harder)` when the card takes the header, `harder`
+/// saying whether it raises the hardest. A host sends a card only headers this takes.
+pub fn check_header(h: &[u8; HEADER_LEN], hardest: Option<&[u8; 4]>) -> std::result::Result<bool, u16> {
+    check_header_at(h, hardest, &FLOOR_BITS)
+}
+
+/// [`check_header`] against another floor (tests).
+pub fn check_header_at(h: &[u8; HEADER_LEN], hardest: Option<&[u8; 4]>, floor: &[u8; 4]) -> std::result::Result<bool, u16> {
+    let bits: [u8; 4] = h[72..76].try_into().expect("4");
+    let target = target_of(&bits).ok_or(SW_WRONG_DATA)?;
+    if header_work_hash(h) > target {
+        return Err(SW_LITTLE_WORK);
+    }
+    if target > target_of(floor).ok_or(SW_WRONG_DATA)? {
+        return Err(SW_LITTLE_WORK);
+    }
+    let hardest_target = match hardest {
+        Some(hb) => Some(target_of(hb).ok_or(SW_WRONG_DATA)?),
+        None => None,
+    };
+    if let Some(ht) = &hardest_target
+        && target > times_four(ht)
+    {
+        return Err(SW_LITTLE_WORK);
+    }
+    if header_is_weak_at(h, hardest, floor).ok_or(SW_WRONG_DATA)? {
+        return Err(SW_LITTLE_WORK);
+    }
+    Ok(hardest_target.is_none_or(|ht| target < ht))
+}
+
+/// Whether a header the card takes is an anchor (4.0): no PIN set and no slot holding value. An
+/// anchor sets the clock to its time, even an earlier one, raises the hardest only where harder,
+/// clears the day's window and spent count, and marks the selection anchored for SET_PIN.
+pub fn anchors(pin_set: bool, holds_value: bool) -> bool {
+    !pin_set && !holds_value
 }
 
 /// The header's hash read as Bitcoin compares it: a big-endian number.
@@ -422,6 +533,52 @@ pub fn sign_release(key: &p256::ecdsa::SigningKey, slot0: &[u8; 32], slot: u8, t
     sig.to_der().as_bytes().to_vec()
 }
 
+// ------------------------------------------------------------------ notes (4.0, DESIGN § 6)
+
+/// SET_NOTE's 56 data bytes before the registry's signature: amount (8, big-endian) ‖ the
+/// federation's signature (48).
+pub fn note_bytes(amount_msat: u64, sig48: &[u8; 48]) -> [u8; NOTE_LEN] {
+    let mut n = [0u8; NOTE_LEN];
+    n[..8].copy_from_slice(&amount_msat.to_be_bytes());
+    n[8..].copy_from_slice(sig48);
+    n
+}
+
+/// What the registry signs for a note and the card checks: the label, the slot's x-only key as
+/// the card holds it, the 56 note bytes (106 bytes).
+pub fn note_message(slot_x: &[u8; 32], amount_msat: u64, sig48: &[u8; 48]) -> Vec<u8> {
+    let mut m = NOTE_LABEL.to_vec();
+    m.extend_from_slice(slot_x);
+    m.extend_from_slice(&note_bytes(amount_msat, sig48));
+    m
+}
+
+/// Check the registry's signature over a note (DER) as the card does: ECDSA P-256 with SHA-256,
+/// either half of `s` taken (p256's verify takes both, as the card's does).
+pub fn verify_note(registry_key: &p256::ecdsa::VerifyingKey, slot_x: &[u8; 32], amount_msat: u64, sig48: &[u8; 48], der: &[u8]) -> bool {
+    p256::ecdsa::Signature::from_der(der).is_ok_and(|sig| registry_key.verify(&note_message(slot_x, amount_msat, sig48), &sig).is_ok())
+}
+
+/// The registry key the tests use: a TEST key, private key 1 (its public key is P-256's
+/// generator), the applet tests' `TEST_REGISTRY_KEY`. Never a deployment key.
+pub fn test_registry_key() -> p256::ecdsa::SigningKey {
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    p256::ecdsa::SigningKey::from_slice(&one).expect("1 is a scalar")
+}
+
+/// A registry key's point as SET_REGISTRY_KEY takes it: 65 bytes uncompressed.
+pub fn registry_point(key: &p256::ecdsa::SigningKey) -> [u8; 65] {
+    key.verifying_key().to_encoded_point(false).as_bytes().try_into().expect("65")
+}
+
+/// Sign a note as the registry does, DER (tests and tools).
+pub fn sign_note(key: &p256::ecdsa::SigningKey, slot_x: &[u8; 32], amount_msat: u64, sig48: &[u8; 48]) -> Vec<u8> {
+    use p256::ecdsa::signature::Signer as _;
+    let sig: p256::ecdsa::Signature = key.sign(&note_message(slot_x, amount_msat, sig48));
+    sig.to_der().as_bytes().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +608,12 @@ mod tests {
             cert_len: 0,
             attest_key: false,
             registry_key: false,
+            pin_set: false,
+            wrong_tries: 0,
+            owed: 0,
+            anchored: false,
+            chip_mul: false,
+            key_in_ram: false,
         };
         assert!(s(0, 0, 0, 0).limit_allows(&[u64::MAX]));
         assert!(s(0, 0, 2000, 0).limit_allows(&[1000, 1000]));
@@ -467,14 +630,49 @@ mod state_tests {
     use super::*;
 
     #[test]
-    fn get_state_takes_59_bytes_and_58_from_a_card_before_releases() {
+    fn get_state_is_65_bytes_with_the_pin_the_anchor_and_the_signer() {
         let mut b = vec![0u8; GET_STATE_LEN];
+        b[2] = SlotState::Keyed.byte();
         b[58] = 1;
-        assert!(CardStatus::parse(&b).unwrap().registry_key);
-        b[58] = 0;
-        assert!(!CardStatus::parse(&b).unwrap().registry_key);
-        assert!(!CardStatus::parse(&b[..58]).unwrap().registry_key, "a pre-release 3.0 card has no registry key");
-        assert!(CardStatus::parse(&b[..57]).is_err());
-        assert!(CardStatus::parse(&[0u8; 60]).is_err());
+        b[59] = 1;
+        b[60] = 4;
+        b[61] = 0x01;
+        b[62] = 0x02;
+        b[63] = 1;
+        b[64] = 2;
+        let st = CardStatus::parse(&b).unwrap();
+        assert!(st.registry_key && st.pin_set && st.anchored && st.key_in_ram && !st.chip_mul);
+        assert_eq!((st.wrong_tries, st.owed), (4, 0x0102));
+        assert!(!st.anchors(), "a PIN is set");
+        b[64] = 1;
+        assert!(CardStatus::parse(&b).unwrap().chip_mul);
+        b[59] = 0;
+        assert!(CardStatus::parse(&b).unwrap().anchors(), "no PIN and a keyed slot holds no value");
+        b[3] = SlotState::Change.byte();
+        assert!(!CardStatus::parse(&b).unwrap().anchors(), "change owed is value");
+        for n in [58, 59, 63, 64, 66] {
+            assert!(CardStatus::parse(&vec![0u8; n]).is_err(), "{n} bytes is not a 4.0 card");
+        }
+    }
+
+    #[test]
+    fn twice_doubles_and_saturates() {
+        let mut a = [0u8; 32];
+        a[31] = 0x81;
+        let t = twice(&a);
+        assert_eq!((t[30], t[31]), (1, 2));
+        let mut top = [0u8; 32];
+        top[0] = 0x80;
+        assert_eq!(twice(&top), [0xFF; 32]);
+    }
+
+    #[test]
+    fn the_note_message_is_label_key_amount_and_federation_signature() {
+        let m = note_message(&[7; 32], 1000, &[9; 48]);
+        assert_eq!(m.len(), 106);
+        assert_eq!(&m[..18], b"fedimintcard/note1");
+        assert_eq!(&m[18..50], &[7; 32]);
+        assert_eq!(&m[50..58], &1000u64.to_be_bytes());
+        assert_eq!(&m[58..], &[9; 48]);
     }
 }

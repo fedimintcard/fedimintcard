@@ -1,7 +1,8 @@
 //! A kit for tests without a card reader or a federation (feature `softkit`): a [`SoftCard`]
 //! behind an APDU [`Transport`], as a phone's NFC session or the relay carries a real card's
 //! answers; a transport that loses the card at a chosen APDU; and a mint of one guardian whose
-//! notes check with `Note::verify` exactly as a federation's do, to load onto a 3.0 SoftCard.
+//! notes check with `Note::verify` exactly as a federation's do, to load onto a 4.0 SoftCard with
+//! the test registry's signature ([`crate::v3::test_registry_key`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,21 @@ use fedimint_core::encoding::Encodable;
 use secp256k1::XOnlyPublicKey;
 
 use crate::{BridgeError, Card, SoftCard, StatusWord, Transport};
+
+/// Mainnet block 900000's header: real work, above the built floor, so a 4.0 card anchors on it.
+pub const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92";
+
+/// Make a fresh 4.0 card ready for its first SET_PIN in this selection, as set-up does: the test
+/// registry's key if it has none, then the anchor (SET_HEADER with [`H900000`]). The card must
+/// hold no value and no PIN.
+pub fn ready_for_pin(card: &mut dyn Card) -> Result<()> {
+    if !card.get_state()?.registry_key {
+        card.set_registry_key(&crate::v3::registry_point(&crate::v3::test_registry_key()))?;
+    }
+    let h: [u8; 80] = hex::decode(H900000).expect("hex").try_into().expect("80 bytes");
+    card.set_header(&h).context("anchoring the clock")?;
+    Ok(())
+}
 
 /// What the card answers to `apdu`, `data || SW`, as a reader returns it. Errors that carry no
 /// status word answer `6F00`.
@@ -118,12 +134,24 @@ impl SoftMint {
         sig.consensus_encode_to_vec().try_into().map_err(|_| anyhow::anyhow!("a signature is 48 bytes"))
     }
 
-    /// Load a note of `amount_msat` onto `slot` of a 3.0 card (`SET_NOTE`), keying the slot first
-    /// if it has no key. Answers the slot's key.
+    /// Load a note of `amount_msat` onto `slot` of a 4.0 card (`SET_NOTE`), keying the slot first
+    /// if it has no key, signed by the test registry ([`crate::v3::test_registry_key`]). A card
+    /// with no registry key and no PIN is given the test registry's first; a card that holds
+    /// another registry's key refuses (6982): use [`SoftMint::load_with`] for it. Answers the
+    /// slot's key.
     pub fn load(&self, card: &mut SoftCard, slot: u8, amount_msat: u64) -> Result<XOnlyPublicKey> {
+        self.load_with(card, slot, amount_msat, &crate::v3::test_registry_key())
+    }
+
+    /// [`SoftMint::load`] with the note signed by `registry`.
+    pub fn load_with(&self, card: &mut SoftCard, slot: u8, amount_msat: u64, registry: &p256::ecdsa::SigningKey) -> Result<XOnlyPublicKey> {
+        if card.registry_key.is_none() {
+            card.set_registry_key(&crate::v3::registry_point(registry))?;
+        }
         let key = card.get_or_gen(slot)?;
         let sig = self.sign(amount_msat, &key)?;
-        card.set_note(slot, amount_msat, &sig)?;
+        let reg_sig = crate::v3::sign_note(registry, &key.serialize(), amount_msat, &sig);
+        card.set_note(slot, amount_msat, &sig, &reg_sig)?;
         Ok(key)
     }
 }
@@ -135,7 +163,7 @@ mod tests {
 
     #[test]
     fn a_soft_card_answers_through_a_transport_as_a_reader_would() {
-        let t = SoftTransport::new(SoftCard::v3());
+        let t = SoftTransport::new(SoftCard::v4());
         let mut c = CardClient::new(t.clone());
         c.select().unwrap();
         assert!(c.applet_version().unwrap().sign_once());
@@ -144,6 +172,7 @@ mod tests {
         // SIGN needs the PIN session; the card's refusal comes back as its status word.
         let e = c.sign(3, &[1; 32]).unwrap_err();
         assert_eq!(crate::status_word(&e), Some(crate::SW_NO_PIN_SET));
+        ready_for_pin(&mut c).unwrap();
         open_pin_session_with(&mut c, TEST_PIN).unwrap();
         assert_eq!(c.get_slot(3).unwrap().state, SlotState::Keyed);
     }
@@ -151,7 +180,7 @@ mod tests {
     #[test]
     fn a_pulled_card_answers_nothing_from_the_chosen_apdu_on() {
         // SELECT, then GET_PUB and GEN_KEY of an empty slot: the fourth APDU is the first lost.
-        let mut c = CardClient::new(PullTransport::new(SoftTransport::new(SoftCard::v3()), 3));
+        let mut c = CardClient::new(PullTransport::new(SoftTransport::new(SoftCard::v4()), 3));
         c.select().unwrap();
         c.get_or_gen(0).unwrap();
         let e = c.get_slot(0).unwrap_err();
@@ -165,7 +194,7 @@ mod tests {
     #[test]
     fn the_soft_mint_signs_notes_its_keys_verify() {
         let mint = SoftMint::powers_of_two(20);
-        let mut card = SoftCard::v3();
+        let mut card = SoftCard::v4();
         let key = mint.load(&mut card, 5, 1 << 14).unwrap();
         let info = card.get_slot(5).unwrap();
         assert_eq!((info.state, info.amount_msat, info.xonly), (SlotState::Note, 1 << 14, Some(key)));

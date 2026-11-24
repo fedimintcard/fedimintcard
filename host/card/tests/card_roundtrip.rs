@@ -4,6 +4,7 @@
 //! * The bridge test runs only when `CARD_BRIDGE_URL` is set.
 //! * `card_from_env` runs against whatever `CARD_BACKEND` selects (soft by default).
 
+use fedimint_card_host_card::v3;
 use fedimint_card_host_card::*;
 use secp256k1::{Message, SECP256K1, XOnlyPublicKey};
 
@@ -14,14 +15,23 @@ fn bridge_lock() -> std::sync::MutexGuard<'static, ()> {
     BRIDGE_CARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Provision a PIN on a card that has none, then open a session with it: `SIGN` needs both, as
-/// on the applet.
+const PIN: &[u8] = b"1234";
+/// Mainnet block 900000's header: real work, above the built floor, so a 4.0 card anchors on it.
+const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92";
+
+/// Open a session, provisioning the PIN on a card that has none: `SIGN` needs both, as on the
+/// applet. A 4.0 card with no PIN first takes the test registry's key and the anchor, in the same
+/// selection as its SET_PIN, which then gives the PIN to that selection; an old card's SET_PIN
+/// is followed by VERIFY_PIN ([`open_pin_session_with`] does both).
 fn open_session(card: &mut dyn Card) {
-    const PIN: &[u8] = b"1234";
-    if status_word(&card.verify_pin(PIN).unwrap_err()) == Some(SW_NO_PIN_SET) {
-        card.set_pin(PIN).expect("SET_PIN on a fresh card");
+    if card.applet_version().unwrap().is_current() && !card.get_state().unwrap().pin_set {
+        if !card.get_state().unwrap().registry_key {
+            card.set_registry_key(&v3::registry_point(&v3::test_registry_key())).expect("SET_REGISTRY_KEY");
+        }
+        let h: [u8; 80] = hex::decode(H900000).unwrap().try_into().unwrap();
+        card.set_header(&h).expect("the anchor");
     }
-    card.verify_pin(PIN).expect("VERIFY_PIN");
+    open_pin_session_with(card, PIN).expect("PIN session");
 }
 
 fn roundtrip(card: &mut dyn Card, slot: u8) {
@@ -30,6 +40,12 @@ fn roundtrip(card: &mut dyn Card, slot: u8) {
     // empty slot needs no PIN, and SIGN (which does) comes after.
     open_session(card);
     assert_eq!(card.get_pub(slot).unwrap(), pk, "GET_PUB is stable");
+    if card.applet_version().unwrap().is_current() {
+        // A 4.0 card signs only a slot holding a note the registry signed.
+        let sig48 = [0x48u8; 48];
+        let reg_sig = v3::sign_note(&v3::test_registry_key(), &pk.serialize(), 1000, &sig48);
+        card.set_note(slot, 1000, &sig48, &reg_sig).expect("SET_NOTE");
+    }
     let msg = [0x5Au8; 32];
     let sig = card.sign(slot, &msg).expect("sign");
     SECP256K1.verify_schnorr(&sig, &Message::from_digest(msg), &pk).expect("signature verifies against the card's key");
@@ -172,11 +188,17 @@ impl Transport for FakeApplet {
             d.extend_from_slice(&[0x90, 0x00]);
             return Ok(d);
         }
+        if apdu[1] == 0xA4 && !self.card.version().is_current() {
+            // An old SoftCard behind a SELECT that answers as applet 4.0 does, so the client's
+            // rule lets the session through: the framing is under test here, not the slot rules.
+            return Ok(vec![0x04, 0x00, 0x90, 0x00]);
+        }
+        let slot = apdu[2];
         if apdu[1] == 0xA4 {
-            return Ok(vec![0x90, 0x00]);
+            let r = self.card.apdu(apdu);
+            return Ok(self.answer(r));
         }
         assert_eq!(apdu[0], 0xB0, "CLA");
-        let slot = apdu[2];
         if apdu[1] != 0x10 {
             assert_eq!(apdu[3], 0, "P2");
         }
@@ -206,25 +228,33 @@ impl Transport for FakeApplet {
                 assert_eq!(apdu.len(), 5 + apdu[4] as usize + 1, "PIN command: Lc bytes, Le");
                 self.card.apdu(apdu)
             }
+            // The 4.0 set-up and the note: the card's own APDU layer too.
+            _ if self.card.version().is_current() => self.card.apdu(apdu),
             _ => return Ok(vec![0x6D, 0x00]),
         };
+        Ok(self.answer(res))
+    }
+}
+
+impl FakeApplet {
+    fn answer(&mut self, res: anyhow::Result<Vec<u8>>) -> Vec<u8> {
         match res {
-            Ok(data) if self.chain => {
+            Ok(data) if self.chain && !data.is_empty() => {
                 let n = data.len() as u8;
                 self.pending = Some(data);
-                Ok(vec![0x61, n])
+                vec![0x61, n]
             }
             Ok(mut data) => {
                 data.extend_from_slice(&[0x90, 0x00]);
-                Ok(data)
+                data
             }
-            Err(e) => Ok(status_word(&e).unwrap().to_be_bytes().to_vec()),
+            Err(e) => status_word(&e).unwrap().to_be_bytes().to_vec(),
         }
     }
 }
 
 fn fake(chain: bool) -> CardClient<FakeApplet> {
-    CardClient::new(FakeApplet { card: SoftCard::new(), chain, pending: None, log: vec![] })
+    CardClient::new(FakeApplet { card: SoftCard::v4(), chain, pending: None, log: vec![] })
 }
 
 #[test]
@@ -240,6 +270,7 @@ fn client_apdu_framing_roundtrip() {
 #[test]
 fn client_follows_get_response() {
     let mut c = fake(true);
+    c.select().unwrap();
     roundtrip(&mut c, 1);
     assert!(c.into_transport().log.iter().any(|a| a[1] == 0xC0));
 }
@@ -313,6 +344,10 @@ fn bridge_roundtrip_when_configured() {
 #[test]
 fn card_from_env() {
     let _guard = bridge_lock();
+    if std::env::var("CARD_BACKEND").as_deref() == Ok("bridge") {
+        // A fresh card: slot 3 may hold a spent note from an earlier run.
+        BridgeTransport::new(&bridge::url_from_env()).reset().expect("bridge /reset");
+    }
     let mut card = open_from_env().expect("backend from CARD_BACKEND");
     roundtrip(card.as_mut(), 3);
 }

@@ -1,6 +1,7 @@
-//! Applet 3.0 on the `SoftCard` (docs/OFFLINE-PROTOCOL.md § 1), mirroring the applet's
-//! `OfflineTest.java` case by case, with the same real mainnet headers; and the 3.0 commands
-//! through `CardClient`'s APDU framing.
+//! Applet 4.0's command set on the `SoftCard` (docs/OFFLINE-PROTOCOL.md § 1), mirroring the
+//! applet's `OfflineTest.java` case by case, with the same real mainnet headers; and the commands
+//! through `CardClient`'s APDU framing. Every note is signed by the test registry
+//! (`v3::test_registry_key`) unless a test names another key.
 
 use fedimint_card_host_card::v3::{self, Certificate};
 use fedimint_card_host_card::*;
@@ -34,18 +35,42 @@ fn sw<T: std::fmt::Debug>(r: anyhow::Result<T>) -> u16 {
 
 const PIN: &[u8] = b"1234";
 
-/// A card with slots 0..n-1 keyed and holding notes of `msat`, a PIN set and verified.
+/// Load a note of `msat` on `slot`, signed by `k`. A card with no registry key and no PIN is given
+/// `k`'s first, as set-up does.
+fn note_by(c: &mut dyn Card, k: &p256::ecdsa::SigningKey, slot: u8, msat: u64) -> anyhow::Result<()> {
+    let st = c.get_state()?;
+    if !st.registry_key && !st.pin_set {
+        c.set_registry_key(&v3::registry_point(k))?;
+    }
+    let x = c.get_pub(slot)?.serialize();
+    c.set_note(slot, msat, &sig48(), &v3::sign_note(k, &x, msat, &sig48()))
+}
+
+/// [`note_by`] under the test registry key.
+fn note(c: &mut dyn Card, slot: u8, msat: u64) -> anyhow::Result<()> {
+    note_by(c, &v3::test_registry_key(), slot, msat)
+}
+
+/// What set-up sends before SET_PIN on 4.0: the test registry's key, then the anchor (a real
+/// header, in this selection).
+fn ready_for_pin(c: &mut dyn Card) {
+    c.set_registry_key(&v3::registry_point(&v3::test_registry_key())).unwrap();
+    c.set_header(&header(H900000)).unwrap();
+}
+
+/// A card set up as set-up does (the limit, the registry key, the anchor at 900000, the PIN,
+/// which gives this selection the PIN), then slots 0..n-1 keyed and holding notes of `msat`.
 fn card(n: u8, msat: u64, limit: u64) -> SoftCard {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     if limit != 0 {
         c.set_limit(limit).unwrap();
     }
+    ready_for_pin(&mut c);
+    c.set_pin(PIN).unwrap();
     for s in 0..n {
         c.gen_key(s).unwrap();
-        c.set_note(s, msat, &sig48()).unwrap();
+        note(&mut c, s, msat).unwrap();
     }
-    c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
     c
 }
 
@@ -77,12 +102,12 @@ fn a_slot_signs_one_transaction_and_only_that_one_again() {
 
 #[test]
 fn only_a_note_is_signed() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     c.gen_key(0).unwrap();
     c.gen_key(1).unwrap();
-    c.set_change(1, 4096, &change(4096)).unwrap();
+    ready_for_pin(&mut c);
     c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
+    c.set_change(1, 4096, &change(4096)).unwrap();
     assert_eq!(sw(c.sign(0, &h(1))), 0x6985, "a key with no note");
     assert_eq!(sw(c.sign(1, &h(1))), 0x6985, "a key owed change");
     assert_eq!(sw(c.sign(2, &h(1))), 0x6985, "an empty slot");
@@ -90,11 +115,11 @@ fn only_a_note_is_signed() {
 
 #[test]
 fn a_key_that_holds_value_is_never_replaced() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     for s in 0..3 {
         c.gen_key(s).unwrap();
     }
-    c.set_note(0, 1000, &sig48()).unwrap();
+    note(&mut c, 0, 1000).unwrap();
     c.set_change(1, 2048, &change(2048)).unwrap();
     assert_eq!(sw(c.gen_key_overwrite(0)), 0x6985, "a note");
     assert_eq!(sw(c.gen_key_overwrite(1)), 0x6985, "change owed");
@@ -113,19 +138,19 @@ fn a_spent_slot_is_re_keyed_and_forgets_its_transaction() {
     assert_eq!(slot.state, SlotState::Keyed);
     assert_ne!(before, c.get_pub(0).unwrap());
     assert_eq!(slot.spent_hash, [0; 32], "the spent hash is gone");
-    c.set_note(0, 1000, &sig48()).unwrap();
+    note(&mut c, 0, 1000).unwrap();
     assert_eq!(sw(c.sign(0, &h(2))), 0x9000, "the new note signs its own transaction");
 }
 
 #[test]
 fn set_note_takes_only_a_keyed_or_change_slot() {
-    let mut c = SoftCard::v3();
-    assert_eq!(sw(c.set_note(0, 1000, &sig48())), 0x6985, "empty");
+    let mut c = SoftCard::v4();
+    assert_eq!(sw(note(&mut c, 0, 1000)), 0x6985, "empty");
     c.gen_key(0).unwrap();
-    assert_eq!(sw(c.set_note(0, 0, &sig48())), 0x6A80, "no amount");
+    assert_eq!(sw(note(&mut c, 0, 0)), 0x6A80, "no amount");
     assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_SET_NOTE, 0, &[0; 55]))), 0x6700);
-    c.set_note(0, 1000, &sig48()).unwrap();
-    assert_eq!(sw(c.set_note(0, 2000, &sig48())), 0x6985, "a note is not overwritten");
+    note(&mut c, 0, 1000).unwrap();
+    assert_eq!(sw(note(&mut c, 0, 2000)), 0x6985, "a note is not overwritten");
     let slot = c.get_slot(0).unwrap();
     assert_eq!(slot.state, SlotState::Note);
     assert_eq!(slot.xonly, Some(c.get_pub(0).unwrap()));
@@ -134,15 +159,15 @@ fn set_note_takes_only_a_keyed_or_change_slot() {
 
 #[test]
 fn change_is_kept_then_finished_with_its_own_amount() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     c.gen_key(3).unwrap();
     let open = change(4096);
     c.set_change(3, 4096, &open).unwrap();
     let slot = c.get_slot(3).unwrap();
     assert_eq!((slot.state, slot.amount_msat, slot.opening), (SlotState::Change, 4096, open));
     assert_eq!(sw(c.set_change(3, 4096, &open)), 0x6985, "only a keyed slot");
-    assert_eq!(sw(c.set_note(3, 2048, &sig48())), 0x6A80, "not the amount it is owed");
-    c.set_note(3, 4096, &sig48()).unwrap();
+    assert_eq!(sw(note(&mut c, 3, 2048)), 0x6A80, "not the amount it is owed");
+    note(&mut c, 3, 4096).unwrap();
     let slot = c.get_slot(3).unwrap();
     assert_eq!(slot.state, SlotState::Note);
     assert_eq!(slot.opening.to_bytes(), [0; 66], "the opening is let go");
@@ -150,16 +175,16 @@ fn change_is_kept_then_finished_with_its_own_amount() {
 
 #[test]
 fn the_limit_is_set_only_before_the_pin() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     c.set_limit(5000).unwrap();
+    ready_for_pin(&mut c);
     c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
     assert_eq!(sw(c.set_limit(1 << 40)), 0x6985);
     assert_eq!(c.get_state().unwrap().limit_msat, 5000);
 }
 
 #[test]
-fn with_no_header_the_limit_holds_for_good_and_an_over_spend_burns_nothing() {
+fn with_no_later_header_the_day_never_ends_and_an_over_spend_burns_nothing() {
     let mut c = card(3, 1000, 2000);
     c.sign(0, &h(1)).unwrap();
     c.sign(1, &h(1)).unwrap();
@@ -192,21 +217,27 @@ fn a_real_header_a_day_later_starts_a_new_day() {
 
 #[test]
 fn headers_without_the_work_are_refused_and_an_older_one_moves_nothing() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     assert_eq!(sw(c.set_header(&header(GENESIS))), 0x6A93, "under the floor");
     let mut forged = header(H900200);
     forged[79] ^= 1; // another nonce: the hash no longer meets the target
     assert_eq!(sw(c.set_header(&forged)), 0x6A93);
     assert!(v3::header_has_work(&header(H900200)) && !v3::header_has_work(&forged) && !v3::header_has_work(&header(GENESIS)));
     assert_eq!(c.set_header(&header(H900200)).unwrap(), 1_749_309_742);
-    assert_eq!(c.set_header(&header(H900000)).unwrap(), 1_749_309_742, "the clock never goes back");
+    // With no PIN and no value an older header is an anchor and sets the clock back (4.0).
+    let t900000 = v3::header_time(&header(H900000));
+    assert_eq!(c.set_header(&header(H900000)).unwrap(), t900000, "an anchor");
+    c.gen_key(0).unwrap();
+    note(&mut c, 0, 1000).unwrap();
+    assert_eq!(c.set_header(&header(H900200)).unwrap(), 1_749_309_742);
+    assert_eq!(c.set_header(&header(H900000)).unwrap(), 1_749_309_742, "once a slot holds value the clock never goes back");
     assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_SET_HEADER, 0, &[0; 79]))), 0x6700);
     assert_eq!(v3::header_time(&header(H900200)), 1_749_309_742);
 }
 
 #[test]
 fn the_card_attests_over_the_challenge_and_its_own_key() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     let slot0 = c.gen_key(0).unwrap().serialize();
     assert_eq!(sw(c.attest(&h(7))), 0x6985, "no key, no certificate");
     let w = c.attest_init().unwrap();
@@ -239,7 +270,8 @@ fn the_card_attests_over_the_challenge_and_its_own_key() {
 
 #[test]
 fn attestation_key_is_not_made_after_the_pin() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
+    ready_for_pin(&mut c);
     c.set_pin(PIN).unwrap();
     assert_eq!(sw(c.attest_init()), 0x6985);
 }
@@ -248,9 +280,11 @@ fn attestation_key_is_not_made_after_the_pin() {
 fn versions() {
     assert_eq!(SoftCard::new().applet_version().unwrap(), AppletVersion::V2_1);
     assert!(!SoftCard::new().applet_version().unwrap().sign_once());
-    assert!(SoftCard::v3().applet_version().unwrap().sign_once());
+    assert!(SoftCard::v4().applet_version().unwrap().sign_once());
+    assert_eq!(SoftCard::v4().applet_version().unwrap(), AppletVersion::V4_0);
     // A 2.1 card refuses the 3.0 commands as unknown instructions.
     assert_eq!(sw(SoftCard::new().get_state()), 0x6D00);
+    assert_eq!(SoftCard::v4().apdu(&SELECT_APDU).unwrap(), vec![4, 0]);
     assert_eq!(SoftCard::v3().apdu(&SELECT_APDU).unwrap(), vec![3, 0]);
     assert!(SoftCard::new().apdu(&SELECT_APDU).unwrap().is_empty());
     // 2.1: any keyed slot signs, any number of times.
@@ -287,15 +321,20 @@ impl Transport for Direct {
 }
 
 #[test]
-fn client_speaks_3_0() {
-    let mut c = CardClient::new(Direct(SoftCard::v3()));
-    // Before SELECT the version comes from GET_STATE; after it, from SELECT's answer.
-    assert_eq!(c.applet_version().unwrap(), AppletVersion::V3_0);
+fn client_speaks_4_0() {
+    let mut c = CardClient::new(Direct(SoftCard::v4()));
+    // Before SELECT the version comes from GET_STATE's length; after it, from SELECT's answer.
+    assert_eq!(c.applet_version().unwrap(), AppletVersion::V4_0);
     c.select().unwrap();
-    assert_eq!(c.applet_version().unwrap(), AppletVersion::V3_0);
+    assert_eq!(c.selected(), Some(AppletVersion::V4_0));
+    assert_eq!(c.applet_version().unwrap(), AppletVersion::V4_0);
     c.gen_key(0).unwrap();
     c.gen_key(1).unwrap();
-    c.set_note(0, 4096, &sig48()).unwrap();
+    c.set_registry_key(&v3::registry_point(&v3::test_registry_key())).unwrap();
+    assert_eq!(c.set_header(&header(H900000)).unwrap(), v3::header_time(&header(H900000)));
+    // The first SET_PIN gives this selection the PIN: no VERIFY_PIN before the change or SIGN.
+    c.set_pin(PIN).unwrap();
+    note(&mut c, 0, 4096).unwrap();
     let open = change(1);
     c.set_change(1, 1024, &open).unwrap();
     let s0 = c.get_slot(0).unwrap();
@@ -304,17 +343,12 @@ fn client_speaks_3_0() {
     assert_eq!((s1.state, s1.amount_msat, s1.opening), (SlotState::Change, 1024, open));
     let st = c.get_state().unwrap();
     assert_eq!(st.states[..3], [SlotState::Note, SlotState::Change, SlotState::Empty]);
-    assert_eq!(c.set_header(&header(H900000)).unwrap(), v3::header_time(&header(H900000)));
-    c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
     c.sign(0, &h(9)).unwrap();
     assert_eq!(c.get_slot(0).unwrap().state, SlotState::Spent);
     assert_eq!(sw(c.get_cert()), 0x6A83);
 
     let mut old = CardClient::new(Direct(SoftCard::new()));
     assert_eq!(old.applet_version().unwrap(), AppletVersion::V2_1, "a 2.1 card refuses GET_STATE");
-    old.select().unwrap();
-    assert_eq!(old.applet_version().unwrap(), AppletVersion::V2_1);
 }
 
 // ------------------------------------------------------------------ releases (§ 6), as ReleaseTest.java
@@ -333,14 +367,14 @@ fn release(k: &p256::ecdsa::SigningKey, slot0: &[u8; 32], slot: u8, txid: &[u8; 
 
 /// A card with the registry key, slot 0 its identity, slot 1 a note, slot 2 keyed; PIN verified.
 fn released_card(k: &p256::ecdsa::SigningKey) -> (SoftCard, [u8; 32]) {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     let slot0 = c.gen_key(0).unwrap().serialize();
     c.gen_key(1).unwrap();
     c.gen_key(2).unwrap();
-    c.set_note(1, 2048, &sig48()).unwrap();
     c.set_registry_key(&point(k)).unwrap();
+    c.set_header(&header(H900000)).unwrap();
     c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
+    note_by(&mut c, k, 1, 2048).unwrap();
     (c, slot0)
 }
 
@@ -375,7 +409,7 @@ fn a_released_change_slot_is_keyed_again() {
     let slot = c.get_slot(2).unwrap();
     assert_eq!(slot.opening, Opening::from_bytes(&[0; 66]), "the opening is gone");
     assert_eq!(slot.amount_msat, 0);
-    c.set_note(2, 4096, &sig48()).unwrap();
+    note_by(&mut c, &k, 2, 4096).unwrap();
     assert_eq!(c.get_slot(2).unwrap().state, SlotState::Note, "the slot takes a new note");
 }
 
@@ -398,25 +432,27 @@ fn only_the_registrys_signature_over_this_card_slot_and_transaction() {
 }
 
 #[test]
-fn the_registry_key_is_set_before_the_pin_and_without_it_nothing_is_released() {
+fn the_registry_key_is_set_before_the_pin_and_without_it_no_note_loads() {
     let k = registry();
-    let mut c = SoftCard::v3();
-    let slot0 = c.gen_key(0).unwrap().serialize();
-    c.gen_key(1).unwrap();
-    c.set_note(1, 2048, &sig48()).unwrap();
+    let mut c = SoftCard::v4();
+    c.gen_key(0).unwrap();
+    let x1 = c.gen_key(1).unwrap().serialize();
+    let reg_sig = v3::sign_note(&k, &x1, 2048, &sig48());
     assert!(!c.get_state().unwrap().registry_key);
+    assert_eq!(sw(c.set_note(1, 2048, &sig48(), &reg_sig)), 0x6985, "no registry key: no note");
+    assert_eq!(c.slot_state(1), Some(SlotState::Keyed));
+    c.set_header(&header(H900000)).unwrap();
+    assert_eq!(sw(c.set_pin(PIN)), 0x6985, "no registry key: no PIN either");
+    c.set_registry_key(&point(&k)).unwrap();
     c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
-    assert_eq!(sw(c.set_registry_key(&point(&k))), 0x6985, "only before the PIN");
-    let t = h(0x66);
-    c.sign(1, &t).unwrap();
-    assert_eq!(sw(c.release(1, &t, &release(&k, &slot0, 1, &t))), 0x6985, "no registry key");
-    assert_eq!(c.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])).unwrap().len(), 59);
+    assert_eq!(sw(c.set_registry_key(&point(&registry()))), 0x6985, "only before the PIN");
+    c.set_note(1, 2048, &sig48(), &reg_sig).unwrap();
+    assert_eq!(c.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])).unwrap().len(), 65);
 }
 
 #[test]
 fn a_malformed_key_or_release_is_refused() {
-    let mut c = SoftCard::v3();
+    let mut c = SoftCard::v4();
     assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_SET_REGISTRY_KEY, 0, &[0; 64]))), 0x6700);
     let mut compressed = [0u8; 65];
     compressed[0] = 2;
@@ -434,15 +470,15 @@ fn a_malformed_key_or_release_is_refused() {
 #[test]
 fn client_speaks_release() {
     let k = registry();
-    let mut c = CardClient::new(Direct(SoftCard::v3()));
+    let mut c = CardClient::new(Direct(SoftCard::v4()));
     c.select().unwrap();
     let slot0 = c.gen_key(0).unwrap().serialize();
     c.gen_key(1).unwrap();
-    c.set_note(1, 2048, &sig48()).unwrap();
     c.set_registry_key(&point(&k)).unwrap();
     assert!(c.get_state().unwrap().registry_key);
+    c.set_header(&header(H900000)).unwrap();
     c.set_pin(PIN).unwrap();
-    c.verify_pin(PIN).unwrap();
+    note_by(&mut c, &k, 1, 2048).unwrap();
     c.sign(1, &h(3)).unwrap();
     assert_eq!(c.release(1, &h(3), &release(&k, &slot0, 1, &h(3))).unwrap(), SlotState::Note);
 }
