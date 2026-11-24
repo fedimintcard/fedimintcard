@@ -49,7 +49,7 @@ class SchnorrHWSignTest {
     }
 
     static SchnorrHW signer() {
-        SchnorrHW h = new SchnorrHW(G, P, A, B, N);
+        SchnorrHW h = new SchnorrHW();
         h.init();
         return h;
     }
@@ -153,15 +153,6 @@ class SchnorrHWSignTest {
         }
     }
 
-    @Test
-    void initRejectsMismatchedGroupOrder() {
-        byte[] wrong = N.clone();
-        wrong[31] ^= 1;
-        ISOException e = assertThrows(ISOException.class,
-            () -> new SchnorrHW(G, P, A, B, wrong).init());
-        assertEquals((short) 0x6F00, e.getReason());
-    }
-
     /** Public key wrapper whose getW returns 02/03 || X. */
     static final class CompressedPub implements ECPublicKey {
         final ECPublicKey d;
@@ -227,13 +218,12 @@ class SchnorrHWSignTest {
         byte[] sig = new byte[64];
         h.sign(priv(d), pub(d), new byte[32], (short) 0, sig, (short) 0);
         ECPrivateKey tmp = (ECPrivateKey) get(h, "tmpPriv");
-        if ((Boolean) get(h, "tmpTransient")) {
-            assertFalse(tmp.isInitialized(), "transient nonce key must be cleared after SIGN");
+        if ((Boolean) get(h, "keyInRam")) {
+            assertFalse(tmp.isInitialized(), "a nonce key in RAM must be cleared after SIGN");
         } else {
             byte[] sBuf = new byte[32];
             assertEquals(32, tmp.getS(sBuf, (short) 0));
-            assertArrayEquals((byte[]) get(h, "kWipe"), sBuf, "persistent nonce key must hold the non-secret wipe value");
-            assertEquals(1, sBuf[31]);
+            assertArrayEquals(Arrays.copyOfRange(G, 1, 33), sBuf, "a persistent nonce key must rest at G's x, a public number");
         }
         for (String f : new String[] { "sc", "work" }) {
             for (byte b : (byte[]) get(h, f)) assertEquals(0, b, f + " must be zero after sign");
@@ -286,7 +276,7 @@ class SchnorrHWSignTest {
     }
 
     @Test
-    void signAcceptsLeadingZeroThirtyThreeByteScalar() {
+    void signRefusesAThirtyThreeByteScalar() {
         SchnorrHW h = signer();
         BigInteger d = KEYS[4];
         ECPrivateKey real = priv(d);
@@ -301,7 +291,10 @@ class SchnorrHWSignTest {
         };
         byte[] msg = new byte[32];
         byte[] sig = new byte[64];
-        h.sign(padded, pub(d), msg, (short) 0, sig, (short) 0);
-        assertTrue(Bip340.verify(Bip340.bytes32(Bip340.pubkey(d)[0]), msg, sig));
+        // The signer takes getS at its word only from 1 to 32 bytes; GEN_KEY aligns a 33-byte
+        // answer (alignScalar) before it stores the key, so a slot key never gives one.
+        ISOException e = assertThrows(ISOException.class, () -> h.sign(padded, pub(d), msg, (short) 0, sig, (short) 0));
+        assertEquals((short) 0x6F00, e.getReason());
+        for (byte b : sig) assertEquals(0, b, "nothing written");
     }
 }

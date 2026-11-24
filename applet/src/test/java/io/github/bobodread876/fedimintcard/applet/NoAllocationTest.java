@@ -22,7 +22,7 @@ import org.junit.jupiter.api.Test;
  * time — in a constructor, {@code install()}, or (SchnorrHW only) {@code init()}, which the applet
  * constructor calls — and a command path may not allocate at all.
  *
- * <p>This is a source scan, not a bytecode check: it reads the three main-source files by path
+ * <p>This is a source scan, not a bytecode check: it reads the main-source files by path
  * (relative to the applet module), strips comments and string/char literals, tracks method bodies
  * by brace depth, and reports every {@code new} with its line number and enclosing method.
  */
@@ -44,10 +44,11 @@ class NoAllocationTest {
     static final Map<String, Set<String>> ALLOWED = Map.of(
         "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor"),
         "SchnorrHW.java", Set.of("SchnorrHW", "init"),
+        "Secp256k1.java", Set.of("<static>"),
         "Opener.java", Set.of("Opener", "install"));
 
     static final List<String> SOURCES = List.of(
-        "FedimintCardApplet.java", "SchnorrHW.java", "Opener.java");
+        "FedimintCardApplet.java", "SchnorrHW.java", "Secp256k1.java", "Opener.java");
 
     /** Where the main sources live, relative to this module ({@code applet/}). */
     static Path sourceDir() {

@@ -1,5 +1,8 @@
 applet/src/main/java/io/github/bobodread876/fedimintcard/applet/SchnorrHW.java is copied
-from cashucard/javacard and trimmed. Its licence follows verbatim.
+whole from cashucard/javacard (applet 3.1). Changed: the package line, the curve names (this
+package keeps them in Secp256k1.java) and one marked block of this package's helpers at the
+end. The tear harness in applet/src/test (TearHook.java, TearLoader.java) is ported from the
+same repository's tests. Its licence follows verbatim.
 
 In FedimintCardApplet.java, applet 3.0's block-header clock (SET_HEADER, targetOf,
 timesFour, the floor), its burn-then-answer order for SIGN and its attestation follow

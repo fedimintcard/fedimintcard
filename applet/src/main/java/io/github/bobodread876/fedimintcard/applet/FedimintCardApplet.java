@@ -201,31 +201,6 @@ public final class FedimintCardApplet extends Applet {
     static final byte PIN_STATE_SET = 1;
     static final byte PIN_STATE_BLOCKED = 2;
 
-    private static final byte[] P = {
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,
-        (byte)0xFF,(byte)0xFF,(byte)0xFC,(byte)0x2F };
-    private static final byte[] A = new byte[32];
-    private static final byte[] B = {
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,7 };
-    private static final byte[] N = {
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,
-        (byte)0xBA,(byte)0xAE,(byte)0xDC,(byte)0xE6,(byte)0xAF,(byte)0x48,(byte)0xA0,(byte)0x3B,
-        (byte)0xBF,(byte)0xD2,(byte)0x5E,(byte)0x8C,(byte)0xD0,(byte)0x36,(byte)0x41,(byte)0x41 };
-    private static final byte[] G = {
-        (byte)0x04,
-        (byte)0x79,(byte)0xBE,(byte)0x66,(byte)0x7E,(byte)0xF9,(byte)0xDC,(byte)0xBB,(byte)0xAC,
-        (byte)0x55,(byte)0xA0,(byte)0x62,(byte)0x95,(byte)0xCE,(byte)0x87,(byte)0x0B,(byte)0x07,
-        (byte)0x02,(byte)0x9B,(byte)0xFC,(byte)0xDB,(byte)0x2D,(byte)0xCE,(byte)0x28,(byte)0xD9,
-        (byte)0x59,(byte)0xF2,(byte)0x81,(byte)0x5B,(byte)0x16,(byte)0xF8,(byte)0x17,(byte)0x98,
-        (byte)0x48,(byte)0x3A,(byte)0xDA,(byte)0x77,(byte)0x26,(byte)0xA3,(byte)0xC4,(byte)0x65,
-        (byte)0x5D,(byte)0xA4,(byte)0xFB,(byte)0xFC,(byte)0x0E,(byte)0x11,(byte)0x08,(byte)0xA8,
-        (byte)0xFD,(byte)0x17,(byte)0xB4,(byte)0x48,(byte)0xA6,(byte)0x85,(byte)0x54,(byte)0x19,
-        (byte)0x9C,(byte)0x47,(byte)0xD0,(byte)0x8F,(byte)0xFB,(byte)0x10,(byte)0xD4,(byte)0xB8 };
-
     private final ECPrivateKey[] privs = new ECPrivateKey[SLOTS];
     private final ECPublicKey[] pubs = new ECPublicKey[SLOTS];
     private final byte[] state = new byte[SLOTS];
@@ -283,7 +258,7 @@ public final class FedimintCardApplet extends Applet {
         tmp = JCSystem.makeTransientByteArray((short) 65, JCSystem.CLEAR_ON_DESELECT);
         // Install-time only, and persistent: see the field's comment.
         newPin = new byte[PIN_MAX];
-        schnorr = new SchnorrHW(G, P, A, B, N);
+        schnorr = new SchnorrHW();
         schnorr.init();
         // Install-time only: OwnerPIN and the state byte are the applet's persistent PIN store.
         // A new instance starts on the not-set path, as the check in set() expects.
@@ -308,26 +283,8 @@ public final class FedimintCardApplet extends Applet {
     }
 
     private static void setParams(ECPrivateKey priv, ECPublicKey pub) {
-        if (priv != null) setPrivParams(priv);
-        if (pub != null) setPubParams(pub);
-    }
-
-    private static void setPrivParams(ECPrivateKey priv) {
-        priv.setFieldFP(P, (short) 0, (short) 32);
-        priv.setA(A, (short) 0, (short) 32);
-        priv.setB(B, (short) 0, (short) 32);
-        priv.setG(G, (short) 0, (short) 65);
-        priv.setR(N, (short) 0, (short) 32);
-        priv.setK((short) 1);
-    }
-
-    private static void setPubParams(ECPublicKey pub) {
-        pub.setFieldFP(P, (short) 0, (short) 32);
-        pub.setA(A, (short) 0, (short) 32);
-        pub.setB(B, (short) 0, (short) 32);
-        pub.setG(G, (short) 0, (short) 65);
-        pub.setR(N, (short) 0, (short) 32);
-        pub.setK((short) 1);
+        if (priv != null) Secp256k1.curve(priv);
+        if (pub != null) Secp256k1.curve(pub);
     }
 
     /**
@@ -533,6 +490,10 @@ public final class FedimintCardApplet extends Applet {
             }
             // The same buffer as CHANGE_PIN's new half, which is only live inside a call.
             Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, newPin, (short) 0, len);
+            // The signer's test of the chip's product, once a life: a card takes SET_PIN once
+            // (a PIN set is never unset), and this is chipMul's one writer. Before the commit
+            // point, so a SET_PIN torn after it runs it again and none is set without it.
+            schnorr.chipMul = schnorr.chipMulInit();
             // The PIN write first, the state byte second: the state byte is the commit point, so
             // a tear before it leaves the card reading as not set and SET_PIN can run again.
             pin.update(newPin, (short) 0, (byte) len);
@@ -654,7 +615,7 @@ public final class FedimintCardApplet extends Applet {
         boolean okEnc = (n == 65 && tmp[0] == 0x04)
             || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03));
         if (!okEnc) {
-            ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+            ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
         }
         Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) 0, (short) 32);
         apdu.setOutgoingAndSend((short) 0, (short) 32);
@@ -756,10 +717,13 @@ public final class FedimintCardApplet extends Applet {
     }
 
     /**
-     * SIGN, at most one transaction per slot (3.0). The signature is made in RAM; the slot's
-     * spent hash, its state and the day's count are committed together; only then does the
-     * signature leave the card. A tear before the commit has spent nothing and given nothing; a
-     * tear after it leaves a spent slot whose one transaction can be signed again.
+     * SIGN, at most one transaction per slot (3.0). The signature is made in RAM and checked
+     * there by the signer (BIP-340's verify, before a byte of it is written): one that fails the
+     * check answers 6F00 and the slot stays a note, with nothing stored. Only after the signer
+     * returns are the slot's spent hash, its signature, its state and the day's count committed
+     * together, and only then does the signature leave the card. A tear before the commit has
+     * spent nothing and given nothing; a tear after it leaves a spent slot whose one transaction
+     * can be answered again from storage.
      */
     private void sign(APDU apdu, byte[] buf) {
         // The gate comes first: without the PIN, a reader learns nothing about the slots.
@@ -777,7 +741,8 @@ public final class FedimintCardApplet extends Applet {
                 ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
             }
             // Answered from storage, as cashucard's SPEND_ALL_AGAIN: the key computes one
-            // signature in its life, which leaves a power analysis nothing to compare.
+            // signature per note it holds (a RELEASE makes the slot a note again, and its next
+            // SIGN signs anew), which leaves a power analysis little to compare.
             Util.arrayCopyNonAtomic(spentSig, (short) (s * 64), buf, (short) 0, (short) 64);
             apdu.setOutgoingAndSend((short) 0, (short) 64);
             return;
@@ -788,7 +753,9 @@ public final class FedimintCardApplet extends Applet {
         }
         Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, x, X_HASH, (short) 32);
         dayAfter((short) (s * NOTE_LEN));
-        schnorr.sign(privs[s], pubs[s], buf, ISO7816.OFFSET_CDATA, buf, (short) 0);
+        // The message is the copy in x, so message and output never overlap. sign() throws 6F00
+        // for a signature that fails its check, before anything here is written.
+        schnorr.sign(privs[s], pubs[s], x, X_HASH, buf, (short) 0);
         JCSystem.beginTransaction();
         Util.arrayCopy(x, X_HASH, spentHash, (short) (s * 32), (short) 32);
         Util.arrayCopy(buf, (short) 0, spentSig, (short) (s * 64), (short) 64);
@@ -954,7 +921,7 @@ public final class FedimintCardApplet extends Applet {
         } else {
             short n = pubs[s].getW(tmp, (short) 0);
             if (!((n == 65 && tmp[0] == 0x04) || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03)))) {
-                ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+                ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
             }
             Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) 1, (short) 32);
             Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
@@ -1150,7 +1117,7 @@ public final class FedimintCardApplet extends Applet {
         Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, buf, (short) (m + 16), (short) 32);
         short n = pubs[0].getW(tmp, (short) 0);
         if (!((n == 65 && tmp[0] == 0x04) || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03)))) {
-            ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+            ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
         }
         Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) (m + 48), (short) 32);
         ecdsa.init(attest.getPrivate(), Signature.MODE_SIGN);
@@ -1200,7 +1167,7 @@ public final class FedimintCardApplet extends Applet {
         Util.arrayCopyNonAtomic(RELEASE_LABEL, (short) 0, buf, m, (short) 17);
         short n = pubs[0].getW(tmp, (short) 0);
         if (!((n == 65 && tmp[0] == 0x04) || (n == 33 && (tmp[0] == 0x02 || tmp[0] == 0x03)))) {
-            ISOException.throwIt(SchnorrHW.SW_CRYPTO_ERROR);
+            ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
         }
         Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) (m + 17), (short) 32);
         buf[(short) (m + 49)] = (byte) s;

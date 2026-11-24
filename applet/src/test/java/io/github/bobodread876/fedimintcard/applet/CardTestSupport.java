@@ -204,6 +204,9 @@ final class CardTestSupport {
         java.lang.reflect.Method keysFor = applet().getClass().getDeclaredMethod("keysFor", short.class);
         keysFor.setAccessible(true);
         keysFor.invoke(applet(), (short) slot);
+        // The curve first, as GEN_KEY sets it: the signer's check works on the slot key's curve.
+        Secp256k1.curve(((ECPrivateKey[]) field("privs"))[slot]);
+        Secp256k1.curve(((ECPublicKey[]) field("pubs"))[slot]);
         ((ECPrivateKey[]) field("privs"))[slot].setS(s, (short) 0, (short) 32);
         ((ECPublicKey[]) field("pubs"))[slot].setW(w, (short) 0, (short) 65);
         ((byte[]) field("state"))[slot] = (byte) ST_KEYED;
