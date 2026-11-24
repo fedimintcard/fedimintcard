@@ -38,6 +38,7 @@ private class FakeCore : OfflineCore {
     val pins = mutableListOf<String>()
     val kits = mutableListOf<String>()
     var onCharge: (String) -> CoreCharge = { ref -> paid(ref) }
+    var holdingSeconds: List<Int> = emptyList()
     val signing = mutableSetOf<String>()
     var signingThrows = false
     val waiting = mutableListOf<String>()
@@ -45,8 +46,9 @@ private class FakeCore : OfflineCore {
     val refused = mutableListOf<RefusedEntry>()
 
     override fun phoneId() = PHONE
-    override fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String): CoreCharge {
+    override fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String, onHolding: (Int) -> Unit): CoreCharge {
         charged += clientRef; pins += pin; kits += kitJson
+        holdingSeconds.forEach(onHolding)
         return onCharge(clientRef)
     }
     override fun stats() = CoreStats(waiting.size, 0, signing.size, refused.size, synced.size)
@@ -214,7 +216,7 @@ class OfflineTillTest {
     @Test fun aHeldRetapThatFailsTheCardsChecksStaysHeld() {
         withKit()
         core.signing += "r1"
-        for ((code, detail) in listOf("no_card" to "the card left", "wrong_pin" to "wrong PIN; 2 tries left before the card blocks", "offline_kit_expired" to "expired")) {
+        for ((code, detail) in listOf("no_card" to "the card left", "pin_wait" to "hold the card", "offline_kit_expired" to "expired")) {
             core.onCharge = { CoreCharge.Refused(code, detail) }
             val r = declined(charge("r1", online = tillUnused))
             assertEquals(ChargeErrorCode.fromWire(code), r.code); assertTrue(code, r.held); assertTrue(r.local)
@@ -222,12 +224,28 @@ class OfflineTillTest {
         assertEquals(List(3) { "r1" }, core.charged)
     }
 
-    @Test fun aWrongPinCarriesTheTriesLeft() {
+    @Test fun aWrongPinCarriesTheWrongTriesAndTheWait() {
         withKit()
-        core.onCharge = { CoreCharge.Refused("wrong_pin", "refused", triesLeft = 2) }
+        core.onCharge = { CoreCharge.Refused("wrong_pin", "refused", wrongTries = 2, waitS = 2) }
         val r = declined(charge("r1", online = linkDown))
         assertEquals(ChargeErrorCode.WRONG_PIN, r.code); assertFalse(r.held)
-        assertEquals(2, parseTriesLeft(r.detail))
+        assertEquals(2, r.wrongTries); assertEquals(2, r.waitS)
+    }
+
+    @Test fun aPinWaitCarriesTheSecondsLeft() {
+        withKit()
+        core.onCharge = { CoreCharge.Refused("pin_wait", "hold", waitS = 6) }
+        val r = declined(charge("r1", online = linkDown))
+        assertEquals(ChargeErrorCode.PIN_WAIT, r.code); assertEquals(6, r.waitS); assertNull(r.wrongTries)
+    }
+
+    @Test fun theSecondsLeftWhileTheCardServesItsWaitReachTheScreen() {
+        withKit()
+        val seen = mutableListOf<Int>()
+        offline.onHolding = { seen += it }
+        core.holdingSeconds = listOf(3, 2, 1, 0)
+        charge("r1", online = linkDown)
+        assertEquals(listOf(3, 2, 1, 0), seen)
     }
 
     @Test fun aRefusalThatHoldsNothingReleasesTheSaleAndKeepsItsPrice() {

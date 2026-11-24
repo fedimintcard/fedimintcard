@@ -4,7 +4,7 @@ import java.util.UUID
 
 enum class ErrorKind {
     BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NO_EXACT_PLAN,
-    DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_BLOCKED, CARD_CHANGED,
+    DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_WAIT, OLD_CARD, SIGN_CHECK_FAILED, CARD_CHANGED,
     UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN,
     OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED,
     OFFLINE_UNSUPPORTED_CARD, CARD_NOT_GENUINE, CARD_LIMIT,
@@ -28,12 +28,13 @@ enum class ErrorKind {
     /**
      * Nothing moved: clears an unresolved sale. A PIN refusal comes from inside the spend, after
      * the till has settled any earlier attempt with the same ref, so it proves nothing is pending.
-     * `pin_required` and the ops codes are answered before that check, so they prove nothing.
+     * `pin_required`, `old_card` and the ops codes are answered before that check, so they prove
+     * nothing about an earlier attempt: an unresolved sale stays unresolved.
      */
-    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NO_EXACT_PLAN, OFFLINE_NO_CHANGE_ROOM, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_BLOCKED)
+    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NO_EXACT_PLAN, OFFLINE_NO_CHANGE_ROOM, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_WAIT, SIGN_CHECK_FAILED)
 
     /** Whether trying the same sale again can help. */
-    val retryable: Boolean get() = this != PIN_BLOCKED
+    val retryable: Boolean get() = this != OLD_CARD
 
     companion object {
         fun from(c: ChargeErrorCode): ErrorKind = when (c) {
@@ -48,7 +49,7 @@ sealed class PosState {
     object Entering : PosState()
     /**
      * The holder types the PIN for [priceMsat]. The digits are in [PosFlow.pinPad], never here.
-     * [wrongPin] after a refused PIN, with the card's [triesLeft] when the till said it.
+     * [wrongPin] after a refused PIN, with the wrong tries in a row ([wrongTries]) when the till said it.
      * [returnTo] is the unresolved Error that asked for the PIN (cancel goes back to it); null
      * means cancel goes back to the amount. [fresh] is a new sale from the amount screen, so a
      * card left on the phone by the last sale must be lifted before it is charged.
@@ -57,7 +58,7 @@ sealed class PosState {
         val priceMsat: Long,
         val clientRef: String,
         val wrongPin: Boolean = false,
-        val triesLeft: Int? = null,
+        val wrongTries: Int? = null,
         val returnTo: Error? = null,
         val fresh: Boolean = false,
     ) : PosState()
@@ -77,6 +78,8 @@ sealed class PosState {
         val unresolvedRef: String? = null,
         val suggestedMsat: Long? = null,
         val held: Boolean = false,
+        /** `pin_wait`: whole seconds the card still owes, when said. */
+        val waitS: Int? = null,
     ) : PosState()
     /** [returnTo] is the unresolved Error to go back to, or null to go back to Entering. */
     data class Sales(val returnTo: Error? = null) : PosState()
@@ -263,9 +266,9 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
         heldPin = null
     }
 
-    private fun askPin(price: Long, ref: String, wrongPin: Boolean = false, triesLeft: Int? = null, returnTo: PosState.Error? = null, fresh: Boolean = false) {
+    private fun askPin(price: Long, ref: String, wrongPin: Boolean = false, wrongTries: Int? = null, returnTo: PosState.Error? = null, fresh: Boolean = false) {
         dropPin()
-        state = PosState.EnteringPin(price, ref, wrongPin, triesLeft, returnTo, fresh)
+        state = PosState.EnteringPin(price, ref, wrongPin, wrongTries, returnTo, fresh)
     }
 
     /** What the Android back button should do in the current state (null = swallow it). */
@@ -393,20 +396,19 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
     /**
      * A refused charge. One the phone holds signing stays unresolved and held, whatever the card's
      * checks answered on the retap (docs/POS-OFFLINE.md): a wrong PIN asks again and comes back to
-     * it, and a blocked PIN says so, with Abandon and no Try again.
+     * it; a PIN wait says so and stays held, with Try again. Any other answer, a refused signature
+     * included, shows the held sale: part of it may already be signed.
      */
     private fun declined(s: PosState.Signing, r: ChargeResult.Declined) {
         val held = if (r.held) PosState.Error(s.priceMsat, ErrorKind.HELD_ON_PHONE, r.detail, s.clientRef, s.clientRef, held = true) else null
         if (r.code == ChargeErrorCode.WRONG_PIN) {
             // Nothing moved; the same ref is a fresh attempt (TILL-API, wrong_pin).
-            val left = parseTriesLeft(r.detail)
-            if (left == 0) state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, held?.unresolvedRef, held = held != null)
-            else askPin(s.priceMsat, s.clientRef, wrongPin = true, triesLeft = left, returnTo = held)
+            askPin(s.priceMsat, s.clientRef, wrongPin = true, wrongTries = r.wrongTries, returnTo = held)
             return
         }
-        if (held != null && r.code == ChargeErrorCode.PIN_BLOCKED) {
-            // Blocked since the tap that left it held: Try again would only answer this again.
-            state = PosState.Error(s.priceMsat, ErrorKind.PIN_BLOCKED, "", s.clientRef, s.clientRef, held = true)
+        if (held != null && r.code == ChargeErrorCode.PIN_WAIT) {
+            // The card is tapped again to finish the wait. The sale stays held.
+            state = PosState.Error(s.priceMsat, ErrorKind.from(r.code), r.detail, s.clientRef, s.clientRef, held = true, waitS = r.waitS)
             return
         }
         if (held != null) {
@@ -421,7 +423,7 @@ class PosFlow(private val newRef: () -> String = { UUID.randomUUID().toString() 
                 else -> it
             }
         }
-        state = error(s, kind, r.detail, r.suggestedMsat)
+        state = error(s, kind, r.detail, r.suggestedMsat).copy(waitS = r.waitS)
     }
 
     fun dispatch(e: PosEvent): List<PosEffect> {

@@ -19,7 +19,7 @@ enum CoreOutcome: Equatable {
     case paid(txid: String, priceMsat: Int64, tillMsat: Int64, overpayMsat: Int64, feesMsat: Int64,
               inputs: [Note], change: [Note], replayed: Bool)
     /// `code` is the till API's (docs/TILL-API.md).
-    case refused(code: String, detail: String, suggestedMsat: Int64?, triesLeft: Int?)
+    case refused(code: String, detail: String, suggestedMsat: Int64?, wrongTries: Int?, waitS: Int?)
     /// The core failed in a way it did not expect: the sale's outcome is unknown, as `undecided`.
     case threw(String)
 }
@@ -69,7 +69,8 @@ struct CoreFailure: Error, Equatable, CustomStringConvertible {
 /// its own serial queue, never on the main thread, where the NFC tag answers.
 protocol OfflineCore: AnyObject {
     func phoneId() -> String
-    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String) -> CoreOutcome
+    /// `onHolding` is told the seconds left while the card serves a PIN wait (any thread).
+    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String, onHolding: @escaping (Int) -> Void) -> CoreOutcome
     func stats() throws -> OfflineStats
     func signingRefs() throws -> [String]
     func drain(max: Int) throws -> CoreDrain
@@ -105,15 +106,15 @@ final class PosCoreAdapter: OfflineCore {
 
     func phoneId() -> String { core.phoneId() }
 
-    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String) -> CoreOutcome {
+    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String, onHolding: @escaping (Int) -> Void) -> CoreOutcome {
         do {
-            switch try core.charge(transport: CoreTransport(card), kitJson: kitJson, priceMsat: UInt64(max(0, priceMsat)),
-                                   clientRef: clientRef, pin: pin) {
+            switch try core.chargeHeld(transport: CoreTransport(card), kitJson: kitJson, priceMsat: UInt64(max(0, priceMsat)),
+                                       clientRef: clientRef, pin: pin, progress: HoldingProgress(onHolding)) {
             case .paid(let txid, let price, let till, let overpay, let fees, _, let inputs, let change, let replayed):
                 return .paid(txid: txid, priceMsat: Self.msat(price), tillMsat: Self.msat(till), overpayMsat: Self.msat(overpay),
                              feesMsat: Self.msat(fees), inputs: Self.notes(inputs), change: Self.notes(change), replayed: replayed)
-            case .refused(let code, let detail, let suggested, _, _, let tries):
-                return .refused(code: code, detail: detail, suggestedMsat: suggested.map(Self.msat), triesLeft: tries.map(Int.init))
+            case .refused(let code, let detail, let suggested, _, _, let tries, let wait):
+                return .refused(code: code, detail: detail, suggestedMsat: suggested.map(Self.msat), wrongTries: tries.map(Int.init), waitS: wait.map(Int.init))
             }
         } catch {
             return .threw(Self.failure(error).description)
@@ -368,6 +369,8 @@ struct OfflineSnapshot: Equatable {
 /// one serial queue of its own.
 @MainActor
 final class OfflinePhone {
+    /// Told the seconds left while the card serves a PIN wait during the phone's own charge (any thread).
+    nonisolated(unsafe) var onHolding: ((Int) -> Void)?
     /// A kept kit is fetched again once it is this old (the till answers the same one for an hour).
     static let kitRefreshAfterMs: Int64 = 10 * 60 * 1000
     /// After a fetch that failed (a till without the route, an `offline_not_ready`), the polls wait
@@ -594,13 +597,14 @@ final class OfflinePhone {
         let kitJson = kitAnswer ?? ""
         let pinText = pin.map { p in p.withBytes { String(decoding: $0, as: UTF8.self) } } ?? ""
         pin?.wipe()
-        let out = await onQueue { core.charge(card: card, kitJson: kitJson, priceMsat: priceMsat, clientRef: clientRef, pin: pinText) }
+        let tell: (Int) -> Void = onHolding ?? { _ in }
+        let out = await onQueue { core.charge(card: card, kitJson: kitJson, priceMsat: priceMsat, clientRef: clientRef, pin: pinText, onHolding: tell) }
         switch out {
         case .threw: heldRefs.insert(clientRef)
-        case .refused(let code, _, _, _) where code == ChargeErrorCode.undecided.rawValue: heldRefs.insert(clientRef)
+        case .refused(let code, _, _, _, _) where code == ChargeErrorCode.undecided.rawValue: heldRefs.insert(clientRef)
         default: heldRefs.remove(clientRef)
         }
-        if case .refused(let code, _, _, _) = out,
+        if case .refused(let code, _, _, _, _) = out,
            [ChargeErrorCode.offlineKitExpired, .offlinePoolExhausted, .offlineCapReached].map(\.rawValue).contains(code) {
             kitRefreshWanted = true
         }
@@ -615,12 +619,11 @@ final class OfflinePhone {
             return .success(ChargeReceipt(saleId: 0, txid: txid, priceMsat: price, receivedMsat: till, overpaidMsat: overpay,
                                           feesMsat: fees, inputs: inputs, change: change, collectionPending: true,
                                           warnings: [], durationMs: durationMs, offline: true))
-        case .refused(let code, let detail, let suggested, let tries):
+        case .refused(let code, let detail, let suggested, let tries, let wait):
             var c = ChargeErrorCode.fromWire(code)
             // A code this app does not know is the card's generic error (docs/POS-OFFLINE.md).
             if c == .unknown { c = .cardError }
-            let d = c == .wrongPin ? tries.map { "wrong PIN; \($0) tries left before the card blocks" } ?? detail : detail
-            return .declined(code: c, detail: d, httpStatus: 0, suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil })
+            return .declined(code: c, detail: detail, httpStatus: 0, suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil }, wrongTries: tries, waitS: wait)
         case .threw(let m):
             return .declined(code: .undecided, detail: "the phone's offline core failed: \(m)", httpStatus: 0)
         }
@@ -750,4 +753,11 @@ final class OfflinePhone {
         _ = await onQueue { try? core.dismiss(txid: txid) }
         await refresh()
     }
+}
+
+/// The core's PIN-wait progress as a closure: the seconds left, told from the core's thread.
+final class HoldingProgress: PinWaitProgress, @unchecked Sendable {
+    private let tell: (Int) -> Void
+    init(_ tell: @escaping (Int) -> Void) { self.tell = tell }
+    func holding(secondsLeft: UInt32) { tell(Int(secondsLeft)) }
 }

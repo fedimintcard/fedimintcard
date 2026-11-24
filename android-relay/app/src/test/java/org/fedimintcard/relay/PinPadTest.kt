@@ -46,7 +46,7 @@ class PinFlowTest {
     private var n = 0
     private fun flow(sats: Int = 5): PosFlow = PosFlow { "ref${++n}" }.also { f -> sats.toString().forEach { f.pad.press(it - '0') } }
     private fun PosFlow.typePin(p: String = "1234") = p.forEach { pinPad.press(it - '0') }
-    private fun wrongPin(detail: String) = ChargeResult.Declined(ChargeErrorCode.WRONG_PIN, detail, 403)
+    private fun wrongPin(tries: Int?) = ChargeResult.Declined(ChargeErrorCode.WRONG_PIN, "wrong PIN", 403, wrongTries = tries, waitS = tries?.let { 1 shl (it - 1) })
     private val receipt = ChargeReceipt(1, "t", 5000, 5000, 0, 0, emptyList(), emptyList(), false, emptyList(), 1)
 
     /** Card on the phone, amount entered, PIN typed and confirmed: the charge effect. */
@@ -106,9 +106,9 @@ class PinFlowTest {
     }
     @Test fun wrongPinReturnsToThePadForTheSameSaleAndRef() {
         val (f, fx) = signed()
-        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin("wrong PIN; 2 tries left before the card blocks")))
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin(2)))
         val s = f.state as PosState.EnteringPin
-        assertEquals(5000L, s.priceMsat); assertTrue(s.wrongPin); assertEquals(2, s.triesLeft)
+        assertEquals(5000L, s.priceMsat); assertTrue(s.wrongPin); assertEquals(2, s.wrongTries)
         assertEquals("same ref: a refused PIN moved nothing", fx.clientRef, s.clientRef)
         assertNull(f.unresolvedRef); assertFalse(f.holdsPin)
         f.typePin("4321")
@@ -119,27 +119,27 @@ class PinFlowTest {
     }
     @Test fun wrongPinWithoutTriesSaysWrongPin() {
         val (f, fx) = signed()
-        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin("")))
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin(null)))
         val s = f.state as PosState.EnteringPin
-        assertTrue(s.wrongPin); assertNull(s.triesLeft)
+        assertTrue(s.wrongPin); assertNull(s.wrongTries)
     }
-    @Test fun wrongPinWithNoTriesLeftIsBlocked() {
+    @Test fun manyWrongTriesInARowStillAskForThePinAgain() {
         val (f, fx) = signed()
-        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin("wrong PIN; 0 tries left before the card blocks")))
-        assertEquals(ErrorKind.PIN_BLOCKED, (f.state as PosState.Error).kind)
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin(15)))
+        val s = f.state as PosState.EnteringPin
+        assertTrue(s.wrongPin); assertEquals(15, s.wrongTries)
     }
     @Test fun cancelAfterWrongPinGoesToTheAmount() {
         val (f, fx) = signed()
-        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin("1 try left")))
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, wrongPin(1)))
         f.dispatch(PosEvent.CancelPressed)
         assertEquals(PosState.Entering, f.state); assertEquals(5L, f.pad.sats)
     }
-    @Test fun pinBlockedCannotBeRetriedAndBackGoesToTheAmount() {
+    @Test fun aPinWaitIsRetryableNeverADeadEnd() {
         val (f, fx) = signed()
-        f.dispatch(PosEvent.ChargeDone(fx.chargeId, ChargeResult.Declined(ChargeErrorCode.PIN_BLOCKED, "blocked", 423)))
+        f.dispatch(PosEvent.ChargeDone(fx.chargeId, ChargeResult.Declined(ChargeErrorCode.PIN_WAIT, "", 423, waitS = 7)))
         val e = f.state as PosState.Error
-        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertNull(e.unresolvedRef); assertFalse(e.kind.retryable)
-        assertTrue(f.dispatch(PosEvent.RetryPressed).isEmpty()); assertSame(e, f.state)
+        assertEquals(ErrorKind.PIN_WAIT, e.kind); assertEquals(7, e.waitS); assertNull(e.unresolvedRef); assertTrue(e.kind.retryable)
         f.dispatch(PosEvent.BackPressed); assertEquals(PosState.Entering, f.state)
     }
     @Test fun wrongPinClearsAnUnresolvedSale() {
@@ -147,7 +147,7 @@ class PinFlowTest {
         f.dispatch(PosEvent.ChargeDone(fx.chargeId, ChargeResult.Failed(TillError.Timeout)))
         assertEquals(fx.clientRef, f.unresolvedRef)
         f.dispatch(PosEvent.RetryPressed); f.typePin(); val again = f.dispatch(PosEvent.PinConfirmed).single() as PosEffect.StartCharge
-        f.dispatch(PosEvent.ChargeDone(again.chargeId, wrongPin("2 tries left")))
+        f.dispatch(PosEvent.ChargeDone(again.chargeId, wrongPin(2)))
         assertTrue(f.state is PosState.EnteringPin); assertNull(f.unresolvedRef)
     }
     @Test fun pinRequiredKeepsAnUnresolvedSale() {
@@ -195,7 +195,7 @@ class PinRequestTest {
     private fun pinOf(s: String): Pin = PinPad().apply { s.forEach { press(it - '0') } }.take()!!
 
     @Test fun pinFromThePadIsSentAndWipedAfter() {
-        val f = Fake(RawResponse(403, """{"ok":false,"error":"wrong_pin","detail":"wrong PIN; 2 tries left before the card blocks"}"""))
+        val f = Fake(RawResponse(403, """{"ok":false,"error":"wrong_pin","detail":"wrong PIN; 2 wrong in a row, so the next try first waits about 2 s"}"""))
         val pin = pinOf("13579")
         val r = TillClient({ "http://h:1" }, f).charge(5000, "ref-1", pin) as ChargeResult.Declined
         assertEquals(ChargeErrorCode.WRONG_PIN, r.code)
@@ -215,23 +215,22 @@ class PinRequestTest {
         assertEquals(ChargeErrorCode.PIN_REQUIRED, r.code)
     }
     @Test fun pinErrorCodesParse() {
-        assertEquals(ChargeErrorCode.PIN_BLOCKED, (parseCharge(423, """{"ok":false,"error":"pin_blocked","detail":"d"}""") as ChargeResult.Declined).code)
+        val w = parseCharge(423, """{"ok":false,"error":"pin_wait","detail":"d","wait_s":12}""") as ChargeResult.Declined
+        assertEquals(ChargeErrorCode.PIN_WAIT, w.code); assertEquals(12, w.waitS); assertNull(w.wrongTries)
+        val r = parseCharge(403, """{"ok":false,"error":"wrong_pin","detail":"d","wrong_tries":3,"wait_s":4}""") as ChargeResult.Declined
+        assertEquals(3, r.wrongTries); assertEquals(4, r.waitS)
+        val plain = parseCharge(409, """{"ok":false,"error":"old_card","detail":"d"}""") as ChargeResult.Declined
+        assertEquals(ChargeErrorCode.OLD_CARD, plain.code); assertNull(plain.wrongTries); assertNull(plain.waitS)
+        assertEquals(ChargeErrorCode.SIGN_CHECK_FAILED, (parseCharge(409, """{"ok":false,"error":"sign_check_failed","detail":"d"}""") as ChargeResult.Declined).code)
+        assertEquals("a retired code reads as unknown", ChargeErrorCode.UNKNOWN, (parseCharge(423, """{"ok":false,"error":"pin_blocked","detail":"d"}""") as ChargeResult.Declined).code)
         assertEquals(ErrorKind.WRONG_PIN, ErrorKind.from(ChargeErrorCode.WRONG_PIN))
     }
-    @Test fun triesLeftParse() {
-        assertEquals(2, parseTriesLeft("wrong PIN; 2 tries left before the card blocks"))
-        assertEquals(1, parseTriesLeft("1 try left"))
-        assertEquals(0, parseTriesLeft("wrong PIN; 0 tries left before the card blocks"))
-        assertNull(parseTriesLeft("wrong PIN"))
-        assertNull(parseTriesLeft(""))
-    }
-    @Test fun wrongPinAndBlockedCopy() {
-        assertEquals("Wrong PIN — 2 tries left", wrongPinCopy(2))
-        assertEquals("Wrong PIN — 1 try left", wrongPinCopy(1))
+    @Test fun wrongPinCopy() {
+        assertEquals("Wrong PIN. 2 wrong tries in a row", wrongPinCopy(2))
+        assertEquals("Wrong PIN. 1 wrong try in a row", wrongPinCopy(1))
         assertEquals("Wrong PIN", wrongPinCopy(null))
-        assertEquals("Wrong PIN — 2 tries left", errorCopy(ErrorKind.WRONG_PIN, "wrong PIN; 2 tries left before the card blocks").first)
+        assertEquals("Wrong PIN. 3 wrong tries in a row", errorCopy(ErrorKind.WRONG_PIN, "d", wrongTries = 3).first)
         assertEquals("Wrong PIN", errorCopy(ErrorKind.WRONG_PIN, "garbled").first)
-        assertEquals("This card's PIN is blocked. The card can't pay.", errorCopy(ErrorKind.PIN_BLOCKED, "").second)
         assertTrue(errorCopy(ErrorKind.PIN_REQUIRED, "").second.contains("app bug"))
     }
 }

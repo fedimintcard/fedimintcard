@@ -243,7 +243,7 @@ class PosUi(
             is PosState.EnteringPin -> {
                 pinAmount.text = "Pay ${formatSats(state.priceMsat)} sats"
                 pinNotice.visibility = if (state.wrongPin) View.VISIBLE else View.GONE
-                pinNotice.text = if (state.wrongPin) wrongPinCopy(state.triesLeft) else ""
+                pinNotice.text = if (state.wrongPin) wrongPinCopy(state.wrongTries) else ""
             }
             is PosState.WaitingForCard -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
             is PosState.Signing -> tapAmount.text = "${formatSats(state.priceMsat)} sats"
@@ -263,12 +263,17 @@ class PosUi(
         show()
     }
 
-    fun resetElapsed() { elapsedS = 0 }
+    fun resetElapsed() { elapsedS = 0; holdingS = 0 }
+
+    private var holdingS = 0
+
+    /** The card is serving its PIN wait: [secondsLeft] to go (0 = done). */
+    fun setHolding(secondsLeft: Int) { holdingS = secondsLeft; if (last is PosState.Signing) renderTapStatus() }
 
     private fun renderTapStatus() {
         tapStatus.text = when (val s = last) {
             is PosState.WaitingForCard -> if (s.mustRemoveFirst) "Remove the card, then hold it again" else "Hold card to phone"
-            is PosState.Signing -> "Paying… keep the card on the phone"
+            is PosState.Signing -> holdingCopy(holdingS)
             PosState.BalanceWaiting -> act.getString(R.string.hold_card)
             is PosState.BalanceReading -> act.getString(R.string.reading_card)
             is PosState.TopUpWaitingForCard -> "Hold the card to load ${formatSats(s.topUp.amountMsat)} sats"
@@ -327,7 +332,7 @@ class PosUi(
 
     private fun renderError(e: PosState.Error) {
         val unresolved = e.unresolvedRef != null
-        val (title, detail) = errorCopy(e.kind, e.detail, e.suggestedMsat, unresolved)
+        val (title, detail) = errorCopy(e.kind, e.detail, e.suggestedMsat, unresolved, e.waitS)
         errTitle.text = title
         errDetail.text = detail
         abandon.visibility = if (unresolved) View.VISIBLE else View.GONE
@@ -598,7 +603,7 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
  * `offline_no_change_room` (the card's) and `offline_pool_exhausted` (the kit's). [unresolved]: an
  * earlier attempt at this sale reached the till and its reply was lost.
  */
-fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unresolved: Boolean = false): Pair<String, String> = when (kind) {
+fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unresolved: Boolean = false, waitS: Int? = null, wrongTries: Int? = null): Pair<String, String> = when (kind) {
     ErrorKind.NO_CARD -> "Card not detected" to "Hold card flat on the phone's NFC antenna"
     ErrorKind.INSUFFICIENT -> "Card balance too low" to ""
     // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
@@ -629,8 +634,10 @@ fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unre
     ErrorKind.OFFLINE_UNSUPPORTED_CARD -> "This card pays online only" to "It can't be taken without the till."
     ErrorKind.CARD_NOT_GENUINE -> "Card declined" to "This isn't a genuine Fedimint Card."
     ErrorKind.CARD_LIMIT -> "Card limit reached" to "This card has reached its daily limit."
-    ErrorKind.WRONG_PIN -> wrongPinCopy(parseTriesLeft(detail)) to "Ask the card holder to enter it again"
-    ErrorKind.PIN_BLOCKED -> "PIN blocked" to "This card's PIN is blocked. The card can't pay."
+    ErrorKind.WRONG_PIN -> wrongPinCopy(wrongTries) to "Ask the card holder to enter it again"
+    ErrorKind.PIN_WAIT -> holdCardCopy(waitS) to "Tap again to finish the wait"
+    ErrorKind.SIGN_CHECK_FAILED -> "Nothing was spent" to "The card did not sign. Tap again."
+    ErrorKind.OLD_CARD -> "Old card" to "This card needs a reset and a new set-up."
     ErrorKind.PIN_REQUIRED -> "Something went wrong" to "The app sent the charge without the holder's PIN. This is an app bug; the card was not touched."
     ErrorKind.CONFLICT -> "Something went wrong" to detail
     ErrorKind.CARD_CHANGED -> "Card changed" to "The card was used elsewhere. Hold it to the phone and try again."
@@ -712,11 +719,17 @@ fun offlineLines(v: OfflineView, nowMs: Long, till: TillStatus? = null): List<St
 }
 
 /** The line over the PIN pad after a refused PIN. Never includes the PIN. */
-fun wrongPinCopy(triesLeft: Int?): String = when (triesLeft) {
-    null -> "Wrong PIN"
-    1 -> "Wrong PIN — 1 try left"
-    else -> "Wrong PIN — $triesLeft tries left"
+fun wrongPinCopy(wrongTries: Int?): String = when (wrongTries) {
+    null, 0 -> "Wrong PIN"
+    1 -> "Wrong PIN. 1 wrong try in a row"
+    else -> "Wrong PIN. $wrongTries wrong tries in a row"
 }
+
+/** "Hold the card, about N s" for a wait of [seconds]; no number when none is known. */
+fun holdCardCopy(seconds: Int?): String = if (seconds != null && seconds > 0) "Hold the card, about $seconds s" else "Hold the card"
+
+/** The line while the card serves its PIN wait during a charge: the seconds left, or the usual line at zero. */
+fun holdingCopy(secondsLeft: Int): String = if (secondsLeft > 0) holdCardCopy(secondsLeft) else "Paying… keep the card on the phone"
 
 /** A crisp QR bitmap, one pixel per module scaled up by the view (filter off keeps edges hard). */
 fun qrBitmap(text: String): android.graphics.Bitmap {

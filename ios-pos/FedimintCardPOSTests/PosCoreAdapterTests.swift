@@ -54,11 +54,11 @@ final class PosCoreAdapterTests: XCTestCase {
     func testAKitTheCoreCannotUseIsRefusedBeforeTheCard() throws {
         let core = try PosCoreAdapter.open(try store())
         let card = RecordingCard()
-        let out = core.charge(card: card, kitJson: "", priceMsat: 5000, clientRef: "a", pin: "1234")
-        guard case .refused("offline_not_ready", _, _, _) = out else { return XCTFail("\(out)") }
+        let out = core.charge(card: card, kitJson: "", priceMsat: 5000, clientRef: "a", pin: "1234", onHolding: { _ in })
+        guard case .refused("offline_not_ready", _, _, _, _) = out else { return XCTFail("\(out)") }
         // The fixture was issued to another phone than this store's.
-        let other = core.charge(card: card, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "b", pin: "1234")
-        guard case .refused("offline_not_ready", _, _, _) = other else { return XCTFail("\(other)") }
+        let other = core.charge(card: card, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "b", pin: "1234", onHolding: { _ in })
+        guard case .refused("offline_not_ready", _, _, _, _) = other else { return XCTFail("\(other)") }
         XCTAssertTrue(card.apdus.isEmpty)
     }
 
@@ -66,15 +66,15 @@ final class PosCoreAdapterTests: XCTestCase {
         let core = try PosCoreAdapter.open(try store(phoneId: PosCoreFixture.phoneId))
         XCTAssertEqual(core.phoneId(), PosCoreFixture.phoneId)
         let card = RecordingCard(lostAt: 0)
-        let out = core.charge(card: card, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "sale-1", pin: "1234")
-        guard case .refused("no_card", _, nil, nil) = out else { return XCTFail("\(out)") }
+        let out = core.charge(card: card, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "sale-1", pin: "1234", onHolding: { _ in })
+        guard case .refused("no_card", _, nil, nil, _) = out else { return XCTFail("\(out)") }
         XCTAssertEqual(card.apdus.map(Hex.encode), ["00a4040008f0464d434152440100"], "the applet is selected first, then the card is gone")
         XCTAssertEqual(try core.stats(), OfflineStats())
         XCTAssertEqual(try core.signingRefs(), [])
         // The PIN's shape is checked before the card is asked anything.
         let short = RecordingCard()
-        let bad = core.charge(card: short, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "sale-2", pin: "12")
-        guard case .refused("bad_request", _, _, _) = bad else { return XCTFail("\(bad)") }
+        let bad = core.charge(card: short, kitJson: PosCoreFixture.kit, priceMsat: 5000, clientRef: "sale-2", pin: "12", onHolding: { _ in })
+        guard case .refused("bad_request", _, _, _, _) = bad else { return XCTFail("\(bad)") }
         XCTAssertTrue(short.apdus.isEmpty)
     }
 
@@ -93,7 +93,7 @@ final class PosCoreAdapterTests: XCTestCase {
         let card = RecordingCard(lostAt: 0)
         let pin = Pin(bytes: Array("1234".utf8))
         let r = await phone.charge(card: card, priceMsat: 5000, clientRef: "sale-1", pin: pin)
-        guard case .declined(.noCard, _, 0, nil) = r else { return XCTFail("\(r)") }
+        guard case .declined(.noCard, _, 0, nil, _, _) = r else { return XCTFail("\(r)") }
         XCTAssertTrue(pin.isWiped)
         XCTAssertEqual(card.apdus.count, 1)
         XCTAssertEqual(card.onMain, [false], "the core runs on the phone's own queue, never where the tag answers")

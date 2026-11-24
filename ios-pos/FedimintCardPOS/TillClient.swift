@@ -42,7 +42,8 @@ enum TillResult<T: Equatable>: Equatable {
 enum ChargeResult: Equatable {
     case success(ChargeReceipt)
     /// `suggestedMsat`: `suggested_msat`, a price the card can pay instead (`offline_no_change_room`).
-    case declined(code: ChargeErrorCode, detail: String, httpStatus: Int, suggestedMsat: Int64? = nil)
+    /// `wrongTries`: `wrong_pin`'s wrong tries in a row. `waitS`: `wrong_pin`'s next wait, or `pin_wait`'s seconds still owed.
+    case declined(code: ChargeErrorCode, detail: String, httpStatus: Int, suggestedMsat: Int64? = nil, wrongTries: Int? = nil, waitS: Int? = nil)
     case failed(TillError)
 }
 
@@ -311,7 +312,8 @@ enum TillParse {
             if !okv.boolValue {
                 let suggested = (o["suggested_msat"] as? NSNumber)?.int64Value
                 return .declined(code: .fromWire(optStr(o, "error")), detail: optStr(o, "detail") ?? "", httpStatus: status,
-                                 suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil })
+                                 suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil },
+                                 wrongTries: (o["wrong_tries"] as? NSNumber)?.intValue, waitS: (o["wait_s"] as? NSNumber)?.intValue)
             }
             return .success(ChargeReceipt(
                 saleId: optLong(o, "sale_id"),

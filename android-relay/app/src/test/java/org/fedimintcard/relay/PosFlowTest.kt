@@ -308,8 +308,8 @@ class PosFlowTest {
 
     // ---- the phone's own charge (docs/POS-OFFLINE.md § Android) ----
 
-    private fun local(c: ChargeErrorCode, held: Boolean = false, detail: String = "d", suggested: Long? = null) =
-        ChargeResult.Declined(c, detail, 0, suggested, held = held, local = true)
+    private fun local(c: ChargeErrorCode, held: Boolean = false, detail: String = "d", suggested: Long? = null, wrongTries: Int? = null, waitS: Int? = null) =
+        ChargeResult.Declined(c, detail, 0, suggested, held = held, local = true, wrongTries = wrongTries, waitS = waitS)
 
     /**
      * The rule for an unclear answer is the till's only. A sale the phone's own core may have
@@ -363,9 +363,9 @@ class PosFlowTest {
     @Test fun aHeldWrongPinAsksAgainAndReturnsToTheHeldSale() {
         val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
         f.retry()
-        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.WRONG_PIN, held = true, detail = "wrong PIN; 2 tries left before the card blocks")))
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.WRONG_PIN, held = true, wrongTries = 2, waitS = 2)))
         val ask = f.state as PosState.EnteringPin
-        assertTrue(ask.wrongPin); assertEquals(2, ask.triesLeft); assertEquals(fx.clientRef, ask.clientRef)
+        assertTrue(ask.wrongPin); assertEquals(2, ask.wrongTries); assertEquals(fx.clientRef, ask.clientRef)
         assertEquals(ErrorKind.HELD_ON_PHONE, ask.returnTo!!.kind); assertTrue(ask.returnTo!!.held)
         assertTrue(f.unresolvedHeld); assertEquals(fx.clientRef, f.unresolvedRef)
         // Cancel goes back to the held sale, never to the amount.
@@ -377,32 +377,31 @@ class PosFlowTest {
         assertEquals(fx.clientRef, again.clientRef)
     }
 
-    @Test fun aHeldWrongPinWithNoTriesLeftIsBlockedAndStillHeld() {
+    /** The card is serving its wait and was lifted: the wait is said, the sale stays held, Try again is there. */
+    @Test fun aHeldPinWaitSaysTheWaitAndStaysHeldAndRetryable() {
         val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
         f.retry()
-        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.WRONG_PIN, held = true, detail = "wrong PIN; 0 tries left before the card blocks")))
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.PIN_WAIT, held = true, waitS = 9)))
         val e = f.state as PosState.Error
-        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertEquals(fx.clientRef, e.unresolvedRef); assertTrue(e.held)
+        assertEquals(ErrorKind.PIN_WAIT, e.kind); assertEquals(9, e.waitS); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
+        assertTrue(e.kind.retryable)
         assertNull(f.systemBack()); assertTrue(f.unresolvedHeld)
-        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
         f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
     }
 
-    /** The card was blocked elsewhere after its held tap: the retap's pin_blocked is said, with no Try again to loop on. */
-    @Test fun aHeldRetapAnsweredPinBlockedIsBlockedAndStillHeld() {
+    /** A held sale may already be signed in part: a refused signature on its retap keeps it held and never says nothing was spent. */
+    @Test fun aHeldRefusedSignatureStaysHeldAndNeverSaysNothingWasSpent() {
         val (f, fx) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
         f.retry()
-        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.PIN_BLOCKED, held = true, detail = "the card's PIN is blocked")))
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), local(ChargeErrorCode.SIGN_CHECK_FAILED, held = true)))
         val e = f.state as PosState.Error
-        assertEquals(ErrorKind.PIN_BLOCKED, e.kind); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
-        assertFalse(e.kind.retryable) // the error screen hides Try again
-        assertNull(f.systemBack()); assertTrue(f.unresolvedHeld)
-        f.dispatch(PosEvent.BackPressed); assertEquals(e, f.state)
-        f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state); assertFalse(f.unresolvedHeld)
+        assertEquals(ErrorKind.HELD_ON_PHONE, e.kind); assertTrue(e.held); assertEquals(fx.clientRef, e.unresolvedRef)
+        assertTrue(e.kind.retryable)
+        assertFalse(f.saysNothingWasSpent())
     }
 
     @Test fun aWrongPinOnALocalChargeThatHoldsNothingIsAFreshAttempt() {
-        val (f, _) = unresolved(local(ChargeErrorCode.WRONG_PIN, detail = "wrong PIN; 2 tries left before the card blocks"))
+        val (f, _) = unresolved(local(ChargeErrorCode.WRONG_PIN, wrongTries = 2, waitS = 2))
         val ask = f.state as PosState.EnteringPin
         assertTrue(ask.wrongPin); assertNull(ask.returnTo); assertFalse(f.unresolvedHeld); assertNull(f.unresolvedRef)
     }
@@ -473,5 +472,53 @@ class PosFlowTest {
         val e = f.state as PosState.Error
         assertEquals(ErrorKind.TILL_UNREACHABLE, e.kind); assertEquals(fx.clientRef, e.unresolvedRef); assertFalse(e.held)
         assertFalse(f.unresolvedHeld)
+    }
+
+    // ---- what may say "Nothing was spent" ----
+
+    private val nothingSpent = Regex("nothing was spent", RegexOption.IGNORE_CASE)
+    private fun PosFlow.saysNothingWasSpent(): Boolean {
+        val e = state as? PosState.Error ?: return false
+        val (t, d) = errorCopy(e.kind, e.detail, e.suggestedMsat, e.unresolvedRef != null, e.waitS)
+        return nothingSpent.containsMatchIn("$t\n$d")
+    }
+
+    /** A lost reply leaves the sale unresolved. An old card tapped on Try again says nothing about the first card's attempt. */
+    @Test fun anOldCardOnTheRetryOfALostReplyLeavesTheSaleUnresolved() {
+        val (f, fx) = unresolved(ChargeResult.Failed(TillError.Timeout))
+        f.retry()
+        f.dispatch(PosEvent.ChargeDone(f.signingId(), declined(ChargeErrorCode.OLD_CARD)))
+        val e = f.state as PosState.Error
+        assertEquals(ErrorKind.OLD_CARD, e.kind); assertEquals(fx.clientRef, e.unresolvedRef)
+        assertEquals(fx.clientRef, f.unresolvedRef)
+        f.dispatch(PosEvent.BackPressed); assertTrue(f.state is PosState.Error)
+        assertNull(f.systemBack())
+        // Abandon still takes the merchant back to the amount, with the sale cleared.
+        f.dispatch(PosEvent.AbandonPressed); assertEquals(PosState.Entering, f.state)
+    }
+
+    @Test fun onlyARefusedSignatureOutsideAHeldSaleSaysNothingWasSpent() {
+        val answers = mutableListOf<Pair<ChargeResult, Boolean>>()
+        for (c in ChargeErrorCode.values()) {
+            answers += declined(c) to (c == ChargeErrorCode.SIGN_CHECK_FAILED)
+            answers += local(c) to (c == ChargeErrorCode.SIGN_CHECK_FAILED)
+        }
+        for (te in listOf(TillError.Unreachable, TillError.Timeout, TillError.Interrupted, TillError.BadResponse("x"))) answers += ChargeResult.Failed(te) to false
+        for ((r, says) in answers) {
+            val (f, _) = unresolved(r)
+            assertEquals("$r", says, f.saysNothingWasSpent())
+        }
+        // A sale held on the phone, whatever its retap answers.
+        for (c in ChargeErrorCode.values()) {
+            val (f, _) = unresolved(local(ChargeErrorCode.UNDECIDED, held = true))
+            f.retry()
+            f.dispatch(PosEvent.ChargeDone(f.signingId(), local(c, held = true)))
+            assertFalse("held $c", f.saysNothingWasSpent())
+        }
+        // Every kind's copy, with and without an unresolved sale.
+        for (k in ErrorKind.values()) for (u in listOf(false, true)) {
+            val (t, d) = errorCopy(k, "d", 1000, u, 3, 3)
+            assertEquals("$k", k == ErrorKind.SIGN_CHECK_FAILED, nothingSpent.containsMatchIn("$t\n$d"))
+        }
     }
 }

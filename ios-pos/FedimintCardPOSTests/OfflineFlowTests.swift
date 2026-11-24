@@ -27,7 +27,7 @@ final class FakeCore: OfflineCore {
 
     func phoneId() -> String { Self.phone }
 
-    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String) -> CoreOutcome {
+    func charge(card: BlockingCardChannel, kitJson: String, priceMsat: Int64, clientRef: String, pin: String, onHolding: @escaping (Int) -> Void) -> CoreOutcome {
         charges.append(Charge(ref: clientRef, priceMsat: priceMsat, pin: pin, kit: kitJson))
         if !outcomes.isEmpty { return outcomes.removeFirst() }
         return .paid(txid: "tx-\(clientRef)", priceMsat: priceMsat, tillMsat: priceMsat, overpayMsat: 0, feesMsat: 0,
@@ -371,7 +371,7 @@ final class OfflineFlowTests: XCTestCase {
     }
 
     /// A refusal from the till's charge route proves nothing about the attempt before it: a till on
-    /// ops answers `no_card`, `card_error`, `wrong_pin` and `pin_blocked` from its card attach,
+    /// ops answers `no_card`, `card_error`, `wrong_pin`, `pin_wait` and `old_card` from its card attach,
     /// before it looks at an earlier attempt with the same `client_ref`. So once `POST /v1/charge`
     /// was sent for a sale, a retry whose link fails never takes the card on the phone, whatever
     /// the till answered, with a kit that would take it.
@@ -379,7 +379,7 @@ final class OfflineFlowTests: XCTestCase {
         let answers: [ChargeResult] = [
             .declined(code: .noCard, detail: "", httpStatus: 409),
             .declined(code: .insufficient, detail: "", httpStatus: 402),
-            .declined(code: .wrongPin, detail: "wrong PIN; 2 tries left before the card blocks", httpStatus: 403),
+            .declined(code: .wrongPin, detail: "wrong PIN", httpStatus: 403, wrongTries: 2, waitS: 2),
         ]
         for answer in answers {
             let f = flow(offline: Offline.ready())
@@ -449,7 +449,7 @@ final class OfflineFlowTests: XCTestCase {
     func testAHeldSaleIsRetriedOnThePhoneOnlyWithTheTillHealthy() async {
         let r = Runner()
         await r.ready()
-        r.core.outcomes = [.refused(code: "undecided", detail: "the card was taken away while it signed", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "undecided", detail: "the card was taken away while it signed", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         r.core.signing = ["ref1"]
         await r.ring(5)
         await r.send(.linkFailed(.unreachable))
@@ -504,7 +504,7 @@ final class OfflineFlowTests: XCTestCase {
         await r.ready()
         r.core.signingThrows = true
         await r.ring(5)
-        r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         await r.send(.linkFailed(.unreachable))
         XCTAssertTrue(r.phone.snapshot.localOnlyRefs.contains("ref1"), "fails closed: the last set plus this sale")
     }
@@ -516,7 +516,7 @@ final class OfflineFlowTests: XCTestCase {
     private func heldSale() async -> Runner {
         let r = Runner()
         await r.ready()
-        r.core.outcomes = [.refused(code: "undecided", detail: "the card was taken away while it signed", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "undecided", detail: "the card was taken away while it signed", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         r.core.signing = ["ref1"]
         await r.ring(5)
         await r.send(.linkFailed(.unreachable))
@@ -529,11 +529,11 @@ final class OfflineFlowTests: XCTestCase {
     func testAHeldSaleStaysHeldWhenTheCoreRefusesItsRetryAtTheCardChecks() async {
         let r = await heldSale()
         let refusals: [(String, ErrorKind)] = [
-            ("no_card", .noCard), ("card_error", .cardError), ("pin_blocked", .pinBlocked),
+            ("no_card", .noCard), ("card_error", .cardError), ("pin_wait", .pinWait),
             ("offline_unsupported_card", .offlineUnsupportedCard), ("card_not_genuine", .cardNotGenuine),
         ]
         for (code, kind) in refusals {
-            r.core.outcomes = [.refused(code: code, detail: "d", suggestedMsat: nil, triesLeft: nil)]
+            r.core.outcomes = [.refused(code: code, detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
             await r.send(.retryPressed)
             await r.ring()
             XCTAssertEqual(r.lastSession, .chargeLocal, code)
@@ -557,26 +557,58 @@ final class OfflineFlowTests: XCTestCase {
         XCTAssertTrue(rc.offline)
     }
 
-    func testAWrongPinOnAHeldSaleGoesBackToTheHeldSale() async {
+    /// A held sale may already be signed in part: a refused signature on its retap shows the held sale.
+    func testARefusedSignatureOnAHeldSaleShowsTheHeldSale() async {
         let r = await heldSale()
-        let held = PosErrorInfo(priceMsat: 5000, kind: .heldOnPhone, detail: "", clientRef: "ref1", unresolvedRef: "ref1")
-        r.core.outcomes = [.refused(code: "wrong_pin", detail: "d", suggestedMsat: nil, triesLeft: 2)]
+        r.core.outcomes = [.refused(code: "sign_check_failed", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         await r.send(.retryPressed)
         await r.ring()
         await r.send(.cardPresent)
-        XCTAssertEqual(r.flow.state, .enteringPin(priceMsat: 5000, clientRef: "ref1", wrongPin: true, triesLeft: 2, returnTo: held))
+        guard let e = r.error else { return XCTFail("\(r.flow.state)") }
+        XCTAssertEqual(e.kind, .heldOnPhone)
+        XCTAssertEqual(e.unresolvedRef, "ref1")
+        XCTAssertNotEqual(errorCopy(e.kind, e.detail, unresolved: true).0, "Nothing was spent")
+    }
+
+    /// Whatever the retap of a held sale answers, the screen never says nothing was spent.
+    func testAHeldSaleNeverSaysNothingWasSpent() async {
+        for code in ChargeErrorCode.allCases {
+            let r = await heldSale()
+            r.core.outcomes = [.refused(code: code.rawValue, detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
+            await r.send(.retryPressed)
+            await r.ring()
+            await r.send(.cardPresent)
+            XCTAssertEqual(r.flow.unresolvedRef, "ref1", code.rawValue)
+            if let e = r.error {
+                let (t, d) = errorCopy(e.kind, e.detail, suggestedMsat: e.suggestedMsat, unresolved: true, waitS: e.waitS)
+                XCTAssertNil("\(t)\n\(d)".range(of: "nothing was spent", options: .caseInsensitive), code.rawValue)
+            }
+        }
+    }
+
+    func testAWrongPinOnAHeldSaleGoesBackToTheHeldSale() async {
+        let r = await heldSale()
+        let held = PosErrorInfo(priceMsat: 5000, kind: .heldOnPhone, detail: "", clientRef: "ref1", unresolvedRef: "ref1")
+        r.core.outcomes = [.refused(code: "wrong_pin", detail: "d", suggestedMsat: nil, wrongTries: 2, waitS: 2)]
+        await r.send(.retryPressed)
+        await r.ring()
+        await r.send(.cardPresent)
+        XCTAssertEqual(r.flow.state, .enteringPin(priceMsat: 5000, clientRef: "ref1", wrongPin: true, wrongTries: 2, returnTo: held))
         XCTAssertEqual(r.flow.unresolvedRef, "ref1")
         await r.send(.cancelPressed)
         XCTAssertEqual(r.error, held, "Cancel goes back to the held sale, never to a new one")
         await r.send(.backPressed)
         XCTAssertEqual(r.error, held)
         XCTAssertEqual(abandonCopy(held: r.phone.snapshot.localOnlyRefs.contains("ref1")), heldAbandon)
-        // The last try gone: the PIN is blocked, and the sale is still held.
-        r.core.outcomes = [.refused(code: "wrong_pin", detail: "d", suggestedMsat: nil, triesLeft: 0)]
+        // The card is serving its wait and was lifted: the wait is said, the sale is still held, and it is retryable.
+        r.core.outcomes = [.refused(code: "pin_wait", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: 9)]
         await r.send(.retryPressed)
         await r.ring()
         await r.send(.cardPresent)
-        XCTAssertEqual(r.error, PosErrorInfo(priceMsat: 5000, kind: .pinBlocked, detail: "", clientRef: "ref1", unresolvedRef: "ref1"))
+        var wait = PosErrorInfo(priceMsat: 5000, kind: .pinWait, detail: "d", clientRef: "ref1", unresolvedRef: "ref1")
+        wait.waitS = 9
+        XCTAssertEqual(r.error, wait)
+        XCTAssertTrue(wait.kind.retryable)
         XCTAssertFalse(r.till.paths.contains("/v1/charge"))
     }
 
@@ -584,7 +616,7 @@ final class OfflineFlowTests: XCTestCase {
     func testASaleNothingHoldsReadsAsBefore() async {
         let r = Runner()
         await r.ready()
-        r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "no_card", detail: "gone", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         await r.ring(5)
         await r.send(.linkFailed(.unreachable))
         XCTAssertEqual(r.error, PosErrorInfo(priceMsat: 5000, kind: .noCard, detail: "gone", clientRef: "ref1", unresolvedRef: nil))
@@ -604,20 +636,20 @@ final class OfflineFlowTests: XCTestCase {
     func testEveryCoreAnswerMapsToItsScreen() async {
         let noPlan = "a spend of 5000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way"
         let cases: [(CoreOutcome, ErrorKind, String)] = [
-            (.refused(code: "offline_kit_expired", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineKitExpired, "Till service unreachable"),
-            (.refused(code: "offline_note_invalid", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineNoteInvalid, "Till service unreachable"),
-            (.refused(code: "offline_cap_reached", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineCapReached, "Till service unreachable"),
-            (.refused(code: "offline_not_ready", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineNoKit, "Till service unreachable"),
-            (.refused(code: "offline_pool_exhausted", detail: "d", suggestedMsat: 12_000, triesLeft: nil), .offlinePoolExhausted, "Amount not available offline"),
-            (.refused(code: "offline_unsupported_card", detail: "d", suggestedMsat: nil, triesLeft: nil), .offlineUnsupportedCard, "This card pays online only"),
-            (.refused(code: "card_not_genuine", detail: "d", suggestedMsat: nil, triesLeft: nil), .cardNotGenuine, "Card declined"),
-            (.refused(code: "card_limit", detail: "d", suggestedMsat: nil, triesLeft: nil), .cardLimit, "Card limit reached"),
-            (.refused(code: "offline_no_change_room", detail: "d", suggestedMsat: 7_000, triesLeft: nil), .offlineNoChangeRoom, "No room for change offline"),
-            (.refused(code: "insufficient", detail: "d", suggestedMsat: nil, triesLeft: nil), .insufficient, "Card balance too low"),
-            (.refused(code: "no_exact_plan", detail: noPlan, suggestedMsat: nil, triesLeft: nil), .noExactPlan, "Can't take this amount"),
-            (.refused(code: "no_card", detail: "d", suggestedMsat: nil, triesLeft: nil), .noCard, "Card not detected"),
-            (.refused(code: "undecided", detail: "d", suggestedMsat: nil, triesLeft: nil), .heldOnPhone, "Payment not finished"),
-            (.refused(code: "something_new", detail: "the card said 6F00", suggestedMsat: nil, triesLeft: nil), .cardError, "Card error"),
+            (.refused(code: "offline_kit_expired", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineKitExpired, "Till service unreachable"),
+            (.refused(code: "offline_note_invalid", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineNoteInvalid, "Till service unreachable"),
+            (.refused(code: "offline_cap_reached", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineCapReached, "Till service unreachable"),
+            (.refused(code: "offline_not_ready", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineNoKit, "Till service unreachable"),
+            (.refused(code: "offline_pool_exhausted", detail: "d", suggestedMsat: 12_000, wrongTries: nil, waitS: nil), .offlinePoolExhausted, "Amount not available offline"),
+            (.refused(code: "offline_unsupported_card", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineUnsupportedCard, "This card pays online only"),
+            (.refused(code: "card_not_genuine", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .cardNotGenuine, "Card declined"),
+            (.refused(code: "card_limit", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .cardLimit, "Card limit reached"),
+            (.refused(code: "offline_no_change_room", detail: "d", suggestedMsat: 7_000, wrongTries: nil, waitS: nil), .offlineNoChangeRoom, "No room for change offline"),
+            (.refused(code: "insufficient", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .insufficient, "Card balance too low"),
+            (.refused(code: "no_exact_plan", detail: noPlan, suggestedMsat: nil, wrongTries: nil, waitS: nil), .noExactPlan, "Can't take this amount"),
+            (.refused(code: "no_card", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .noCard, "Card not detected"),
+            (.refused(code: "undecided", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .heldOnPhone, "Payment not finished"),
+            (.refused(code: "something_new", detail: "the card said 6F00", suggestedMsat: nil, wrongTries: nil, waitS: nil), .cardError, "Card error"),
         ]
         for (out, kind, title) in cases {
             let r = Runner()
@@ -642,17 +674,20 @@ final class OfflineFlowTests: XCTestCase {
         }
     }
 
-    func testAWrongPinOnThePhoneAsksAgainWithTheTriesLeft() async {
+    func testAWrongPinOnThePhoneAsksAgainWithTheWrongTries() async {
         let r = Runner()
         await r.ready()
-        r.core.outcomes = [.refused(code: "wrong_pin", detail: "wrong PIN; 2 tries left before the card blocks", suggestedMsat: nil, triesLeft: 2)]
+        r.core.outcomes = [.refused(code: "wrong_pin", detail: "wrong PIN", suggestedMsat: nil, wrongTries: 2, waitS: 2)]
         await r.ring(5)
         await r.send(.linkFailed(.unreachable))
-        XCTAssertEqual(r.flow.state, .enteringPin(priceMsat: 5000, clientRef: "ref1", wrongPin: true, triesLeft: 2, returnTo: nil))
+        XCTAssertEqual(r.flow.state, .enteringPin(priceMsat: 5000, clientRef: "ref1", wrongPin: true, wrongTries: 2, returnTo: nil))
         // The tries come from the core's count, whatever its words.
-        XCTAssertEqual(OfflinePhone.result(.refused(code: "wrong_pin", detail: "", suggestedMsat: nil, triesLeft: 1), durationMs: 0),
-                       .declined(code: .wrongPin, detail: "wrong PIN; 1 tries left before the card blocks", httpStatus: 0))
-        XCTAssertEqual(parseTriesLeft("wrong PIN; 1 tries left before the card blocks"), 1)
+        XCTAssertEqual(OfflinePhone.result(.refused(code: "wrong_pin", detail: "wrong PIN", suggestedMsat: nil, wrongTries: 1, waitS: 1), durationMs: 0),
+                       .declined(code: .wrongPin, detail: "wrong PIN", httpStatus: 0, wrongTries: 1, waitS: 1))
+        XCTAssertEqual(OfflinePhone.result(.refused(code: "pin_wait", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: 6), durationMs: 0),
+                       .declined(code: .pinWait, detail: "d", httpStatus: 0, wrongTries: nil, waitS: 6))
+        XCTAssertEqual(OfflinePhone.result(.refused(code: "old_card", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), durationMs: 0).declinedCode, .oldCard)
+        XCTAssertEqual(OfflinePhone.result(.refused(code: "sign_check_failed", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), durationMs: 0).declinedCode, .signCheckFailed)
     }
 
     func testTheCoreAnswerAsTheTillsWouldBe() {
@@ -663,7 +698,7 @@ final class OfflineFlowTests: XCTestCase {
                                                     collectionPending: true, warnings: [], durationMs: 900, offline: true)))
         XCTAssertEqual(OfflinePhone.result(.threw("boom"), durationMs: 0),
                        .declined(code: .undecided, detail: "the phone's offline core failed: boom", httpStatus: 0))
-        XCTAssertEqual(OfflinePhone.result(.refused(code: "offline_pool_exhausted", detail: "d", suggestedMsat: 0, triesLeft: nil), durationMs: 0),
+        XCTAssertEqual(OfflinePhone.result(.refused(code: "offline_pool_exhausted", detail: "d", suggestedMsat: 0, wrongTries: nil, waitS: nil), durationMs: 0),
                        .declined(code: .offlinePoolExhausted, detail: "d", httpStatus: 0), "a zero price is no suggestion")
     }
 
@@ -1010,13 +1045,13 @@ final class OfflineFlowTests: XCTestCase {
         XCTAssertFalse(r.phone.kitRefreshDue())
         // A local refusal that a new kit may cure asks for one.
         for code in ["offline_pool_exhausted", "offline_kit_expired", "offline_cap_reached"] {
-            r.core.outcomes = [.refused(code: code, detail: "d", suggestedMsat: nil, triesLeft: nil)]
+            r.core.outcomes = [.refused(code: code, detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
             _ = await r.phone.charge(card: SilentCard(), priceMsat: 5000, clientRef: "s-\(code)", pin: Pin(bytes: Array("1234".utf8)))
             XCTAssertTrue(r.phone.kitRefreshDue(), code)
             _ = await r.phone.refreshKit(client: r.client, federationId: "fed1", tillURL: Offline.base)
             XCTAssertFalse(r.phone.kitRefreshDue(), code)
         }
-        r.core.outcomes = [.refused(code: "insufficient", detail: "d", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "insufficient", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         _ = await r.phone.charge(card: SilentCard(), priceMsat: 5000, clientRef: "s-ins", pin: nil)
         XCTAssertFalse(r.phone.kitRefreshDue())
     }
@@ -1024,7 +1059,7 @@ final class OfflineFlowTests: XCTestCase {
     func testAHeldSaleOnAnExpiredKitRenewsTheKitFirst() async {
         let r = Runner()
         await r.ready()
-        r.core.outcomes = [.refused(code: "undecided", detail: "d", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "undecided", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         r.core.signing = ["ref1"]
         await r.ring(5)
         await r.send(.linkFailed(.unreachable))
@@ -1204,4 +1239,8 @@ final class NFCApduTransportTests: XCTestCase {
         guard case .failure = offMain(u) else { return XCTFail() }
         XCTAssertTrue(card.calls.isEmpty)
     }
+}
+
+private extension ChargeResult {
+    var declinedCode: ChargeErrorCode? { if case .declined(let c, _, _, _, _, _) = self { return c }; return nil }
 }

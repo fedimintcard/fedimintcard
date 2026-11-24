@@ -3,6 +3,7 @@ package org.fedimintcard.relay
 import android.util.Log
 import org.fedimintcard.poscore.ApduTransport
 import org.fedimintcard.poscore.ChargeOutcome
+import org.fedimintcard.poscore.PinWaitProgress
 import org.fedimintcard.poscore.PosCore
 import org.fedimintcard.poscore.SlotMsat
 import org.fedimintcard.poscore.TransportException
@@ -18,13 +19,15 @@ import java.util.concurrent.Executors
 class PosCoreAdapter private constructor(private val core: PosCore) : OfflineCore {
     override fun phoneId(): String = core.phoneId()
 
-    override fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String): CoreCharge =
-        when (val o = core.charge(CardTransport(card), kitJson, priceMsat.toULong(), clientRef, pin)) {
+    override fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String, onHolding: (Int) -> Unit): CoreCharge =
+        when (val o = core.chargeHeld(CardTransport(card), kitJson, priceMsat.toULong(), clientRef, pin, object : PinWaitProgress {
+            override fun holding(secondsLeft: UInt) = onHolding(secondsLeft.toInt())
+        })) {
             is ChargeOutcome.Paid -> CoreCharge.Paid(
                 o.txid, o.priceMsat.toLong(), o.tillMsat.toLong(), o.overpayMsat.toLong(), o.feesMsat.toLong(),
                 o.inputs.map(::note), o.change.map(::note), o.replayed,
             )
-            is ChargeOutcome.Refused -> CoreCharge.Refused(o.code, o.detail, o.suggestedMsat?.toLong(), o.triesLeft?.toInt())
+            is ChargeOutcome.Refused -> CoreCharge.Refused(o.code, o.detail, o.suggestedMsat?.toLong(), o.wrongTries?.toInt(), o.waitS?.toInt())
         }
 
     override fun stats(): CoreStats = core.stats().let {

@@ -281,7 +281,7 @@ final class PosControllerOfflineTests: XCTestCase {
         // The core holds the sale `signing` (its card was taken away mid-SIGN before a restart).
         r.core.signing = [ref]
         await r.phone.refresh()
-        r.core.outcomes = [.refused(code: "no_card", detail: "the card left", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "no_card", detail: "the card left", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         r.typePin()
         XCTAssertEqual(r.reader.log, ["begin"])
         r.reader.onCard?(MockCard())
@@ -332,7 +332,7 @@ final class PosControllerOfflineTests: XCTestCase {
         guard case .enteringPin(_, let ref, _, _, _) = r.pos.state else { return XCTFail("\(r.pos.state)") }
         r.core.signing = [ref]
         await r.phone.refresh()
-        r.core.outcomes = [.refused(code: "no_card", detail: "the card left", suggestedMsat: nil, triesLeft: nil)]
+        r.core.outcomes = [.refused(code: "no_card", detail: "the card left", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
         r.typePin()
         r.reader.onCard?(MockCard())
         await r.until("the core's answer") { if case .error = r.pos.state { return true }; return false }
