@@ -239,6 +239,14 @@ struct Fx {
     dir: tempfile::TempDir,
 }
 
+/// A 4.0 soft card as the Setup app leaves one before its PIN: the test registry's key and the
+/// anchor. Its first `open_pin_session` sets the PIN.
+fn card4() -> SoftCard {
+    let mut c = SoftCard::v4();
+    fedimint_card_host_card::softkit::ready_for_pin(&mut c).unwrap();
+    c
+}
+
 async fn fx() -> anyhow::Result<Fx> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
     let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).build()).await?;
@@ -246,7 +254,7 @@ async fn fx() -> anyhow::Result<Fx> {
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let cw = CardWallet::new(wallet, store, Box::new(SoftCard::new()));
+    let cw = CardWallet::new(wallet, store, Box::new(card4()));
     Ok(Fx { _fed: fed, cw, dir })
 }
 
@@ -281,7 +289,7 @@ async fn a_till_without_a_token_refuses_card_jobs_until_approved_then_attaches_l
         sales,
         Box::new(move || {
             *counter.lock().unwrap() += 1;
-            Ok(Box::new(SoftCard::new()) as Box<dyn Card>)
+            Ok(Box::new(card4()) as Box<dyn Card>)
         }),
         conn.clone(),
     )

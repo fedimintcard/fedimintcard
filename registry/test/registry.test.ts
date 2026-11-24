@@ -2320,6 +2320,63 @@ describe('note signatures (DESIGN § 6)', () => {
     expect(afterLoad[3]).not.toBeNull();
   });
 
+  it('a repeat that sends some of a charge’s recorded change replays and signs only those; anything else is 409', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    const [c1, c2] = [keyNonce(shortId, 1), keyNonce(shortId, 2)];
+    const out = (slot: number, n: string) => ({slot, amount_msat: 24_000, nonce: n, blinding_key: 'e'.repeat(64), out_idx: slot});
+    expect((await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [out(1, c1), out(2, c2)]}))).status).toBe(200);
+    const note = (n: string) => ({nonce: n, signature: sign(n, 24_000)});
+    await hook('/test/cert-key', {off: true});
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [note(c1), note(c2)]})).status).toBe(200);
+    await hook('/test/cert-key', {off: false});
+    const regSigs = async () => Object.fromEntries((await notesOf(till.token, shortId)).filter(n => n.status === 'live').map(n => [n.slot, n.reg_sig]));
+    // The spent input with the change (as an offline charge's till once sent it), a note never
+    // recorded, a recorded note under another signature, and a rejection: each is 409, signs nothing.
+    for (const change of [[note(c2), note(nonce(1))], [note(nonce(9))], [{nonce: c2, signature: sign(c2, 1_000)}]]) {
+      expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change})).status).toBe(409);
+    }
+    expect((await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: false})).status).toBe(409);
+    expect(await regSigs()).toEqual({1: null, 2: null});
+    // Only slot 2's note, still waiting: a replay that signs slot 2 and nothing else.
+    const res = await post(`/cards/${shortId}/outcome`, till.token, {txid: txid(7), accepted: true, change: [note(c2)]});
+    expect(res.status).toBe(200);
+    const answer = (await res.json()) as {replayed: boolean; notes: {slot: number}[]};
+    expect(answer.replayed).toBe(true);
+    expect(answer.notes.map(n => n.slot)).toEqual([2]);
+    const after = await regSigs();
+    expect(after[1]).toBeNull();
+    expect(after[2]).not.toBeNull();
+  });
+
+  it('a holder’s repeat that sends some of a load’s notes signs only those; a note never recorded is 409', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = '1a2b3c4d';
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: await newBatch(token)}))).status).toBe(200);
+    const [n3, n5] = [keyNonce(shortId, 3), keyNonce(shortId, 5)];
+    const loadBody = {
+      version: 0,
+      txid: txid(20),
+      notes: [n3, n5].map((nonce, i) => ({slot: 3 + 2 * i, amount_msat: 1_000, nonce, blinding_key: 'e'.repeat(64), out_idx: i})),
+    };
+    expect((await post(`/cards/${shortId}/load`, null, loadBody)).status).toBe(200);
+    const note = (n: string) => ({nonce: n, signature: sign(n, 1_000)});
+    await hook('/test/cert-key', {off: true});
+    expect((await post(`/cards/${shortId}/load/outcome`, null, {txid: txid(20), notes: [note(n3), note(n5)]})).status).toBe(200);
+    await hook('/test/cert-key', {off: false});
+    expect((await post(`/cards/${shortId}/load/outcome`, null, {txid: txid(20), notes: [note(n3), note(nonce(9))]})).status).toBe(409);
+    const res = await post(`/cards/${shortId}/load/outcome`, null, {txid: txid(20), notes: [note(n5)]});
+    expect(res.status).toBe(200);
+    const answer = (await res.json()) as {replayed: boolean; notes: {slot: number}[]};
+    expect(answer.replayed).toBe(true);
+    expect(answer.notes.map(n => n.slot)).toEqual([5]);
+    const live = (await notesOf(till.token, shortId)).filter(n => n.status === 'live');
+    expect(live.find(n => n.slot === 3)!.reg_sig).toBeNull();
+    expect(live.find(n => n.slot === 5)!.reg_sig).not.toBeNull();
+  });
+
   it('a rejected charge answers no notes and signs nothing', async () => {
     const token = await signIn();
     const till = await newTill(token);

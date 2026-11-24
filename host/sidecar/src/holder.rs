@@ -332,15 +332,22 @@ impl<'w> Loader<'w> {
         }
         match self.finish_signed(&pending).await? {
             Some(sigs) => {
-                // A 3.0 card holds its notes: write them in this tap. A failure is only a
-                // warning; the next till to attach the card writes them.
-                let notes: Vec<(u8, XOnlyPublicKey, u64, String)> = pending
+                // A 4.0 card holds its notes: write those the registry signed in this tap. A
+                // failure, or a note it has not signed, is only a warning; the next till to
+                // attach the card writes them.
+                let notes: Vec<crate::glue::CardNote> = pending
                     .notes
                     .iter()
                     .zip(&sigs)
-                    .filter_map(|(n, sig)| {
+                    .filter_map(|(n, (sig, reg_sig))| {
                         let key = outs.iter().find(|o| o.slot == n.slot)?.nonce.0.x_only_public_key().0;
-                        Some((n.slot, key, n.amount_msat, sig.clone()))
+                        Some(crate::glue::CardNote {
+                            slot: n.slot,
+                            key,
+                            amount_msat: n.amount_msat,
+                            signature: sig.clone(),
+                            reg_sig: reg_sig.clone(),
+                        })
                     })
                     .collect();
                 if on_card(|| card.applet_version()).is_ok_and(|v| v.sign_once())
@@ -377,8 +384,9 @@ impl<'w> Loader<'w> {
         Ok(self.finish_signed(p).await?.map(|_| p.notes.iter().map(|n| (n.slot, n.amount_msat)).collect()))
     }
 
-    /// [`Self::finish`], answering each note's signature (hex) in the order of `p.notes`.
-    async fn finish_signed(&self, p: &PendingLoad) -> Result<Option<Vec<String>>> {
+    /// [`Self::finish`], answering each note's signature (hex) in the order of `p.notes`, with the
+    /// registry's signature over it when ops's answer carried one.
+    async fn finish_signed(&self, p: &PendingLoad) -> Result<Option<Vec<(String, Option<String>)>>> {
         let client = &self.wallet.client;
         let op = OperationId(hex::decode(&p.operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id in the journal")?);
         let txid = TransactionId::from_str(&p.txid).map_err(|_| anyhow!("bad txid in the journal"))?;
@@ -417,12 +425,12 @@ impl<'w> Loader<'w> {
             }
         };
         let accepted = outcome["accepted"] != json!(false);
-        match self.ops.load_outcome(&p.short_id, &outcome).await {
-            Ok(_) => {}
+        let signed = match self.ops.load_outcome(&p.short_id, &outcome).await {
+            Ok(a) => a.notes,
             // Rejected and ops never had it, or already ended it: nothing to record.
-            Err(OpsError::UnknownCard(_)) if !accepted => {}
+            Err(OpsError::UnknownCard(_)) if !accepted => vec![],
             Err(e) => return Err(e).context("recording the load's outcome in ops"),
-        }
+        };
         // Out of the journal, and, for a load to keep, how it ended, in one save.
         self.update_whole(|j| {
             j.loads.retain(|q| q.txid != p.txid);
@@ -438,10 +446,15 @@ impl<'w> Loader<'w> {
                 });
             }
         })?;
-        let sigs = outcome["notes"]
-            .as_array()
-            .map(|a| a.iter().map(|n| n["signature"].as_str().unwrap_or_default().to_owned()).collect())
-            .unwrap_or_default();
+        let sigs = p
+            .notes
+            .iter()
+            .zip(outcome["notes"].as_array().into_iter().flatten())
+            .map(|(n, o)| {
+                let reg = signed.iter().find(|s| s.nonce == n.nonce && s.slot == n.slot).map(|s| s.reg_sig.clone());
+                (o["signature"].as_str().unwrap_or_default().to_owned(), reg)
+            })
+            .collect();
         Ok(accepted.then_some(sigs))
     }
 }

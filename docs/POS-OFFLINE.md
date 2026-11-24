@@ -136,7 +136,7 @@ UniFFI, feature `ffi`: Swift module `FedimintCardPosCore`, Kotlin package
 - `PosCore.open(dir)`, `phone_id()`, `charge(transport, kit_json, price_msat, client_ref, pin)`
   returning `Paid { txid, price_msat, till_msat, overpay_msat, fees_msat, fee_margin_msat,
   inputs, change, replayed }` or `Refused { code, detail, suggested_msat, below_msat, above_msat,
-  tries_left }`, `stats()`, `signing_refs()`, `drain(max)`, `mark_synced(answer_json)`,
+  wrong_tries, wait_s }`, `stats()`, `signing_refs()`, `drain(max)`, `mark_synced(answer_json)`,
   `dismiss(txid)`.
 - Every method but `phone_id()` throws `PosCoreError` (`Store`, `Answer`, or `Internal` for a
   failure the core did not expect, a panic caught); a refusal is `Refused`, not an error. A
@@ -213,8 +213,8 @@ health: "Try again" opens an NFC session with no card link, and the till never s
 ("Payment not finished": hold the same card to the phone, it won't be charged twice). The caps do
 not hold such a retry back, and it fetches a new kit first when its kit has expired and the till
 answers. The sale stays held whatever its retry answers: the core refuses a retap at its card
-checks (`no_card`, `card_error`, `wrong_pin`, `pin_blocked`, `offline_unsupported_card`,
-`card_not_genuine`) before it reaches the held charge, and `signing_refs()` still lists it. So
+checks (`no_card`, `card_error`, `old_card`, `wrong_pin`, `pin_wait`, `sign_check_failed`,
+`offline_unsupported_card`, `card_not_genuine`) before it reaches the held charge, and `signing_refs()` still lists it. So
 there is no Back, Cancel on a wrong PIN goes back to the held sale, and Try again stays on the
 phone. Abandon only leaves the screen, and its alert says the card's next tap on this phone still
 finishes the sale (the owner's decision, 2026-11-10; ENG-854 is the follow-up that names the
@@ -270,13 +270,15 @@ is shown as its generic card error.
 | `offline_not_ready` | no kit yet, or one this phone cannot use | "Till service unreachable": no kit yet |
 | `offline_kit_expired` | the kit is past its expiry (phone's clock or card's) | kit expired: reach the till |
 | `offline_cap_reached` | the phone's caps on what waits to sync | caps reached: reach the till |
-| `offline_unsupported_card` | an applet 2.x card | this card pays online only |
+| `old_card` | a card older than applet 4.0 (`detail` is the message to show) | "This card has an older applet. Reset it and set it up again." |
+| `offline_unsupported_card` | a card the offline path does not take | this card pays online only |
 | `card_not_genuine` | not a card the registry certified (a clone) | decline |
 | `offline_note_invalid` | notes that do not check, and the rest do not pay | a card the kit cannot verify |
 | `offline_no_change_room` | needs change the card has no fresh slot for | "Try N sats" (`suggested_msat`) |
 | `offline_pool_exhausted` | the kit has run out of a tier the price needs | "Try N sats", then a new kit |
-| `wrong_pin` | the card refused the PIN (`tries_left`) | ask again |
-| `pin_blocked` | the PIN is blocked | the card cannot pay |
+| `wrong_pin` | the card refused the PIN (`63 CX`): `wrong_tries` is X, the wrong tries in a row; `wait_s` is about how long the next try waits | ask again; the card holds the next try for `wait_s` |
+| `pin_wait` | the card was taken away while it served its PIN wait (`wait_s` left, about) | hold the card to the phone again until the wait is over |
+| `sign_check_failed` | the card's signature failed its own check; nothing was spent | tap again, same `client_ref` |
 | `card_limit` | the card's daily limit | decline |
 | `insufficient` | the card's notes do not cover the price | decline: "Card balance too low" |
 | `no_exact_plan` | the card cannot pay this price in one tap | decline: "Can't take this amount", then "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."; the core's `detail` is not shown |
@@ -326,8 +328,8 @@ Balance reads and top-ups never go offline. While the core drives the card, the 
 
 **A held sale.** A card taken away while it signed leaves "Payment not finished": no Back, no
 Check sales (the till has no record of it), Try again (the PIN, then the core with the same
-`client_ref`; a wrong PIN asks again and comes back to it, and a PIN blocked since says so, with no
-Try again), and Abandon, which only hides the sale. That card's next tap on this phone still
+`client_ref`; a wrong PIN asks again and comes back to it, after the card's wait, which grows with each
+wrong try in a row), and Abandon, which only hides the sale. That card's next tap on this phone still
 finishes it, whatever sale is rung then (the owner's decision of 2026-11-10; ENG-854 is to make
 that tap's outcome name the sale it finished). After a restart, the home screen says "1 payment is
 waiting for its card: tap that card to finish it."

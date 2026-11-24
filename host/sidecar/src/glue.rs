@@ -14,6 +14,7 @@
 //!    until the federation answers accepted or rejected.
 //! 3. `accepted = true`: only collection of the outputs remains; it is retried until it succeeds.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -40,7 +41,7 @@ use crate::ops::{OpsError, OpsLink};
 use crate::plan::{self, Plan};
 use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
 use crate::state::{
-    HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
+    CardState, HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
 };
 use crate::wallet::Wallet;
 
@@ -313,11 +314,16 @@ impl CardWallet {
     /// The holder's PIN, when the job has one, is only verified: a card without a PIN is not
     /// pinned at a till with whatever the holder typed.
     pub fn verify_pin_session(&mut self) -> Result<()> {
-        if let Some(pin) = self.pin.as_deref() {
-            return on_card(|| self.card.verify_pin(pin)).context("verifying the holder's PIN");
-        }
-        let pin = fedimint_card_host_card::pin_from_env();
-        on_card(|| fedimint_card_host_card::open_pin_session_with(self.card.as_mut(), &pin)).context("opening the PIN session")
+        // VERIFY_PIN with the card's wait served (applet 4.0): the same command resent while the
+        // card answers `6A98`; a card taken away during the wait is `pin_wait`.
+        use fedimint_card_pos_core::charge::{Pin, open_pin};
+        let pin = match self.pin.clone() {
+            Some(p) => Pin::Verify(p),
+            None => Pin::OpenWith(fedimint_card_host_card::pin_from_env()),
+        };
+        let holding = |s: u32| tracing::debug!("the card serves a PIN wait: about {s} s left");
+        let card = self.card.as_mut();
+        on_card(|| open_pin(card, &pin, Some(&holding)))
     }
 
     fn fee_fn(&self) -> impl Fn(u64) -> u64 + use<> {
@@ -605,6 +611,7 @@ impl CardWallet {
                 blinding_key: Some(enc(&o.key)),
                 txid: None,
                 out_idx: Some(i as u64),
+                reg_sig: None,
             });
         }
         // The ref lands in this save or not at all: a replay can then never see a note that the
@@ -684,8 +691,10 @@ impl CardWallet {
         for (i, o) in outs.iter().enumerate() {
             self.finalize_card_note(&nonce_hex(o.nonce), OutPoint { txid, out_idx: i as u64 }, FETCH_TIMEOUT).await?;
         }
-        self.sync_card_notes();
+        // The registry signs the notes when their load reaches it, and a 4.0 card takes a note
+        // only with that signature: ops first, then the card.
         self.ops_sync().await;
+        self.sync_card_notes();
         Ok(outs.iter().map(|o| (o.slot, o.amount)).collect())
     }
 
@@ -1211,7 +1220,7 @@ impl CardWallet {
         let group = txid.to_string();
         // 0. A 3.0 card signs only a slot that holds its note, and only within its day's limit:
         //    write any note it lacks (SET_NOTE) and check the limit before anything is recorded.
-        if self.card_sign_once() {
+        if self.card_sign_once()? {
             self.prepare_inputs_v3(inputs, txid.to_byte_array())?;
         }
 
@@ -1228,6 +1237,7 @@ impl CardWallet {
                     blinding_key: Some(enc(key)),
                     txid: Some(group.clone()),
                     out_idx: Some(i as u64),
+                    reg_sig: None,
                 }),
                 Owner::Host { kp, key, kind } => self.store.state.host_pending.push(HostPending {
                     amount_msat: o.amount,
@@ -1430,8 +1440,9 @@ impl CardWallet {
         // key (split keying): the plan is made over both, and only the slots the change needs (and
         // `KEY_AHEAD`) are keyed below. Unkeyed slots left over still count as room for the
         // planner's `ROOM_AFTER_CHARGE`, since the tap of a later load keys them the same way.
+        let waiting = self.notes_waiting_for_the_registry()?;
         let attempt = |me: &Self| -> Result<(Vec<NoteRec>, Plan)> {
-            let live: Vec<NoteRec> = me.store.state.live_notes().into_iter().cloned().collect();
+            let live: Vec<NoteRec> = me.store.state.live_notes().into_iter().filter(|n| !waiting.contains(&n.nonce)).cloned().collect();
             let amounts: Vec<u64> = live.iter().map(|n| n.amount_msat).collect();
             let room = me.store.state.free_slots().len() + me.keyable_slots();
             let plan = plan::solve(&amounts, price_msat, room, &fee, min_denom)?;
@@ -1505,7 +1516,9 @@ impl CardWallet {
             }
         };
         warnings.extend(rec.errors.iter().cloned());
-        // The change is live: on a 3.0 card it is written in this tap (SET_NOTE).
+        // The change is live. Its outcome goes to ops first, whose answer carries the registry's
+        // signatures, so a 4.0 card takes the change in this tap (SET_NOTE).
+        self.ops_sync().await;
         self.sync_card_notes();
         let renewed = match self.renew_spent_slots().await {
             Ok(r) => r,
@@ -1615,17 +1628,49 @@ impl CardWallet {
 
 // -------------------------------------------------------------------- applet 3.0
 
-/// Write live notes to a 3.0 card that lacks them (`SET_NOTE`): each `(slot, x-only key,
-/// msat, signature hex)` whose slot is KEYED, or CHANGE owed that amount, under that key. A slot
-/// holding anything else, or another key, is left alone. Answers how many were written; a card
-/// error stops it and is returned.
-pub fn write_notes(card: &mut dyn Card, notes: &[(u8, XOnlyPublicKey, u64, String)]) -> Result<usize> {
+/// A live note as a card takes it (`SET_NOTE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardNote {
+    pub slot: u8,
+    /// The slot key the note was issued to.
+    pub key: XOnlyPublicKey,
+    pub amount_msat: u64,
+    /// The federation's signature, hex (48 bytes).
+    pub signature: String,
+    /// The registry's signature over the note, DER hex. Without it the card refuses the note, so
+    /// it is not sent: the note waits for a later tap.
+    pub reg_sig: Option<String>,
+}
+
+impl CardNote {
+    /// The note as the card takes it, when `n` is live and its nonce parses.
+    pub fn of(n: &NoteRec) -> Option<Self> {
+        Some(Self {
+            slot: n.slot,
+            key: XOnlyPublicKey::from(nonce_from_hex(&n.nonce).ok()?.0),
+            amount_msat: n.amount_msat,
+            signature: n.signature.clone()?,
+            reg_sig: n.reg_sig.clone(),
+        })
+    }
+}
+
+/// Write live notes to a 4.0 card that lacks them (`SET_NOTE`, with the registry's signature):
+/// each note whose slot is KEYED, or CHANGE owed that amount, under its key. A slot holding
+/// anything else, or another key, is left alone, and so is a note the registry has not signed
+/// yet. Answers how many were written; a card error stops it and is returned.
+pub fn write_notes(card: &mut dyn Card, notes: &[CardNote]) -> Result<Written> {
+    let waiting = notes.iter().filter(|n| n.reg_sig.is_none()).count();
+    if waiting > 0 {
+        tracing::info!("{waiting} note(s) wait for the registry's signature before they go on the card");
+    }
+    let notes: Vec<&CardNote> = notes.iter().filter(|n| n.reg_sig.is_some()).collect();
+    let mut out = Written::default();
     if notes.is_empty() {
-        return Ok(0);
+        return Ok(out);
     }
     let st = on_card(|| card.get_state())?;
-    let mut n = 0;
-    for (slot, key, amount, sig) in notes {
+    for CardNote { slot, key, amount_msat: amount, signature: sig, reg_sig } in notes {
         let Some(state) = st.states.get(*slot as usize) else { continue };
         if !matches!(state, SlotState::Keyed | SlotState::Change) {
             continue;
@@ -1636,23 +1681,100 @@ pub fn write_notes(card: &mut dyn Card, notes: &[(u8, XOnlyPublicKey, u64, Strin
             continue;
         }
         let sig = sig48_of(sig)?;
-        on_card(|| card.set_note(*slot, *amount, &sig)).with_context(|| format!("SET_NOTE on slot {slot}"))?;
-        n += 1;
+        let reg_hex = reg_sig.as_deref().expect("filtered above");
+        let Ok(reg) = hex::decode(reg_hex) else {
+            tracing::warn!("slot {slot}: the registry's signature is not hex; not written");
+            out.refused.push((*slot, reg_hex.to_owned()));
+            continue;
+        };
+        match on_card(|| card.set_note(*slot, *amount, &sig, &reg)) {
+            Ok(()) => out.written += 1,
+            // The card does not take this signature: the note waits, and the next ones go on.
+            Err(e) if status_word(&e) == Some(fedimint_card_host_card::v3::SW_SECURITY_STATUS_NOT_SATISFIED) => {
+                tracing::warn!("slot {slot}: the card refused the registry's signature over the note; not written");
+                out.refused.push((*slot, reg_hex.to_owned()));
+            }
+            Err(e) => return Err(e.context(format!("SET_NOTE on slot {slot}"))),
+        }
     }
-    Ok(n)
+    Ok(out)
+}
+
+/// What [`write_notes`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Written {
+    /// Notes now on the card.
+    pub written: usize,
+    /// (slot, registry signature) of each note the card refused for its signature (`6982`).
+    pub refused: Vec<(u8, String)>,
+}
+
+/// Whether a till keeps `der_hex` as the registry's signature over note `n`: not one this card
+/// refused, and, when the till holds the registry's key (`cert_key`, hex SEC1), one that verifies
+/// under it as the card checks it. Without the key, or for a note that does not parse, the card
+/// decides.
+pub fn reg_sig_kept(st: &CardState, cert_key: Option<&str>, n: &NoteRec, der_hex: &str) -> bool {
+    if st.refused_reg_sigs.iter().any(|s| s == der_hex) {
+        return false;
+    }
+    let verdict = || -> Option<bool> {
+        let key = fedimint_card_host_card::v3::registry_key_of(&hex::decode(cert_key?).ok()?)?;
+        let c = CardNote::of(n)?;
+        let sig = sig48_of(&c.signature).ok()?;
+        let Ok(der) = hex::decode(der_hex) else { return Some(false) };
+        Some(fedimint_card_host_card::v3::verify_note(&key, &c.key.serialize(), c.amount_msat, &sig, &der))
+    };
+    verdict() != Some(false)
+}
+
+/// Drop each registry signature the card refused from the note that carried it, so the note
+/// waits and is asked for again; the refusal counts as a fruitless asking of its transaction, so
+/// the asking backs off (`crate::ops`).
+pub fn forget_refused_reg_sigs(st: &mut CardState, refused: &[(u8, String)], now_ms: u64) {
+    for (slot, sig) in refused {
+        st.refuse_reg_sig(sig);
+        let Some(n) = st.notes.iter_mut().find(|n| n.slot == *slot && n.reg_sig.as_deref() == Some(sig.as_str())) else { continue };
+        n.reg_sig = None;
+        if let Some(t) = n.txid.clone() {
+            let a = st.sig_asks.entry(t).or_default();
+            a.misses = a.misses.saturating_add(1);
+            a.last_ms = now_ms;
+        }
+    }
 }
 
 impl CardWallet {
-    /// Whether the card in the field is applet 3.0 (each slot signs once; notes on the card).
-    /// A card that cannot say is taken for 2.x.
-    pub fn card_sign_once(&mut self) -> bool {
+    /// Whether the card in the field is applet 4.0 (each slot signs once; notes on the card). A
+    /// card that says it is older answers `false`; a card the till opened is never one, because
+    /// `open_card_over` refuses it. When the version check itself fails, because the last SELECT
+    /// did not pass the rule for every reader, the answer is the old-card error
+    /// ([`fedimint_card_host_card::is_old_card`]), never "2.x": such a card is not charged.
+    pub fn card_sign_once(&mut self) -> Result<bool> {
         match on_card(|| self.card.applet_version()) {
-            Ok(v) => v.sign_once(),
-            Err(e) => {
-                tracing::warn!("the card's version: {e:#}");
-                false
+            Ok(v) => Ok(v.is_current()),
+            Err(e) if fedimint_card_host_card::is_old_card(&e) => Err(e),
+            Err(e) if e.downcast_ref::<fedimint_card_host_card::NotSelected>().is_some() => {
+                Err(anyhow::Error::new(fedimint_card_host_card::UnsupportedApplet::Old { answer: vec![] }).context(format!("{e:#}")))
             }
+            Err(e) => Err(e.context("asking the card for its version")),
         }
+    }
+
+    /// The nonces of live notes a charge cannot spend yet: on a card that holds its notes, a note
+    /// not on the card (its slot not NOTE) that the registry has not signed, so `SET_NOTE` cannot
+    /// put it there. They wait for a later tap.
+    fn notes_waiting_for_the_registry(&mut self) -> Result<HashSet<String>> {
+        let unsigned: Vec<(u8, String)> =
+            self.store.state.live_notes().into_iter().filter(|n| n.reg_sig.is_none()).map(|n| (n.slot, n.nonce.clone())).collect();
+        if unsigned.is_empty() || !self.card_sign_once()? {
+            return Ok(HashSet::new());
+        }
+        let st = on_card(|| self.card.get_state())?;
+        Ok(unsigned
+            .into_iter()
+            .filter(|(slot, _)| st.states.get(*slot as usize) != Some(&SlotState::Note))
+            .map(|(_, nonce)| nonce)
+            .collect())
     }
 
     /// Before SIGN on a 3.0 card: every input slot holds its note (a KEYED or CHANGE slot gets it
@@ -1678,7 +1800,12 @@ impl CardWallet {
                 }
                 SlotState::Keyed | SlotState::Change => {
                     let sig = sig48_of(n.signature.as_deref().context("live note without signature")?)?;
-                    on_card(|| self.card.set_note(n.slot, n.amount_msat, &sig)).with_context(|| format!("SET_NOTE on slot {}", n.slot))?;
+                    let Some(reg) = n.reg_sig.as_deref() else {
+                        bail!("the note for slot {} is not on the card and the registry has not signed it yet; nothing was signed", n.slot)
+                    };
+                    let reg = hex::decode(reg).context("the registry's signature is not hex")?;
+                    on_card(|| self.card.set_note(n.slot, n.amount_msat, &sig, &reg))
+                        .with_context(|| format!("SET_NOTE on slot {}", n.slot))?;
                     counted.push(n.amount_msat);
                 }
                 SlotState::Spent if info.spent_hash == txid => {}
@@ -1700,22 +1827,27 @@ impl CardWallet {
     /// On a 3.0 card, write every live note of this state that the card lacks (a load or change
     /// finished at another tap, or by a till that could not reach the card). Never fails the job.
     pub fn sync_card_notes(&mut self) -> usize {
-        if !self.card_sign_once() {
+        if !self.card_sign_once().unwrap_or(false) {
             return 0;
         }
         let st = &self.store.state;
-        let notes: Vec<(u8, XOnlyPublicKey, u64, String)> = st
+        let notes: Vec<CardNote> = st
             .slots
             .iter()
             .flat_map(|s| st.notes_on_current_key(s.slot))
             .filter(|n| n.status == NoteStatus::Live)
-            .filter_map(|n| {
-                let key = XOnlyPublicKey::from(nonce_from_hex(&n.nonce).ok()?.0);
-                Some((n.slot, key, n.amount_msat, n.signature.clone()?))
-            })
+            .filter_map(CardNote::of)
             .collect();
         match write_notes(self.card.as_mut(), &notes) {
-            Ok(n) => n,
+            Ok(w) => {
+                if !w.refused.is_empty() {
+                    forget_refused_reg_sigs(&mut self.store.state, &w.refused, crate::claim::now_ms());
+                    if let Err(e) = self.store.save() {
+                        tracing::warn!("the refused note signatures are not saved yet: {e:#}");
+                    }
+                }
+                w.written
+            }
             Err(e) => {
                 tracing::warn!("writing notes to the card: {e:#}");
                 0
@@ -1727,7 +1859,7 @@ impl CardWallet {
     /// fails the job.
     pub fn sync_card_clock(&mut self) {
         let Some(h) = self.headers.as_ref().and_then(|h| h.latest()) else { return };
-        if !self.card_sign_once() {
+        if !self.card_sign_once().unwrap_or(false) {
             return;
         }
         let r: Result<()> = (|| {
@@ -1764,4 +1896,136 @@ struct PlannedOut {
     amount: u64,
     blinded: tbs::BlindedMessage,
     owner: Owner,
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_card_host_card::softkit::ready_for_pin;
+    use fedimint_card_host_card::v3::{SW_SECURITY_STATUS_NOT_SATISFIED, sign_note, test_registry_key};
+    use fedimint_card_host_card::{SoftCard, status_word};
+
+    use super::*;
+
+    const SIG48: [u8; 48] = [7; 48];
+
+    /// A fresh 4.0 card holding the test registry's key, with `slots` keyed, and a live note of
+    /// 1024 msat for each, signed by `registry` when given.
+    fn card_and_notes(slots: &[u8], registry: Option<&p256::ecdsa::SigningKey>) -> (SoftCard, Vec<CardNote>) {
+        let mut card = SoftCard::v4();
+        ready_for_pin(&mut card).unwrap();
+        let notes = slots
+            .iter()
+            .map(|&slot| {
+                let key = card.gen_key(slot).unwrap();
+                CardNote {
+                    slot,
+                    key,
+                    amount_msat: 1024,
+                    signature: hex::encode(SIG48),
+                    reg_sig: registry.map(|r| hex::encode(sign_note(r, &key.serialize(), 1024, &SIG48))),
+                }
+            })
+            .collect();
+        (card, notes)
+    }
+
+    fn state_of(card: &mut SoftCard, slot: u8) -> SlotState {
+        card.get_slot(slot).unwrap().state
+    }
+
+    #[test]
+    fn a_note_goes_on_the_card_with_the_registrys_signature() {
+        let (mut card, notes) = card_and_notes(&[0, 3], Some(&test_registry_key()));
+        assert_eq!(write_notes(&mut card, &notes).unwrap().written, 2);
+        assert_eq!(state_of(&mut card, 0), SlotState::Note);
+        assert_eq!(state_of(&mut card, 3), SlotState::Note);
+        // Written once: a second pass finds the slots NOTE and sends nothing.
+        assert_eq!(write_notes(&mut card, &notes).unwrap().written, 0);
+    }
+
+    #[test]
+    fn a_note_the_registry_has_not_signed_waits_on_the_till() {
+        let (mut card, mut notes) = card_and_notes(&[0, 1], Some(&test_registry_key()));
+        notes[1].reg_sig = None;
+        assert_eq!(write_notes(&mut card, &notes).unwrap().written, 1);
+        assert_eq!(state_of(&mut card, 0), SlotState::Note);
+        assert_eq!(state_of(&mut card, 1), SlotState::Keyed);
+        // A till with no ops holds no registry signature, so it writes nothing to the card.
+        let (mut card, notes) = card_and_notes(&[0, 1], None);
+        assert_eq!(write_notes(&mut card, &notes).unwrap().written, 0);
+        assert_eq!(state_of(&mut card, 0), SlotState::Keyed);
+        assert_eq!(state_of(&mut card, 1), SlotState::Keyed);
+    }
+
+    #[test]
+    fn a_note_the_card_refuses_is_skipped_and_the_next_one_written() {
+        let other = p256::ecdsa::SigningKey::from_slice(&[2; 32]).unwrap();
+        let (mut card, mut notes) = card_and_notes(&[0, 1], Some(&test_registry_key()));
+        let (_, theirs) = card_and_notes(&[0], Some(&other));
+        let bad = theirs[0].reg_sig.clone().unwrap();
+        notes[0].reg_sig = Some(bad.clone());
+        let w = write_notes(&mut card, &notes).unwrap();
+        assert_eq!(w, Written { written: 1, refused: vec![(0, bad)] });
+        assert_eq!(state_of(&mut card, 0), SlotState::Keyed);
+        assert_eq!(state_of(&mut card, 1), SlotState::Note);
+        let _ = (status_word, SW_SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    /// A live note of `txid` on `slot` of a fresh card (1024 msat, the test federation
+    /// signature), and the note as the card takes it, signed by the test registry.
+    fn note_rec(slot: u8, txid: &str) -> (NoteRec, CardNote) {
+        let (_, notes) = card_and_notes(&[slot], Some(&test_registry_key()));
+        let n = notes[0].clone();
+        let rec = NoteRec {
+            slot,
+            amount_msat: n.amount_msat,
+            nonce: hex::encode(n.key.public_key(fedimint_core::secp256k1::Parity::Even).serialize()),
+            signature: Some(n.signature.clone()),
+            status: NoteStatus::Live,
+            blinding_key: None,
+            txid: Some(txid.into()),
+            out_idx: Some(0),
+            reg_sig: None,
+        };
+        (rec, n)
+    }
+
+    #[test]
+    fn a_signature_is_kept_only_if_it_verifies_under_the_registry_key_and_the_card_never_refused_it() {
+        let other = p256::ecdsa::SigningKey::from_slice(&[2; 32]).unwrap();
+        let cert = hex::encode(fedimint_card_host_card::v3::registry_point(&test_registry_key()));
+        let (n, c) = note_rec(0, "t1");
+        let good = c.reg_sig.clone().unwrap();
+        let wrong = hex::encode(sign_note(&other, &c.key.serialize(), 1024, &SIG48));
+        let mut st = CardState::default();
+        assert!(reg_sig_kept(&st, Some(&cert), &n, &good));
+        assert!(!reg_sig_kept(&st, Some(&cert), &n, &wrong), "another key's signature");
+        assert!(!reg_sig_kept(&st, Some(&cert), &n, "zz"), "not hex");
+        assert!(reg_sig_kept(&st, None, &n, &wrong), "without the key the card decides");
+        st.refuse_reg_sig(&good);
+        assert!(!reg_sig_kept(&st, Some(&cert), &n, &good), "the card refused it once");
+        assert!(!reg_sig_kept(&st, None, &n, &good));
+    }
+
+    #[test]
+    fn a_refused_signature_is_dropped_from_its_note_and_counts_as_a_miss() {
+        let (mut n, c) = note_rec(3, "t1");
+        let sig = c.reg_sig.unwrap();
+        n.reg_sig = Some(sig.clone());
+        let mut st = CardState { notes: vec![n], ..Default::default() };
+        forget_refused_reg_sigs(&mut st, &[(3, sig.clone())], 77);
+        assert_eq!(st.notes[0].reg_sig, None);
+        assert_eq!(st.refused_reg_sigs, vec![sig]);
+        assert_eq!(st.sig_asks["t1"], crate::state::SigAsk { last_ms: 77, misses: 1, load: false });
+    }
+
+    #[test]
+    fn a_note_under_another_key_or_amount_is_left_alone() {
+        let (mut card, mut notes) = card_and_notes(&[0, 1], Some(&test_registry_key()));
+        notes[0].key = notes[1].key;
+        notes[1].amount_msat = 2048;
+        notes[1].slot = 2; // never keyed: EMPTY
+        assert_eq!(write_notes(&mut card, &notes).unwrap().written, 0);
+        assert_eq!(state_of(&mut card, 0), SlotState::Keyed);
+    }
 }

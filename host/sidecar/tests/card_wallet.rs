@@ -680,3 +680,28 @@ async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::R
     drop(f.fed);
     Ok(())
 }
+
+/// A slot whose note this till holds as spent is re-keyed only once the federation reports that
+/// note spent: until then a transaction the federation has not seen (signed offline, say) may
+/// still need the key's note.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_slot_is_renewed_only_once_the_federation_reports_its_note_spent() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    let slot = f.cw.topup(&[1 << 20]).await?[0].0;
+    let key = f.cw.card.get_pub(slot)?;
+    let held_spent = |f: &mut Fx, status: NoteStatus| {
+        let n = f.cw.store.state.notes.iter_mut().find(|n| n.slot == slot && n.nonce == hex_of(nonce_for(key).0.serialize())).unwrap();
+        n.status = status;
+    };
+    held_spent(&mut f, NoteStatus::Spent);
+    assert_eq!(f.cw.renew_spent_slots().await?, Vec::<u8>::new(), "the federation has not seen the note spent");
+    assert_eq!(f.cw.card.get_pub(slot)?, key, "the key is kept");
+
+    // The federation spends the note: the charge's own renewal now re-keys the slot.
+    held_spent(&mut f, NoteStatus::Live);
+    let r = f.cw.spend(100_000).await?;
+    assert_eq!(r.inputs, vec![(slot, 1 << 20)]);
+    assert_ne!(f.cw.card.get_pub(slot)?, key, "renewed once the federation reports the note spent");
+    drop(f.fed);
+    Ok(())
+}

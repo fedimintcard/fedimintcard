@@ -56,6 +56,10 @@ pub struct NoteRec {
     /// Index of the note's output in that transaction, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_idx: Option<u64>,
+    /// The registry's signature over the note (DER ECDSA P-256, hex), from ops once the note is
+    /// live there. A 4.0 card takes a note (`SET_NOTE`) only with it; a note without one waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reg_sig: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +155,49 @@ pub struct CardState {
     /// reads the card again (`CardWallet::card_strands` in `crate::ops`).
     #[serde(skip)]
     pub held: Vec<Held>,
+    /// Registry signatures over notes that this card refused (`6982`) or that did not verify
+    /// under the registry's key, newest last, at most [`MAX_REFUSED_REG_SIGS`]. Never kept again,
+    /// so such a note waits and is asked for again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_reg_sigs: Vec<String>,
+    /// The transactions whose note signatures this till asked the registry for again, by txid
+    /// (`crate::ops`): kept while one of their notes still waits.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sig_asks: std::collections::BTreeMap<String, SigAsk>,
+    /// When this till last asked the holder's load route for note signatures (ms; 0: never).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub load_ask_ms: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// At most this many refused registry signatures a card file keeps.
+pub const MAX_REFUSED_REG_SIGS: usize = 64;
+
+/// One transaction whose note signatures a till asked the registry for again.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SigAsk {
+    /// When it was last asked (ms).
+    pub last_ms: u64,
+    /// Askings in a row that brought no signature, and card refusals of what they brought.
+    pub misses: u32,
+    /// The registry does not know it as a transaction (`404`): a holder's load, asked at the
+    /// load route.
+    #[serde(default)]
+    pub load: bool,
+}
+
+impl CardState {
+    /// Remember a registry signature the card refused, so no answer brings it back.
+    pub fn refuse_reg_sig(&mut self, der_hex: &str) {
+        if !self.refused_reg_sigs.iter().any(|s| s == der_hex) {
+            self.refused_reg_sigs.push(der_hex.to_owned());
+        }
+        let over = self.refused_reg_sigs.len().saturating_sub(MAX_REFUSED_REG_SIGS);
+        self.refused_reg_sigs.drain(..over);
+    }
 }
 
 /// Why an online tap holds a slot back (ENG-867).
@@ -419,6 +466,7 @@ mod tests {
             blinding_key: None,
             txid: None,
             out_idx: None,
+            reg_sig: None,
         }
     }
 

@@ -93,6 +93,10 @@ pub struct Class {
 /// ([`fedimint_card_pos_core::class_of`]): one vocabulary.
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
+    // SIGN's `6F00` is a context on the card's error, so it is asked of the whole error first.
+    if fedimint_card_host_card::is_sign_check_failed(err) {
+        return c(409, "sign_check_failed");
+    }
     for cause in err.chain() {
         if let Some((status, code)) = fedimint_card_pos_core::class_of(cause) {
             return c(status, code);
@@ -117,14 +121,29 @@ pub fn classify(err: &anyhow::Error) -> Class {
     c(500, "internal")
 }
 
-pub(crate) fn error_reply(err: &anyhow::Error) -> Reply {
+/// The API answer for `err`. A PIN refusal also carries what docs/TILL-API.md promises an app: `wrong_pin` adds
+/// `wrong_tries` (the wrong tries in a row) and `wait_s` (whole seconds the next try first
+/// waits); `pin_wait` adds `wait_s` (whole seconds still owed, 0 when not known). Both come from
+/// the core a phone shares ([`fedimint_card_pos_core::refusal`]), so till and phone agree.
+pub fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
-    let detail = match class.code {
+    match class.code {
         // Said plainly, for the holder, as a phone says it.
-        "wrong_pin" | "pin_blocked" => fedimint_card_pos_core::refusal(err).detail,
-        _ => format!("{err:#}"),
-    };
-    Reply::fail(class.status, class.code, detail)
+        "wrong_pin" | "pin_wait" | "old_card" | "sign_check_failed" => {
+            let r = fedimint_card_pos_core::refusal(err);
+            let mut reply = Reply::fail(class.status, class.code, &r.detail);
+            match class.code {
+                "wrong_pin" => {
+                    reply.body["wrong_tries"] = json!(r.wrong_tries.unwrap_or(0));
+                    reply.body["wait_s"] = json!(r.wait_s.unwrap_or(0));
+                }
+                "pin_wait" => reply.body["wait_s"] = json!(r.wait_s.unwrap_or(0)),
+                _ => {}
+            }
+            reply
+        }
+        _ => Reply::fail(class.status, class.code, format!("{err:#}")),
+    }
 }
 
 // ------------------------------------------------------------------ the till and the registry
@@ -355,7 +374,9 @@ pub fn open_link_card(link: &Link) -> Result<Box<dyn Card>> {
     open_card_over(link.transport(), &format!("card link {}", link.id))
 }
 
-/// [`open_relay_card`] over any transport: probe, then SELECT (a `6A82` is tolerated).
+/// [`open_relay_card`] over any transport: probe, then SELECT (a `6A82` is tolerated). The SELECT
+/// is the rule for every reader: a card whose applet answers older than 4.0 (or newer than this
+/// till knows) is refused here with the old-card error, before any command of a job reaches it.
 pub fn open_card_over<T: Transport + 'static>(transport: T, what: &str) -> Result<Box<dyn Card>> {
     let mut c = CardClient::new(transport);
     c.get_data_ff21()
@@ -364,9 +385,14 @@ pub fn open_card_over<T: Transport + 'static>(transport: T, what: &str) -> Resul
             None => Err(e),
         })
         .with_context(|| what.to_owned())?;
-    // A blank card, or one whose applet is absent, answers a status word; that is `precheck`'s
-    // subject, not a reason to refuse to hand the card over.
-    let _ = c.select();
+    match c.select() {
+        Ok(()) => {}
+        // A blank card, or one whose applet is absent, answers a status word; that is
+        // `precheck`'s subject, not a reason to refuse to hand the card over. Its PIN commands
+        // stay refused by the card library until a SELECT passes.
+        Err(e) if status_word(&e).is_some() => {}
+        Err(e) => return Err(e).with_context(|| what.to_owned()),
+    }
     Ok(Box::new(c))
 }
 

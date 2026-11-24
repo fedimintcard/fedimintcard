@@ -93,8 +93,27 @@ async fn outcome(
         r.fail_outcomes.fetch_sub(1, Ordering::SeqCst);
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
     }
+    let notes = sign_loaded(&r.loads.lock().unwrap(), &body);
     r.outcomes.lock().unwrap().push(body);
-    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3})))
+    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3, "notes": notes})))
+}
+
+/// As ops signs a load's notes once the load is accepted: each note of the outcome, under the test
+/// registry key the card was set up with, listed as an outcome's answer lists them.
+fn sign_loaded(loads: &[Value], body: &Value) -> Vec<Value> {
+    let key = fedimint_card_host_card::v3::test_registry_key();
+    let mut out = vec![];
+    for o in body["notes"].as_array().into_iter().flatten() {
+        let Some(n) = loads.iter().flat_map(|l| l["notes"].as_array().unwrap().iter()).find(|n| n["nonce"] == o["nonce"]) else {
+            continue;
+        };
+        let nonce = o["nonce"].as_str().unwrap();
+        let x: [u8; 32] = hex::decode(&nonce[2..]).unwrap().try_into().unwrap();
+        let sig48 = fedimint_card_sidecar::glue::sig48_of(o["signature"].as_str().unwrap()).unwrap();
+        let reg = fedimint_card_host_card::v3::sign_note(&key, &x, n["amount_msat"].as_u64().unwrap(), &sig48);
+        out.push(json!({"slot": n["slot"], "nonce": nonce, "reg_sig": hex::encode(reg)}));
+    }
+    out
 }
 
 async fn serve_registry(r: Arc<FakeRegistry>) -> String {
@@ -159,10 +178,16 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
 
-    let card = Arc::new(Mutex::new(SoftCard::new()));
+    // A 4.0 card set up as the Setup app does: keyed, the test registry's key, anchored, a PIN.
+    let card = Arc::new(Mutex::new(SoftCard::v4()));
     let mut keys = vec![];
-    for s in 0..8 {
-        keys.push(card.lock().unwrap().gen_key(s)?);
+    {
+        let mut c = card.lock().unwrap();
+        for s in 0..8 {
+            keys.push(c.gen_key(s)?);
+        }
+        fedimint_card_host_card::softkit::ready_for_pin(&mut *c)?;
+        fedimint_card_host_card::open_pin_session(&mut *c)?;
     }
     let short_id = short_id_of(&keys[0]);
     let registry = Arc::new(FakeRegistry {

@@ -219,6 +219,62 @@ pub struct RemoteNote {
     pub status: NoteStatus,
     pub txid: Option<String>,
     pub out_idx: Option<u64>,
+    /// The registry's signature over the note (DER hex), once it signed it. Absent from a
+    /// registry older than note signatures.
+    #[serde(default)]
+    pub reg_sig: Option<String>,
+}
+
+/// A note the registry signed, as an accepted outcome's answer lists it (`notes[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SignedNote {
+    pub slot: u8,
+    /// The note's nonce, hex, as the till recorded it.
+    pub nonce: String,
+    /// DER ECDSA P-256, hex.
+    pub reg_sig: String,
+}
+
+/// What an outcome call answered: the card's new version, and the notes the registry signed in
+/// it (none from a registry older than note signatures, or one that could not sign yet).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutcomeAnswer {
+    pub version: u64,
+    pub notes: Vec<SignedNote>,
+}
+
+impl OutcomeAnswer {
+    fn of(v: &Value) -> Result<Self, OpsError> {
+        let version = OpsClient::version(v)?;
+        // Entries without a signature are skipped: such a note waits for a later answer.
+        #[derive(Deserialize)]
+        struct Maybe {
+            slot: u8,
+            nonce: String,
+            reg_sig: Option<String>,
+        }
+        // So is an entry that does not parse: the outcome is recorded all the same, and only the
+        // version decides whether the answer stands.
+        let notes = match v.get("notes") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|e| match serde_json::from_value::<Maybe>(e.clone()) {
+                    Ok(m) => Some(m),
+                    Err(err) => {
+                        tracing::warn!("ops: an entry of the outcome's notes did not parse and is skipped: {err}");
+                        None
+                    }
+                })
+                .filter_map(|m| Some(SignedNote { slot: m.slot, nonce: m.nonce, reg_sig: m.reg_sig? }))
+                .collect(),
+            Some(_) => {
+                tracing::warn!("ops: the outcome's notes are not a list and are skipped");
+                vec![]
+            }
+        };
+        Ok(Self { version, notes })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -297,8 +353,9 @@ impl OpsClient {
         Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/submitted"), Some(&body)).await?)
     }
 
-    pub async fn outcome(&self, short_id: &str, body: &Value) -> Result<u64, OpsError> {
-        Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/outcome"), Some(body)).await?)
+    /// `POST /cards/:id/outcome`: the new version and, when accepted, the notes the registry signed.
+    pub async fn outcome(&self, short_id: &str, body: &Value) -> Result<OutcomeAnswer, OpsError> {
+        OutcomeAnswer::of(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/outcome"), Some(body)).await?)
     }
 
     pub async fn renew_slot(&self, short_id: &str, slot: u8, body: &Value) -> Result<u64, OpsError> {
@@ -385,8 +442,8 @@ impl OpsClient {
     }
 
     /// `POST /cards/:id/load/outcome` (holder): the signatures, or `{accepted: false}`.
-    pub async fn load_outcome(&self, short_id: &str, body: &Value) -> Result<u64, OpsError> {
-        Self::version(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/load/outcome"), Some(body)).await?)
+    pub async fn load_outcome(&self, short_id: &str, body: &Value) -> Result<OutcomeAnswer, OpsError> {
+        OutcomeAnswer::of(&self.call(reqwest::Method::POST, &format!("/cards/{short_id}/load/outcome"), Some(body)).await?)
     }
 }
 
@@ -504,6 +561,9 @@ pub struct OpsLink {
     pub releases: Vec<RemoteRelease>,
     /// The card's stranded slots as ops last answered them ([`CardWallet::card_strands`]).
     pub stranded: Vec<RemoteStranded>,
+    /// The registry's certificate key this till keeps (hex SEC1, `till-ops.json`): the key a 4.0
+    /// card checks the registry's note signatures under. `None` when the till has none yet.
+    pub cert_key: Option<String>,
 }
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old path.
@@ -514,6 +574,86 @@ pub use fedimint_card_pos_core::short_id_of;
 pub struct Ops {
     pub client: OpsClient,
     cards_dir: PathBuf,
+}
+
+/// At most this many transactions a tap asks the registry again for the note signatures it has
+/// not given ([`CardWallet::ops_ask_reg_sigs`]): a slow registry costs a tap a bounded wait.
+pub const MAX_SIG_ASKS_PER_TAP: usize = 4;
+
+/// The wait before a transaction is asked again after its second fruitless asking in a row; it
+/// doubles with each one after, up to [`SIG_ASK_MOST_WAIT_MS`].
+pub const SIG_ASK_FIRST_WAIT_MS: u64 = 60_000;
+/// The longest wait between two askings of one transaction: a day.
+pub const SIG_ASK_MOST_WAIT_MS: u64 = 86_400_000;
+/// A holder's load is asked at the holder's route, which spends the card's hourly load budget:
+/// at most once in this long for a card, whatever the transaction.
+pub const LOAD_ASK_EVERY_MS: u64 = 3_600_000;
+
+/// How long a transaction waits before it is asked again after `misses` fruitless askings in a
+/// row: none after the first (the next tap asks once more, as a key may be back by then), then
+/// [`SIG_ASK_FIRST_WAIT_MS`], doubling up to [`SIG_ASK_MOST_WAIT_MS`].
+pub fn sig_ask_backoff_ms(misses: u32) -> u64 {
+    if misses < 2 {
+        return 0;
+    }
+    SIG_ASK_FIRST_WAIT_MS.saturating_mul(1u64 << (misses - 2).min(20)).min(SIG_ASK_MOST_WAIT_MS)
+}
+
+/// A note still waiting for the registry's signature: live, with the federation's, without the
+/// registry's.
+fn waits_for_reg_sig(n: &NoteRec) -> bool {
+    n.status == NoteStatus::Live && n.signature.is_some() && n.reg_sig.is_none()
+}
+
+/// The transactions a tap asks the registry again for note signatures, least recently asked
+/// first, at most [`MAX_SIG_ASKS_PER_TAP`]. Each has a live note with the federation's signature
+/// and not the registry's, is not open in ops (`open`) and owes no outcome or load in the outbox,
+/// so a repeat never decides anything, and is past its back-off. A holder's load (asked at the
+/// load route) is left out until the card's hourly load-route limit allows an asking, and at most
+/// one is in a tap, so waiting loads never take the places of the till's own charges. Forgets the
+/// askings of transactions that have no such note left.
+pub(crate) fn sig_asks_due(st: &mut CardState, open: &[String], now_ms: u64) -> Vec<String> {
+    let mut waiting: Vec<String> = vec![];
+    for n in st.notes.iter().filter(|n| waits_for_reg_sig(n)) {
+        if let Some(t) = &n.txid
+            && !waiting.contains(t)
+        {
+            waiting.push(t.clone());
+        }
+    }
+    st.sig_asks.retain(|t, _| waiting.contains(t));
+    let owed =
+        |t: &str| st.ops_outbox.iter().any(|w| matches!(w, OpsWrite::Outcome { txid, .. } | OpsWrite::Load { txid, .. } if txid == t));
+    let load_route_free = now_ms >= st.load_ask_ms.saturating_add(LOAD_ASK_EVERY_MS);
+    let mut due: Vec<(u64, bool, String)> = waiting
+        .into_iter()
+        .filter(|t| !open.contains(t) && !owed(t))
+        .filter_map(|t| match st.sig_asks.get(&t) {
+            None => Some((0, false, t)),
+            Some(a) if a.load && !load_route_free => None,
+            Some(a) if now_ms >= a.last_ms.saturating_add(sig_ask_backoff_ms(a.misses)) => Some((a.last_ms, a.load, t)),
+            Some(_) => None,
+        })
+        .collect();
+    due.sort_by_key(|(last, _, _)| *last);
+    let mut loads = 0;
+    due.retain(|(_, load, _)| {
+        loads += usize::from(*load);
+        !*load || loads == 1
+    });
+    due.into_iter().take(MAX_SIG_ASKS_PER_TAP).map(|(_, _, t)| t).collect()
+}
+
+/// The change a repeat of `txid`'s accepted outcome lists: only its notes still waiting for the
+/// registry's signature. The registry takes a repeat whose notes are among those it recorded
+/// (`cards.ts repeatMatches`); every note with the txid would not do, as the registry files an
+/// offline charge's inputs under it too, and a spent change note of an online charge keeps it.
+pub(crate) fn repeat_change(st: &CardState, txid: &str) -> Vec<Value> {
+    st.notes
+        .iter()
+        .filter(|n| n.txid.as_deref() == Some(txid) && waits_for_reg_sig(n))
+        .filter_map(|n| n.signature.as_ref().map(|s| json!({"nonce": n.nonce, "signature": s})))
+        .collect()
 }
 
 impl Ops {
@@ -531,6 +671,12 @@ impl Ops {
     pub async fn attach(&self, cw: &mut CardWallet) -> Result<StateStore> {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
         let base = self.attach_id(cw, &short_id_of(&pk)).await?;
+        // Live notes the registry has not signed yet (its key was off, or its signing failed):
+        // asked for again now, so this tap can write them to the card.
+        let asked = cw.ops_ask_reg_sigs().await;
+        if asked > 0 {
+            tracing::info!("card {}: {asked} note signature(s) from the registry on a repeat", short_id_of(&pk));
+        }
         // A 3.0 card: what the registry released (before planning, so this tap can use it), the
         // slots nothing explains (held out of this job's plans, reported as it ends), its clock,
         // any live note it lacks (a load or change finished elsewhere), then its spare reserve.
@@ -572,6 +718,7 @@ impl Ops {
             open: vec![],
             releases: vec![],
             stranded: vec![],
+            cert_key: self.cards_dir.parent().and_then(|d| crate::claim::read_cert_key(d).ok().flatten()),
         });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
@@ -652,7 +799,7 @@ impl CardWallet {
     /// release that does not take is logged and comes again with the card's next state.
     pub fn card_releases(&mut self) -> usize {
         let Some((releases, short_id)) = self.ops.as_ref().map(|l| (l.releases.clone(), l.short_id.clone())) else { return 0 };
-        if releases.is_empty() || !self.card_sign_once() {
+        if releases.is_empty() || !self.card_sign_once().unwrap_or(false) {
             return 0;
         }
         let st = match on_card(|| self.card.get_state()) {
@@ -717,7 +864,7 @@ impl CardWallet {
     pub fn card_strands(&mut self, data_dir: Option<&Path>) {
         self.store.state.held.clear();
         let Some(link) = self.ops.clone() else { return };
-        if !self.card_sign_once() {
+        if !self.card_sign_once().unwrap_or(false) {
             return;
         }
         let st = match on_card(|| self.card.get_state()) {
@@ -893,7 +1040,8 @@ impl CardWallet {
             self.ops_push().await?;
             remote = self.ops_fetch().await?;
         }
-        merge(&mut self.store.state, &remote);
+        let cert_key = self.ops.as_ref().and_then(|l| l.cert_key.clone());
+        merge_checked(&mut self.store.state, &remote, cert_key.as_deref());
         self.store.save()
     }
 
@@ -942,7 +1090,7 @@ impl CardWallet {
                 let change: Vec<Value> = change.iter().map(|(n, s)| json!({"nonce": n, "signature": s})).collect();
                 let body = json!({"txid": txid, "accepted": accepted, "change": change});
                 match link.client.outcome(id, &body).await {
-                    Ok(v) => Ok(v),
+                    Ok(a) => Ok(self.take_reg_sigs(a)),
                     // No such charge (its intent never reached ops) or resolved otherwise by
                     // another till: ops is right, and the next load brings this file in line.
                     Err(OpsError::Changed(m)) | Err(OpsError::UnknownCard(m)) => {
@@ -996,12 +1144,99 @@ impl CardWallet {
                 }
                 let sigs: Vec<Value> =
                     local.iter().map(|n| json!({"nonce": n.nonce, "signature": n.signature.as_deref().unwrap_or_default()})).collect();
-                link.client.outcome(id, &json!({"txid": txid, "accepted": true, "change": sigs})).await
+                link.client.outcome(id, &json!({"txid": txid, "accepted": true, "change": sigs})).await.map(|a| self.take_reg_sigs(a))
             }
         };
         let v = r?;
         self.ops.as_mut().expect("set").version = v;
         Ok(Sent::Done)
+    }
+
+    /// Ask the registry again for the signature of each note live in ops that has none, by
+    /// repeating its transaction's accepted outcome (`POST /cards/:id/outcome`; a holder's load,
+    /// which that route does not know, at `/load/outcome`), and keep what the answers sign. Only a
+    /// transaction ops no longer holds open and this till owes no write for, so a repeat never
+    /// decides anything; at most [`MAX_SIG_ASKS_PER_TAP`] a tap, and the first failure to reach
+    /// the registry ends the asking for this tap. Never fails the tap. Answers how many notes it
+    /// took a signature for.
+    pub async fn ops_ask_reg_sigs(&mut self) -> usize {
+        let Some(link) = self.ops.clone() else { return 0 };
+        let now = crate::claim::now_ms();
+        let due = sig_asks_due(&mut self.store.state, &link.open, now);
+        let waiting =
+            |s: &Self, t: &str| s.store.state.notes.iter().filter(|n| n.txid.as_deref() == Some(t) && n.reg_sig.is_none()).count();
+        let id = link.short_id.as_str();
+        let mut took = 0;
+        let mut changed = false;
+        for txid in due {
+            let change = repeat_change(&self.store.state, &txid);
+            let before = waiting(self, &txid);
+            let answer = if self.store.state.sig_asks.get(&txid).is_some_and(|a| a.load) {
+                Err(OpsError::UnknownCard("a holder's load".into()))
+            } else {
+                link.client.outcome(id, &json!({"txid": txid, "accepted": true, "change": change})).await
+            };
+            let answer = match answer {
+                // Not a transaction the registry knows: a holder's load, asked at its own route
+                // (`409` is a transaction it knows, and never comes here).
+                Err(OpsError::UnknownCard(_)) => {
+                    changed = true;
+                    self.store.state.sig_asks.entry(txid.clone()).or_default().load = true;
+                    if now < self.store.state.load_ask_ms.saturating_add(LOAD_ASK_EVERY_MS) {
+                        continue;
+                    }
+                    self.store.state.load_ask_ms = now;
+                    link.client.load_outcome(id, &json!({"txid": txid, "notes": change})).await
+                }
+                r => r,
+            };
+            match answer {
+                Ok(a) => {
+                    let v = self.take_reg_sigs(a);
+                    self.ops.as_mut().expect("set").version = v;
+                }
+                // A 429 (the holder's budget, which anyone with the short id can spend) is no
+                // answer about the transaction: like an unreachable registry, it is no miss.
+                Err(e @ (OpsError::Unreachable(_) | OpsError::Refused(429, _))) => {
+                    tracing::warn!("ops: note signatures not asked for this tap: {e}");
+                    break;
+                }
+                Err(e) => tracing::warn!("ops: no note signatures from a repeat of {txid}: {e}"),
+            }
+            changed = true;
+            let got = before.saturating_sub(waiting(self, &txid));
+            took += got;
+            let a = self.store.state.sig_asks.entry(txid).or_default();
+            a.last_ms = now;
+            if got == 0 {
+                a.misses = a.misses.saturating_add(1);
+            }
+        }
+        if changed && let Err(e) = self.store.save() {
+            tracing::warn!("ops: the note signatures asked for are not saved yet: {e:#}");
+        }
+        took
+    }
+
+    /// Keep the registry's signature for each note an outcome's answer lists, on the local note with
+    /// that nonce and slot. Answers the answer's version.
+    /// A signature the till can tell is wrong ([`crate::glue::reg_sig_kept`]) is not kept: the
+    /// note waits and is asked for again.
+    fn take_reg_sigs(&mut self, a: OutcomeAnswer) -> u64 {
+        let cert_key = self.ops.as_ref().and_then(|l| l.cert_key.clone());
+        for s in &a.notes {
+            let st = &self.store.state;
+            let Some(i) = st.notes.iter().position(|n| n.nonce == s.nonce && n.slot == s.slot) else {
+                tracing::warn!("ops: the registry signed a note this till does not hold (slot {})", s.slot);
+                continue;
+            };
+            if !crate::glue::reg_sig_kept(st, cert_key.as_deref(), &st.notes[i], &s.reg_sig) {
+                tracing::warn!("ops: the registry's signature over the note on slot {} does not hold; the note waits", s.slot);
+                continue;
+            }
+            self.store.state.notes[i].reg_sig = Some(s.reg_sig.clone());
+        }
+        a.version
     }
 
     /// Queue `w`, replacing an earlier entry for the same transaction or slot.
@@ -1089,7 +1324,7 @@ impl CardWallet {
     pub async fn card_spares(&mut self, released: usize, written: usize) -> Result<SpareReport> {
         let mut rep = SpareReport::default();
         let Some(link) = self.ops.clone() else { return Ok(rep) };
-        if self.spares.target == 0 || self.spares.max_per_tap == 0 || !self.card_sign_once() {
+        if self.spares.target == 0 || self.spares.max_per_tap == 0 || !self.card_sign_once()? {
             return Ok(rep);
         }
         let st = on_card(|| self.card.get_state()).context("GET_STATE")?;
@@ -1216,6 +1451,13 @@ fn queued_txids(data_dir: Option<&Path>, short_id: &str) -> Vec<String> {
 /// Replace the card side of `st` with `remote`, keeping what only this till knows: its own
 /// outputs, its unsent writes and the history of keys ops no longer reports.
 pub fn merge(st: &mut CardState, remote: &RemoteState) {
+    merge_checked(st, remote, None)
+}
+
+/// [`merge`], keeping a registry signature over a note only where
+/// [`crate::glue::reg_sig_kept`] does under `cert_key`: the till's own copy stands in for one
+/// that does not hold, and without either the note waits and is asked for again.
+pub fn merge_checked(st: &mut CardState, remote: &RemoteState, cert_key: Option<&str>) {
     // Slots: ops's keys, with this till's renewals that ops has not taken yet laid over them.
     st.slots = remote.slots.iter().map(|s| SlotRec { slot: s.slot, pubkey: s.pubkey.clone(), unknown: false }).collect();
     st.slots.sort_by_key(|s| s.slot);
@@ -1239,6 +1481,9 @@ pub fn merge(st: &mut CardState, remote: &RemoteState) {
         })
         .flatten()
         .collect();
+    // A signature this till already holds is kept if ops's copy lacks it.
+    let held: std::collections::HashMap<String, String> =
+        st.notes.iter().filter_map(|n| Some((n.nonce.clone(), n.reg_sig.clone()?))).collect();
     let kept: Vec<NoteRec> = st
         .notes
         .drain(..)
@@ -1257,9 +1502,21 @@ pub fn merge(st: &mut CardState, remote: &RemoteState) {
             blinding_key: n.blinding_key.clone(),
             txid: n.txid.clone(),
             out_idx: n.out_idx,
+            reg_sig: n.reg_sig.clone().or_else(|| held.get(&n.nonce).cloned()),
         })
         .chain(kept)
         .collect();
+    for i in 0..st.notes.len() {
+        let Some(sig) = st.notes[i].reg_sig.clone() else { continue };
+        if crate::glue::reg_sig_kept(st, cert_key, &st.notes[i], &sig) {
+            continue;
+        }
+        let ours = held.get(&st.notes[i].nonce).filter(|h| **h != sig && crate::glue::reg_sig_kept(st, cert_key, &st.notes[i], h)).cloned();
+        if ours.is_none() {
+            tracing::warn!("ops: the registry's signature over the note on slot {} does not hold; the note waits", st.notes[i].slot);
+        }
+        st.notes[i].reg_sig = ours;
+    }
 
     // Open charges: each becomes a `PendingTx`, so `resolve_pending` finishes it. Without signed
     // bytes it is abandoned (recorded rejected); with them it is resubmitted and recorded as the
@@ -1288,11 +1545,13 @@ pub fn merge(st: &mut CardState, remote: &RemoteState) {
     }
 }
 
-/// Whether `err` is the card refusing the holder's PIN (`63 CX`, or blocked).
+/// Whether `err` is the card refusing the holder's PIN (`63 CX`: wrong, X in a row) or a PIN wait
+/// the card was taken from (`pin_wait`): either way no PIN was taken.
 pub fn pin_refused(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|c| c.downcast_ref::<fedimint_card_host_card::StatusWord>())
-        .any(|s| matches!(s.0, 0x63C0..=0x63CF | fedimint_card_host_card::SW_PIN_BLOCKED))
+    err.chain().any(|c| {
+        c.downcast_ref::<fedimint_card_host_card::StatusWord>().is_some_and(|s| matches!(s.0, 0x63C0..=0x63CF))
+            || c.downcast_ref::<fedimint_card_pos_core::PinWait>().is_some()
+    })
 }
 
 /// Whether ops gave no definitive answer (unreachable, timed out, 5xx): the write may or may not
@@ -1322,7 +1581,17 @@ mod tests {
     use fedimint_core::secp256k1::XOnlyPublicKey;
 
     fn note(nonce: &str, slot: u8, status: NoteStatus) -> NoteRec {
-        NoteRec { slot, amount_msat: 1024, nonce: nonce.into(), signature: None, status, blinding_key: None, txid: None, out_idx: None }
+        NoteRec {
+            slot,
+            amount_msat: 1024,
+            nonce: nonce.into(),
+            signature: None,
+            status,
+            blinding_key: None,
+            txid: None,
+            out_idx: None,
+            reg_sig: None,
+        }
     }
 
     fn remote(notes: Vec<RemoteNote>, open: Vec<RemoteTx>) -> RemoteState {
@@ -1414,6 +1683,7 @@ mod tests {
                 status: NoteStatus::Spent,
                 txid: None,
                 out_idx: None,
+                reg_sig: None,
             }],
             vec![
                 RemoteTx {
@@ -1517,5 +1787,151 @@ mod tests {
         st.ops_outbox.clear();
         merge(&mut st, &remote(vec![], vec![]));
         assert!(st.notes.is_empty());
+    }
+
+    #[test]
+    fn an_outcome_answer_keeps_only_the_notes_the_registry_signed() {
+        let a = OutcomeAnswer::of(&json!({"version": 7, "notes": [
+            {"slot": 1, "nonce": "02aa", "reg_sig": "3006020101020101"},
+            {"slot": 2, "nonce": "02bb", "reg_sig": null},
+        ]}))
+        .unwrap();
+        assert_eq!(a.version, 7);
+        assert_eq!(a.notes, vec![SignedNote { slot: 1, nonce: "02aa".into(), reg_sig: "3006020101020101".into() }]);
+        // A registry older than note signatures answers no notes at all.
+        assert_eq!(OutcomeAnswer::of(&json!({"version": 3})).unwrap(), OutcomeAnswer { version: 3, notes: vec![] });
+        assert!(OutcomeAnswer::of(&json!({"notes": []})).is_err(), "an answer without a version is not taken");
+    }
+
+    #[test]
+    fn merge_carries_the_registrys_signature_and_keeps_one_the_till_holds() {
+        let mut st = CardState::default();
+        let mut held = note("02bb", 1, NoteStatus::Live);
+        held.reg_sig = Some("aa".into());
+        st.notes.push(held);
+        let theirs = |nonce: &str, slot: u8, reg_sig: Option<&str>| RemoteNote {
+            slot,
+            amount_msat: 1024,
+            nonce: nonce.into(),
+            signature: None,
+            blinding_key: None,
+            status: NoteStatus::Live,
+            txid: None,
+            out_idx: None,
+            reg_sig: reg_sig.map(Into::into),
+        };
+        merge(&mut st, &remote(vec![theirs("02aa", 0, Some("cc")), theirs("02bb", 1, None), theirs("02dd", 2, None)], vec![]));
+        let sig = |nonce: &str| st.notes.iter().find(|n| n.nonce == nonce).unwrap().reg_sig.clone();
+        assert_eq!(sig("02aa").as_deref(), Some("cc"));
+        assert_eq!(sig("02bb").as_deref(), Some("aa"));
+        assert_eq!(sig("02dd"), None);
+    }
+
+    /// A live note of `txid` with the federation's signature and no registry signature.
+    fn waiting(nonce: &str, slot: u8, txid: &str) -> NoteRec {
+        let mut n = note(nonce, slot, NoteStatus::Live);
+        n.signature = Some("ab".into());
+        n.txid = Some(txid.into());
+        n.reg_sig = None;
+        n
+    }
+
+    #[test]
+    fn an_outcome_answer_skips_an_entry_that_does_not_parse_and_needs_only_the_version() {
+        let a = OutcomeAnswer::of(&json!({"version": 4, "notes": [
+            {"slot": "one", "nonce": "02aa", "reg_sig": "30"},
+            7,
+            {"slot": 2, "nonce": "02bb", "reg_sig": 5},
+            {"slot": 3, "nonce": "02cc", "reg_sig": "3006"},
+        ]}))
+        .unwrap();
+        assert_eq!(a, OutcomeAnswer { version: 4, notes: vec![SignedNote { slot: 3, nonce: "02cc".into(), reg_sig: "3006".into() }] });
+        assert_eq!(OutcomeAnswer::of(&json!({"version": 5, "notes": {"slot": 1}})).unwrap().notes, vec![]);
+        assert!(OutcomeAnswer::of(&json!({"notes": []})).is_err(), "no version");
+    }
+
+    #[test]
+    fn a_repeat_never_asks_for_a_transaction_open_in_ops_or_owed_in_the_outbox() {
+        let mut st = CardState {
+            notes: vec![waiting("02aa", 0, "open"), waiting("02bb", 1, "owed"), waiting("02cc", 2, "loading"), waiting("02dd", 3, "done")],
+            ops_outbox: vec![
+                OpsWrite::Outcome { txid: "owed".into(), accepted: true, change: vec![] },
+                OpsWrite::Load { txid: "loading".into(), client_ref: "r".into(), notes: vec![] },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(sig_asks_due(&mut st, &["open".to_string()], 1_000), vec!["done".to_string()]);
+    }
+
+    #[test]
+    fn a_transaction_that_brings_nothing_backs_off_and_leaves_its_place_to_the_others() {
+        assert_eq!((0..4).map(sig_ask_backoff_ms).collect::<Vec<_>>(), vec![0, 0, 60_000, 120_000]);
+        assert_eq!(sig_ask_backoff_ms(40), SIG_ASK_MOST_WAIT_MS);
+        let mut st = CardState { notes: (0..6).map(|i| waiting(&format!("02a{i}"), i, &format!("t{i}"))).collect(), ..Default::default() };
+        let now = 10_000_000;
+        for i in 0..4 {
+            st.sig_asks.insert(format!("t{i}"), crate::state::SigAsk { last_ms: now - 30_000, misses: 2, load: false });
+        }
+        st.sig_asks.insert("t4".into(), crate::state::SigAsk { last_ms: now - 200_000, misses: 3, load: false });
+        st.sig_asks.insert("gone".into(), crate::state::SigAsk { last_ms: 0, misses: 9, load: false });
+        // t0..t3 wait out their minute; t5 was never asked, t4 is past its two minutes.
+        assert_eq!(sig_asks_due(&mut st, &[], now), vec!["t5".to_string(), "t4".to_string()]);
+        assert!(!st.sig_asks.contains_key("gone"), "a transaction with nothing waiting is forgotten");
+        // A minute on, all are due, least recently asked first, four a tap.
+        assert_eq!(sig_asks_due(&mut st, &[], now + 60_000), ["t5", "t4", "t0", "t1"].map(String::from).to_vec());
+    }
+
+    #[test]
+    fn a_repeat_lists_only_the_notes_of_its_transaction_still_waiting() {
+        let mut st = CardState::default();
+        // An offline charge's input carries its txid too (the registry files it so), and is spent.
+        let mut spent = waiting("02aa", 0, "t1");
+        spent.status = NoteStatus::Spent;
+        let mut signed = waiting("02dd", 3, "t1");
+        signed.reg_sig = Some("ab".into());
+        st.notes = vec![spent, waiting("02bb", 1, "t1"), signed, waiting("02cc", 2, "t2")];
+        let nonces: Vec<String> = repeat_change(&st, "t1").iter().map(|c| c["nonce"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(nonces, vec!["02bb"]);
+    }
+
+    #[test]
+    fn a_load_the_hourly_limit_holds_back_leaves_the_taps_places_to_the_tills_own_charges() {
+        let mut st = CardState { notes: (0..6).map(|i| waiting(&format!("02a{i}"), i, &format!("t{i}"))).collect(), ..Default::default() };
+        let now = 10_000_000;
+        st.load_ask_ms = now - 600_000;
+        for i in 0..4 {
+            st.sig_asks.insert(format!("t{i}"), crate::state::SigAsk { last_ms: now - 900_000, misses: 0, load: true });
+        }
+        st.sig_asks.insert("t4".into(), crate::state::SigAsk { last_ms: now - 1_000, misses: 0, load: false });
+        // Four holder loads wait out the hour; the till's own charge t4 and the new t5 are asked.
+        assert_eq!(sig_asks_due(&mut st, &[], now), vec!["t5".to_string(), "t4".to_string()]);
+        // Once the hour is up, one load a tap (only one can reach the load route), then the rest.
+        let later = now - 600_000 + LOAD_ASK_EVERY_MS;
+        assert_eq!(sig_asks_due(&mut st, &[], later), ["t5", "t0", "t4"].map(String::from).to_vec());
+    }
+
+    #[test]
+    fn merge_drops_a_signature_the_card_refused() {
+        let mut st = CardState::default();
+        st.refuse_reg_sig("cc");
+        let theirs = |nonce: &str, reg_sig: &str| {
+            let mut n = remote(vec![], vec![]);
+            n.notes.push(RemoteNote {
+                slot: 0,
+                amount_msat: 1024,
+                nonce: nonce.into(),
+                signature: None,
+                blinding_key: None,
+                status: NoteStatus::Live,
+                txid: None,
+                out_idx: None,
+                reg_sig: Some(reg_sig.into()),
+            });
+            n
+        };
+        merge(&mut st, &theirs("02aa", "cc"));
+        assert_eq!(st.notes[0].reg_sig, None, "refused once, never kept again");
+        merge(&mut st, &theirs("02aa", "dd"));
+        assert_eq!(st.notes[0].reg_sig.as_deref(), Some("dd"));
     }
 }

@@ -559,6 +559,12 @@ pub fn verify_note(registry_key: &p256::ecdsa::VerifyingKey, slot_x: &[u8; 32], 
     p256::ecdsa::Signature::from_der(der).is_ok_and(|sig| registry_key.verify(&note_message(slot_x, amount_msat, sig48), &sig).is_ok())
 }
 
+/// The registry key from its point as `/registry/cert-key` gives it (SEC1), or `None` when it
+/// does not parse.
+pub fn registry_key_of(point: &[u8]) -> Option<p256::ecdsa::VerifyingKey> {
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(point).ok()
+}
+
 /// The registry key the tests use: a TEST key, private key 1 (its public key is P-256's
 /// generator), the applet tests' `TEST_REGISTRY_KEY`. Never a deployment key.
 pub fn test_registry_key() -> p256::ecdsa::SigningKey {

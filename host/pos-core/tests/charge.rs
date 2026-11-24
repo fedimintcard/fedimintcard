@@ -162,7 +162,7 @@ fn a_kit_with_a_header_sets_the_cards_clock_and_pays() {
     let fx = Fx::new(true);
     let (_dir, s) = store();
     let card = fx.card(32, &[1 << 16]);
-    assert_eq!(clock_of(&card), 0);
+    assert!(clock_of(&card) < T, "set up at an older header");
     let mut kit = fx.kit(s.phone_id(), 8, now_ms(), DAY_MS);
     kit.block_header = Some(H900200.into());
     let t = take(&s, &card, &serde_json::to_string(&kit).unwrap(), 20_000, "header").unwrap();
@@ -226,6 +226,7 @@ fn the_cards_clock_rechecks_the_kits_expiry() {
         keyed_ok: None,
         now_ms: T * 1_000 - 10 * DAY_MS,
         expires_at_ms: Some(expires_at_ms),
+        holding: None,
     };
     let card = fx.card(32, &[1 << 16]);
     let r = charge(&mut client(card.clone()), &queue, &env(T * 1_000 - DAY_MS), 20_000, Some("late-by-the-card"));
@@ -383,7 +384,7 @@ fn a_note_that_does_not_check_is_refused_as_invalid() {
     let (_dir, s) = store();
     // A note from another mint: the kit's keys do not verify it.
     let card = fx.card(32, &[]);
-    SoftMint::powers_of_two(32).load(&mut card.0.lock().unwrap(), 0, 1 << 16).unwrap();
+    SoftMint::powers_of_two(32).load_with(&mut card.0.lock().unwrap(), 0, 1 << 16, &fx.registry).unwrap();
     let r = take(&s, &card, &fx.kit_json(s.phone_id()), 20_000, "forged");
     let f = refusal(r.as_ref().err().unwrap());
     assert_eq!((f.status, f.code), (403, "offline_note_invalid"), "{}", f.detail);
@@ -402,7 +403,7 @@ fn a_clone_without_the_certified_attestation_key_is_refused() {
 }
 
 #[test]
-fn a_wrong_pin_says_the_tries_left_and_a_malformed_one_spends_none() {
+fn a_wrong_pin_says_the_wrong_tries_and_the_wait_and_a_malformed_one_spends_none() {
     let fx = Fx::new(true);
     let (_dir, s) = store();
     let card = fx.card(32, &[1 << 16]);
@@ -414,10 +415,120 @@ fn a_wrong_pin_says_the_tries_left_and_a_malformed_one_spends_none() {
     }
     let (r, _) = take_counted(&s, &card, &json, 20_000, "pin", b"9999");
     let f = refusal(r.as_ref().err().unwrap());
-    assert_eq!((f.code, f.tries_left), ("wrong_pin", Some(2)), "two tries left: none was spent before");
+    assert_eq!((f.status, f.code, f.wrong_tries, f.wait_s), (403, "wrong_pin", Some(1), Some(1)), "none was spent before");
+    // The second try first serves its one asking (the card answers 6A98 once), then is wrong.
     let (r, _) = take_counted(&s, &card, &json, 20_000, "pin", b"9998");
-    assert_eq!(refusal(r.as_ref().err().unwrap()).tries_left, Some(1));
-    assert!(take(&s, &card, &json, 20_000, "pin").is_ok(), "the right PIN pays and resets the tries");
+    let f = refusal(r.as_ref().err().unwrap());
+    assert_eq!((f.wrong_tries, f.wait_s), (Some(2), Some(2)), "{}", f.detail);
+    assert_eq!(card.0.lock().unwrap().get_state().unwrap().owed, 2, "the next try owes two askings");
+    assert!(take(&s, &card, &json, 20_000, "pin").is_ok(), "the right PIN, its wait served, pays and resets the count");
+    let st = card.0.lock().unwrap().get_state().unwrap();
+    assert_eq!((st.wrong_tries, st.owed), (0, 0));
+}
+
+/// Fails every APDU once `verifies` VERIFY_PINs (`INS 40`) went through: the card taken away
+/// while it serves a PIN wait.
+struct PullAtVerify {
+    inner: SoftTransport,
+    verifies: usize,
+}
+
+impl Transport for PullAtVerify {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if apdu.get(1) == Some(&0x40) {
+            if self.verifies == 0 {
+                return Err(BridgeError::NoCard("the card left during the wait".into()).into());
+            }
+            self.verifies -= 1;
+        }
+        self.inner.transmit(apdu)
+    }
+}
+
+/// A card taken away while it serves its PIN wait: `pin_wait` with about the seconds it still
+/// owes, no try counted and nothing charged; the retap held long enough pays. While the card is
+/// held, `holding` hears the seconds left, never rising, down to 0.
+#[test]
+fn a_card_taken_away_during_its_pin_wait_is_pin_wait_and_the_held_retap_pays() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16]);
+    let json = fx.kit_json(s.phone_id());
+    card.0.lock().unwrap().set_pin_marks(4, 8);
+    let r = s.charge(&mut CardClient::new(PullAtVerify { inner: card.clone(), verifies: 3 }), &json, 20_000, "wait", b"1234");
+    let f = refusal(r.as_ref().err().unwrap());
+    assert_eq!((f.status, f.code, f.wrong_tries), (423, "pin_wait", None), "{}", f.detail);
+    assert_eq!(f.wait_s, Some(4), "5 of 8 askings left, at 0.75 s");
+    assert!(f.detail.starts_with("hold the card"), "{}", f.detail);
+    assert_eq!(card.0.lock().unwrap().get_state().unwrap().wrong_tries, 4, "no try was counted");
+    assert_eq!((s.stats().waiting, s.stats().signing), (0, 0));
+    // Held: the wait is served from the card's own count, and `holding` hears it go down.
+    let mut c = client(card.clone());
+    c.select().unwrap();
+    let heard = std::cell::RefCell::new(vec![]);
+    let holding = |sec: u32| heard.borrow_mut().push(sec);
+    fedimint_card_pos_core::charge::open_pin(&mut c, &Pin::Verify(TEST_PIN.to_vec()), Some(&holding)).unwrap();
+    let heard = heard.into_inner();
+    assert_eq!((heard.first(), heard.last(), heard.len()), (Some(&6), Some(&0), 9), "{heard:?}");
+    assert!(heard.windows(2).all(|w| w[0] >= w[1]), "{heard:?}");
+    card.0.lock().unwrap().set_pin_marks(1, 1);
+    let t = take(&s, &card, &json, 20_000, "wait").unwrap();
+    assert_eq!(t.charge.state, ChargeState::Queued);
+}
+
+/// The rule for every reader: a card older than applet 4.0, over the phone's transport or as the
+/// card itself, is `old_card` with the old-card message, and it hears no PIN command.
+#[test]
+fn an_old_card_is_refused_with_the_old_card_message_before_any_pin_command() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let json = fx.kit_json(s.phone_id());
+    for old in [fedimint_card_host_card::SoftCard::v3(), fedimint_card_host_card::SoftCard::new()] {
+        let t = SoftTransport::new(old);
+        let n = Arc::new(Mutex::new(0));
+        let mut c = CardClient::new(PinCounted { inner: t, pins: n.clone() });
+        let f = refusal(&s.charge(&mut c, &json, 20_000, "old", b"1234").unwrap_err());
+        assert_eq!((f.status, f.code, f.detail.as_str()), (409, "old_card", fedimint_card_host_card::OLD_CARD_MESSAGE));
+        assert_eq!(*n.lock().unwrap(), 0, "no PIN command reached the card");
+    }
+    let mut direct = fedimint_card_host_card::SoftCard::new();
+    assert_eq!(code(&s.charge(&mut direct, &json, 20_000, "old", b"1234")), "old_card");
+}
+
+/// Counts the PIN commands (`INS 40`, `41`, `42`) that reach the card.
+struct PinCounted {
+    inner: SoftTransport,
+    pins: Arc<Mutex<usize>>,
+}
+
+impl Transport for PinCounted {
+    fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if matches!(apdu.get(1), Some(0x40..=0x42)) {
+            *self.pins.lock().unwrap() += 1;
+        }
+        self.inner.transmit(apdu)
+    }
+}
+
+/// SIGN's `6F00`: the card's signature failed its own check and it stored none. The charge is
+/// `sign_check_failed`, nothing is queued or marked spent, every note is still on the card, and
+/// the next tap of the same sale pays.
+#[test]
+fn a_signature_the_card_refuses_after_its_own_check_spends_nothing_and_the_retap_pays() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16]);
+    let json = fx.kit_json(s.phone_id());
+    let notes = slots_in(&card, SlotState::Note);
+    card.0.lock().unwrap().fail_next_sign_check();
+    let f = refusal(&take(&s, &card, &json, 20_000, "check").unwrap_err());
+    assert_eq!((f.status, f.code), (409, "sign_check_failed"));
+    assert!(f.detail.contains("nothing was spent, tap again"), "{}", f.detail);
+    assert_eq!(slots_in(&card, SlotState::Note), notes, "every note is still on the card");
+    assert!(spent_hashes(&card).is_empty());
+    assert!(s.charges().is_empty(), "nothing queued, nothing left signing");
+    let t = take(&s, &card, &json, 20_000, "check").unwrap();
+    assert_eq!((t.charge.state, t.replayed), (ChargeState::Queued, false));
 }
 
 // ------------------------------------------------------------------ replays
@@ -514,7 +625,7 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
             c.sign(unsigned, &[7; 32]).unwrap();
             if rekeyed {
                 c.gen_key_overwrite(unsigned).unwrap();
-                fx.mint.load(&mut c, unsigned, 1 << 16).unwrap();
+                fx.mint.load_with(&mut c, unsigned, 1 << 16, &fx.registry).unwrap();
             }
         }
         let t = take(&s, &card, &json, 90_000, "half").unwrap_or_else(|e| panic!("{what}: {e:#}"));
@@ -825,6 +936,7 @@ fn a_charge_left_signing_is_resumed_with_no_env_and_no_second_charge() {
         keyed_ok: None,
         now_ms: now,
         expires_at_ms: Some(now + DAY_MS),
+        holding: None,
     };
     let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]);
     // 90,000 msat takes two notes; the card leaves at the second SIGN, the sale undecided.

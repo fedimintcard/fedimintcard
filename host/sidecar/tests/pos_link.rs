@@ -81,12 +81,23 @@ async fn fx(notes: &[u64]) -> anyhow::Result<Fx> {
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let card = Arc::new(Mutex::new(SoftCard::new()));
+    let card = Arc::new(Mutex::new(SoftCard::v4()));
     let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone())));
     cw.card_setup(false)?;
+    fedimint_card_host_card::softkit::ready_for_pin(cw.card.as_mut())?;
     open_pin_session(cw.card.as_mut())?;
     if !notes.is_empty() {
         cw.topup(notes).await?;
+        // This till has no registry: the test stands in for it, signing each new note under the
+        // test registry key the card was set up with, and the till writes them to the card.
+        let key = fedimint_card_host_card::v3::test_registry_key();
+        for n in cw.store.state.notes.iter_mut().filter(|n| n.reg_sig.is_none() && n.signature.is_some()) {
+            let x: [u8; 32] = hex::decode(&n.nonce[2..])?.try_into().unwrap();
+            let sig48 = fedimint_card_sidecar::glue::sig48_of(n.signature.as_deref().unwrap()).unwrap();
+            n.reg_sig = Some(hex::encode(fedimint_card_host_card::v3::sign_note(&key, &x, n.amount_msat, &sig48)));
+        }
+        cw.store.save()?;
+        assert_eq!(cw.sync_card_notes(), notes.len(), "every note on the card");
     }
     Ok(Fx { _fed: fed, cw, card, dir })
 }

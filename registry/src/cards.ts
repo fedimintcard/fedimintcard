@@ -846,7 +846,9 @@ export function recordIntent(
  * offline one held them pending under its txid, and they are live again).
  * Any till of the operator may record it, so a charge whose till died is
  * finished by the next one to see the card. A repeat of the recorded outcome
- * answers 200; a different one is a 409.
+ * answers 200, and so does one that sends only some of its change (a till asks
+ * again with the notes still waiting for a signature: `repeatMatches`); any
+ * other is a 409.
  *
  * `release` names, for a charge newly recorded rejected, every slot the card
  * may have left SPENT (its inputs') or CHANGE (its change's) for it: the
@@ -854,7 +856,7 @@ export function recordIntent(
  * touched the card's slot states and has none.
  *
  * `sign` names, for an accepted charge, the change notes that passed the federation check and
- * are now live; on a repeat, those of them still unsigned. The caller signs them (`signNotes`).
+ * are now live; on a repeat, those of them it sent still unsigned. The caller signs them (`signNotes`).
  */
 export function recordOutcome(
   storage: DurableObjectStorage,
@@ -896,9 +898,9 @@ export function recordOutcome(
       throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
     }
     if (tx.status !== 'open') {
-      if (tx.outcome === outcome) {
-        const body = JSON.parse(tx.body) as {change: ChangeOut[]};
-        const sign = r.accepted ? unsignedLive(sql, shortId, body.change.map(c => c.nonce)) : [];
+      if (repeatMatches(tx.outcome, r.accepted as boolean, signatures)) {
+        // Only the notes the repeat sent, all of them this charge's change.
+        const sign = r.accepted ? unsignedLive(sql, shortId, [...signatures.keys()]) : [];
         return {version: versionOf(sql, shortId), replayed: true, release: null, sign};
       }
       throw new Conflict(`charge ${String(r.txid)} is already resolved differently`);
@@ -974,6 +976,26 @@ export function recordOutcome(
     );
     return {version: bump(sql, shortId), replayed: false, release, sign};
   });
+}
+
+/**
+ * Whether a repeat matches the outcome recorded (`recorded`, as `recordOutcome` and
+ * `recordLoadOutcome` store it): the same `accepted`, and every sent `{nonce, signature}` among the
+ * recorded ones. Fewer is a match: a till repeats with only the notes still waiting for the
+ * registry's signature, which leaves out its spent ones and any already signed (an offline
+ * charge's inputs carry its txid too, so "every note with the txid" is never the recorded set).
+ * A note or a signature not recorded is no match.
+ */
+export function repeatMatches(recorded: string | null, accepted: boolean, sent: ReadonlyMap<string, string>): boolean {
+  if (recorded === null) {
+    return false;
+  }
+  const r = JSON.parse(recorded) as {accepted: boolean; change?: [string, string][]; notes?: [string, string][]};
+  if (r.accepted !== accepted) {
+    return false;
+  }
+  const pairs = new Map(r.change ?? r.notes ?? []);
+  return [...sent].every(([nonce, signature]) => pairs.get(nonce) === signature);
 }
 
 /**

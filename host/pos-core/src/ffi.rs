@@ -13,7 +13,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use fedimint_card_host_card::{BridgeError, CardClient, SELECT_APDU, Transport};
+use fedimint_card_host_card::{BridgeError, CardClient, Transport};
 
 use crate::charge::Taken;
 use crate::refusal::refusal;
@@ -48,23 +48,25 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for TransportError {
     }
 }
 
-/// The card behind the app's transport, as the card crate's `Transport`: it selects the applet
-/// before its first command (so the card hears nothing until the core has checked the kit and
-/// the request), and a failed APDU is [`BridgeError::NoCard`].
+/// Told while the card serves a PIN wait (applet 4.0): about how many seconds the holder must
+/// still hold the card, first before the wait and last 0. The app shows "Hold the card, about N s".
+/// Called on the charge's thread; it must return quickly.
+#[uniffi::export(with_foreign)]
+pub trait PinWaitProgress: Send + Sync {
+    fn holding(&self, seconds_left: u32);
+}
+
+/// The card behind the app's transport, as the card crate's `Transport`: each APDU as it is, and
+/// a failed one is [`BridgeError::NoCard`]. It never selects by itself: the charge sends SELECT
+/// through the `CardClient`, after it has checked the kit and the request, so the card library
+/// applies the rule for every reader (applet 4.x, else `old_card`) before any PIN command.
 struct Nfc {
     t: Arc<dyn ApduTransport>,
-    selected: bool,
 }
 
 impl Transport for Nfc {
     fn transmit(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let lost = |e: TransportError| anyhow::Error::new(BridgeError::NoCard(e.to_string()));
-        if !self.selected {
-            // A card without the applet answers a status word; its first command then says so.
-            self.t.transmit(SELECT_APDU.to_vec()).map_err(lost)?;
-            self.selected = true;
-        }
-        self.t.transmit(apdu.to_vec()).map_err(lost)
+        self.t.transmit(apdu.to_vec()).map_err(|e| anyhow::Error::new(BridgeError::NoCard(e.to_string())))
     }
 }
 
@@ -115,14 +117,16 @@ pub enum ChargeOutcome {
     },
     /// Not charged: `code` is the till API's (docs/TILL-API.md); a code the app does not know is a
     /// card error. The prices are `offline_no_change_room`'s and `offline_pool_exhausted`'s;
-    /// `tries_left` is `wrong_pin`'s.
+    /// `wrong_tries` is `wrong_pin`'s (the wrong tries in a row); `wait_s` is `pin_wait`'s (about
+    /// how long the card still owes: tap again and hold it) and `wrong_pin`'s (the next try's).
     Refused {
         code: String,
         detail: String,
         suggested_msat: Option<u64>,
         below_msat: Option<u64>,
         above_msat: Option<u64>,
-        tries_left: Option<u8>,
+        wrong_tries: Option<u8>,
+        wait_s: Option<u32>,
     },
 }
 
@@ -214,6 +218,23 @@ impl PosCore {
         guarded("charge", || Ok(self.charge_now(transport, &kit_json, price_msat, &client_ref, &pin)))
     }
 
+    /// [`charge`](Self::charge), with `progress` told the seconds left while the card serves a PIN
+    /// wait, so the app can say how long to hold the card.
+    pub fn charge_held(
+        &self,
+        transport: Arc<dyn ApduTransport>,
+        kit_json: String,
+        price_msat: u64,
+        client_ref: String,
+        pin: String,
+        progress: Arc<dyn PinWaitProgress>,
+    ) -> Result<ChargeOutcome, PosCoreError> {
+        guarded("charge", || {
+            let tell = |s: u32| progress.holding(s);
+            Ok(self.charge_now_held(transport, &kit_json, price_msat, &client_ref, &pin, Some(&tell)))
+        })
+    }
+
     pub fn stats(&self) -> Result<PhoneStats, PosCoreError> {
         guarded("stats", || {
             let s: store::PhoneStats = self.store.stats();
@@ -267,8 +288,20 @@ impl PosCore {
 
 impl PosCore {
     fn charge_now(&self, transport: Arc<dyn ApduTransport>, kit_json: &str, price_msat: u64, client_ref: &str, pin: &str) -> ChargeOutcome {
-        let mut card = CardClient::new(Nfc { t: transport, selected: false });
-        match self.store.charge(&mut card, kit_json, price_msat, client_ref, pin.as_bytes()) {
+        self.charge_now_held(transport, kit_json, price_msat, client_ref, pin, None)
+    }
+
+    fn charge_now_held(
+        &self,
+        transport: Arc<dyn ApduTransport>,
+        kit_json: &str,
+        price_msat: u64,
+        client_ref: &str,
+        pin: &str,
+        holding: Option<&dyn Fn(u32)>,
+    ) -> ChargeOutcome {
+        let mut card = CardClient::new(Nfc { t: transport });
+        match self.store.charge_held(&mut card, kit_json, price_msat, client_ref, pin.as_bytes(), holding) {
             Ok(Taken { charge: c, replayed }) => ChargeOutcome::Paid {
                 txid: c.txid.clone(),
                 price_msat: c.price_msat,
@@ -288,7 +321,8 @@ impl PosCore {
                     suggested_msat: r.suggested_msat,
                     below_msat: r.below_msat,
                     above_msat: r.above_msat,
-                    tries_left: r.tries_left,
+                    wrong_tries: r.wrong_tries,
+                    wait_s: r.wait_s,
                 }
             }
         }

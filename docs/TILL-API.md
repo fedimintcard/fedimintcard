@@ -169,7 +169,7 @@ the tap needs the holder's PIN), queued, reported in the same tap and recorded a
 sale. A charge none of whose inputs the card signed is dropped. One that can never be finished is
 set aside as above. The slots of a dropped or set aside charge are stranded slots, held and
 reported in the same tap. A failure of this step is logged and the tap goes on, except a PIN the
-card refuses (`wrong_pin`, `pin_blocked`), which ends it first. A pay's charge (`POST /v1/pay`) is
+card refuses (`wrong_pin`, `pin_wait`), which ends it first. A pay's charge (`POST /v1/pay`) is
 taken online only and settles nothing: until the card's next `POST /v1/charge`, a pay on that card
 can still plan from a note such a charge signed, which the card will not sign again (that pay is
 refused 500 `internal` with `state: "not_charged"`, nothing charged), or put change into its
@@ -308,8 +308,8 @@ starts a second spend while the first may still count, outside the window under 
 
 With `pin`: a finished sale replays without a PIN, but every other repeat on a till that requires
 one (unresolved, in flight, or a fresh attempt) needs `pin` again, since `pin_required` is
-answered before the till looks at the earlier attempt. A `no_card`, `card_error`, `wrong_pin` or
-`pin_blocked` on a repeat comes after the till looked at the earlier attempt with that ref (on ops
+answered before the till looks at the earlier attempt. A `no_card`, `card_error`, `wrong_pin`,
+`pin_wait` or `sign_check_failed` on a repeat comes after the till looked at the earlier attempt with that ref (on ops
 too: a repeat is answered from the till's records before the card is read or the PIN tried), so it
 proves nothing moved: the POS asks the holder again and resends the **same** `client_ref` (with
 the new PIN after a `wrong_pin`). The exceptions are an offline sale whose card was taken away
@@ -331,15 +331,17 @@ the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an e
 | `undecided` | 202 | submitted, not yet confirmed; nothing further to do now. Offline, or online for a sale this till took offline: the card was taken away while it signed (its next offline tap, or any `POST /v1/charge` of that card, finishes the sale), or an earlier attempt with this `client_ref` waits for that card and this one was not charged; on ops also a repeat whose earlier attempt left a record the till could not settle now because the registry did not hand over that card's state (no answer, or a refusal such as `unknown_card`; nothing was charged again) | show "pending", then poll /v1/sales; for a sale taken offline, ask for the first card again (its tap finishes the sale, online or not) |
 | `recovering` | 503 | an earlier transaction is still being resolved | retry after a few seconds |
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
-| `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); `detail` says how many tries are left; nothing moved | ask the holder again |
-| `pin_blocked` | 423 | the card's PIN is blocked (`69 83`) | stop: the card cannot pay |
+| `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); the body adds `wrong_tries` (integer, X: the wrong tries in a row, 1 to 15) and `wait_s` (integer, whole seconds: about how long the card makes the next try wait, 2^(X-1) askings of 0.75 s, rounded up); nothing moved | ask the holder again; the next try takes about `wait_s` |
+| `pin_wait` | 423 | the card is serving its PIN wait and was taken away before it ended (`6A98`); the body adds `wait_s` (integer, whole seconds, rounded up: about what is left, 0 when the till does not know) and no `wrong_tries`; nothing moved | hold the card again until the wait is over, same `client_ref` |
+| `old_card` | 409 | the card's applet is older than 4.0; `detail` is the message to show; no PIN command was sent and nothing moved | show `detail`: the card must be reset and set up again |
+| `sign_check_failed` | 409 | the card's signature failed the card's own check (`6F00` from SIGN); nothing was spent | tap again, same `client_ref` |
 | `card_changed` | 409 | on ops: the card's state changed under this till (another till, a stale version) | retry the tap |
 | `unknown_card` | 404 | on ops: the registry has no such card for this till's operator | card not provisioned for this operator |
 | `ops_unreachable` | 502 | on ops: the registry could not be reached; nothing was sent | retry; check the network |
 | `ops_refused` | 502 | on ops: the registry refused the till (bad or revoked token) | check the till token |
 | `ops_not_connected` | 503 | the till belongs on ops but has no token yet (no claim, a claim waiting for approval, or an expired one); nothing ran | connect the till (Connect to registry), approve it in the provisioner app |
 | `card_limit` | 402 | a 3.0 card's daily limit (`6A95`) does not take this charge; checked before anything is signed or recorded | decline; the card pays again once a later block header starts its next day |
-| `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is applet 2.x, which this till takes only online; nothing moved | decline, or retry once the till is online |
+| `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is one this till takes only online; nothing moved | decline, or retry once the till is online |
 | `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online) | retry once the till is online |
 | `card_not_genuine` | 403 | offline: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
 | `offline_no_change_room` | 409 | offline: the price needs change and the card has no fresh keyed slot (or too few) for it; an online till keys more. The body adds `suggested_msat`, `suggest_below_msat` and `suggest_above_msat`, prices in whole sats the card pays exactly now (each may be null); nothing moved | show "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
@@ -566,7 +568,7 @@ and preimages are never logged.
 | `lightning_error` | 502 | the wallet could not be asked about the invoice; nothing was charged | retry |
 | `pay_disabled` | 503 | the till does not pay invoices (`--pay-enabled` is off) | none |
 | `lightning_unavailable` | 503 | the till's federation has no usable `ln` module, or no gateway can pay the invoice now; nothing was charged | try again later |
-| card and ops errors | | as `/v1/charge` (`wrong_pin`, `pin_blocked`, `insufficient`, `no_card`, `card_link_gone`, `busy`, `ops_*`, `card_limit`, …), with `state: "not_charged"` when the card was refused | as `/v1/charge` |
+| card and ops errors | | as `/v1/charge` (`wrong_pin`, `pin_wait`, `old_card`, `insufficient`, `no_card`, `card_link_gone`, `busy`, `ops_*`, `card_limit`, …), with `state: "not_charged"` when the card was refused | as `/v1/charge` |
 | `internal` | 500 | the pay could not be recorded, so the card was not charged; or anything else | show detail |
 
 ### GET /v1/pay/{pay_id}, GET /v1/pays
@@ -630,7 +632,7 @@ Empty body (or `{"batch_id":"<string>"}`, ignored). **Read-only**: nothing is wr
 the provisioning loop needs it — must the sweep ask first, is the applet ours, can the ISD take an
 INSTALL.
 
-`200 {"ok":true,"applet_present":B,"isd_open":B,"keyed_slots":[...],"live_msat":N,"safe_to_replace":B,"kind":"blank|installed|foreign","applet":"unknown|not_set|set|blocked","empty_slots":[...],"foreign_slots":[...],"free_slots":[...],"live_notes":[{"slot":S,"msat":N}],"slots":8}`
+`200 {"ok":true,"applet_present":B,"isd_open":B,"keyed_slots":[...],"live_msat":N,"safe_to_replace":B,"kind":"blank|installed|foreign","applet":"unknown|not_set|set|wait","pin_wait_s":N|null,"empty_slots":[...],"foreign_slots":[...],"free_slots":[...],"live_notes":[{"slot":S,"msat":N}],"slots":8}`
 
 * `applet_present` — `SELECT` of our AID answered `9000`; `false` on `6A82`.
 * `isd_open` — `GET DATA FF21` got an answer. A status word counts; only a transport error does not.
@@ -646,7 +648,7 @@ INSTALL.
 Runs `card setup` (never `--fresh`: re-keying destroys live notes) then `SET_PIN`, then
 `VERIFY_PIN`. Shares the single job slot with charges.
 
-`200 {"ok":true,"keys":[{"slot":0,"pubkey":"<hex>"}],"short_id":"<8 hex>","pin_set":B,"pin":"set|set_now|not_set|blocked","generated":[...]}`
+`200 {"ok":true,"keys":[{"slot":0,"pubkey":"<hex>"}],"short_id":"<8 hex>","pin_set":B,"pin":"set|set_now|not_set","generated":[...]}`
 
 Idempotent: keys already present are kept, an existing PIN answers `6985` and is reported `"set"`
 (not reset), and `generated` is empty on a repeat. `short_id` is 8 hex chars hashed over the whole

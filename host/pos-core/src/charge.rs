@@ -21,7 +21,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, SW_OVER_LIMIT, header_time};
-use fedimint_card_host_card::{Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, open_pin_session_with, status_word};
+use fedimint_card_host_card::{
+    Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, UnsupportedApplet, open_pin_session_held, status_word,
+    verify_pin_held,
+};
 use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::CommonModuleInit as _;
@@ -38,6 +41,7 @@ use tbs::{AggregatePublicKey, BlindedMessage, BlindingKey};
 use crate::files::{HostKind, HostPending, LoadNote};
 use crate::plan::{self, ALL_TIERS, MAX_CARD_NOTES, PlanError, Tiers};
 use crate::queue::{ChargeState, OfflineCharge, OfflineConfig, OfflineError, OfflineInput, PoolRef, Queue, Stats};
+use crate::refusal::{PinWait, wait_seconds};
 use crate::{blind, nonce_for, short_id_of};
 
 /// Largest price accepted (2^40 msat, about 11 BTC), as the till API.
@@ -104,6 +108,9 @@ pub struct Env<'a> {
     pub now_ms: u64,
     /// A phone's offline kit expires: no charge from then on, by this clock or the card's.
     pub expires_at_ms: Option<u64>,
+    /// Called while the card serves a PIN wait, with about how many seconds it still owes (first
+    /// before the wait, last with 0 when the card takes the PIN): "Hold the card, about N s".
+    pub holding: Option<&'a dyn Fn(u32)>,
 }
 
 /// A decoder registry with only the mint module, at `mint_id`: all an offline charge holds.
@@ -132,7 +139,9 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 /// 2. a charge already queued under this `client_ref` is that charge (`conflict` for another price);
 /// 3. a phone's kit expiry, then the count cap (not for a retap of a sale this device holds
 ///    `signing`: finishing that charge adds none);
-/// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
+/// 4. SELECT, and only applet 4.x goes on (the rule for every reader: an older card is `old_card`),
+///    its certificate and attestation, its clock (and the kit's expiry by it), the PIN, its wait
+///    served while the card is held (a card taken away during it is `pin_wait`);
 /// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
 ///    card for one is `undecided`; one that can never be finished is `abandoned` and frees its
 ///    `client_ref` and the notes the card never signed for it;
@@ -168,11 +177,16 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         }
     }
 
-    let v = card.applet_version()?;
-    if !v.sign_once() {
-        bail!(OfflineError::Unsupported(format!(
-            "applet {v} can sign a note twice, so it is taken only online; the registry or the federation is unreachable"
-        )));
+    // The rule for every reader: the card hears its first command only now, after the request
+    // and the kit were checked, and a card whose SELECT does not answer applet 4.x gets no PIN
+    // command. On a `CardClient` the version is that SELECT's answer, or its old-card error.
+    card.select_applet().context("selecting the applet")?;
+    let v = card.applet_version().context("the applet's version")?;
+    if !v.is_current() {
+        return Err(anyhow::Error::new(
+            UnsupportedApplet::check(&[v.major, v.minor]).err().unwrap_or(UnsupportedApplet::Old { answer: vec![v.major, v.minor] }),
+        )
+        .context(format!("applet {v}")));
     }
     let Some(cert_key) = env.cert_key else {
         bail!(OfflineError::NotReady(
@@ -191,7 +205,7 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         )));
     }
     // The PIN, before anything on the card changes: a wrong one leaves the card as it was.
-    open_pin(card, &env.pin)?;
+    open_pin(card, &env.pin, env.holding)?;
 
     // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
     // stored signatures, never a second transaction. Another card for it waits for the first.
@@ -277,11 +291,34 @@ fn sync_clock(card: &mut dyn Card, header: Option<[u8; HEADER_LEN]>) -> Option<u
     r.map_err(|e| tracing::warn!("the card's clock: {e:#}")).ok()
 }
 
-fn open_pin(card: &mut dyn Card, pin: &Pin) -> Result<()> {
-    match pin {
-        Pin::Verify(p) => card.verify_pin(p).context("verifying the holder's PIN"),
-        Pin::OpenWith(p) => open_pin_session_with(card, p).context("opening the PIN session"),
-    }
+/// VERIFY_PIN (or, for a till's own PIN, SET_PIN on a card with none) with the card's wait served
+/// as the card library serves it: the same VERIFY_PIN resent while the card answers `6A98`, with
+/// nothing between, `holding` told the seconds left. A wait cut short (the card left, or an
+/// asking the wait did not owe) is [`PinWait`] with what was still owed: no PIN was tried.
+pub fn open_pin(card: &mut dyn Card, pin: &Pin, holding: Option<&dyn Fn(u32)>) -> Result<()> {
+    let mut left = 0u16;
+    let r = {
+        let mut progress = |askings: u16| {
+            left = askings;
+            if let Some(h) = holding {
+                h(wait_seconds(askings));
+            }
+        };
+        match pin {
+            Pin::Verify(p) => verify_pin_held(card, p, &mut progress).context("verifying the holder's PIN"),
+            Pin::OpenWith(p) => open_pin_session_held(card, p, &mut progress).context("opening the PIN session"),
+        }
+    };
+    let cut_short = |e: anyhow::Error| anyhow::Error::new(PinWait { askings: left.max(1) }).context(format!("{e:#}"));
+    r.map_err(|e| match status_word(&e) {
+        // The card answered: a wrong PIN, no PIN set, or another refusal. Itself.
+        Some(sw) if sw != fedimint_card_host_card::v3::SW_KEEP_HOLDING => e,
+        // An asking past what the wait owed.
+        Some(_) => cut_short(e),
+        // The card left while it still owed askings.
+        None if left > 0 => cut_short(e),
+        None => e,
+    })
 }
 
 fn sig_of(sig48: &[u8; 48]) -> Result<tbs::Signature> {

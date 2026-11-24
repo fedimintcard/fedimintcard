@@ -25,7 +25,7 @@
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, heldChange, heldChangeSlots, requireVersion, slotCount, unkeyedSlots, unsignedLive, versionOf} from './cards';
+import {bump, heldChange, heldChangeSlots, repeatMatches, requireVersion, slotCount, unkeyedSlots, unsignedLive, versionOf} from './cards';
 import type {CheckedNote} from './offline';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
@@ -258,7 +258,8 @@ export function recordLoad(
  * checked against the federation's key for its note's tier, and only if all verify do the notes
  * become live; one bad signature is a 422 and changes nothing. `{accepted: false}`: the federation
  * refused the transaction, the notes are deleted and their slots free. A repeat of the recorded
- * outcome answers 200; a different one is a 409.
+ * outcome answers 200, and so does one that sends only some of its notes (`repeatMatches`); any
+ * other is a 409.
  *
  * A load that expired is still finished by its signatures while each of its slots holds the same
  * key and no note has been recorded under it since.
@@ -300,7 +301,7 @@ export function recordLoadOutcome(
       throw new NotFound(`no load ${String(r.txid)} on card ${shortId}`);
     }
     if (load.status === 'accepted' || load.status === 'rejected') {
-      if (load.outcome === outcome) {
+      if (repeatMatches(load.outcome, accepted, signatures)) {
         const sign = accepted ? unsignedLive(sql, shortId, [...signatures.keys()]) : [];
         return {version: versionOf(sql, shortId), replayed: true, sign};
       }
