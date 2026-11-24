@@ -456,6 +456,126 @@ export async function recordReleases(
   }
 }
 
+/* ------------------------------------------------------------------------- */
+/* Note signatures (DESIGN § 6)                                              */
+/* ------------------------------------------------------------------------- */
+
+/** Domain separator of a note signature, 18 ASCII bytes. */
+const NOTE_DOMAIN = new TextEncoder().encode('fedimintcard/note1');
+
+/** A note that has passed the federation check (`checkNotes`) and is live. */
+export interface CheckedNote {
+  readonly slot: number;
+  readonly nonce: string;
+  readonly amount_msat: number;
+  readonly signature: string;
+}
+
+/**
+ * What a note signature signs, 106 bytes: the label (18), the slot's x-only key (32, the note's
+ * nonce without its 02 prefix), the amount in msat (8, big-endian) and the federation's signature
+ * (48). The last 56 are SET_NOTE's data, so the card builds the same message from its own slot key.
+ */
+export function noteMessage(nonce: string, amountMsat: number, signature: string): Uint8Array {
+  if (!isHex(nonce, 33) || !isHex(signature, 48) || !Number.isSafeInteger(amountMsat) || amountMsat < 0) {
+    throw new Error('a note is a 33-byte nonce, a whole msat amount and a 48-byte signature');
+  }
+  const m = new Uint8Array(106);
+  m.set(NOTE_DOMAIN, 0);
+  m.set(fromHex(nonce).subarray(1), 18);
+  new DataView(m.buffer).setBigUint64(50, BigInt(amountMsat), false);
+  m.set(fromHex(signature), 58);
+  return m;
+}
+
+/** A signer of notes under the certificate key `secret`: DER hex over `noteMessage`. */
+export async function noteSigner(secret: string | undefined): Promise<(note: CheckedNote) => Promise<string>> {
+  const key = await certKey(secret);
+  return async note => {
+    const message = noteMessage(note.nonce, note.amount_msat, note.signature);
+    return toHex(rawToDer(new Uint8Array(await crypto.subtle.sign({name: 'ECDSA', hash: 'SHA-256'}, key, message))));
+  };
+}
+
+/**
+ * Sign each of `notes` with the certificate key (ECDSA P-256, SHA-256, DER: what a release is) and
+ * keep each signature in `notes.reg_sig`. The caller passes only notes its transaction has just
+ * checked against the federation's keys and made live. A note is signed only when its nonce is
+ * `02` and its slot's current key, the key the card checks the signature over; any other is left
+ * unsigned. Signing awaits, so it runs after that transaction; the write checks that each note is
+ * still live with the same amount and federation signature, still under its slot's current key,
+ * and has no signature of ours yet.
+ *
+ * Never throws: with no `CERT_SIGNING_KEY` (or any other failure) it logs and writes nothing, and
+ * the outcome it follows stands. Such a note stays unsigned; a repeat of the outcome signs it.
+ */
+export async function signNotes(
+  storage: DurableObjectStorage,
+  secret: string | undefined,
+  shortId: string,
+  notes: readonly CheckedNote[],
+): Promise<number> {
+  if (notes.length === 0) return 0;
+  const sql = storage.sql;
+  try {
+    if (!secret) {
+      console.warn(`notes: CERT_SIGNING_KEY is not set; ${notes.length} note(s) on card ${shortId} left unsigned`);
+      return 0;
+    }
+    // Only a note under its slot's current key, the key the card checks SET_NOTE against.
+    const keys = slotKeys(sql, shortId);
+    const keyed = notes.filter(n => keys.get(n.slot) !== undefined && n.nonce === '02' + keys.get(n.slot));
+    if (keyed.length < notes.length) {
+      console.warn(`notes: ${notes.length - keyed.length} note(s) on card ${shortId} not under their slot's key; left unsigned`);
+    }
+    if (keyed.length === 0) return 0;
+    const sign = await noteSigner(secret);
+    const signed: {note: CheckedNote; sig: string}[] = [];
+    for (const note of keyed) {
+      signed.push({note, sig: await sign(note)});
+    }
+    return storage.transactionSync(() => {
+      let written = 0;
+      for (const {note, sig} of signed) {
+        const done = sql.exec(
+          `UPDATE notes SET reg_sig = ?
+           WHERE short_id = ? AND nonce = ? AND slot = ? AND status = 'live' AND amount_msat = ? AND signature = ? AND reg_sig IS NULL
+             AND nonce = '02' || (SELECT pubkey FROM card_slots WHERE short_id = notes.short_id AND slot = notes.slot)`,
+          sig, shortId, note.nonce, note.slot, note.amount_msat, note.signature,
+        );
+        if (done.rowsWritten > 0) written += 1;
+      }
+      return written;
+    });
+  } catch (e) {
+    console.warn(`notes: none signed on card ${shortId}: ${e instanceof Error ? e.message : String(e)}`);
+    return 0;
+  }
+}
+
+/** A card's current slot keys (x-only, hex), by slot. */
+function slotKeys(sql: Sql, shortId: string): Map<number, string> {
+  return new Map(
+    sql
+      .exec('SELECT slot, pubkey FROM card_slots WHERE short_id = ?', shortId)
+      .toArray()
+      .map(r => [Number(r.slot), String(r.pubkey)] as const),
+  );
+}
+
+/** The signed live notes of `txid` on a card, as an outcome answers them. */
+export function noteSigs(sql: Sql, shortId: string, txid: string): {slot: number; nonce: string; reg_sig: string}[] {
+  return sql
+    .exec(
+      `SELECT slot, nonce, reg_sig FROM notes
+       WHERE short_id = ? AND txid = ? AND status = 'live' AND reg_sig IS NOT NULL ORDER BY slot`,
+      shortId,
+      txid,
+    )
+    .toArray()
+    .map(r => ({slot: Number(r.slot), nonce: String(r.nonce), reg_sig: String(r.reg_sig)}));
+}
+
 /** Still true when the releases for a rejected charge are written. */
 export const chargeRejected = (txid: string) => (sql: SqlStorage) =>
   sql.exec("SELECT 1 FROM card_txs WHERE txid = ? AND status = 'rejected'", txid).toArray().length > 0;

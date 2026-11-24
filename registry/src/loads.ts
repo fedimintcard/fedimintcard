@@ -25,7 +25,8 @@
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, heldChange, heldChangeSlots, requireVersion, slotCount, unkeyedSlots, versionOf} from './cards';
+import {bump, heldChange, heldChangeSlots, requireVersion, slotCount, unkeyedSlots, unsignedLive, versionOf} from './cards';
+import type {CheckedNote} from './offline';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
 import {cardFederation, checkNotes, isTier, mintKeysFor} from './mint';
@@ -261,13 +262,16 @@ export function recordLoad(
  *
  * A load that expired is still finished by its signatures while each of its slots holds the same
  * key and no note has been recorded under it since.
+ *
+ * `sign` names the notes that passed the check and are now live (on a repeat, those still
+ * unsigned); the caller signs them (`signNotes`).
  */
 export function recordLoadOutcome(
   storage: DurableObjectStorage,
   shortId: string,
   r: Record<string, unknown>,
   now: number,
-): {version: number; replayed: boolean} {
+): {version: number; replayed: boolean; sign: CheckedNote[]} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -297,7 +301,8 @@ export function recordLoadOutcome(
     }
     if (load.status === 'accepted' || load.status === 'rejected') {
       if (load.outcome === outcome) {
-        return {version: versionOf(sql, shortId), replayed: true};
+        const sign = accepted ? unsignedLive(sql, shortId, [...signatures.keys()]) : [];
+        return {version: versionOf(sql, shortId), replayed: true, sign};
       }
       throw new Conflict(`load ${String(r.txid)} is already resolved differently`);
     }
@@ -306,16 +311,18 @@ export function recordLoadOutcome(
       if (load.status === 'expired') {
         // Its notes went with the expiry; record what the wallet says, nothing else changes.
         sql.exec("UPDATE holder_loads SET status = 'rejected', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-        return {version: versionOf(sql, shortId), replayed: false};
+        return {version: versionOf(sql, shortId), replayed: false, sign: []};
       }
       sql.exec("DELETE FROM notes WHERE short_id = ? AND txid = ? AND status = 'pending'", shortId, r.txid);
       sql.exec("UPDATE holder_loads SET status = 'rejected', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-      return {version: bump(sql, shortId), replayed: false};
+      return {version: bump(sql, shortId), replayed: false, sign: []};
     }
     if (signatures.size !== notes.length || !notes.every(n => signatures.has(n.nonce))) {
       throw new BadRequest('an accepted load needs a signature for every note it recorded, and no others');
     }
     checkNotes(sql, shortId, notes.map(n => ({nonce: n.nonce, amount_msat: n.amount_msat, signature: signatures.get(n.nonce)!})));
+    // Checked: the caller signs these once this transaction has made them live (`signNotes`).
+    const sign = notes.map(n => ({slot: n.slot, nonce: n.nonce, amount_msat: n.amount_msat, signature: signatures.get(n.nonce)!}));
     if (load.status === 'expired') {
       const slots = currentKeys(sql, shortId);
       for (const n of notes) {
@@ -347,6 +354,6 @@ export function recordLoadOutcome(
       }
     }
     sql.exec("UPDATE holder_loads SET status = 'accepted', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-    return {version: bump(sql, shortId), replayed: false};
+    return {version: bump(sql, shortId), replayed: false, sign};
   });
 }

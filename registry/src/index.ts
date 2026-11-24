@@ -14,6 +14,7 @@
  * Routes, by who may call them:
  *
  *   anyone     GET  /health
+ *              GET  /v1/chain/tip                the latest Bitcoin header, from two sources (chain.ts)
  *              GET  /registry/cert-key           the certificate key's public point (65 bytes hex)
  *              POST /auth/operator/session       {name, password} -> {operator_id, token}
  *              POST /till-claims                 {name} -> {claim_id, code, poll_secret, expires_at}
@@ -93,6 +94,7 @@ import {
   renewSlot,
 } from './cards';
 import {backupStatus, nextBackupAt, runBackup} from './backup';
+import {CHAIN_TIP_TTL_MS, chainTip, newTipCache, webFetch} from './chain';
 import {approveClaim, pollClaim, readClaim, startClaim} from './claims';
 import {migrate} from './db';
 import {
@@ -110,11 +112,13 @@ import {
   certPublicKey,
   chargeRejected,
   listOfflineReports,
+  noteSigs,
   recordAttestation,
   recordOfflineCharge,
   recordReleases,
   recordStranded,
   reportRefused,
+  signNotes,
 } from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
 import {completeReset, resetCheck, resetOwner} from './reset';
@@ -470,9 +474,13 @@ export class Registry {
       return json(200, {ok: true, ...recordSubmitted(storage, shortId, body)});
     }
     if (rest === '/outcome' && method === 'POST') {
-      const {release, ...done} = recordOutcome(storage, shortId, body, now);
+      const {release, sign, ...done} = recordOutcome(storage, shortId, body, now);
       if (release) {
         await recordReleases(storage, this.certSecret(), shortId, release.txid, release.slots, chargeRejected(release.txid), now);
+      }
+      if (body.accepted === true) {
+        await signNotes(storage, this.certSecret(), shortId, sign);
+        return json(200, {ok: true, ...done, notes: noteSigs(storage.sql, shortId, String(body.txid))});
       }
       return json(200, {ok: true, ...done});
     }
@@ -532,7 +540,12 @@ export class Registry {
     if (what === 'load') {
       return json(200, {ok: true, ...recordLoad(storage, shortId, body, now)});
     }
-    return json(200, {ok: true, ...recordLoadOutcome(storage, shortId, body, now)});
+    const {sign, ...done} = recordLoadOutcome(storage, shortId, body, now);
+    if (body.accepted === false) {
+      return json(200, {ok: true, ...done});
+    }
+    await signNotes(storage, this.certSecret(), shortId, sign);
+    return json(200, {ok: true, ...done, notes: noteSigs(storage.sql, shortId, String(body.txid))});
   }
 
   /**
@@ -600,11 +613,23 @@ export class Registry {
   }
 }
 
+/** The Worker isolate's tip cache (`chain.ts`). */
+const TIP_CACHE = newTipCache();
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/health') {
       return json(200, {ok: true});
+    }
+    if (url.pathname === '/v1/chain/tip') {
+      // Answered by the Worker, not the object: it holds no state and must not queue behind writes.
+      if (request.method !== 'GET') return fail(405, 'use GET');
+      const tip = await chainTip(TIP_CACHE, webFetch, Date.now());
+      if (!tip.ok) return fail(tip.status, tip.reason);
+      const res = json(200, tip);
+      res.headers.set('cache-control', `public, max-age=${CHAIN_TIP_TTL_MS / 1000}`);
+      return res;
     }
     if (url.pathname.startsWith('/test/') || url.pathname.startsWith('/internal/')) {
       return fail(404, 'no such route');

@@ -8,7 +8,7 @@ import {p256} from '@noble/curves/nist.js';
 import {decrypt} from '../src/backup';
 import {STRANDED_GRACE_MS} from '../src/cards';
 import {fromHex, toHex} from '../src/http';
-import {derToRaw, rawToDer, releaseMessage, strandingOpen} from '../src/offline';
+import {derToRaw, noteMessage, rawToDer, releaseMessage, strandingOpen} from '../src/offline';
 import {messageOf} from '../src/tbs';
 
 /**
@@ -420,6 +420,46 @@ describe('POST /cards/:id/offline-charges', () => {
     }
     expect((await post(`/cards/${shortId}/offline-charges`, null, charge())).status).toBe(401);
     expect((await post(`/cards/${shortId}/offline-charges`, token, charge())).status).toBe(403);
+  });
+});
+
+describe('note signatures on an offline charge (DESIGN § 6)', () => {
+  type Note = {slot: number; nonce: string; status: string; reg_sig: string | null};
+  const notesOf = async (token: string, shortId: string) => (await state(token, shortId)).notes as unknown as Note[];
+  const accept = (changeNonce: string, t = txid(7)) => ({txid: t, accepted: true, change: [{nonce: changeNonce, signature: sign(changeNonce, 24_000)}]});
+  const withChange = (changeNonce: string, t = txid(7)) =>
+    charge({txid: t, change: [{slot: 1, amount_msat: 24_000, nonce: changeNonce, blinding_key: 'e'.repeat(64), out_idx: 1}]});
+
+  it('signs the change under the slot’s current key once the charge is accepted', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await cardWithNote(token);
+    const change = '02' + slots(shortId)[1]!;
+    expect((await post(`/cards/${shortId}/offline-charges`, till.token, withChange(change))).status).toBe(200);
+    const res = await post(`/cards/${shortId}/outcome`, till.token, accept(change));
+    expect(res.status).toBe(200);
+    const [answered] = ((await res.json()) as {notes: {slot: number; reg_sig: string}[]}).notes;
+    expect(answered!.slot).toBe(1);
+    const certKey = fromHex(((await (await get('/registry/cert-key', null)).json()) as {key: string}).key);
+    const fed = accept(change).change[0]!.signature;
+    expect(p256.verify(fromHex(answered!.reg_sig), noteMessage(change, 24_000, fed), certKey, {format: 'der', lowS: false})).toBe(true);
+  });
+
+  it('never signs change whose nonce is not the slot’s current key, on the outcome or a repeat', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    for (const [i, id] of ['9c2f0a1b', '5e6f7a8b'].entries()) {
+      const shortId = await cardWithNote(token, id);
+      // Another slot's key, and a key the card never had.
+      const other = i === 0 ? '02' + slots(shortId)[2]! : nonce(2);
+      const t = txid(7 + i);
+      expect((await post(`/cards/${shortId}/offline-charges`, till.token, withChange(other, t))).status).toBe(200);
+      const res = await post(`/cards/${shortId}/outcome`, till.token, accept(other, t));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as {notes: unknown[]}).notes).toEqual([]);
+      expect(await (await post(`/cards/${shortId}/outcome`, till.token, accept(other, t))).json()).toMatchObject({replayed: true, notes: []});
+      expect((await notesOf(till.token, shortId)).find(n => n.nonce === other)).toMatchObject({status: 'live', reg_sig: null});
+    }
   });
 });
 

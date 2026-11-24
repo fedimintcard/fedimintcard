@@ -27,7 +27,7 @@ import {
   NotFound,
 } from './http';
 import {isChip, linkChip} from './managerKeys';
-import {adoptPendingAttestation} from './offline';
+import {adoptPendingAttestation, type CheckedNote} from './offline';
 import {checkNotes, putMintKeys} from './mint';
 
 /**
@@ -436,6 +436,8 @@ export interface NoteView {
   readonly status: 'live' | 'pending' | 'spent' | 'dead';
   readonly txid: string | null;
   readonly out_idx: number | null;
+  /** The registry's signature over the note (`noteMessage`), DER hex; null until it is signed. */
+  readonly reg_sig: string | null;
 }
 
 /**
@@ -561,7 +563,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
   // a till keeps off those slots but does not try to collect them (`loads.ts`).
   const notes: NoteView[] = sql
     .exec(
-      `SELECT slot, amount_msat, nonce, signature, status, out_idx,
+      `SELECT slot, amount_msat, nonce, signature, status, out_idx, reg_sig,
          CASE WHEN held THEN NULL ELSE txid END AS txid,
          CASE WHEN held THEN NULL ELSE blinding_key END AS blinding_key
        FROM (SELECT *, status = 'pending' AND txid IN (SELECT txid FROM holder_loads) AS held FROM notes)
@@ -581,6 +583,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
       status: String(r.status) as NoteView['status'],
       txid: r.txid === null ? null : String(r.txid),
       out_idx: r.out_idx === null ? null : Number(r.out_idx),
+      reg_sig: r.reg_sig === null ? null : String(r.reg_sig),
     }));
   const open = sql
     .exec(
@@ -849,13 +852,21 @@ export function recordIntent(
  * may have left SPENT (its inputs') or CHANGE (its change's) for it: the
  * caller signs a release for each (`recordReleases`). A load (no inputs) never
  * touched the card's slot states and has none.
+ *
+ * `sign` names, for an accepted charge, the change notes that passed the federation check and
+ * are now live; on a repeat, those of them still unsigned. The caller signs them (`signNotes`).
  */
 export function recordOutcome(
   storage: DurableObjectStorage,
   shortId: string,
   r: Record<string, unknown>,
   now: number,
-): {version: number; replayed: boolean; release: {txid: string; slots: number[]} | null} {
+): {
+  version: number;
+  replayed: boolean;
+  release: {txid: string; slots: number[]} | null;
+  sign: CheckedNote[];
+} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -886,12 +897,15 @@ export function recordOutcome(
     }
     if (tx.status !== 'open') {
       if (tx.outcome === outcome) {
-        return {version: versionOf(sql, shortId), replayed: true, release: null};
+        const body = JSON.parse(tx.body) as {change: ChangeOut[]};
+        const sign = r.accepted ? unsignedLive(sql, shortId, body.change.map(c => c.nonce)) : [];
+        return {version: versionOf(sql, shortId), replayed: true, release: null, sign};
       }
       throw new Conflict(`charge ${String(r.txid)} is already resolved differently`);
     }
     const body = JSON.parse(tx.body) as {inputs: string[]; change: ChangeOut[]};
     let release: {txid: string; slots: number[]} | null = null;
+    let sign: CheckedNote[] = [];
     if (r.accepted) {
       if (
         signatures.size !== body.change.length ||
@@ -906,6 +920,8 @@ export function recordOutcome(
         shortId,
         body.change.map(c => ({nonce: c.nonce, amount_msat: c.amount_msat, signature: signatures.get(c.nonce)!})),
       );
+      // Checked: the caller signs these once this transaction has made them live (`signNotes`).
+      sign = body.change.map(c => ({slot: c.slot, nonce: c.nonce, amount_msat: c.amount_msat, signature: signatures.get(c.nonce)!}));
       for (const nonce of body.inputs) {
         sql.exec(
           "UPDATE notes SET status = 'spent' WHERE short_id = ? AND nonce = ?",
@@ -956,8 +972,32 @@ export function recordOutcome(
       now,
       r.txid,
     );
-    return {version: bump(sql, shortId), replayed: false, release};
+    return {version: bump(sql, shortId), replayed: false, release, sign};
   });
+}
+
+/**
+ * Of `nonces`, the card's live notes that still have no registry signature (a signing that failed,
+ * or a key that was unset), checked again against the federation's keys, for a repeated outcome to
+ * sign. Nothing when the check fails: the repeat answers as before and signs nothing.
+ */
+export function unsignedLive(sql: Sql, shortId: string, nonces: readonly string[]): CheckedNote[] {
+  const wanted = new Set(nonces);
+  const rows = sql
+    .exec(
+      `SELECT slot, nonce, amount_msat, signature FROM notes
+       WHERE short_id = ? AND status = 'live' AND reg_sig IS NULL AND signature IS NOT NULL`,
+      shortId,
+    )
+    .toArray()
+    .map(r => ({slot: Number(r.slot), nonce: String(r.nonce), amount_msat: Number(r.amount_msat), signature: String(r.signature)}))
+    .filter(n => wanted.has(n.nonce));
+  try {
+    checkNotes(sql, shortId, rows);
+  } catch {
+    return [];
+  }
+  return rows;
 }
 
 /**
