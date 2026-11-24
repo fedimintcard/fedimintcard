@@ -10,6 +10,9 @@
 //! next tap from the card's own answers (a SPENT slot repeats its signature for the same hash),
 //! and the tap that left it is answered `undecided`, never `no_card`, so the app keeps the sale.
 //!
+//! Change goes only into KEYED slots of those kept for the change of offline sales, 24 to 31
+//! ([`fedimint_card_host_card::is_change_slot`]), for a till and a phone alike.
+//!
 //! What differs between a till and a phone is in [`Env`]: the till makes its own outputs
 //! ([`TillOuts::Fresh`]) and knows from its copy of the card which KEYED slots once carried a note
 //! (`keyed_ok`); a phone takes the till's outputs from its offline kit's pool
@@ -22,8 +25,8 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, SW_OVER_LIMIT, header_time};
 use fedimint_card_host_card::{
-    Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, UnsupportedApplet, open_pin_session_held, status_word,
-    verify_pin_held,
+    Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, UnsupportedApplet, is_change_slot, open_pin_session_held,
+    status_word, verify_pin_held,
 };
 use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -81,7 +84,8 @@ pub enum TillOuts<'a> {
     Pool(&'a [PoolEntry]),
 }
 
-/// Given a card's short id and its KEYED slots, the ones change may go to.
+/// Given a card's short id and its KEYED slots among those kept for change
+/// ([`fedimint_card_host_card::is_change_slot`]), the ones change may go to.
 pub type KeyedFilter<'a> = &'a dyn Fn(&str, &[u8]) -> Result<Vec<u8>>;
 
 /// What an offline charge works with besides the card and the queue.
@@ -103,7 +107,8 @@ pub struct Env<'a> {
     pub pin: Pin,
     pub till_outs: TillOuts<'a>,
     /// A till's: change may not go to a KEYED slot whose key once carried a note (a load not yet
-    /// written to the card, or a dead change key the registry refuses). `None`: any KEYED slot.
+    /// written to the card, or a dead change key the registry refuses). `None`: any KEYED slot of
+    /// those kept for change.
     pub keyed_ok: Option<KeyedFilter<'a>>,
     pub now_ms: u64,
     /// A phone's offline kit expires: no charge from then on, by this clock or the card's.
@@ -415,7 +420,8 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
                 }
                 notes.push(n);
             }
-            SlotState::Keyed => keyed.push(slot),
+            // Change goes only into the slots kept for it.
+            SlotState::Keyed if is_change_slot(slot) => keyed.push(slot),
             _ => {}
         }
     }
@@ -424,7 +430,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         None => keyed,
     };
 
-    // The plan, from the card's own notes, change into KEYED slots, the till's notes in the tiers
+    // The plan, from the card's own notes, change into KEYED slots 24 to 31, the till's notes in the tiers
     // its outputs can have. On a federation that takes a surplus, with a fee margin
     // (OFFLINE-PLAN.md § 10): the charge is sent days later, perhaps under higher fees. Older
     // federations refuse any surplus: an exact balance.

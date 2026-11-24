@@ -27,6 +27,8 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     switch kind {
     case .noCard: return ("Card not detected", "Hold the card to the top of the phone and keep it there")
     case .insufficient: return ("Card balance too low", "")
+    // The till's detail speaks of msat; the copy says only that part of the balance does not pay now.
+    case .notesHeld: return ("Part of the balance is on hold", "Some of this card's money can't be used. A smaller amount may work, or take another payment.")
     // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
     case .noExactPlan: return ("Can't take this amount", "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
     // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.

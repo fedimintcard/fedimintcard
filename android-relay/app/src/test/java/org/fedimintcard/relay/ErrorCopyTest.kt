@@ -24,6 +24,18 @@ class ErrorCopyTest {
         assertEquals("Card error", errorCopy(ErrorKind.CARD_ERROR, "6E00").first)
     }
 
+    /**
+     * `notes_held` (402) is a refusal of its own: never "Outcome unknown", nothing moved, and the
+     * till's detail (msat) is not shown.
+     */
+    @Test
+    fun aBalanceOnHoldSaysWhatToDo() {
+        assertEquals(ErrorKind.NOTES_HELD, ErrorKind.from(ChargeErrorCode.fromWire("notes_held")))
+        assertEquals(true, ErrorKind.NOTES_HELD.definitive)
+        assertFalse(ErrorKind.NOTES_HELD.needsSalesCheck)
+        assertEquals("Part of the balance is on hold" to "Some of this card's money can't be used. A smaller amount may work, or take another payment.", errorCopy(ErrorKind.NOTES_HELD, "the card can pay 1000 msat now"))
+    }
+
     @Test
     fun otherKindsAreUnchanged() {
         assertEquals("Card declined", errorCopy(ErrorKind.DECLINED, "nope").first)

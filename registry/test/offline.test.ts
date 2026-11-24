@@ -1,5 +1,5 @@
 import {env, runInDurableObject, SELF} from 'cloudflare:test';
-import {beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 
 import {bls12_381} from '@noble/curves/bls12-381.js';
 
@@ -110,6 +110,13 @@ function charge(over: Record<string, unknown> = {}) {
 beforeEach(async () => {
   await hook('/test/reset');
 });
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+const alerts = (warn: {mock: {calls: unknown[][]}}, name: string) =>
+  warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith(`ALERT ${name} `));
 
 describe('GET /registry/cert-key', () => {
   it('answers the public point, 65 bytes uncompressed, with no session', async () => {
@@ -306,6 +313,37 @@ describe('POST /cards/:id/offline-charges', () => {
       [nonce(2), 'pending', txid(7)],
     ]);
     expect(after.open_txs).toEqual([expect.objectContaining({txid: txid(7), signed_hex: 'cd'.repeat(120)})]);
+  });
+
+  it('records change into a slot from 24 to 31 of a 32-slot card, with no alert', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = '3a3b3c3d';
+    const keys = Array.from({length: 32}, (_, i) => key(i + 1, i === 0 ? shortId : i.toString(16).padStart(8, '0')));
+    const res0 = await post('/registry/batches', token, {federation_id: FED, count: 5, pin_policy: 'batch', load_sha256: SHA});
+    const batchId = ((await res0.json()) as {batch: {batch_id: number}}).batch.batch_id;
+    const card = {
+      short_id: shortId, batch_id: batchId, installed_at: 1_760_000_000_000, load_sha256: SHA,
+      pin_set: true, pin_policy: 'batch', notes_issued: 0, slot_pubkeys: keys,
+    };
+    expect((await post('/registry/cards', token, card)).status).toBe(200);
+    await hook('/test/note', {short_id: shortId, nonce: nonce(1), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+    const before = await state(till.token, shortId);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const change = [
+      {slot: 24, amount_msat: 16_000, nonce: '02' + keys[24]!, blinding_key: 'e'.repeat(64), out_idx: 1},
+      {slot: 31, amount_msat: 8_000, nonce: '02' + keys[31]!, blinding_key: 'e'.repeat(64), out_idx: 2},
+    ];
+    const res = await post(`/cards/${shortId}/offline-charges`, till.token, charge({change}));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ok: true, version: before.version + 1});
+    const after = await state(till.token, shortId);
+    expect(after.notes.map(n => [n.slot, n.status, n.txid])).toEqual([
+      [0, 'pending', txid(7)],
+      [24, 'pending', txid(7)],
+      [31, 'pending', txid(7)],
+    ]);
+    expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('ALERT '))).toEqual([]);
   });
 
   it('needs no version, and records after the card’s version moved on', async () => {
@@ -852,9 +890,16 @@ describe('stranded notes (docs/OFFLINE-PROTOCOL.md § 7)', () => {
     // Slot 5 holds a note the registry has not signed yet, so on the card that slot is still keyed.
     await hook('/test/note', {short_id: shortId, nonce: keyNonce(shortId, 5), slot: 5, amount_msat: 24_000, signature: 'c'.repeat(96)});
     const refused = {ok: false, reason: 'double_spend', conflicts: [{nonce: keyNonce(shortId, 5), status: 'change_used', txid: null}]};
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const res = await post(`/cards/${shortId}/offline-charges`, till.token, late(shortId));
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual(refused);
+    const lines = alerts(warn, 'change_used');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`card=${shortId}`);
+    expect(lines[0]).toContain(`till=${till.till_id}`);
+    expect(lines[0]).toContain(`txid=${T}`);
+    expect(lines[0]).toContain('slots=5');
     const rels = await releasesOf(till.token, shortId);
     expect(rels.map(r => [r.slot, r.txid])).toEqual([[5, T]]);
     await expectSigned(shortId, rels);

@@ -39,6 +39,7 @@
  *              GET  /registry/backup-status      last backup; 503 if none or stale
  *              POST /registry/cards/:id/attestation  {attest_pub} -> {cert}: the card's certificate
  *              GET  /registry/offline-reports?short_id=  offline charges reported, newest first
+ *              GET  /registry/change-slot-check  live or pending notes and open holder loads on slots 24 to 31
  *   operator   GET  /cards/:short_id/state
  *   or till    POST /cards/:short_id/slots/:n/key   {pubkey}: the first key of a never-keyed slot
  *              POST /cards/:short_id/slot-keys      {keys: [{slot, pubkey}]}: the same, several at once
@@ -107,7 +108,7 @@ import {
   ServiceUnavailable,
   Unprocessable,
 } from './http';
-import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
+import {changeSlotCheck, expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
 import {
   certPublicKey,
   chargeRejected,
@@ -378,6 +379,9 @@ export class Registry {
       const id = url.searchParams.get('short_id');
       if (id !== null && !isShortId(id)) return fail(400, 'short_id must be 8 lower-case hex characters');
       return json(200, {ok: true, reports: listOfflineReports(sql, op, id)});
+    }
+    if (path === '/registry/change-slot-check' && method === 'GET') {
+      return json(200, {ok: true, ...changeSlotCheck(sql, op)});
     }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.

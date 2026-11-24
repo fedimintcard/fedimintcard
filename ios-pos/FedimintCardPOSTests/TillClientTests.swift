@@ -213,7 +213,7 @@ final class ErrorMappingTests: XCTestCase {
     /// read as "Outcome unknown". The list is copied from the doc.
     func testEveryDocumentedChargeCodeIsKnown() {
         let documented = [
-            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
+            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "notes_held", "no_exact_plan",
             "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_wait", "old_card", "sign_check_failed", "card_changed", "unknown_card",
             "ops_unreachable", "ops_refused", "ops_not_connected", "card_limit", "offline_unsupported_card", "offline_not_ready",
             "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
@@ -289,7 +289,7 @@ final class ErrorMappingTests: XCTestCase {
         let kinds: [ErrorKind] = [.badRequest, .busy, .noCard, .relayUnreachable, .cardError, .insufficient, .noExactPlan, .declined,
                                   .undecided, .recovering, .conflict, .pinRequired, .wrongPin, .pinWait, .oldCard, .signCheckFailed, .cardChanged, .unknownCard,
                                   .opsUnreachable, .opsRefused, .cardLinkGone, .unauthorized, .internal, .unknown, .tillUnreachable,
-                                  .timeoutUnknown, .notPaired, .offlineNoChangeRoom]
+                                  .timeoutUnknown, .notPaired, .offlineNoChangeRoom, .notesHeld]
         for k in kinds {
             let (t, d) = errorCopy(k, "")
             XCTAssertFalse(t.isEmpty)
@@ -297,6 +297,12 @@ final class ErrorMappingTests: XCTestCase {
         }
         XCTAssertEqual(errorCopy(.pinWait, "", waitS: 12).0, "Hold the card, about 12 s")
         XCTAssertEqual(errorCopy(.insufficient, "").0, "Card balance too low")
+        // `notes_held` (402): a refusal of its own, never "Outcome unknown"; nothing moved; the till's msat detail is not shown.
+        XCTAssertEqual(ErrorKind.from(ChargeErrorCode.fromWire("notes_held")), .notesHeld)
+        XCTAssertTrue(ErrorKind.notesHeld.definitive)
+        XCTAssertFalse(ErrorKind.notesHeld.needsSalesCheck)
+        XCTAssertEqual(errorCopy(.notesHeld, "the card can pay 1000 msat now").0, "Part of the balance is on hold")
+        XCTAssertEqual(errorCopy(.notesHeld, "the card can pay 1000 msat now").1, "Some of this card's money can't be used. A smaller amount may work, or take another payment.")
         XCTAssertEqual(errorCopy(.noExactPlan, "").0, "Can't take this amount")
         XCTAssertEqual(errorCopy(.noExactPlan, "").1, "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
         // Offline with no slot for change is not a full card (OFFLINE-PLAN.md § 10).

@@ -42,6 +42,22 @@ export const SLOT_COUNTS = [8, 32] as const;
  * the rest later, at a tap, through `addSlotKeys`.
  */
 export const MIN_REGISTERED_KEYS = 8;
+/**
+ * The first of the slots kept for the change of offline sales: 24 to 31 of a 32-slot card.
+ * A note under one of their keys is recorded from an offline sale's report. A holder's load
+ * and a charge recorded before the card signs keep to the slots below.
+ */
+export const CHANGE_SLOT_MIN = 24;
+
+/** The keys on record for the card's change slots, each as a note nonce (`02` and the key). */
+export function changeSlotNonces(sql: Sql, shortId: string): Set<string> {
+  return new Set(
+    sql
+      .exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot >= ?', shortId, CHANGE_SLOT_MIN)
+      .toArray()
+      .map(r => '02' + String(r.pubkey)),
+  );
+}
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
 export const MAX_TX_HEX = 64 * 1024;
 
@@ -733,6 +749,11 @@ export function parseIntent(r: Record<string, unknown>, slots: number) {
  * stale version, a second open charge, an input that is not a live note of
  * this card, or change into an occupied, unknown or held slot is refused (a
  * held slot is a stranded CHANGE slot, docs/OFFLINE-PROTOCOL.md § 7).
+ *
+ * A charge's change keeps below the change slots (`CHANGE_SLOT_MIN`), by slot and by key: it is
+ * refused here, before the card signs. A load (no inputs) is told to the registry after the
+ * federation issued its notes, so one that names a change slot or its key is recorded all the
+ * same, with the log line `ALERT load_in_change_slot`.
  */
 export function recordIntent(
   storage: DurableObjectStorage,
@@ -786,6 +807,13 @@ export function recordIntent(
       ),
     );
     const strandedChange = heldChangeSlots(sql, shortId);
+    const changeNonces = changeSlotNonces(sql, shortId);
+    const kept = intent.body.change.filter(c => c.slot >= CHANGE_SLOT_MIN || changeNonces.has(c.nonce));
+    if (kept.length > 0 && intent.body.inputs.length > 0) {
+      throw new Conflict(
+        `change in slot ${kept[0]!.slot} of card ${shortId} names a slot or key kept for offline change (slots ${CHANGE_SLOT_MIN} and up); use a lower slot`,
+      );
+    }
     for (const c of intent.body.change) {
       if (!slots.has(c.slot)) {
         throw new Conflict(`card ${shortId} has no key in slot ${c.slot} yet; key it first (POST /slots/${c.slot}/key)`);
@@ -836,6 +864,10 @@ export function recordIntent(
         intent.txid,
         c.out_idx,
       );
+    }
+    if (kept.length > 0) {
+      const where = kept.map(c => c.slot).sort((a, b) => a - b).join(',');
+      console.warn(`ALERT load_in_change_slot card=${shortId} till=${tillId} txid=${intent.txid} slots=${where}`);
     }
     return {version: bump(sql, shortId), replayed: false};
   });

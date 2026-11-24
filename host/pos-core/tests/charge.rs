@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use common::{DAY_MS, Fx, now_ms, slots_in, spent_hashes};
 use fedimint_card_host_card::softkit::{PullTransport, SoftMint, SoftTransport};
-use fedimint_card_host_card::{BridgeError, Card, CardClient, SlotState, TEST_PIN, Transport, open_pin_session_with};
+use fedimint_card_host_card::{
+    BridgeError, CHANGE_SLOTS_FROM, Card, CardClient, SlotState, TEST_PIN, Transport, is_change_slot, open_pin_session_with,
+};
 use fedimint_card_pos_core::charge::{Env, Pin, Taken, TillOuts, charge};
 use fedimint_card_pos_core::queue::{ChargeState, QUEUE_FILE, Queue};
 use fedimint_card_pos_core::refusal;
@@ -155,21 +157,61 @@ fn a_card_pays_offline_from_a_kit() {
     }
 }
 
-/// A note waiting for the registry's signature is not on the card, and its slot reads KEYED. A
-/// phone's kit names no such slot, so the phone plans change into any KEYED slot, the first one
-/// included. The registry answers a report whose change lands on such a slot as a double spend and
-/// releases the change slots (registry `offline.test.ts`, "a sale whose change slot holds a note").
+/// Change from an offline sale goes only into the slots kept for it, 24 to 31, though every slot
+/// of the card is keyed.
 #[test]
-fn a_phone_plans_change_into_any_keyed_slot_and_relies_on_the_registry_for_one_with_a_waiting_note() {
+fn a_phone_plans_change_only_into_slots_24_to_31() {
     let fx = Fx::new(true);
     let (_dir, s) = store();
     let card = fx.card(32, &[1 << 16]);
-    let keyed = slots_in(&card, SlotState::Keyed);
-    let kit = fx.kit(s.phone_id(), 40, now_ms(), 7 * DAY_MS);
-    let t = take(&s, &card, &serde_json::to_string(&kit).unwrap(), 20_000, "sale-1").unwrap();
+    assert_eq!(slots_in(&card, SlotState::Keyed), (1..32).collect::<Vec<u8>>());
+    let t = take(&s, &card, &fx.kit_json(s.phone_id()), 20_000, "sale-1").unwrap();
     let change: Vec<u8> = t.charge.change.iter().map(|c| c.slot).collect();
-    assert!(!change.is_empty() && change.iter().all(|s| keyed.contains(s)), "{change:?} in {keyed:?}");
-    assert!(change.contains(&keyed[0]), "the first KEYED slot is not held back: {change:?}");
+    assert!(!change.is_empty() && change.iter().all(|s| is_change_slot(*s)), "{change:?}");
+    assert_eq!(slots_in(&card, SlotState::Change), change);
+    assert_eq!(slots_in(&card, SlotState::Keyed).iter().filter(|s| !is_change_slot(**s)).count(), 23, "slots 1 to 23 stay KEYED");
+}
+
+/// A KEYED slot below 24 is never chosen: with one slot keyed from 24 up, a sale with one change
+/// note puts it there, and a sale that needs more is refused before the card signs.
+#[test]
+fn a_keyed_slot_below_24_is_never_chosen_for_change() {
+    let fx = Fx::new(false);
+    let slots: Vec<u8> = (0..CHANGE_SLOTS_FROM).chain([30]).collect();
+    // One change note, of 32,768 msat.
+    let (_dir, s) = store();
+    let card = fx.card_with_keys(&slots, &[1 << 16]);
+    let json = fx.kit_json(s.phone_id());
+    let t = take(&s, &card, &json, 1 << 15, "one-note").unwrap();
+    assert_eq!(t.charge.change.iter().map(|c| (c.slot, c.amount_msat)).collect::<Vec<_>>(), vec![(30, 1 << 15)]);
+    assert_eq!(slots_in(&card, SlotState::Change), vec![30]);
+    assert_eq!(slots_in(&card, SlotState::Keyed), (1..CHANGE_SLOTS_FROM).collect::<Vec<u8>>());
+    // More than one change note.
+    let (_dir, s) = store();
+    let card = fx.card_with_keys(&slots, &[1 << 16]);
+    let r = take(&s, &card, &fx.kit_json(s.phone_id()), 20_000, "more-notes");
+    let f = refusal(r.as_ref().err().unwrap());
+    assert_eq!(f.code, "offline_no_change_room", "{}", f.detail);
+    assert!(f.detail.contains("(1 free slot(s) for change)"), "{}", f.detail);
+    assert_eq!((slots_in(&card, SlotState::Spent), slots_in(&card, SlotState::Change)), (vec![], vec![]), "nothing signed");
+}
+
+/// A card with no KEYED slot from 24 up has no room for change, however many lower slots are
+/// keyed: the sale is refused with prices the card pays exactly, and the card signs nothing.
+#[test]
+fn a_card_with_no_keyed_slot_from_24_up_has_no_room_for_change() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(CHANGE_SLOTS_FROM, &[1 << 16, 1 << 14]);
+    assert_eq!(slots_in(&card, SlotState::Keyed), (2..CHANGE_SLOTS_FROM).collect::<Vec<u8>>());
+    let json = fx.kit_json(s.phone_id());
+    let r = take(&s, &card, &json, 50_000, "needs-change");
+    let f = refusal(r.as_ref().err().unwrap());
+    assert_eq!(f.code, "offline_no_change_room", "{}", f.detail);
+    assert!(f.detail.contains("(0 free slot(s) for change)"), "{}", f.detail);
+    assert_eq!((slots_in(&card, SlotState::Spent), slots_in(&card, SlotState::Change)), (vec![], vec![]), "nothing signed");
+    let t = take(&s, &card, &json, f.suggested_msat.expect("a price"), "exact").unwrap();
+    assert!(t.charge.change.is_empty());
 }
 
 /// The till's newest block header travels in the kit: the card's clock moves to it, and the charge
@@ -852,7 +894,11 @@ fn sync_marks_what_the_till_took_and_keeps_what_it_refused() {
     let (_dir, s) = store();
     let card = fx.card(32, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]);
     let json = fx.kit_json(s.phone_id());
-    let ids: Vec<String> = ["a", "b", "c"].iter().map(|r| take(&s, &card, &json, 20_000, r).unwrap().charge.txid).collect();
+    // Two sales fill the card's eight change slots, so the third is paid with another card.
+    let mut ids: Vec<String> = ["a", "b"].iter().map(|r| take(&s, &card, &json, 20_000, r).unwrap().charge.txid).collect();
+    assert_eq!(slots_in(&card, SlotState::Change), (CHANGE_SLOTS_FROM..32).collect::<Vec<u8>>());
+    let other = fx.card(32, &[1 << 16]);
+    ids.push(take(&s, &other, &json, 20_000, "c").unwrap().charge.txid);
     let d = s.drain(50);
     let body: Value = serde_json::from_str(&d.body).unwrap();
     assert_eq!((body["phone_id"].as_str(), body["charges"].as_array().unwrap().len()), (Some(s.phone_id()), 3));

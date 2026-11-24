@@ -1,7 +1,8 @@
 # Rollout: offline payments to production
 
 Status: checklist, 2026-11-07, for `main` @ `3a0b0e8`; step 7 (the POS phones) added 2026-11-13,
-step 8 (registry v13, ENG-867) added 2026-11-14.
+step 8 (registry v13, ENG-867) added 2026-11-14, step 9 (change slots, Fedimint Card 4.0)
+added 2026-11-24.
 Each step changes production and waits for the owner's OK. Production reached step 6 on
 2026-11-07, with zion's till at `0.1.0:3` (built from `efdc3a6`). Since 2026-11-10 zion has run
 `0.1.0:4` (built from `a630a22`, with the phones' kit and charge routes), and step 7 was drilled
@@ -151,6 +152,36 @@ registry's 404 by holding the slots, with nothing released until this step.
   it has no gate on a late report of a released transaction. A release comes at least 37 days
   after a slot was first reported, so a rollback within 37 days of this deploy leaves nothing
   released unguarded; after that, fix forward instead.
+
+## 9. Change slots (Fedimint Card 4.0)
+
+Slots 0 to 23 of a 32-slot card take loads and online change; slots 24 to 31 take only the change
+of offline sales (`OFFLINE-PROTOCOL.md` § 8). Release order: **the registry, then the till, then
+the Setup app, then the POS apps**, each with the owner's OK.
+
+- [ ] **Registry.** All suites green on the commit (step 0). Staging first (`npx wrangler deploy
+      --env staging`, then a balance tap through the staging till), then `cd registry && npx
+      wrangler deploy`. No migration. Check: `GET /cards/<id>/slots` on a live 32-slot card lists
+      no slot from 24 up.
+- [ ] **The change-slot check, before the till goes out:** `GET /registry/change-slot-check` with
+      an operator session. It lists, for the operator's cards, the live or pending notes on slots
+      24 to 31 (or under their keys) and the open or expired holder loads that name those slots.
+      A listed note pays as any note does; once it is spent, the new till re-keys its slot at a tap
+      with the holder's PIN. A listed holder load that is finished later logs
+      `ALERT load_in_change_slot`. Keep the list with the release notes. From here on, watch the
+      registry's log (`npx wrangler tail`) for `ALERT load_in_change_slot` and `ALERT change_used`.
+- [ ] **Till.** zion's package from the commit, as step 4. Check: a balance tap on a 32-slot card
+      keys slots 24 and 25 (the card's state in the registry lists them keyed); a top-up and an
+      online charge's change land below 24.
+- [ ] **Setup app**, both platforms, as step 5.
+- [ ] **POS apps**, `android-relay` and `ios-pos` from one commit, one phone at a time as step 7
+      (each with 0 waiting to sync first). The iOS POS goes out as 1.1.0 build 6: build 5 is
+      already with the App Store, which refuses a build number it has.
+- A POS app from this step refuses an offline sale that needs change on a card whose slots 24 to
+  31 are not keyed yet ("No room for change offline", with a price to try). Before a day of
+  offline sales, one online tap of each card at the new till keys them.
+- Rollback: the registry, `npx wrangler rollback <previous version id>` (no schema change); the
+  till, the previous `.s9pk` with an empty offline queue, as step 4.
 
 ## Afterwards
 

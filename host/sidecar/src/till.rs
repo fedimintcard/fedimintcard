@@ -115,6 +115,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 SpendFault::Undecided(_) => c(202, "undecided"),
                 SpendFault::Unresolved(_) => c(503, "recovering"),
                 SpendFault::WrongCard(_) => c(502, "card_error"),
+                SpendFault::Held(_) => c(402, "notes_held"),
             };
         }
     }
@@ -2034,7 +2035,8 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         }
         let ops = h.conn.lock().unwrap().ops.clone();
         let Some(ops) = ops else { return Reply::fail(503, "ops_not_connected", "this till is not connected to a registry") };
-        // Unkeyed slots (split keying) count as room: the load's tap keys them (`holder.rs`).
+        // Unkeyed slots (split keying) below 24 count as room: the load's tap keys them
+        // (`holder.rs`). `free_slots` lists no slot from 24 up.
         let free = match ops.client.free_slots(id).await {
             Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
             Err(e) => return Reply::fail(503, "ops_unreachable", format!("the card's free slots: {e}")),

@@ -254,7 +254,7 @@ The 4.0 load file is **14,752 bytes**, 60 LOAD commands at 247 bytes, sha256
 build; a CAP built twice has the same load file. SELECT answers `04 00`.
 
 Measured on a blank J3R180 (ATR `3B8A80014A546178436F7265563150`, SCP02, default keys) on 2026-11-24,
-package `fedimint-card-4.0-c51f348.cap`:
+package `fedimint-card-4.0.cap`:
 
 | What | Measured |
 |---|---|

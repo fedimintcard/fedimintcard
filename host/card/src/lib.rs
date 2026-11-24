@@ -28,6 +28,14 @@ pub use bridge::{BridgeError, BridgeTransport};
 /// 0 until the applet answers [`SW_SLOT_OUT_OF_RANGE`] (see [`past_last_slot`]). Applet 2.0 cards,
 /// prod card `15989f91` among them, have [`MIN_SLOTS`] and keep working.
 pub const SLOTS: u8 = 32;
+/// The first of the slots kept for change from offline sales: slots `CHANGE_SLOTS_FROM..SLOTS`
+/// (24 to 31) take that change and nothing else, and slots `0..CHANGE_SLOTS_FROM` (0 to 23) take
+/// loads and the change of online payments.
+pub const CHANGE_SLOTS_FROM: u8 = 24;
+/// Whether `slot` is one kept for change from offline sales ([`CHANGE_SLOTS_FROM`] and up).
+pub const fn is_change_slot(slot: u8) -> bool {
+    slot >= CHANGE_SLOTS_FROM && slot < SLOTS
+}
 /// Key slots on applet 2.0, the fewest any card we issued has. A card answering
 /// [`SW_SLOT_OUT_OF_RANGE`] below this is not one of ours.
 pub const MIN_SLOTS: u8 = 8;
@@ -1579,5 +1587,21 @@ pub fn open_from_env() -> Result<Box<dyn Card>> {
         #[cfg(not(feature = "pcsc"))]
         "pcsc" => bail!("CARD_BACKEND=pcsc needs `--features pcsc`"),
         other => bail!("unknown CARD_BACKEND {other:?} (soft|bridge|pcsc)"),
+    }
+}
+
+#[cfg(test)]
+mod slot_split_tests {
+    use super::*;
+
+    // Setup keys slots 0 to 7 on every card: none of them is a change slot.
+    const _: () = assert!(CHANGE_SLOTS_FROM >= MIN_SLOTS);
+
+    #[test]
+    fn the_last_eight_slots_are_kept_for_offline_change() {
+        let change: Vec<u8> = (0..=u8::MAX).filter(|s| is_change_slot(*s)).collect();
+        assert_eq!(change, (24..=31).collect::<Vec<u8>>());
+        assert_eq!(SLOTS - CHANGE_SLOTS_FROM, 8);
+        assert!((0..MIN_SLOTS).all(|s| !is_change_slot(s)));
     }
 }

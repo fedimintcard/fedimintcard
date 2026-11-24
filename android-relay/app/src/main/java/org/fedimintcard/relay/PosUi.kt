@@ -606,6 +606,8 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
 fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unresolved: Boolean = false, waitS: Int? = null, wrongTries: Int? = null): Pair<String, String> = when (kind) {
     ErrorKind.NO_CARD -> "Card not detected" to "Hold card flat on the phone's NFC antenna"
     ErrorKind.INSUFFICIENT -> "Card balance too low" to ""
+    // The till's detail speaks of msat; the copy says only that part of the balance does not pay now.
+    ErrorKind.NOTES_HELD -> "Part of the balance is on hold" to "Some of this card's money can't be used. A smaller amount may work, or take another payment."
     // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
     ErrorKind.NO_EXACT_PLAN -> "Can't take this amount" to "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."
     // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.

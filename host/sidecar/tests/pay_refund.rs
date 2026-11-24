@@ -55,6 +55,8 @@ struct FakeRegistry {
     /// have taken the load: the till's journal keeps it, and the federation never sees it).
     fail_loads: AtomicUsize,
     version: AtomicU64,
+    /// Slots listed as having no key on record yet.
+    unkeyed: Mutex<Vec<u8>>,
 }
 
 async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> Json<Value> {
@@ -68,7 +70,8 @@ async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> J
         .collect();
     let free: Vec<Value> =
         (1..r.keys.len() as u64).filter(|s| !used.contains(s)).take(n).map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]})).collect();
-    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": []}))
+    let unkeyed = r.unkeyed.lock().unwrap().clone();
+    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": unkeyed}))
 }
 
 async fn load(
@@ -199,6 +202,7 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
         fail_outcomes: AtomicUsize::new(0),
         fail_loads: AtomicUsize::new(0),
         version: AtomicU64::new(1),
+        unkeyed: Mutex::new(vec![]),
     });
     let url = serve_registry(registry.clone()).await;
     let conn = if on_ops {
@@ -463,6 +467,25 @@ async fn only_the_card_that_paid_and_only_a_pay_failed_pay_is_refunded() -> anyh
         // No such pay.
         assert_eq!(refund(addr, 99, None).await.0, 404);
         assert_eq!(call(addr, "POST", "/v1/pay/x/refund", None).await.0, 404);
+        assert!(registry.loads.lock().unwrap().is_empty(), "nothing was loaded");
+    })
+    .await;
+    Ok(())
+}
+
+/// Slots 24 and up take the change of offline sales only: a refund counts none of them as room,
+/// so a card with no free or unkeyed slot below 24 is refused as full and the pay stays owed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
+    let (f, actor) = start(true).await?;
+    let id = put_pay(&f.pays, "full24", PayState::PayFailed, PRICE, Some(&f.short_id));
+    let (addr, pays, registry, card) = (f.addr, f.pays.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        registry.free.store(0, Ordering::SeqCst);
+        *registry.unkeyed.lock().unwrap() = (24..32).collect();
+        let (s, v) = refund(addr, id, Some(card)).await;
+        assert_eq!((s, v["error"].as_str(), v["state"].as_str()), (409, Some("card_full"), Some("pay_failed")), "{v}");
+        assert_eq!(pays.get(id).unwrap().state, PayState::PayFailed);
         assert!(registry.loads.lock().unwrap().is_empty(), "nothing was loaded");
     })
     .await;

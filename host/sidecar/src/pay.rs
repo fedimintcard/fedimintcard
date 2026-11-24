@@ -1587,7 +1587,8 @@ pub(crate) async fn refund_job(
         Err(e) => return about(error_reply(&e), &rec),
     };
     let room = match slots {
-        // Unkeyed slots (split keying) count: the load keys them at this tap.
+        // Unkeyed slots (split keying) below 24 count: the load keys them at this tap.
+        // `free_slots` lists no slot from 24 up.
         Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
         Err(e) => return about(Reply::fail(502, "ops_unreachable", format!("the card's free slots: {e}")), &rec),
     };

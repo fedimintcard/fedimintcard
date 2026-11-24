@@ -65,12 +65,19 @@ pub enum SpendFault {
     Unresolved(String),
     /// The card in the field is not the one this wallet was set up with.
     WrongCard(String),
+    /// The notes the card can pay now fall short, and the notes held back for a transaction
+    /// nobody here can settle ([`crate::state::Held`]) would cover the price.
+    Held(String),
 }
 
 impl std::fmt::Display for SpendFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpendFault::Declined(m) | SpendFault::Undecided(m) | SpendFault::Unresolved(m) | SpendFault::WrongCard(m) => f.write_str(m),
+            SpendFault::Declined(m)
+            | SpendFault::Undecided(m)
+            | SpendFault::Unresolved(m)
+            | SpendFault::WrongCard(m)
+            | SpendFault::Held(m) => f.write_str(m),
         }
     }
 }
@@ -196,7 +203,9 @@ pub struct BalanceReport {
     pub notes: Vec<NoteView>,
     /// What the card can pay: its live notes, less those held back.
     pub live_msat: u64,
-    /// The live notes held back, until the registry releases them ([`crate::state::Held`]).
+    /// The live notes held back for a sale that was never settled ([`crate::state::Held`]): most
+    /// are freed by the registry's release after the grace; a double spend's still-live inputs stay
+    /// held.
     pub stranded_msat: u64,
     /// When the last of them may be released (ms, the registry's clock); `None` when there is no
     /// date to wait for ([`crate::state::CardState::stranded_until_ms`]).
@@ -313,6 +322,9 @@ impl CardWallet {
     ///
     /// The holder's PIN, when the job has one, is only verified: a card without a PIN is not
     /// pinned at a till with whatever the holder typed.
+    ///
+    /// The first Ok in a job also releases and re-keys the card's dead change slots
+    /// ([`card_dead_change`](Self::card_dead_change)).
     pub fn verify_pin_session(&mut self) -> Result<()> {
         // VERIFY_PIN with the card's wait served (applet 4.0): the same command resent while the
         // card answers `6A98`; a card taken away during the wait is `pin_wait`.
@@ -323,7 +335,9 @@ impl CardWallet {
         };
         let holding = |s: u32| tracing::debug!("the card serves a PIN wait: about {s} s left");
         let card = self.card.as_mut();
-        on_card(|| open_pin(card, &pin, Some(&holding)))
+        on_card(|| open_pin(card, &pin, Some(&holding)))?;
+        self.card_dead_change();
+        Ok(())
     }
 
     fn fee_fn(&self) -> impl Fn(u64) -> u64 + use<> {
@@ -1148,6 +1162,12 @@ impl CardWallet {
     pub async fn balance(&mut self) -> Result<BalanceReport> {
         self.recover_overwrites()?;
         let recovered = self.resolve_pending(RECOVER_TIMEOUT).await?;
+        // Change made live just now (a sale this tap sent): its outcome goes to ops first, whose
+        // answer carries the registry's signatures, so the card takes the change in this tap.
+        if self.ops.is_some() {
+            self.ops_sync().await;
+            self.sync_card_notes();
+        }
         let live: Vec<(usize, Nonce)> = self
             .store
             .state
@@ -1433,6 +1453,10 @@ impl CardWallet {
     /// the save that creates it, before anything is signed or submitted.
     pub async fn spend_ref(&mut self, price_msat: u64, client_ref: Option<&str>) -> Result<SpendReport> {
         self.start_clean().await?;
+        // Change made live just now (a sale this tap sent): its outcome goes to ops first, whose
+        // answer carries the registry's signatures, so this charge can write it to the card and
+        // spend it.
+        self.ops_sync().await;
         let fee = self.fee_fn();
         let min_denom = self.wallet.min_denom();
 
@@ -1467,7 +1491,20 @@ impl CardWallet {
                     }
                     renewed += 1;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let held = self.store.state.stranded_total_msat();
+                    if let Some(plan::PlanError::Insufficient { have, need }) = e.downcast_ref::<plan::PlanError>()
+                        && held > 0
+                        && have + held >= *need
+                    {
+                        return Err(SpendFault::Held(format!(
+                            "the card can pay {have} msat now, short of the {need} msat this charge needs: {held} msat more are held \
+                             for a sale that was never settled, and the card's other notes cannot pay this amount; a smaller amount may work, or take another payment"
+                        ))
+                        .into());
+                    }
+                    return Err(e);
+                }
             }
         };
         let inputs: Vec<NoteRec> = plan.inputs.iter().map(|&i| live[i].clone()).collect();

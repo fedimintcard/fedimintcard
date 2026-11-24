@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use fedimint_card_host_card::{Card, SW_NO_SPACE, SlotState, status_word};
+use fedimint_card_host_card::{Card, SW_NO_SPACE, SlotState, is_change_slot, status_word};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -57,12 +57,14 @@ pub const KEY_AHEAD: usize = 3;
 pub const SPARE_TARGET: usize = 12;
 /// Most slots one tap keys for that reserve. A `GEN_KEY` takes about 320 ms on a J3R180.
 pub const MAX_KEY_PER_TAP: usize = 2;
-/// What the reserve's budget counts, per card command (J3R180 estimates: a `GEN_KEY` measured
-/// at about 320 ms, a `RELEASE` checks a P-256 signature in about 75 ms, a `SET_NOTE` writes
-/// 56 bytes).
+/// What the reserve's budget counts, per card command (J3R180: a `GEN_KEY` measured at about
+/// 316 ms, a `RELEASE` checks a P-256 signature in about 75 ms, a `SET_NOTE` measured at 136 ms).
 const GEN_KEY_MS: u64 = 320;
 const RELEASE_MS: u64 = 100;
-const SET_NOTE_MS: u64 = 40;
+const SET_NOTE_MS: u64 = 136;
+/// Change slots (24 to 31) a tap keys while fewer than this many are KEYED and free, whatever
+/// the tap already wrote: a card's first tap leaves it able to take change offline.
+pub const MIN_CHANGE_SPARES: usize = 2;
 
 /// Most slots one tap reads (`GET_SLOT`) to tell whether they are stranded
 /// ([`CardWallet::card_strands`]); the rest are held on doubt and read at a later tap.
@@ -97,6 +99,22 @@ pub fn spares_to_key(fresh: usize, cfg: SpareConfig, released: usize, written: u
     let busy = released as u64 * RELEASE_MS + written as u64 * SET_NOTE_MS;
     let n = (budget.saturating_sub(busy) / GEN_KEY_MS) as usize;
     n.min(cfg.target - fresh)
+}
+
+/// Whether a tap that has already keyed or renewed `taken` for the reserve takes `slot` too:
+/// any slot while fewer than `n` ([`spares_to_key`]) are taken, but a slot below 24 only if what
+/// is left of `n` still leaves room for the `floor` change slots (24 to 31) the tap owes; a
+/// change slot also while fewer than `floor` change slots are taken.
+pub fn spare_may_take(slot: u8, taken: &[u8], n: usize, floor: usize) -> bool {
+    let change = taken.iter().filter(|s| is_change_slot(**s)).count();
+    if is_change_slot(slot) { taken.len() < n || change < floor } else { taken.len() + floor.saturating_sub(change) < n }
+}
+
+/// `slots` with the change slots (24 to 31) first, each part lowest first: the order the reserve
+/// keys and renews in.
+fn change_slots_first(mut slots: Vec<u8>) -> Vec<u8> {
+    slots.sort_by_key(|s| (!is_change_slot(*s), *s));
+    slots
 }
 
 /// What [`CardWallet::card_spares`] did at a tap.
@@ -430,10 +448,13 @@ impl OpsClient {
         serde_json::from_value(v).map_err(|e| OpsError::Unreachable(format!("the slot-keys answer did not parse: {e}")))
     }
 
-    /// `GET /cards/:id/slots` (holder): the card's free slot keys, its version and federation.
+    /// `GET /cards/:id/slots` (holder): the card's free slot keys, its version and federation,
+    /// with every slot from 24 up left out ([`FreeSlots::for_loads`]).
     pub async fn free_slots(&self, short_id: &str) -> Result<FreeSlots, OpsError> {
         let v = self.call(reqwest::Method::GET, &format!("/cards/{short_id}/slots"), None).await?;
-        serde_json::from_value(v).map_err(|e| OpsError::Unreachable(format!("the free slots did not parse: {e}")))
+        serde_json::from_value::<FreeSlots>(v)
+            .map(FreeSlots::for_loads)
+            .map_err(|e| OpsError::Unreachable(format!("the free slots did not parse: {e}")))
     }
 
     /// `POST /cards/:id/load` (holder): the notes, pending, before the wallet submits.
@@ -466,6 +487,16 @@ pub struct FreeSlots {
     /// Slots with no key on record yet, ascending: a till keys them at a tap ([`key_slots`]).
     #[serde(default)]
     pub unkeyed_slots: Vec<u8>,
+}
+
+impl FreeSlots {
+    /// Only the slots a load may take: slots 24 and up hold the change of offline sales and
+    /// nothing else, so they are dropped from both lists, whatever the registry listed.
+    pub fn for_loads(mut self) -> Self {
+        self.free.retain(|s| !is_change_slot(s.slot));
+        self.unkeyed_slots.retain(|s| !is_change_slot(*s));
+        self
+    }
 }
 
 /// `POST /cards/:id/slot-keys` as the registry answers it.
@@ -564,6 +595,20 @@ pub struct OpsLink {
     /// The registry's certificate key this till keeps (hex SEC1, `till-ops.json`): the key a 4.0
     /// card checks the registry's note signatures under. `None` when the till has none yet.
     pub cert_key: Option<String>,
+    /// Dead change slots this job releases and re-keys once the PIN is checked
+    /// ([`CardWallet::card_dead_change`]), as [`CardWallet::card_releases`] found them.
+    pub dead_change: Vec<DeadChange>,
+}
+
+/// A change slot ([`CardState::dead_change_slot`]) left for [`CardWallet::card_dead_change`]:
+/// its release (txid, signature) when the card reads it CHANGE, `None` when it already reads
+/// KEYED on the burned key (a tap cut between the two steps).
+///
+/// [`CardState::dead_change_slot`]: crate::state::CardState::dead_change_slot
+#[derive(Clone, Debug)]
+pub struct DeadChange {
+    pub slot: u8,
+    pub release: Option<([u8; 32], Vec<u8>)>,
 }
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old path.
@@ -702,6 +747,18 @@ impl Ops {
             }
             Err(e) => tracing::warn!("card {}: spare reserve not topped up this tap: {e:#}", short_id_of(&pk)),
         }
+        // Dead change slots wait for the PIN (`card_dead_change`): a job that carries it checks it
+        // here when nothing above did, and a refused PIN ends the tap as above.
+        if cw.pin.is_some()
+            && cw.ops.as_ref().is_some_and(|l| !l.dead_change.is_empty())
+            && let Err(e) = cw.verify_pin_session()
+        {
+            if pin_refused(&e) {
+                Self::finish(cw, base).await;
+                return Err(e);
+            }
+            tracing::warn!("card {}: dead change slots not renewed this tap: {e:#}", short_id_of(&pk));
+        }
         Ok(base)
     }
 
@@ -719,6 +776,7 @@ impl Ops {
             releases: vec![],
             stranded: vec![],
             cert_key: self.cards_dir.parent().and_then(|d| crate::claim::read_cert_key(d).ok().flatten()),
+            dead_change: vec![],
         });
         match cw.ops_load().await {
             Ok(()) => Ok(base),
@@ -797,9 +855,19 @@ impl CardWallet {
     /// (ops never issued its note), so the working copy from ops already reads them so and the
     /// card is brought in line with it. Answers how many were released; never fails the tap: a
     /// release that does not take is logged and comes again with the card's next state.
+    ///
+    /// A CHANGE slot whose notes on its current key are all dead in the card's file
+    /// ([`CardState::dead_change_slot`]) is not released here: it is listed in the link's
+    /// `dead_change` with its release, as is such a slot the card already reads KEYED, for
+    /// [`card_dead_change`](Self::card_dead_change) to release and re-key once the PIN is checked.
+    /// Until then the slot reads CHANGE and no phone takes it.
+    ///
+    /// [`CardState::dead_change_slot`]: crate::state::CardState::dead_change_slot
     pub fn card_releases(&mut self) -> usize {
         let Some((releases, short_id)) = self.ops.as_ref().map(|l| (l.releases.clone(), l.short_id.clone())) else { return 0 };
-        if releases.is_empty() || !self.card_sign_once().unwrap_or(false) {
+        let dead: Vec<u8> =
+            self.store.state.slots.iter().map(|s| s.slot).filter(|s| self.store.state.dead_change_slot(*s) && self.may_renew(*s)).collect();
+        if (releases.is_empty() && dead.is_empty()) || !self.card_sign_once().unwrap_or(false) {
             return 0;
         }
         let st = match on_card(|| self.card.get_state()) {
@@ -809,6 +877,34 @@ impl CardWallet {
                 return 0;
             }
         };
+        let mut unit: Vec<DeadChange> = dead
+            .iter()
+            .filter(|s| st.states.get(**s as usize) == Some(&SlotState::Keyed))
+            .map(|s| DeadChange { slot: *s, release: None })
+            .collect();
+        let n = self.card_send_releases(&short_id, releases, &st, &dead, &mut unit);
+        if !unit.is_empty() {
+            tracing::info!("card {short_id}: dead change slot(s) {:?} wait for the PIN", unit.iter().map(|d| d.slot).collect::<Vec<_>>());
+        }
+        if let Some(l) = self.ops.as_mut() {
+            l.dead_change = unit;
+        }
+        n
+    }
+
+    /// [`card_releases`](Self::card_releases) with the card's state read: each release that fits
+    /// is sent, except a dead change slot's, which goes to `unit`.
+    fn card_send_releases(
+        &mut self,
+        short_id: &str,
+        releases: Vec<RemoteRelease>,
+        st: &fedimint_card_host_card::CardStatus,
+        dead: &[u8],
+        unit: &mut Vec<DeadChange>,
+    ) -> usize {
+        if releases.is_empty() {
+            return 0;
+        }
         if !st.registry_key {
             tracing::warn!("card {short_id} has no registry key (set at provisioning); {} release(s) not sent", releases.len());
             return 0;
@@ -836,6 +932,10 @@ impl CardWallet {
             if !fits {
                 continue;
             }
+            if st.states.get(r.slot as usize) == Some(&SlotState::Change) && dead.contains(&r.slot) {
+                unit.push(DeadChange { slot: r.slot, release: Some((txid, sig)) });
+                continue;
+            }
             match on_card(|| self.card.release(r.slot, &txid, &sig)) {
                 Ok(now) => {
                     tracing::info!("card {short_id}: slot {} released from {} ({now:?})", r.slot, r.txid);
@@ -847,6 +947,33 @@ impl CardWallet {
         n
     }
 
+    /// Release and re-key, as one unit, the dead change slots [`card_releases`](Self::card_releases)
+    /// listed: RELEASE (when the card reads CHANGE), then [`overwrite_slot`] at once. Run once per
+    /// job, by [`verify_pin_session`] when it first answers Ok: re-keying needs the PIN session.
+    /// Outside the spare budget; a dead note needs no federation call. A tap cut between the two
+    /// steps leaves the slot KEYED on its burned key, and the next tap with the PIN re-keys it.
+    /// Never fails the job: a step that does not take is logged and comes again.
+    ///
+    /// [`overwrite_slot`]: CardWallet::overwrite_slot
+    /// [`verify_pin_session`]: CardWallet::verify_pin_session
+    pub fn card_dead_change(&mut self) {
+        let Some(link) = self.ops.as_mut() else { return };
+        let unit = std::mem::take(&mut link.dead_change);
+        let short_id = link.short_id.clone();
+        for d in unit {
+            if let Some((txid, sig)) = &d.release
+                && let Err(e) = on_card(|| self.card.release(d.slot, txid, sig))
+            {
+                tracing::warn!("card {short_id}: RELEASE of dead change slot {}: {e:#}", d.slot);
+                continue;
+            }
+            match self.overwrite_slot(d.slot) {
+                Ok(_) => tracing::info!("card {short_id}: dead change slot {} released and re-keyed", d.slot),
+                Err(e) => tracing::warn!("card {short_id}: re-keying dead change slot {}: {e:#}", d.slot),
+            }
+        }
+    }
+
     /// Hold back, for this job, what the registry's copy of a 3.0 card cannot explain (ENG-867):
     /// a SPENT slot whose note it calls live, or a CHANGE slot whose key never carried a note, for
     /// a transaction it never saw (a POS phone's offline sales, lost with the phone). Unheld, the
@@ -854,7 +981,8 @@ impl CardWallet {
     /// be planned into such a slot. A slot is explained, and left alone, when its note is an input
     /// of an open charge, or its transaction is one this till or the registry has: an open charge,
     /// a live or pending note's transaction, or a charge in this till's offline queue under
-    /// `data_dir` for the card that it has not abandoned (`queued_txids`).
+    /// `data_dir` for the card that it has neither abandoned nor had refused by the registry
+    /// (`queued_txids`).
     ///
     /// A slot the registry lists as stranded, as the same kind, is held as listed: a SPENT slot
     /// cannot sign again and a CHANGE slot cannot reopen. Up to [`MAX_STRAND_CHECKS`] others are
@@ -1316,9 +1444,11 @@ impl CardWallet {
     /// SPENT slots whose notes are settled (spent or dead in ops, confirmed spent by the
     /// federation, no charge open on them) are renewed first ([`overwrite_slot`], queued to ops
     /// like every renewal); they need the holder's PIN, so only a job that carries it renews.
-    /// Then never-keyed slots, recorded in ops as split keying does ([`key_slots`]). Off ops, on a
-    /// 2.x card, or with the reserve full it does nothing. The caller logs any error and goes on,
-    /// except a refused PIN.
+    /// Then never-keyed slots, recorded in ops as split keying does ([`key_slots`]). Both take the
+    /// change slots (24 to 31) first, and while fewer than [`MIN_CHANGE_SPARES`] of those are
+    /// KEYED and free the tap keys that many whatever its budget ([`spare_may_take`]). Off ops,
+    /// on a 2.x card, or with the reserve full it does nothing. The caller logs any error and
+    /// goes on, except a refused PIN.
     ///
     /// [`overwrite_slot`]: CardWallet::overwrite_slot
     pub async fn card_spares(&mut self, released: usize, written: usize) -> Result<SpareReport> {
@@ -1329,49 +1459,72 @@ impl CardWallet {
         }
         let st = on_card(|| self.card.get_state()).context("GET_STATE")?;
         let on_card_is = |slot: u8, want: &[SlotState]| st.states.get(slot as usize).is_some_and(|s| want.contains(s));
-        rep.fresh = self.store.state.free_slots().into_iter().filter(|s| on_card_is(*s, &[SlotState::Keyed])).count();
+        let fresh: Vec<u8> = self
+            .store
+            .state
+            .free_slots()
+            .into_iter()
+            .chain(self.store.state.free_change_slots())
+            .filter(|s| on_card_is(*s, &[SlotState::Keyed]))
+            .collect();
+        rep.fresh = fresh.len();
         let n = spares_to_key(rep.fresh, self.spares, released, written);
-        if n == 0 {
-            return Ok(rep);
-        }
-
-        // 1. Settled SPENT slots: their keys are burned, so renewing one costs the card nothing.
-        if self.pin.is_some() {
+        let spent: Vec<u8> = if self.pin.is_some() {
             let open: Vec<&String> = self.store.state.pending_txs.iter().flat_map(|p| &p.inputs).collect();
-            let spent: Vec<u8> = self
+            let spent = self
                 .store
                 .state
                 .overwritable_slots()
                 .into_iter()
                 .filter(|s| self.may_renew(*s) && on_card_is(*s, &[SlotState::Spent, SlotState::Keyed]))
                 .filter(|s| self.store.state.notes_on_current_key(*s).all(|n| !open.contains(&&n.nonce)))
+                .filter(|s| !link.dead_change.iter().any(|d| d.slot == *s))
                 .collect();
-            if !spent.is_empty() {
-                self.verify_pin_session()?;
-                for slot in spent {
-                    if rep.renewed.len() >= n {
-                        break;
+            change_slots_first(spent)
+        } else {
+            vec![]
+        };
+        let unkeyed = change_slots_first(link.unkeyed.clone());
+        // The change slots this tap owes beyond its budget: as many as the card lacks of
+        // MIN_CHANGE_SPARES, if it has slots to give them.
+        let open_change = spent.iter().chain(&unkeyed).filter(|s| is_change_slot(**s)).count();
+        let floor = MIN_CHANGE_SPARES.saturating_sub(fresh.iter().filter(|s| is_change_slot(**s)).count()).min(open_change);
+        if n == 0 && floor == 0 {
+            return Ok(rep);
+        }
+
+        // 1. Settled SPENT slots: their keys are burned, so renewing one costs the card nothing.
+        if spent.iter().any(|s| spare_may_take(*s, &[], n, floor)) {
+            self.verify_pin_session()?;
+            for slot in spent {
+                if !spare_may_take(slot, &rep.renewed, n, floor) {
+                    continue;
+                }
+                match self.renewable(slot).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!("spare reserve: slot {slot}: {e:#}");
+                        continue;
                     }
-                    match self.renewable(slot).await {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            tracing::warn!("spare reserve: slot {slot}: {e:#}");
-                            continue;
-                        }
-                    }
-                    match self.overwrite_slot(slot) {
-                        Ok(_) => rep.renewed.push(slot),
-                        Err(e) => tracing::warn!("spare reserve: could not renew slot {slot}: {e:#}"),
-                    }
+                }
+                match self.overwrite_slot(slot) {
+                    Ok(_) => rep.renewed.push(slot),
+                    Err(e) => tracing::warn!("spare reserve: could not renew slot {slot}: {e:#}"),
                 }
             }
         }
 
         // 2. Never-keyed slots.
-        let more = n - rep.renewed.len();
-        if more > 0 && !link.unkeyed.is_empty() {
-            let want: Vec<u8> = link.unkeyed.iter().take(more).copied().collect();
+        let mut taken = rep.renewed.clone();
+        let mut want = vec![];
+        for slot in unkeyed {
+            if spare_may_take(slot, &taken, n, floor) {
+                taken.push(slot);
+                want.push(slot);
+            }
+        }
+        if !want.is_empty() {
             self.ops_key_unkeyed(&want).await?;
             rep.keyed = want;
         }
@@ -1396,9 +1549,11 @@ impl CardWallet {
         Ok(())
     }
 
-    /// Unkeyed slots this tap may key: those ops reported, none off ops.
+    /// Unkeyed slots this tap may key for a load or an online charge's change: those ops
+    /// reported below 24, none off ops. Slots 24 to 31 are the spare reserve's
+    /// ([`CardWallet::card_spares`]).
     pub(crate) fn keyable_slots(&self) -> usize {
-        self.ops.as_ref().map_or(0, |l| l.unkeyed.len())
+        self.ops.as_ref().map_or(0, |l| l.unkeyed.iter().filter(|s| !is_change_slot(**s)).count())
     }
 
     /// Make sure the card has `need` free keyed slots, keying unkeyed ones if it has too few
@@ -1409,11 +1564,12 @@ impl CardWallet {
     pub(crate) async fn ops_make_room(&mut self, need: usize) -> Result<Vec<u8>> {
         let Some(link) = self.ops.clone() else { return Ok(vec![]) };
         let free = self.store.state.free_slots().len();
-        let n = slots_to_key(need, free, link.unkeyed.len());
+        let unkeyed: Vec<u8> = link.unkeyed.iter().copied().filter(|s| !is_change_slot(*s)).collect();
+        let n = slots_to_key(need, free, unkeyed.len());
         if n == 0 || free + n < need {
             return Ok(vec![]);
         }
-        let want = link.unkeyed[..n].to_vec();
+        let want = unkeyed[..n].to_vec();
         self.ops_key_unkeyed(&want).await?;
         Ok(want)
     }
@@ -1426,19 +1582,34 @@ impl CardWallet {
 }
 
 /// The transactions this till's offline queue (`<data_dir>/offline_queue.json`) holds for card
-/// `short_id`, abandoned ones aside: this till knows them, so their slots are explained. An
-/// abandoned charge is never sent (an input slot of it paid another transaction or was re-keyed),
-/// so the slots the card spent or opened for it are stranded, and are held and reported like a
-/// lost phone's. A queue that cannot be read is taken as empty: the slot is then held and
-/// reported, and the sender's report of the charge clears its row in the registry.
+/// `short_id`, abandoned and refused ones aside: this till knows them, so their slots are
+/// explained. An abandoned charge is never sent (an input slot of it paid another transaction or
+/// was re-keyed), and a charge the registry refused (`DoubleSpent`, `Refused`) is never sent
+/// either, so the slots the card spent or opened for it are stranded, and are held and reported
+/// like a lost phone's. What the registry does with them depends on its refusal:
+/// - a refusal that leaves the transaction unseen there (a change nonce that already carried a
+///   note, `change_used`; the money gate's refusal, `released`; a 400 or another 409, which it
+///   keeps no report of) takes a stranding for each slot still held and releases it after its
+///   grace (docs/OFFLINE-PROTOCOL.md § 7);
+/// - a double spend, an input not live at the registry, counts as the registry having seen the
+///   transaction (`SEEN_REPORT`, registry/src/cards.ts). It releases the sale's change slots at
+///   once (§ 6) and takes no stranding for it. An input it still lists live keeps its SPENT slot
+///   on the card and is held here: the report of it is ignored, the registry never lists it, so
+///   it is reported again at every tap and no release comes for it.
+///
+/// A queue that cannot be read is taken as empty: the slot is then held and reported, and the
+/// sender's report of the charge clears its row in the registry.
 fn queued_txids(data_dir: Option<&Path>, short_id: &str) -> Vec<String> {
+    use fedimint_card_pos_core::queue::ChargeState;
     let Some(dir) = data_dir else { return vec![] };
     match fedimint_card_pos_core::queue::Queue::open(dir) {
         Ok(q) => q
             .file
             .charges
             .into_iter()
-            .filter(|c| c.short_id == short_id && c.state != fedimint_card_pos_core::queue::ChargeState::Abandoned)
+            .filter(|c| {
+                c.short_id == short_id && !matches!(c.state, ChargeState::Abandoned | ChargeState::DoubleSpent | ChargeState::Refused)
+            })
             .map(|c| c.txid)
             .collect(),
         Err(e) => {
@@ -1614,13 +1785,48 @@ mod tests {
         assert_eq!(spares_to_key(15, cfg, 0, 0), 0);
         assert_eq!(spares_to_key(11, cfg, 0, 0), 1, "the shortfall");
         assert_eq!(spares_to_key(0, cfg, 0, 0), 2, "never more than the cap");
-        // A tap busy with a release or a few notes has room for one key; with more, none.
+        // A tap busy with a release or up to two notes has room for one key; with more, none. A
+        // note costs the 136 ms a SET_NOTE was measured at.
         assert_eq!(spares_to_key(0, cfg, 1, 0), 1);
-        assert_eq!(spares_to_key(0, cfg, 0, 3), 1);
+        assert_eq!(spares_to_key(0, cfg, 0, 2), 1);
+        assert_eq!(spares_to_key(0, cfg, 0, 3), 0);
         assert_eq!(spares_to_key(0, cfg, 4, 0), 0);
         assert_eq!(spares_to_key(0, cfg, 0, 16), 0);
         assert_eq!(spares_to_key(0, SpareConfig { target: 0, max_per_tap: 2 }, 0, 0), 0, "off");
         assert_eq!(spares_to_key(0, SpareConfig { target: 6, max_per_tap: 0 }, 0, 0), 0, "off");
+    }
+
+    /// The slots a tap takes, offered `offer` in order, with a budget of `n` and a floor.
+    fn spares_taken(offer: &[u8], n: usize, floor: usize) -> Vec<u8> {
+        let mut taken = vec![];
+        for s in change_slots_first(offer.to_vec()) {
+            if spare_may_take(s, &taken, n, floor) {
+                taken.push(s);
+            }
+        }
+        taken
+    }
+
+    #[test]
+    fn the_spare_reserve_keys_change_slots_first_and_two_of_them_whatever_the_budget() {
+        let never_keyed: Vec<u8> = (8..32).collect();
+        assert_eq!(change_slots_first(vec![9, 30, 8, 24]), vec![24, 30, 8, 9]);
+        // Within the budget: change slots first.
+        assert_eq!(spares_taken(&never_keyed, 2, 0), vec![24, 25]);
+        assert_eq!(spares_taken(&never_keyed, 2, 2), vec![24, 25]);
+        // A tap whose notes spent the budget still keys the floor, and no more.
+        assert_eq!(spares_taken(&never_keyed, 0, 2), vec![24, 25]);
+        assert_eq!(spares_taken(&never_keyed, 1, 2), vec![24, 25]);
+        assert_eq!(spares_taken(&never_keyed, 0, 1), vec![24]);
+        assert_eq!(spares_taken(&never_keyed, 0, 0), Vec::<u8>::new());
+        // All change slots keyed: the budget goes to low slots, lowest first.
+        assert_eq!(spares_taken(&(8..24).collect::<Vec<u8>>(), 2, 0), vec![8, 9]);
+        // A low slot never takes the place the floor keeps for a change slot.
+        assert!(!spare_may_take(8, &[], 2, 2));
+        assert!(!spare_may_take(8, &[9], 2, 1));
+        assert!(spare_may_take(8, &[24], 2, 1));
+        assert!(spare_may_take(26, &[8, 9], 2, 1), "the floor: one change slot past the budget");
+        assert!(!spare_may_take(26, &[24, 25], 2, 2));
     }
 
     #[test]

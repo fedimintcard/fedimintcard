@@ -51,8 +51,14 @@ impl Fx {
     /// `1234` in one selection; then `notes` (msat) loaded into slots 0, 1, ..., each signed by
     /// this fixture's registry.
     pub fn card(&self, keyed: u8, notes: &[u64]) -> SoftTransport {
+        self.card_with_keys(&(0..keyed).collect::<Vec<u8>>(), notes)
+    }
+
+    /// The same card with keys in `slots` only (slot 0 first: its key is the certified one).
+    pub fn card_with_keys(&self, slots: &[u8], notes: &[u64]) -> SoftTransport {
+        assert_eq!(slots.first(), Some(&0), "slot 0 carries the certificate");
         let mut c = SoftCard::v4();
-        let keys: Vec<_> = (0..keyed).map(|s| c.gen_key(s).unwrap()).collect();
+        let keys: Vec<_> = slots.iter().map(|s| c.gen_key(*s).unwrap()).collect();
         let w = c.attest_init().unwrap();
         let cert = Certificate::sign(&self.registry, &keys[0].serialize(), &w).unwrap();
         c.set_cert(&cert.to_bytes()).unwrap();

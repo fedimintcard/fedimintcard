@@ -589,9 +589,10 @@ async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::R
 async fn slot_limits_follow_the_card_size() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     assert_eq!(SLOTS, 32);
-    assert_eq!(f.cw.store.state.free_slots().len(), 32);
+    // Loads take slots 0 to 23; 24 to 31 are for offline change.
+    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (24, 8));
     f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
-    assert_eq!(f.cw.store.state.free_slots().len(), 29);
+    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (21, 8));
     drop(f.fed);
     Ok(())
 }
@@ -625,12 +626,12 @@ async fn an_eight_slot_card_behaves_as_before() -> anyhow::Result<()> {
 async fn a_50k_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
     let mut f = fx_card(false, Amount::from_sats(60_000), Box::new(SoftCard::new())).await?;
     assert_eq!(f.cw.store.state.slots.len(), 32, "a key in every slot");
-    assert_eq!(f.cw.store.state.free_slots().len(), 32);
+    assert_eq!(f.cw.store.state.free_slots().len(), 24, "slots 0 to 23 take loads");
     assert_eq!(plan::binary(50_000_000).len(), 12);
     let notes = f.cw.topup(&[50_000_000]).await?;
     assert_eq!(notes.len(), 12);
     assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000);
-    assert_eq!(f.cw.store.state.free_slots().len(), 20);
+    assert_eq!(f.cw.store.state.free_slots().len(), 12);
     // And it spends: the change lands in slots past the old eighth.
     let r = f.cw.spend(12_345_000).await?;
     assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000 - 12_345_000 - r.overpay_msat, "{r:?}");
@@ -646,7 +647,7 @@ async fn fresh_setup_rekeys_and_refuses_with_live_notes() -> anyhow::Result<()> 
     let new: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
     assert_eq!(new.len(), SLOTS as usize);
     assert!(old.iter().zip(&new).all(|(a, b)| a != b), "every slot has a new key");
-    assert_eq!(f.cw.store.state.free_slots().len(), SLOTS as usize);
+    assert_eq!(f.cw.store.state.free_slots().len() + f.cw.store.state.free_change_slots().len(), SLOTS as usize);
     f.cw.topup(&[1 << 18]).await?;
     let err = f.cw.card_setup(true).expect_err("live note");
     assert!(err.to_string().contains("live or pending"), "{err}");

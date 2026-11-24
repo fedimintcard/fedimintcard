@@ -1,7 +1,7 @@
 import Foundation
 
 enum ErrorKind: Equatable, CaseIterable {
-    case badRequest, busy, noCard, relayUnreachable, cardError, insufficient, noExactPlan
+    case badRequest, busy, noCard, relayUnreachable, cardError, insufficient, notesHeld, noExactPlan
     case declined, undecided, recovering, conflict, pinRequired, wrongPin, pinWait, oldCard, signCheckFailed, cardChanged
     case unknownCard, opsUnreachable, opsRefused, cardLinkGone, unauthorized, `internal`, unknown
     /// Offline, the price needs change and the card has no slot for it (not a full card).
@@ -36,6 +36,7 @@ enum ErrorKind: Equatable, CaseIterable {
         case .relayUnreachable: return .relayUnreachable
         case .cardError: return .cardError
         case .insufficient: return .insufficient
+        case .notesHeld: return .notesHeld
         case .noExactPlan: return .noExactPlan
         case .declined: return .declined
         case .undecided: return .undecided
@@ -89,7 +90,7 @@ enum ErrorKind: Equatable, CaseIterable {
     /// `pin_required`, `old_card`, the ops codes and the link/auth refusals come before the earlier
     /// attempt on every till, so they prove nothing about it: an unresolved sale stays unresolved.
     var definitive: Bool {
-        [.insufficient, .noExactPlan, .offlineNoChangeRoom, .declined, .badRequest, .noCard, .cardError, .wrongPin, .pinWait, .signCheckFailed].contains(self)
+        [.insufficient, .notesHeld, .noExactPlan, .offlineNoChangeRoom, .declined, .badRequest, .noCard, .cardError, .wrongPin, .pinWait, .signCheckFailed].contains(self)
     }
 
     /// Whether trying the same sale again can help.

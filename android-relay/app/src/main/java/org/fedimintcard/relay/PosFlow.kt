@@ -3,7 +3,7 @@ package org.fedimintcard.relay
 import java.util.UUID
 
 enum class ErrorKind {
-    BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NO_EXACT_PLAN,
+    BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NOTES_HELD, NO_EXACT_PLAN,
     DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_WAIT, OLD_CARD, SIGN_CHECK_FAILED, CARD_CHANGED,
     UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN,
     OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED,
@@ -31,7 +31,7 @@ enum class ErrorKind {
      * `pin_required`, `old_card` and the ops codes are answered before that check, so they prove
      * nothing about an earlier attempt: an unresolved sale stays unresolved.
      */
-    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NO_EXACT_PLAN, OFFLINE_NO_CHANGE_ROOM, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_WAIT, SIGN_CHECK_FAILED)
+    val definitive: Boolean get() = this in setOf(INSUFFICIENT, NOTES_HELD, NO_EXACT_PLAN, OFFLINE_NO_CHANGE_ROOM, DECLINED, BAD_REQUEST, NO_CARD, CARD_ERROR, WRONG_PIN, PIN_WAIT, SIGN_CHECK_FAILED)
 
     /** Whether trying the same sale again can help. */
     val retryable: Boolean get() = this != OLD_CARD

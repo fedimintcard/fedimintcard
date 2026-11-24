@@ -29,7 +29,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use fedimint_card_host_card::Card;
+use fedimint_card_host_card::{Card, is_change_slot};
 use fedimint_client::transaction::TransactionBuilder;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -243,7 +243,7 @@ impl<'w> Loader<'w> {
             if n > 0 && free.free.len() + n >= notes.len() {
                 let keyed = crate::ops::key_slots(card, keyer, &short_id, &free.unkeyed_slots[..n]).await?;
                 free.version = keyed.answer.version;
-                free.unkeyed_slots = keyed.answer.unkeyed_slots.clone();
+                free.unkeyed_slots = keyed.answer.unkeyed_slots.iter().copied().filter(|s| !is_change_slot(*s)).collect();
                 free.free.extend(keyed.keys.into_iter().map(|(slot, pubkey)| RemoteSlot { slot, pubkey }));
                 free.free.sort_by_key(|s| s.slot);
             }

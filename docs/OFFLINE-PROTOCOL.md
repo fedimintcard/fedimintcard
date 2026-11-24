@@ -121,8 +121,8 @@ ops (the certificate key and the report route are the registry's). `offline` in 
 counts `double_spent` and `refused` (reports the registry refused for another reason). The queue is
 `<data_dir>/offline_queue.json`; it is written before `SET_CHANGE`, with every secret, so an entry
 cut off before the card's answer is finished from the card's stored signatures at its next tap,
-offline or a `POST /v1/charge` (§ 7). Change goes only to KEYED slots the till's copy of the card
-does not know to hold a note.
+offline or a `POST /v1/charge` (§ 7). Change goes only to KEYED slots from 24 to 31 whose current
+key has never carried a note, by the till's copy of the card (§ 8).
 Online, a 3.0 card's `SIGN` counts against its daily limit too, so the till checks the limit
 (`GET_STATE`) before an intent and answers `card_limit` instead of leaving a half-signed charge.
 
@@ -273,3 +273,65 @@ reports it, but only for the grace: a till that stays off ops for longer than 37
 those sales refused by the gate when it reconnects, the merchant's loss, as a wiped phone's would
 be. A till whose kit window is longer than the grace can hold a phone's sale the registry has
 already refused (the merchant's loss, within the caps).
+
+## 8. Slots for loads and slots for change (Fedimint Card 4.0)
+
+A 32-slot card's slots have two uses. Every card with applet 4.x is one: the applet's slot count
+is fixed at 32 (`SLOTS`), so every such card has the eight change slots. Slots 0 to 23 take loads (a top-up, a holder's load, a
+refund) and the change of an online charge. Slots 24 to 31 take only the change of an offline
+charge, a phone's or the till's own.
+
+- **Registry.** `GET /cards/:id/slots` lists free and unkeyed slots below 24 only;
+  `GET /cards/:id/state` still lists slots 24 to 31, for the till to key. A holder's `/load` that
+  names a slot from 24 up is 409, before anything is recorded. An `/intent` with inputs (a
+  charge) whose change names a slot from 24 up, or a nonce under the current key of such a slot,
+  is 409, after its replay check and before anything is recorded. An intent with no inputs there
+  (a till's load) is recorded as before and logs `ALERT load_in_change_slot card=<id> till=<id>
+  txid=<txid> slots=<list>` once; a holder's load finished late onto such a slot logs the same
+  line, with `holder` for the till. An offline report's change in slots 24 to 31 is recorded as
+  before (§ 3); a report whose change nonce already carried a note answers its 409 and logs
+  `ALERT change_used card=<id> till=<id> txid=<txid> slots=<list>`.
+- **`GET /registry/change-slot-check`** (operator session, 401 without): for the operator's own
+  cards, every live or pending note on a slot from 24 up or under such a slot's key, with its txid
+  and status, and every open or expired holder load that names such a slot, with its status. The
+  change of offline sales recorded there is listed too; its txid tells it apart.
+- **Till.** Loads and online change take slots 0 to 23: the room a top-up, a load or a refund
+  counts is those slots, keyed or not, and a load keys only those. The spare reserve
+  (`TILL-API.md`, "Spare slots for offline change") renews and keys slots 24 to 31 first, and while fewer
+  than 2 of them are keyed and free it keys up to 2 whatever the tap's budget: a card's first
+  online tap keys 24 and 25. The till's own offline charge puts change only in KEYED slots from 24
+  to 31 whose current key carries no note in its copy of the card, so a slot that held a spent
+  note takes change again only once it is re-keyed; with none it answers 409
+  `offline_no_change_room`, with the prices the card pays exactly.
+- **Phone.** The POS core's offline charge plans change only into KEYED slots from 24 to 31. A
+  card with none is refused before it signs: 409 `offline_no_change_room`, with the prices the
+  card pays exactly. A price that needs no change is taken as before. The card's next online tap
+  at a till keys its change slots.
+- **A dead change slot.** A slot from 24 to 31 whose key carried notes that are now all dead is
+  not released at an attach, nor after a wrong PIN. Once the card takes the holder's PIN, the till
+  sends the registry's release for the slot when one is listed and re-keys the slot at once, in
+  the same tap, queuing the new key for the registry as every renewal is. A tap cut off between the two leaves the
+  slot KEYED under its old key; the next tap that carries the PIN re-keys it (when such a slot
+  waits, the till checks the PIN at attach). A tap without the PIN leaves the slot as it is.
+- **Change written in the same tap.** A tap that settles an offline sale the till has reported
+  (a balance tap, or a charge tap before it plans) sends the sale's outcome to the registry during
+  the tap and writes the change notes onto the card before the tap ends. A charge tap can spend
+  the change of the sale it settles.
+- **The inputs of a refused sale.** When the registry refuses an offline sale (409
+  `double_spend`, or another refusal), the card still holds the sale's inputs SPENT, and the sale's
+  signed bytes are never sent to the federation. At the card's next online tap the till holds
+  those slots out of its plans and reports them as stranded (§ 7). What comes back depends on the
+  refusal:
+  - a refusal that leaves the transaction unseen at the registry (a change nonce that already
+    carried a note, `change_used`; the money gate's refusal; a 400 or another refusal, of which it
+    keeps no report): the registry takes a stranding for each slot, and its release after the
+    grace gives the value back;
+  - a double spend, an input not live at the registry: the report counts as the registry having
+    seen the transaction, and its change slots are released at once (§ 6). An input of that sale
+    the registry still lists live is not given a stranding and is not released: its slot stays
+    SPENT on the card, and the till holds it and reports it again at each online tap (§ 7, the
+    live inputs of such a double spend).
+
+  A charge the card's other notes pay goes ahead around them. A charge they do not pay, but
+  would with the held notes, is refused 402 `notes_held`, its detail naming the held amount;
+  nothing is signed.

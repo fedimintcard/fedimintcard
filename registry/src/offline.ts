@@ -337,6 +337,7 @@ export function recordOfflineCharge(
     if (used.length > 0) {
       report('double_spend', {client_ref: intent.client_ref, signed_at: r.signed_at, inputs: intent.body.inputs, conflicts: used});
       const slots = intent.body.change.map(c => c.slot).sort((a, b) => a - b);
+      console.warn(`ALERT change_used card=${shortId} till=${tillId} txid=${intent.txid} slots=${slots.join(',')}`);
       return {recorded: false, conflicts: used, release: {txid: intent.txid, slots}};
     }
     sql.exec(

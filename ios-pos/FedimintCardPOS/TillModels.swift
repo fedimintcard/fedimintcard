@@ -26,7 +26,9 @@ struct CardBalance: Equatable {
     /// the balance screen sends it so the till fits the amount to this card's free slots.
     var shortId: String? = nil
     /// Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
-    /// in `liveMsat`, until the registry releases them. 0 from a till from before these fields.
+    /// in `liveMsat`, held for a sale that was never settled. Most are freed by the registry's
+    /// release after the grace; a double spend's still-live inputs stay held. 0 from a till from
+    /// before these fields.
     var strandedMsat: Int64 = 0
     /// When the last of them may be released, by the registry's clock (`stranded_until_ms`); nil
     /// when there is no date to wait for, or the till does not say.
@@ -75,6 +77,8 @@ enum ChargeErrorCode: String, CaseIterable {
     case relayUnreachable = "relay_unreachable"
     case cardError = "card_error"
     case insufficient
+    /// The live notes do not pay; with the notes held for a sale the registry refused they would. Nothing ran.
+    case notesHeld = "notes_held"
     case noExactPlan = "no_exact_plan"
     case declined
     case undecided

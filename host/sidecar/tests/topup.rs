@@ -848,7 +848,7 @@ async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow:
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!((s, v["amount_msat"].as_u64()), (200, Some(100_352)), "three notes fit: {v}");
 
-        *registry.unkeyed.lock().unwrap() = vec![31];
+        *registry.unkeyed.lock().unwrap() = vec![23];
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["amount_msat"].as_u64().unwrap().count_ones(), 1, "one unkeyed slot, one note: {v}");
@@ -857,6 +857,29 @@ async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow:
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
         assert!(registry.key_posts.lock().unwrap().is_empty(), "making an invoice keys nothing");
+    })
+    .await;
+    Ok(())
+}
+
+/// Slots 24 and up take the change of offline sales only: a top-up counts none of them as room,
+/// free or unkeyed, so its invoice never promises more notes than the tap can write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, registry) = (f.addr, f.registry.clone());
+    with_actor(actor, async move {
+        let create = |body: Value| async move { call(addr, "POST", "/v1/topup", None, Some(body)).await };
+        registry.free.store(0, Ordering::SeqCst);
+        registry.keyed.lock().unwrap().extend([(24, "k24".to_owned()), (25, "k25".to_owned())]);
+        *registry.unkeyed.lock().unwrap() = (26..32).collect();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
+
+        *registry.unkeyed.lock().unwrap() = (23..32).filter(|s| *s != 24 && *s != 25).collect();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["amount_msat"].as_u64().unwrap().count_ones(), 1, "slot 23 alone is room: {v}");
     })
     .await;
     Ok(())
@@ -924,7 +947,7 @@ async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("seven keyed slots");
     let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
-    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 24));
+    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 16), "unkeyed 8-23; 24-31 hold no load");
     assert!(full.to_string().contains("a till keys them"), "{full}");
     assert!(registry.key_posts.lock().unwrap().is_empty());
 
@@ -937,6 +960,25 @@ async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result
     assert_eq!(keyed, (8..16).collect::<Vec<u8>>());
     assert_eq!(*registry.unkeyed.lock().unwrap(), (16..32).collect::<Vec<u8>>());
     assert!(card.get_pub(16).is_err(), "slot 16 stays empty on the card");
+    Ok(())
+}
+
+/// A till's loader keys and loads only slots below 24: with 7 free slots, a keyed slot 24 and
+/// unkeyed 22, 23 and 25-31, a 12-note load is refused as full and nothing is keyed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_keys_and_loads_no_slot_from_24_up() -> anyhow::Result<()> {
+    let mut card = SoftCard::new();
+    let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
+    let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
+    let k24 = card.gen_key(24)?.to_string();
+    registry.keyed.lock().unwrap().push((24, k24));
+    *registry.unkeyed.lock().unwrap() = (22..32).filter(|s| *s != 24).collect();
+    let err = Loader::new(&wallet, &url, dir.path())?.with_keyer(till).load(&mut card, &[50_000_000]).await.expect_err("7 + 2 < 12");
+    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
+    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 2));
+    assert!(registry.key_posts.lock().unwrap().is_empty(), "nothing keyed");
+    assert!(registry.loads.lock().unwrap().is_empty(), "nothing loaded");
+    assert!(card.get_pub(22).is_err() && card.get_pub(25).is_err());
     Ok(())
 }
 

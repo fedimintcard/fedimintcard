@@ -1,5 +1,5 @@
 import {env, runDurableObjectAlarm, runInDurableObject, SELF} from 'cloudflare:test';
-import {beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 
 import {bls12_381} from '@noble/curves/bls12-381.js';
 import {p256} from '@noble/curves/nist.js';
@@ -1804,15 +1804,15 @@ describe('32-slot cards', () => {
     }
   });
 
-  it('bounds a charge’s change by the card’s own count: slot 31 on a 32-slot card, slot 8 nowhere on an 8-slot one', async () => {
+  it('bounds a charge’s change by the card’s own count: slot 32 nowhere on a 32-slot card, slot 8 nowhere on an 8-slot one', async () => {
     const {till, shortId} = await card32();
     await hook('/test/note', {short_id: shortId, nonce: nonce(1), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
     const bad = await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [{slot: 32, amount_msat: 24_000, nonce: nonce(2), blinding_key: BK, out_idx: 1}]}));
     expect(bad.status).toBe(400);
     expect(await bad.text()).toContain('slot 0-31');
-    const ok = await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [{slot: 31, amount_msat: 24_000, nonce: nonce(2), blinding_key: BK, out_idx: 1}]}));
+    const ok = await post(`/cards/${shortId}/intent`, till.token, intent(0, {change: [{slot: 23, amount_msat: 24_000, nonce: nonce(2), blinding_key: BK, out_idx: 1}]}));
     expect(ok.status).toBe(200);
-    expect((await state(till.token, shortId)).notes.find(n => n.slot === 31)?.status).toBe('pending');
+    expect((await state(till.token, shortId)).notes.find(n => n.slot === 23)?.status).toBe('pending');
 
     const token = await signIn();
     const {shortId: eight} = await cardWithNote(token, '8a8b8c8e');
@@ -1835,11 +1835,11 @@ describe('32-slot cards', () => {
     expect(await res.text()).toContain('0 to 7');
   });
 
-  it('lists all 32 free slots and takes a 12-note holder load, which an 8-slot card could not hold', async () => {
+  it('lists the 24 slots below the change slots as free and takes a 12-note holder load, which an 8-slot card could not hold', async () => {
     const {till, shortId} = await card32();
     const free = (await (await get(`/cards/${shortId}/slots`, null)).json()) as {free: {slot: number}[]};
-    expect(free.free.map(f => f.slot)).toEqual(Array.from({length: 32}, (_, i) => i));
-    const picked = Array.from({length: 12}, (_, i) => 20 + i); // slots 20-31
+    expect(free.free.map(f => f.slot)).toEqual(Array.from({length: 24}, (_, i) => i));
+    const picked = Array.from({length: 12}, (_, i) => 12 + i); // slots 12-23
     const body = {
       version: 0,
       txid: txid(30),
@@ -1867,6 +1867,190 @@ describe('32-slot cards', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('1 to 8 notes');
   });
+  describe('slots 24 to 31 are kept for the change of offline sales', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+    const alerts = (warn: {mock: {calls: unknown[][]}}, name: string) =>
+      warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith(`ALERT ${name} `));
+    const out = (shortId: string, slot: number, over: Record<string, unknown> = {}) => ({
+      slot,
+      amount_msat: 1_000,
+      nonce: keyNonce32(shortId, slot),
+      blinding_key: BK,
+      out_idx: 0,
+      ...over,
+    });
+
+    it('refuses a holder load that names one, and records nothing', async () => {
+      const {till, shortId} = await card32();
+      for (const slot of [24, 31]) {
+        const res = await post(`/cards/${shortId}/load`, null, {version: 0, txid: txid(40), notes: [out(shortId, slot)]});
+        expect(res.status).toBe(409);
+        expect(await res.text()).toContain('offline change');
+      }
+      const s = await state(till.token, shortId);
+      expect(s.version).toBe(0);
+      expect(s.notes).toEqual([]);
+      const low = await post(`/cards/${shortId}/load`, null, {version: 0, txid: txid(40), notes: [out(shortId, 23)]});
+      expect(low.status).toBe(200);
+    });
+
+    it('refuses a charge whose change names one or is under one’s key, before anything is recorded', async () => {
+      const {till, shortId} = await card32();
+      await hook('/test/note', {short_id: shortId, nonce: nonce(1), slot: 0, amount_msat: 1_024_000, signature: 'c'.repeat(96)});
+      const before = await state(till.token, shortId);
+      const bySlot = intent(before.version, {change: [out(shortId, 24, {nonce: nonce(2), out_idx: 1})]});
+      const byKey = intent(before.version, {change: [out(shortId, 5, {nonce: keyNonce32(shortId, 30), out_idx: 1})]});
+      for (const body of [bySlot, byKey]) {
+        const res = await post(`/cards/${shortId}/intent`, till.token, body);
+        expect(res.status).toBe(409);
+        expect(await res.text()).toContain('offline change');
+      }
+      const after = await state(till.token, shortId);
+      expect(after.version).toBe(before.version);
+      expect(after.open_txs).toEqual([]);
+      expect(after.notes.map(n => [n.slot, n.status])).toEqual([[0, 'live']]);
+      const low = intent(before.version, {change: [out(shortId, 23, {out_idx: 1})]});
+      expect((await post(`/cards/${shortId}/intent`, till.token, low)).status).toBe(200);
+    });
+
+    it('records a till’s load that names one or is under one’s key, and logs the alert once', async () => {
+      const {till, shortId} = await card32();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const load = {
+        version: 0,
+        txid: txid(41),
+        client_ref: 'issue-1',
+        inputs: [],
+        change: [out(shortId, 24), out(shortId, 3, {nonce: keyNonce32(shortId, 25), out_idx: 1})],
+      };
+      const res = await post(`/cards/${shortId}/intent`, till.token, load);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ok: true, version: 1, replayed: false});
+      const s = await state(till.token, shortId);
+      expect(s.notes.map(n => [n.slot, n.status])).toEqual([[3, 'pending'], [24, 'pending']]);
+      expect(s.open_txs.map(t => t.txid)).toEqual([txid(41)]);
+      const lines = alerts(warn, 'load_in_change_slot');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`card=${shortId}`);
+      expect(lines[0]).toContain(`till=${till.till_id}`);
+      expect(lines[0]).toContain(`txid=${txid(41)}`);
+      expect(lines[0]).toContain('slots=3,24');
+      // The same load again is a replay: nothing new is recorded or logged.
+      expect(await (await post(`/cards/${shortId}/intent`, till.token, load)).json()).toEqual({ok: true, version: 1, replayed: true});
+      expect(alerts(warn, 'load_in_change_slot')).toHaveLength(1);
+      // It finishes like any load.
+      const sig = {
+        txid: txid(41),
+        accepted: true,
+        change: load.change.map(c => ({nonce: c.nonce, signature: sign(c.nonce, 1_000)})),
+      };
+      expect((await post(`/cards/${shortId}/outcome`, till.token, sig)).status).toBe(200);
+      expect((await state(till.token, shortId)).notes.map(n => [n.slot, n.status])).toEqual([[3, 'live'], [24, 'live']]);
+    });
+
+    it('logs no alert for a till’s load below slot 24', async () => {
+      const {till, shortId} = await card32();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const load = {version: 0, txid: txid(42), client_ref: 'issue-2', inputs: [], change: [out(shortId, 23)]};
+      expect((await post(`/cards/${shortId}/intent`, till.token, load)).status).toBe(200);
+      expect(alerts(warn, 'load_in_change_slot')).toEqual([]);
+    });
+
+    it('GET /registry/change-slot-check lists the notes, and the open or expired holder loads, found there', async () => {
+      const {token, shortId} = await card32();
+      const check = async () => {
+        const res = await get('/registry/change-slot-check', token);
+        expect(res.status).toBe(200);
+        return (await res.json()) as unknown;
+      };
+      expect((await get('/registry/change-slot-check', null)).status).toBe(401);
+      expect(await check()).toEqual({ok: true, notes: [], loads: []});
+      const note = (slot: number, n: string) =>
+        hook('/test/note', {short_id: shortId, nonce: n, slot, amount_msat: 1_000, signature: 'c'.repeat(96)});
+      await note(1, keyNonce32(shortId, 1));
+      await note(2, keyNonce32(shortId, 27));
+      await note(26, keyNonce32(shortId, 26));
+      await runInDurableObject(stub(), (_, ctx) => {
+        const row = (id: string, slot: number, status: string) =>
+          ctx.storage.sql.exec(
+            `INSERT INTO holder_loads (txid, short_id, body, status, outcome, created_at, expires_at, resolved_at)
+             VALUES (?, ?, ?, ?, NULL, 1, 2, NULL)`,
+            id, shortId, JSON.stringify([out(shortId, slot)]), status,
+          );
+        row(txid(50), 29, 'open');
+        row(txid(51), 5, 'open');
+        row(txid(52), 30, 'expired');
+      });
+      expect(await check()).toEqual({
+        ok: true,
+        notes: [
+          {short_id: shortId, slot: 2, nonce: keyNonce32(shortId, 27), status: 'live', txid: null},
+          {short_id: shortId, slot: 26, nonce: keyNonce32(shortId, 26), status: 'live', txid: null},
+        ],
+        loads: [
+          {short_id: shortId, txid: txid(50), status: 'open', slots: [29], expires_at: 2},
+          {short_id: shortId, txid: txid(52), status: 'expired', slots: [30], expires_at: 2},
+        ],
+      });
+      // Another operator's cards are not listed.
+      await hook('/test/operator', {name: 'second', password: 'another long password'});
+      const other = await get('/registry/change-slot-check', await signIn('second', 'another long password'));
+      expect(await other.json()).toEqual({ok: true, notes: [], loads: []});
+    });
+
+    it('lists an expired holder load on slot 24 until it is finished late, and logs the alert when it is', async () => {
+      const {token, shortId} = await card32();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const note = out(shortId, 24);
+      // Recorded before the rule, then expired: its pending note is gone, so only the load row shows it.
+      await runInDurableObject(stub(), (_, ctx) => {
+        ctx.storage.sql.exec(
+          `INSERT INTO holder_loads (txid, short_id, body, status, outcome, created_at, expires_at, resolved_at)
+           VALUES (?, ?, ?, 'expired', NULL, 1, 2, 3)`,
+          txid(53), shortId, JSON.stringify([note]),
+        );
+      });
+      const check = async () => (await (await get('/registry/change-slot-check', token)).json()) as unknown;
+      expect(await check()).toEqual({
+        ok: true,
+        notes: [],
+        loads: [{short_id: shortId, txid: txid(53), status: 'expired', slots: [24], expires_at: 2}],
+      });
+      const finish = {txid: txid(53), notes: [{nonce: note.nonce, signature: sign(note.nonce, 1_000)}]};
+      expect((await post(`/cards/${shortId}/load/outcome`, null, finish)).status).toBe(200);
+      const lines = alerts(warn, 'load_in_change_slot');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`card=${shortId}`);
+      expect(lines[0]).toContain(`txid=${txid(53)}`);
+      expect(lines[0]).toContain('slots=24');
+      // A repeat is a replay: no second alert.
+      expect((await post(`/cards/${shortId}/load/outcome`, null, finish)).status).toBe(200);
+      expect(alerts(warn, 'load_in_change_slot')).toHaveLength(1);
+      expect(await check()).toEqual({
+        ok: true,
+        notes: [{short_id: shortId, slot: 24, nonce: note.nonce, status: 'live', txid: txid(53)}],
+        loads: [],
+      });
+    });
+
+    it('logs no alert when an expired holder load below slot 24 is finished late', async () => {
+      const {shortId} = await card32();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const note = out(shortId, 5);
+      await runInDurableObject(stub(), (_, ctx) => {
+        ctx.storage.sql.exec(
+          `INSERT INTO holder_loads (txid, short_id, body, status, outcome, created_at, expires_at, resolved_at)
+           VALUES (?, ?, ?, 'expired', NULL, 1, 2, 3)`,
+          txid(54), shortId, JSON.stringify([note]),
+        );
+      });
+      const finish = {txid: txid(54), notes: [{nonce: note.nonce, signature: sign(note.nonce, 1_000)}]};
+      expect((await post(`/cards/${shortId}/load/outcome`, null, finish)).status).toBe(200);
+      expect(alerts(warn, 'load_in_change_slot')).toEqual([]);
+    });
+  });
 });
 
 describe('split keying: a 32-slot card registered with keys for slots 0-7', () => {
@@ -1888,7 +2072,7 @@ describe('split keying: a 32-slot card registered with keys for slots 0-7', () =
   }
   const range = (a: number, b: number) => Array.from({length: b - a}, (_, i) => a + i);
 
-  it('registers slot_count 32 with 8 keys; state and /slots show 8-31 unkeyed and not free', async () => {
+  it('registers slot_count 32 with 8 keys; state shows 8-31 unkeyed, /slots 8-23, none free', async () => {
     const {till, token, batchId, body, stored} = await split();
     expect(stored.slot_count).toBe(32);
     expect(stored.slot_pubkeys).toHaveLength(8);
@@ -1899,11 +2083,30 @@ describe('split keying: a 32-slot card registered with keys for slots 0-7', () =
     const free = (await (await get(`/cards/${SHORT}/slots`, null)).json()) as SlotsBody;
     expect(free.slot_count).toBe(32);
     expect(free.free.map(f => f.slot)).toEqual(range(0, 8));
-    expect(free.unkeyed_slots).toEqual(range(8, 32));
+    expect(free.unkeyed_slots).toEqual(range(8, 24));
     // The outbox's re-post replays; the same keys as an 8-slot card are a different card.
     expect((await post('/registry/cards', token, body)).status).toBe(200);
     expect((await post('/registry/cards', token, {...body, slot_count: 8})).status).toBe(409);
     expect((await post('/registry/cards', token, card({short_id: SHORT, batch_id: batchId, slot_pubkeys: all.slice(0, 8)}))).status).toBe(409);
+  });
+
+  it('/slots never names a slot from 24 up, keyed or unkeyed; the card state still does', async () => {
+    const {till} = await split();
+    const keyed = [8, 9, 24, 25];
+    expect((await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: keyed.map(slot => ({slot, pubkey: all[slot]}))})).status).toBe(200);
+    const free = (await (await get(`/cards/${SHORT}/slots`, null)).json()) as SlotsBody;
+    expect(free.free.map(f => f.slot)).toEqual(range(0, 10));
+    expect(free.unkeyed_slots).toEqual(range(10, 24));
+    expect([...free.free.map(f => f.slot), ...free.unkeyed_slots].filter(slot => slot >= 24)).toEqual([]);
+    // The till's spare reserve reads its unkeyed list from the card state: 26 to 31 are there to key.
+    const s = (await state(till.token, SHORT)) as unknown as {slots: {slot: number}[]; unkeyed_slots: number[]};
+    expect(s.slots.map(x => x.slot)).toEqual([...range(0, 10), 24, 25]);
+    expect(s.unkeyed_slots).toEqual([...range(10, 24), ...range(26, 32)]);
+    // Every slot keyed: /slots lists 0 to 23 free and nothing unkeyed.
+    expect((await post(`/cards/${SHORT}/slot-keys`, till.token, {keys: [...range(10, 24), ...range(26, 32)].map(slot => ({slot, pubkey: all[slot]}))})).status).toBe(200);
+    const full = (await (await get(`/cards/${SHORT}/slots`, null)).json()) as SlotsBody;
+    expect(full.free.map(f => f.slot)).toEqual(range(0, 24));
+    expect(full.unkeyed_slots).toEqual([]);
   });
 
   it('takes slot_count with a prefix of 8 to 32 keys; refuses fewer than 8, more than the count, and a bad count', async () => {

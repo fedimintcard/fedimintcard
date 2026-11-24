@@ -34,7 +34,9 @@ data class CardBalance(
     val shortId: String? = null,
     /**
      * Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
-     * in [liveMsat], until the registry releases them. 0 from a till from before these fields.
+     * in [liveMsat], held for a sale that was never settled. Most are freed by the registry's
+     * release after the grace; a double spend's still-live inputs stay held. 0 from a till from
+     * before these fields.
      */
     val strandedMsat: Long = 0,
     /**
@@ -85,6 +87,8 @@ enum class ChargeErrorCode(val wire: String) {
     RELAY_UNREACHABLE("relay_unreachable"),
     CARD_ERROR("card_error"),
     INSUFFICIENT("insufficient"),
+    /** The live notes do not pay; with the notes held for a sale the registry refused they would. Nothing ran. */
+    NOTES_HELD("notes_held"),
     NO_EXACT_PLAN("no_exact_plan"),
     DECLINED("declined"),
     UNDECIDED("undecided"),

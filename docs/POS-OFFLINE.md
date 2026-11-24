@@ -259,8 +259,11 @@ redeem window) waits for good instead of being listed refused.
 ## Refusals
 
 The core answers the till API's codes (`docs/TILL-API.md`); the till's `classify` and the
-phone's `Refused.code` come from one place (`pos_core::refusal`). A code the app does not know
-is shown as its generic card error.
+phone's `Refused.code` come from one place (`pos_core::refusal`). The words on screen are each
+app's own (`errorCopy`), the same on both save where to hold the card (`no_card`), which follows
+each phone's reader. A code the app does not know shows "Something went
+wrong" when the phone's own charge answers it, and "Outcome unknown" when the till does, since it
+does not say whether the till took the sale.
 
 | code | when | the app shows |
 |---|---|---|
@@ -274,20 +277,29 @@ is shown as its generic card error.
 | `offline_unsupported_card` | a card the offline path does not take | this card pays online only |
 | `card_not_genuine` | not a card the registry certified (a clone) | decline |
 | `offline_note_invalid` | notes that do not check, and the rest do not pay | a card the kit cannot verify |
-| `offline_no_change_room` | needs change the card has no fresh slot for | "Try N sats" (`suggested_msat`) |
+| `offline_no_change_room` | needs change, and the card has no fresh KEYED slot from 24 to 31 for it | "No room for change offline", then "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_pool_exhausted` | the kit has run out of a tier the price needs | "Try N sats", then a new kit |
 | `wrong_pin` | the card refused the PIN (`63 CX`): `wrong_tries` is X, the wrong tries in a row; `wait_s` is about how long the next try waits | ask again; the card holds the next try for `wait_s` |
 | `pin_wait` | the card was taken away while it served its PIN wait (`wait_s` left, about) | hold the card to the phone again until the wait is over |
 | `sign_check_failed` | the card's signature failed its own check; nothing was spent | tap again, same `client_ref` |
 | `card_limit` | the card's daily limit | decline |
 | `insufficient` | the card's notes do not cover the price | decline: "Card balance too low" |
+| `notes_held` | from the till (402): the card's live notes do not cover the price, and would with the notes held for a sale the registry refused | decline: "Part of the balance is on hold", then "Some of this card's money can't be used. A smaller amount may work, or take another payment."; the till's `detail` is not shown |
 | `no_exact_plan` | the card cannot pay this price in one tap | decline: "Can't take this amount", then "This card can't pay it in one tap. Try a smaller amount, or take this sale another way."; the core's `detail` is not shown |
 | `no_card` | the card left the field before it signed anything | tap again, same `client_ref` |
 | `card_error`, `internal` | anything else | show `detail` |
 
+**Change slots.** Offline change goes only into slots 24 to 31 (`OFFLINE-PROTOCOL.md` § 8). On a
+card whose slots 24 to 31 are not keyed yet, an offline sale that needs change is refused before
+the card signs, and the merchant sees "No room for change offline" with a price the card pays
+exactly; a price that needs no change is taken. The card's first online tap at a till keys two of
+those slots. An offline sale's change is written onto the card at the first online tap after the
+sale reaches the till, and pays from that same tap.
+
 ## Android
 
-The POS app in `android-relay/` (ENG-844). The copy is the one set both apps share.
+The POS app in `android-relay/` (ENG-844). The copy is the set both apps share, save where to hold the card
+(`no_card`).
 
 **Build.** Gradle runs `host/scripts/pos-core-mobile.sh` from the checkout: `bindings kotlin`
 before every compile (task `posCoreBindings`, Rust only) and `android` before packaging

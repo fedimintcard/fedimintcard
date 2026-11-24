@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use fedimint_card_host_card::is_change_slot;
 use serde::{Deserialize, Serialize};
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old paths.
@@ -327,9 +328,24 @@ impl CardState {
         self.held.iter().any(|h| h.slot == slot && h.kind == kind)
     }
 
-    /// Slots whose key has never carried a note: usable for a new note right now. A held CHANGE
-    /// slot is not: the card is owed another transaction's change there.
+    /// Slots below [`CHANGE_SLOTS_FROM`] whose key has never carried a note: usable for a load or
+    /// an online charge's change right now. A held CHANGE slot is not: the card is owed another
+    /// transaction's change there.
+    ///
+    /// [`CHANGE_SLOTS_FROM`]: fedimint_card_host_card::CHANGE_SLOTS_FROM
     pub fn free_slots(&self) -> Vec<u8> {
+        self.unused_slots().into_iter().filter(|s| !is_change_slot(*s)).collect()
+    }
+
+    /// Slots from [`CHANGE_SLOTS_FROM`] up whose key has never carried a note: the only slots an
+    /// offline charge puts change into, so no load or online change goes there.
+    ///
+    /// [`CHANGE_SLOTS_FROM`]: fedimint_card_host_card::CHANGE_SLOTS_FROM
+    pub fn free_change_slots(&self) -> Vec<u8> {
+        self.unused_slots().into_iter().filter(|s| is_change_slot(*s)).collect()
+    }
+
+    fn unused_slots(&self) -> Vec<u8> {
         self.slots
             .iter()
             .filter(|s| !s.unknown)
@@ -363,6 +379,21 @@ impl CardState {
             .collect()
     }
 
+    /// Whether `slot` is a change slot ([`free_change_slots`](Self::free_change_slots)) whose
+    /// current key carried notes that are all dead: the change of a sale the federation rejected.
+    /// The key is burned; the till releases and re-keys the slot as one unit once a tap has
+    /// checked the PIN (`CardWallet::card_dead_change`).
+    pub fn dead_change_slot(&self, slot: u8) -> bool {
+        let mut any = false;
+        for n in self.notes_on_current_key(slot) {
+            if n.status != NoteStatus::Dead {
+                return false;
+            }
+            any = true;
+        }
+        any && is_change_slot(slot)
+    }
+
     /// The live notes the card can pay with: a note on a held SPENT slot is not one.
     pub fn live_notes(&self) -> Vec<&NoteRec> {
         self.notes.iter().filter(|n| n.status == NoteStatus::Live && !self.is_held(n.slot, HeldKind::Spent)).collect()
@@ -373,7 +404,8 @@ impl CardState {
     }
 
     /// The live notes this job holds back ([`Held`]): the card signed them away for a transaction
-    /// nobody here knows, so they are on hold until the registry releases them.
+    /// nobody here knows, so they are on hold. Most are freed by the registry's release after the
+    /// grace; a double spend's still-live inputs stay held.
     pub fn stranded_notes(&self) -> Vec<&NoteRec> {
         self.notes.iter().filter(|n| n.status == NoteStatus::Live && self.is_held(n.slot, HeldKind::Spent)).collect()
     }
@@ -518,6 +550,20 @@ mod tests {
         // A pending overwrite blocks reuse until resolved.
         st.pending_overwrites.push(PendingOverwrite { slot: 2, old_pubkey: pk(3) });
         assert!(st.free_slots().is_empty());
+    }
+
+    #[test]
+    fn loads_take_slots_below_24_and_offline_change_slots_24_to_31() {
+        let mut st = CardState::default();
+        for i in 0..32 {
+            st.set_slot_pubkey(i, pk(i + 1));
+        }
+        assert_eq!(st.free_slots(), (0..24).collect::<Vec<u8>>());
+        assert_eq!(st.free_change_slots(), (24..32).collect::<Vec<u8>>());
+        st.notes.push(note(1, 2, NoteStatus::Live));
+        st.notes.push(note(25, 26, NoteStatus::Pending));
+        assert!(!st.free_slots().contains(&1) && st.free_slots().len() == 23);
+        assert_eq!(st.free_change_slots(), vec![24, 26, 27, 28, 29, 30, 31]);
     }
 
     fn held(slot: u8, kind: HeldKind) -> Held {
