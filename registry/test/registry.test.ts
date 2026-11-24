@@ -2039,10 +2039,18 @@ describe('split keying: a 32-slot card registered with keys for slots 0-7', () =
     expect(await renew.text()).toContain('/slots/30/key');
   });
 
-  it('refuses a key a note was once recorded under', async () => {
+  it('takes a key its own slot’s notes are under; refuses one a note on another slot, or a spent note, was under', async () => {
     const {till} = await split();
-    await hook('/test/note', {short_id: SHORT, nonce: keyNonce(9), slot: 9, amount_msat: 1_000, signature: 'c'.repeat(96)});
-    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: all[9]})).status).toBe(409);
+    const note = (nonce: string, slot: number) => hook('/test/note', {short_id: SHORT, nonce, slot, amount_msat: 1_000, signature: 'c'.repeat(96)});
+    await note(keyNonce(9), 9);
+    await note(keyNonce(10), 11);
+    await note(keyNonce(12), 12);
+    await runInDurableObject(stub(), async (_instance, state) => {
+      state.storage.sql.exec("UPDATE notes SET status = 'spent' WHERE short_id = ? AND nonce = ?", SHORT, keyNonce(12));
+    });
+    expect((await post(`/cards/${SHORT}/slots/10/key`, till.token, {pubkey: all[10]})).status).toBe(409);
+    expect((await post(`/cards/${SHORT}/slots/12/key`, till.token, {pubkey: all[12]})).status).toBe(409);
+    expect((await post(`/cards/${SHORT}/slots/9/key`, till.token, {pubkey: all[9]})).status).toBe(200);
   });
 });
 

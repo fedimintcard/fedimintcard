@@ -1,29 +1,49 @@
 # Offline payments: the contract between card, registry, till and apps
 
-Status: 2026-11-07, for `OFFLINE-PLAN.md` F3–F5. Applet 3.0 is built (`26d784a`); its commands are
+Status: 2026-11-07, for `OFFLINE-PLAN.md` F3–F5. Applet 4.0 is built (branch `card-4.0`); its commands are
 in `FedimintCardApplet.java`'s class comment and are the source of truth for § 1. § 7 (stranded
 slots, ENG-867) added 2026-11-14.
 
-## 1. Applet 3.0 (summary)
+## 1. Applet 4.0 (summary)
 
-SELECT answers `03 00`. A host treats 3.0 as 32 slots with the rules below; 2.0 and 2.1 cards keep
-the old behaviour (any keyed slot signs, nothing else exists).
+SELECT answers `04 00`. A host reads the version first and sends no PIN command to a card whose
+major version is below 4. Slots: 32.
 
 | INS | Command | Data | Answer / rule |
 |---|---|---|---|
-| 12 | SIGN P1=slot | hash (32) | Only a NOTE slot (counted against the day's limit, then SPENT), or a SPENT slot for the same hash. 6985 otherwise, 6A95 over the limit |
-| 14 | SET_NOTE P1=slot | amount msat (8, BE) ‖ federation signature (48) | KEYED → NOTE; CHANGE → NOTE with the same amount (6A80 if not). No PIN |
+| 12 | SIGN P1=slot | hash (32) | Only a NOTE slot (counted against the day's limit, then SPENT), or a SPENT slot for the same hash. 6985 otherwise, 6A95 over the limit, 6A94 without a PIN session. 6F00 when the card's own check of the signature fails: the slot stays NOTE |
+| 14 | SET_NOTE P1=slot | amount msat (8, BE) ‖ federation signature (48) ‖ registry signature (DER, 8..72) | Lc 64..128, else 6700. KEYED → NOTE; CHANGE → NOTE with the same amount (6A80 if not). 6985 with no registry key or in another state; 6982 for a signature that does not verify, with nothing written. No PIN |
 | 15 | GET_SLOT P1=slot | – | state (1) ‖ x-only key (32) ‖ amount+signature (56) ‖ spent hash (32) ‖ opening (66) = 187 |
-| 16 | GET_STATE | – | 32 states ‖ now (4) ‖ window (4) ‖ limit (8) ‖ spent in window (8) ‖ cert len (1) ‖ attest key made (1) = 58 |
-| 17 | SET_CHANGE P1=slot | amount (8) ‖ txid (32) ‖ out_idx (2, BE) ‖ blinding key (32) | KEYED → CHANGE |
+| 16 | GET_STATE | – | 32 states ‖ now (4) ‖ window (4) ‖ limit (8) ‖ spent in window (8) ‖ cert len (1) ‖ attest key made (1) ‖ registry key set (1, byte 58) ‖ PIN state (1, byte 59) ‖ wrong PINs in a row (1, byte 60) ‖ askings owed (2, bytes 61..62) ‖ anchored in this selection (1, byte 63) ‖ signer bits (1, byte 64: bit 0 chip RSA path, bit 1 nonce key in RAM) = 65 |
+| 17 | SET_CHANGE P1=slot | amount (8) ‖ txid (32) ‖ out_idx (2, BE) ‖ blinding key (32) | KEYED → CHANGE. Once a PIN is set, only in a PIN session (6A94 otherwise) |
 | 18 | SET_LIMIT | limit msat (8) | only before SET_PIN; 0 = none |
-| 19 | SET_HEADER | Bitcoin header (80) | → now (4, BE). 6A93 without the work |
+| 19 | SET_HEADER | Bitcoin header (80) | → now (4, BE). 6A93 for a header without enough work. The first header of a set-up selection, before any PIN and while no slot holds value, is the anchor: the card's clock takes its time |
 | 30 | ATTEST_INIT | – | → P-256 public key, 65 bytes uncompressed. Before SET_PIN and SET_CERT only |
 | 31 | SET_CERT | certificate (≤ 160) | once, before SET_PIN |
 | 32 | GET_CERT | – | the certificate |
 | 33 | ATTEST | challenge (32) | → ECDSA-SHA256, DER, over `"fedimintcard/at1"` (16 ASCII) ‖ challenge ‖ slot 0's x-only key |
+| 40 | VERIFY_PIN | PIN (4..8) | 9000 opens the PIN session; 63CX a wrong PIN, X tries left; 6A98 while a wait is owed: send the same command again (see the wait below); 6984 no PIN set. The card never answers 6983 |
+| 41 | SET_PIN | PIN (4..8) | once. 6A96 until the anchor is set in this selection; 6985 if a PIN is set, there is no registry key, or a slot holds value. Opens the PIN session |
+| 42 | CHANGE_PIN | P1 = old PIN length (4..8; 0 = equal halves) ‖ old PIN ‖ new PIN (new 4..8, Lc ≤ 16) | the old PIN is checked as VERIFY_PIN checks it, wrong tries counted with their wait; the session ends. 6700 for a new PIN outside 4..8, 6B00 for a bad P1 or P2 |
 
-States: EMPTY 0, KEYED 1, NOTE 2, CHANGE 3, SPENT 4. GEN_KEY P2=1 re-keys only KEYED or SPENT.
+States: EMPTY 0, KEYED 1, NOTE 2, CHANGE 3, SPENT 4. GEN_KEY P2=1 re-keys only KEYED or SPENT, in a
+PIN session once a PIN is set.
+
+**Signed notes.** The registry signs each note it issues: ECDSA P-256, SHA-256, by `CERT_SIGNING_KEY`
+(the key SET_REGISTRY_KEY holds), over `"fedimintcard/note1"` (18 ASCII) ‖ the x-only key of the
+slot (32) ‖ the note's 56 bytes (amount ‖ federation signature). The card checks it before it writes
+the note. A host gets the signature as `notes[].reg_sig` (DER hex) from the registry; a note with no
+`reg_sig` yet waits for a later tap, and the sync with the registry runs before the card write.
+
+**Order of set-up, in one selection.** SET_REGISTRY_KEY, SET_HEADER (a header from the registry's
+`GET /v1/chain/tip`; it answers its time), GET_STATE byte 63 = 1, then SET_PIN. Without the anchor
+SET_PIN is 6A96; a header without enough work is 6A93.
+
+**The wait.** The card counts a wrong PIN before it compares. After the n-th wrong PIN in a row the
+next VERIFY_PIN answers 6A98 for 2^(n-1) askings (at most 16,384, from the 15th), each asking doing
+fixed work on the card (about 600 ms on a J3R180), and the asking after them is the try. A host sends
+the same VERIFY_PIN again on 6A98. The owed askings survive a lifted card and a power cycle; a right
+PIN clears them. The card never blocks.
 
 ## 2. The certificate
 
@@ -66,8 +86,11 @@ ATTEST with a fresh random challenge; check that signature with the certificate'
   `inputs`, and `conflicts` for a double spend). Both are in the nightly backup. Without
   `CERT_SIGNING_KEY`, `/registry/cert-key` and the attestation route answer 503. An offline charge
   does not repeat `/intent`'s change-slot checks (the card chose its slots offline); it refuses only
-  a change nonce that already carried a note (409). A replay of a double spend answers the stored
-  conflicts. `GET /registry/offline-reports` lists at most 200, newest first, only for the
+  a change nonce that already carried a note. That answers as a double spend (409, conflicts with
+  status `change_used`) and releases the charge's change slots, so the card can write the note that
+  slot waits for; the registry's notes are unchanged, and the inputs the card spent come back through
+  a stranding, since such a refusal does not count as the registry having seen the transaction. A
+  replay of a double spend answers the stored conflicts. `GET /registry/offline-reports` lists at most 200, newest first, only for the
   operator's own cards.
 
 ## 4. Till (F3)
@@ -123,7 +146,7 @@ and undoes exactly that.
   data = txid (32) ‖ DER ECDSA-SHA256 signature): a SPENT slot whose spent hash is txid → NOTE;
   a CHANGE slot whose opening names txid → KEYED; answers the new state (1). 6982 for a bad
   signature, 6985 for a slot the release does not fit or a card with no registry key.
-  GET_STATE is 59 bytes: byte 58 is 1 once the registry key is set.
+  GET_STATE is 65 bytes (§ 1): byte 58 is 1 once the registry key is set.
 - **Signed message.** ECDSA P-256, SHA-256, by `CERT_SIGNING_KEY`, over `"fedimintcard/rel1"`
   (17 ASCII) ‖ slot 0's x-only key (32) ‖ slot (1) ‖ txid (32). The card wants DER; WebCrypto
   gives r ‖ s, so the registry converts.

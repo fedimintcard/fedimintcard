@@ -95,7 +95,7 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
 * `sales.json` in the data dir (mode 0600) is a convenience ledger for the app and for
   `client_ref` replays. The money truth is the federation and `card_state.json`.
 * No authentication: keep it on loopback (a warning is printed otherwise).
-* Applet 3.0 cards and offline charges (`docs/TILL-API.md`, `docs/OFFLINE-PROTOCOL.md` § 4):
+* Applet 4.0 cards and offline charges (`docs/TILL-API.md`, `docs/OFFLINE-PROTOCOL.md` § 4):
   `--esplora-url` (`TILL_ESPLORA_URL`, default `https://mempool.space/api`, empty to turn off)
   is where block headers for the cards' clocks come from (every 10 minutes, kept in
   `block-header.json`); `--offline-cap-msat` (default 100,000,000) and `--offline-cap-count`

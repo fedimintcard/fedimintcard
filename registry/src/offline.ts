@@ -323,11 +323,21 @@ export function recordOfflineCharge(
       const slots = intent.body.change.map(c => c.slot).sort((a, b) => a - b);
       return {recorded: false, conflicts, release: slots.length > 0 ? {txid: intent.txid, slots} : null};
     }
+    // A change nonce that already carries a note: a slot whose note waits for its registry signature
+    // stays keyed on the card, so a till that cannot see that note may plan change into it. The sale
+    // is refused like a double spend and its change slots are released, so the card can write the
+    // waiting note again. Its inputs stay live here: the card holds them spent under this
+    // transaction, and a stranding gives them back (`change_used` is not a report that counts as
+    // seen, `SEEN_REPORT` in cards.ts).
+    const used: Conflicts[] = [];
     for (const c of intent.body.change) {
-      const used = sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, c.nonce).toArray();
-      if (used.length > 0) {
-        throw new Conflict(`change nonce ${c.nonce} already carried a note on card ${shortId}`);
-      }
+      const note = sql.exec('SELECT txid FROM notes WHERE short_id = ? AND nonce = ?', shortId, c.nonce).toArray()[0];
+      if (note) used.push({nonce: c.nonce, status: 'change_used', txid: note.txid === null ? null : String(note.txid)});
+    }
+    if (used.length > 0) {
+      report('double_spend', {client_ref: intent.client_ref, signed_at: r.signed_at, inputs: intent.body.inputs, conflicts: used});
+      const slots = intent.body.change.map(c => c.slot).sort((a, b) => a - b);
+      return {recorded: false, conflicts: used, release: {txid: intent.txid, slots}};
     }
     sql.exec(
       `INSERT INTO card_txs (txid, short_id, till_id, client_ref, body, status, outcome, created_at, resolved_at, signed_hex)

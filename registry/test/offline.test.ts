@@ -461,6 +461,68 @@ describe('note signatures on an offline charge (DESIGN § 6)', () => {
       expect((await notesOf(till.token, shortId)).find(n => n.nonce === other)).toMatchObject({status: 'live', reg_sig: null});
     }
   });
+
+  describe('change on a slot whose key the registry does not hold yet', () => {
+    /** The registry holds no key for `slot`, as when the card made one that never reached it. */
+    const forget = (shortId: string, slot: number) =>
+      runInDurableObject(stub(), (_i, st) => {
+        st.storage.sql.exec('DELETE FROM card_slots WHERE short_id = ? AND slot = ?', shortId, slot);
+      });
+    const signedSlots = async (res: Response) => {
+      expect(res.status).toBe(200);
+      return ((await res.json()) as {notes: {slot: number; reg_sig: string}[]}).notes.map(n => n.slot);
+    };
+    const postKey = (tok: string, shortId: string, slot: number, pubkey: string) =>
+      post(`/cards/${shortId}/slot-keys`, tok, {keys: [{slot, pubkey}]});
+
+    it('a key another till made: taken after the outcome, and a repeat signs the change', async () => {
+      const token = await signIn();
+      const till = await newTill(token);
+      const shortId = await cardWithNote(token);
+      await forget(shortId, 1);
+      const change = '02' + slots(shortId)[1]!;
+      expect((await post(`/cards/${shortId}/offline-charges`, till.token, withChange(change))).status).toBe(200);
+      expect(await signedSlots(await post(`/cards/${shortId}/outcome`, till.token, accept(change)))).toEqual([]);
+      expect((await postKey(till.token, shortId, 1, slots(shortId)[1]!)).status).toBe(200);
+      expect(await signedSlots(await post(`/cards/${shortId}/outcome`, till.token, accept(change)))).toEqual([1]);
+      expect((await notesOf(till.token, shortId)).find(n => n.nonce === change)?.reg_sig).toMatch(/^30/);
+    });
+
+    it('a key whose post failed: taken while the change is pending, and the outcome signs it', async () => {
+      const token = await signIn();
+      const till = await newTill(token);
+      const shortId = await cardWithNote(token);
+      await forget(shortId, 1);
+      const change = '02' + slots(shortId)[1]!;
+      expect((await post(`/cards/${shortId}/offline-charges`, till.token, withChange(change))).status).toBe(200);
+      expect((await postKey(till.token, shortId, 1, slots(shortId)[1]!)).status).toBe(200);
+      expect(await signedSlots(await post(`/cards/${shortId}/outcome`, till.token, accept(change)))).toEqual([1]);
+    });
+
+    it('a renewal still queued: taken although the slot holds the change, and a repeat signs it', async () => {
+      const token = await signIn();
+      const till = await newTill(token);
+      const shortId = await cardWithNote(token);
+      const fresh = key(0x41);
+      const change = '02' + fresh;
+      expect((await post(`/cards/${shortId}/offline-charges`, till.token, withChange(change))).status).toBe(200);
+      expect(await signedSlots(await post(`/cards/${shortId}/outcome`, till.token, accept(change)))).toEqual([]);
+      const renew = {version: (await state(till.token, shortId)).version, old_pubkey: slots(shortId)[1], pubkey: fresh};
+      expect((await call('PUT', `/cards/${shortId}/slots/1`, till.token, renew)).status).toBe(200);
+      expect(await signedSlots(await post(`/cards/${shortId}/outcome`, till.token, accept(change)))).toEqual([1]);
+    });
+
+    it('a renewal is still refused while the slot holds a note under another key', async () => {
+      const token = await signIn();
+      const till = await newTill(token);
+      const shortId = await cardWithNote(token);
+      const renew = {version: (await state(till.token, shortId)).version, old_pubkey: slots(shortId)[0], pubkey: key(0x42, shortId)};
+      expect((await call('PUT', `/cards/${shortId}/slots/0`, till.token, renew)).status).toBe(409);
+      await hook('/test/note', {short_id: shortId, nonce: '02' + slots(shortId)[2]!, slot: 2, amount_msat: 1_000, signature: 'c'.repeat(96)});
+      const two = {version: (await state(till.token, shortId)).version, old_pubkey: slots(shortId)[2], pubkey: key(0x43)};
+      expect((await call('PUT', `/cards/${shortId}/slots/2`, till.token, two)).status).toBe(409);
+    });
+  });
 });
 
 describe('GET /registry/offline-reports', () => {
@@ -781,6 +843,39 @@ describe('stranded notes (docs/OFFLINE-PROTOCOL.md § 7)', () => {
       ok: true, held: [2, 3, 5], released: [], spent: [], ignored: [],
     });
     expect(await strandedOf(till.token, shortId)).toEqual(list);
+  });
+
+  it('a sale whose change slot holds a note: refused, its change slot released, its inputs left to a stranding', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const shortId = await strandedCard(token);
+    // Slot 5 holds a note the registry has not signed yet, so on the card that slot is still keyed.
+    await hook('/test/note', {short_id: shortId, nonce: keyNonce(shortId, 5), slot: 5, amount_msat: 24_000, signature: 'c'.repeat(96)});
+    const refused = {ok: false, reason: 'double_spend', conflicts: [{nonce: keyNonce(shortId, 5), status: 'change_used', txid: null}]};
+    const res = await post(`/cards/${shortId}/offline-charges`, till.token, late(shortId));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual(refused);
+    const rels = await releasesOf(till.token, shortId);
+    expect(rels.map(r => [r.slot, r.txid])).toEqual([[5, T]]);
+    await expectSigned(shortId, rels);
+    // A repeat answers the same refusal and signs nothing new.
+    const again = await post(`/cards/${shortId}/offline-charges`, till.token, late(shortId));
+    expect(again.status).toBe(409);
+    expect(await again.json()).toEqual(refused);
+    expect(await releasesOf(till.token, shortId)).toEqual(rels);
+    // Nothing moved on the registry's side: the inputs and the waiting note are live, with no transaction.
+    const notes = (await state(till.token, shortId)).notes;
+    for (const slot of [2, 3, 5]) {
+      expect(notes.find(n => n.nonce === keyNonce(shortId, slot))).toMatchObject({slot, status: 'live', txid: null});
+    }
+    const reports = await runInDurableObject(stub(), (_i, st) =>
+      st.storage.sql.exec('SELECT result FROM offline_reports WHERE txid = ?', T).toArray().map(r => String(r.result)),
+    );
+    expect(reports).toEqual(['double_spend']);
+    // The inputs the card spent are held as a sale the registry never took; the released change slot is not.
+    expect(await reported(till.token, shortId, [spentSlot(2), spentSlot(3), changeSlot(5)])).toEqual({
+      ok: true, held: [2, 3], released: [], spent: [], ignored: [5],
+    });
   });
 
   it('ignores known transactions, a spent slot without a live note under its key, a used change key, and a slot held for another transaction', async () => {

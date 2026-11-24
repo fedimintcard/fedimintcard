@@ -150,7 +150,7 @@ operator provisioned.
 from the holder, typed on the till's screen, and the till sends `VERIFY_PIN` in the selection
 that signs, as it already does (`703780e`). `CARD_PIN` in the environment
 (`host/card/src/lib.rs`) is removed outside tests. The PIN is never logged, stored or sent to
-ops. Wrong PINs report the tries left (`63 CX`); a blocked card (`69 83`) is a stop.
+ops. Wrong PINs report the tries left (`63 CX`); while a wait is owed the card answers `6A98` and the same command is sent again.
 
 **Value comes from the holder's wallet** (§ 9, decision 2), as cashucard leaves loading to
 holder apps. The provisioner stops loading value; install-only is already the default

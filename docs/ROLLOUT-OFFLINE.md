@@ -80,8 +80,8 @@ from `registry/` (a new key, never printed):
 - [ ] Setup app, Android: release-signed with the upload key (keychain item
       `fedimintcard-android-upload`), from `apps/provisioner/android`: `./gradlew -q
       generateCodegenArtifactsFromSchema && rm -rf app/.cxx`, then `assembleRelease`. Check the
-      bundle holds the 3.0 load file (`strings` of `assets/index.android.bundle` contains
-      `3180fff668cd2f22`).
+      bundle holds the 4.0 load file (`strings` of `assets/index.android.bundle` contains
+      `61b7abd9d0d18745`).
 - [ ] Setup app, iOS: archive `FedimintProvisioner` for the Max.
 - [ ] POS: `android-relay` and `ios-pos`, the same commit.
 - [ ] Install on the Pixel and the Max. Setup app settings: **Live** registry, **Island Bitcoin
@@ -90,8 +90,8 @@ from `registry/` (a new key, never printed):
 
 ## 6. First production card
 
-- [ ] Set up one blank J3R180 on Live. Check on the USB reader: SELECT `03 00`, GET_STATE byte 56
-      = 130 (certificate), 57 = 1, 58 = 1 (registry key).
+- [ ] Set up one blank J3R180 on Live. Check on the USB reader: SELECT `04 00`, GET_STATE (65 bytes) byte 56
+      = 130 (certificate), 57 = 1, 58 = 1 (registry key), 59 = 1 (PIN set), 60 and 61..62 = 0.
 - [ ] Top up by Lightning through zion, a balance tap (the spare reserve grows by 2 a tap), a charge.
 - [ ] Optional, before a village: stop zion's internet for a charge or two and see "Paid offline",
       then restore it and watch `offline.queued` return to 0. This is zion's own offline path; the

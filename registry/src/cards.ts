@@ -476,9 +476,11 @@ export const STRANDED_GRACE_MS = 37 * 24 * 60 * 60 * 1000;
  * An offline report that counts as the registry having seen its transaction: any but the money
  * gate's refusal (`recordOfflineCharge`), whose conflicts are all `released`. The gate refuses a
  * transaction because a stranding of it was released, so its refusal leaves the transaction's
- * other held slots to their own release rather than holding them for good.
+ * other held slots to their own release rather than holding them for good. A refusal for a change
+ * nonce that already carries a note (`change_used`) is not either: the registry never took the
+ * transaction, and the inputs the card spent under it come back through a stranding.
  */
-const SEEN_REPORT = `json_extract(o.detail, '$.conflicts[0].status') IS NOT 'released'`;
+const SEEN_REPORT = `IFNULL(json_extract(o.detail, '$.conflicts[0].status'), '') NOT IN ('released', 'change_used')`;
 
 /**
  * Whether the registry has seen the transaction: a charge on record, or an offline report of it
@@ -1125,8 +1127,9 @@ export function listFederationNames(
 }
 
 /**
- * A slot's new key after the till renewed it (GEN_KEY with P2 = 01): only a
- * slot that backs no live or pending note, and only from the key on record.
+ * A slot's new key after the till renewed it (GEN_KEY with P2 = 01): only from
+ * the key on record, and only for a slot that backs no live or pending note but
+ * notes under the new key itself (`notesFitKey`).
  */
 export function renewSlot(
   storage: DurableObjectStorage,
@@ -1165,7 +1168,7 @@ export function renewSlot(
         slot,
       )
       .toArray();
-    if (held.length > 0) {
+    if (held.length > 0 && !notesFitKey(sql, shortId, slot, String(r.pubkey))) {
       throw new Conflict(`slot ${slot} of card ${shortId} still backs a note`);
     }
     sql.exec(
@@ -1179,6 +1182,23 @@ export function renewSlot(
     sql.exec('DELETE FROM strandings WHERE short_id = ? AND slot = ?', shortId, slot);
     return {version: bump(sql, shortId)};
   });
+}
+
+/**
+ * Whether `pubkey` may become `slot`'s key although the slot holds notes, or notes were recorded
+ * under that key: the card made the key and a till put change under it before the registry heard
+ * of it (a key another till made, a post of it that failed, a renewal still queued). It may when
+ * every note ever recorded under the key is live or pending on that slot, and every live or pending
+ * note on that slot is under the key. The note is then signed under it like any other (`signNotes`).
+ */
+function notesFitKey(sql: Sql, shortId: string, slot: number, pubkey: string): boolean {
+  const nonce = '02' + pubkey;
+  const under = sql.exec('SELECT slot, status FROM notes WHERE short_id = ? AND nonce = ?', shortId, nonce).toArray();
+  if (under.some(n => Number(n.slot) !== slot || (n.status !== 'live' && n.status !== 'pending'))) return false;
+  return sql
+    .exec("SELECT nonce FROM notes WHERE short_id = ? AND slot = ? AND status IN ('live', 'pending')", shortId, slot)
+    .toArray()
+    .every(n => String(n.nonce) === nonce);
 }
 
 /** Most keys one `addSlotKeys` call takes: every slot of the largest card. */
@@ -1225,8 +1245,8 @@ export function parseSlotKeys(r: Record<string, unknown>, pathSlot?: number): {s
  * - A slot must be below the card's slot count (400).
  * - A slot that already holds the same key is a replay and changes nothing; one
  *   holding another key is 409: replacing a key is a renewal (`renewSlot`).
- * - A key already on another slot of the card, or one a note was ever recorded
- *   under, is 409.
+ * - A key already on another slot of the card is 409, and so is one a note was
+ *   ever recorded under, unless those notes are the slot's own (`notesFitKey`).
  * - Slot 0's key must end in the short id (409), though registration always keys it.
  *
  * No `version` is asked: filling an empty slot cannot clash with a charge,
@@ -1265,7 +1285,10 @@ export function addSlotKeys(
       if (onCard.has(k.pubkey)) {
         throw new Conflict(`that key is already on another slot of card ${shortId}`);
       }
-      if (sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, '02' + k.pubkey).toArray().length > 0) {
+      if (
+        sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, '02' + k.pubkey).toArray().length > 0 &&
+        !notesFitKey(sql, shortId, k.slot, k.pubkey)
+      ) {
         throw new Conflict(`a note was already recorded under the key for slot ${k.slot}`);
       }
       if (k.slot === 0 && k.pubkey.slice(-8) !== shortId) {

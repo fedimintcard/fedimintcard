@@ -155,6 +155,23 @@ fn a_card_pays_offline_from_a_kit() {
     }
 }
 
+/// A note waiting for the registry's signature is not on the card, and its slot reads KEYED. A
+/// phone's kit names no such slot, so the phone plans change into any KEYED slot, the first one
+/// included. The registry answers a report whose change lands on such a slot as a double spend and
+/// releases the change slots (registry `offline.test.ts`, "a sale whose change slot holds a note").
+#[test]
+fn a_phone_plans_change_into_any_keyed_slot_and_relies_on_the_registry_for_one_with_a_waiting_note() {
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[1 << 16]);
+    let keyed = slots_in(&card, SlotState::Keyed);
+    let kit = fx.kit(s.phone_id(), 40, now_ms(), 7 * DAY_MS);
+    let t = take(&s, &card, &serde_json::to_string(&kit).unwrap(), 20_000, "sale-1").unwrap();
+    let change: Vec<u8> = t.charge.change.iter().map(|c| c.slot).collect();
+    assert!(!change.is_empty() && change.iter().all(|s| keyed.contains(s)), "{change:?} in {keyed:?}");
+    assert!(change.contains(&keyed[0]), "the first KEYED slot is not held back: {change:?}");
+}
+
 /// The till's newest block header travels in the kit: the card's clock moves to it, and the charge
 /// pays.
 #[test]

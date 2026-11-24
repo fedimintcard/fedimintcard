@@ -65,25 +65,25 @@ key every time).
 
 ## APDUs
 
-CLA `B0`. Applet AID `F0464D4341524401`. Key slots: 8 on a 2.0 card, 32 on a 2.1 card (P1 = 0..7 or 0..31). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
+CLA `B0`. Applet AID `F0464D4341524401`. Key slots: 32 (P1 = 0..31). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
 
 | Command | INS | Data | Response |
 |---|---|---|---|
 | GEN_KEY | `10` | none | 32-byte x-only pubkey; P2 = 0: `6985` if the slot is used; P2 = 1 (overwrite): wipes the slot and generates a new key, used or not |
 | GET_PUB | `11` | none | 32-byte x-only pubkey; `6985` if empty |
 | SIGN | `12` | 32-byte message | 64-byte BIP340 signature; `6985` if empty; needs a `VERIFY_PIN` in the same session |
-| VERIFY_PIN | `40` | 4..8-byte PIN | `9000` and this session may SIGN; `63CX` wrong, X tries left; `6983` blocked; `6984` no PIN set |
+| VERIFY_PIN | `40` | 4..8-byte PIN | `9000` and this session may SIGN; `63CX` wrong, X tries left; `6A98` a wait is owed, send it again; `6984` no PIN set |
 | SET_PIN | `41` | 4..8-byte PIN | `9000` the first time; `6985` if a PIN is already set; does not open a session |
-| CHANGE_PIN | `42` | old PIN then new PIN, 8..16 bytes, equal lengths | `9000`; needs a `VERIFY_PIN` first and ends the session; a length change needs `SET_PIN` on a re-keyed card |
+| CHANGE_PIN | `42` | old PIN then new PIN, 8..16 bytes, equal lengths | `9000`; P1 = old PIN length (0 = equal halves); the old PIN is checked as in `VERIFY_PIN` and ends the session |
 
-`SELECT` answers `02009000`: the applet's version 2.0 in two data bytes, then the status word.
+`SELECT` answers `04009000`: the applet's version 4.0 in two data bytes, then the status word.
 
 The applet is meant for contactless (T=1 style) use. GEN_KEY and GET_PUB call
 `setIncomingAndReceive` on commands with no data, which may stall on T=0 contact transports;
 step 7 must re-check this on the real card.
 
-Status words: `9000` ok, `6700` wrong length, `6A94` PIN required, `6983` PIN blocked,
-`6984` no PIN set, `6B00` bad P1/P2, `6985` state refused, `6D00`
+Status words: `9000` ok, `6700` wrong length, `6A94` PIN required, `6A98` a PIN wait is owed (send the same command again),
+`6A96` clock not anchored, `6982` bad note signature, `6984` no PIN set, `6B00` bad P1/P2, `6985` state refused, `6D00`
 unknown INS, `6E00` wrong CLA, `6F00` crypto failure.
 
 ## License

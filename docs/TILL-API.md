@@ -26,12 +26,12 @@ till's own outputs, `sales.json` and `cashouts.log` stay local. Slot 0 is never 
 its key is the card's short id. At startup the till reports the federation's name to ops. The
 token is never logged.
 
-### Applet 3.0 cards and offline charges
+### Applet 4.0 cards and offline charges
 
-A card with applet 3.0 (`SELECT` answers `03 00`; `docs/OFFLINE-PROTOCOL.md` § 1) signs each slot
+A card with applet 4.0 (`SELECT` answers `04 00`; `docs/OFFLINE-PROTOCOL.md` § 1) signs each slot
 once, ever, and only a slot that holds its note. The till keeps it so, online: before the card
-signs, every input slot gets its note if it lacks one (`SET_NOTE` from the registry's amount and
-signature), and the card's daily limit is checked (`card_limit` otherwise, before anything is
+signs, every input slot gets its note if it lacks one (`SET_NOTE` from the registry's amount, signature and `reg_sig`),
+and the card's daily limit is checked (`card_limit` otherwise, before anything is
 recorded); notes issued in a tap (change, a load, a top-up load) are written to the card in that
 tap; and every attach writes any live note the card still lacks (a change finished elsewhere). The
 till also keeps the newest Bitcoin block header (`--esplora-url`, default

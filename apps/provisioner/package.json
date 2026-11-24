@@ -1,7 +1,7 @@
 {
   "name": "fedimint-provisioner",
-  "version": "1.0.0",
-  "provisionerBuild": 14,
+  "version": "1.1.0",
+  "provisionerBuild": 15,
   "private": true,
   "scripts": {
     "android": "react-native run-android",
