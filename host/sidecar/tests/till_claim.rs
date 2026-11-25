@@ -429,3 +429,153 @@ async fn a_till_with_no_registry_settings_stays_local() -> anyhow::Result<()> {
     assert_eq!((&st["connected"], &st["ops_state"]), (&json!(false), &json!("local")));
     Ok(())
 }
+
+/// Run the installed binary from an empty directory. Exercise both listeners and make sure
+/// approval and the two independent credentials survive replacing the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn merchant_setup_from_empty_storage_and_restart() -> anyhow::Result<()> {
+    use std::process::{Child, Command};
+    struct Service(Child);
+    impl Drop for Service {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let (registry, fake) = fake_registry(600_000).await;
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fed = tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).build()).await?;
+    let dir = tempfile::tempdir()?;
+    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let pos_port = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let admin = admin_port.local_addr()?;
+    let pos = pos_port.local_addr()?;
+    drop((admin_port, pos_port));
+    let password = format!("admin-{}", hex::encode(rand::random::<[u8; 16]>()));
+    let launch = |data_dir: &std::path::Path| -> anyhow::Result<Service> {
+        Ok(Service(
+            Command::new(env!("CARGO_BIN_EXE_card-sidecar"))
+                .args(["till", "admin"])
+                .env("CARD_DATA_DIR", data_dir)
+                .env("TILL_ADMIN_PASSWORD", &password)
+                .env_remove("TILL_ADMIN_PASSWORD_FILE")
+                .env_remove("OPS_TILL_TOKEN")
+                .env("TILL_ESPLORA_URL", "")
+                .env("OPS_URL", &registry)
+                .env("CARD_BRIDGE_URL", "http://127.0.0.1:1")
+                .env("TILL_ADMIN_LISTEN", admin.to_string())
+                .env("TILL_LISTEN", pos.to_string())
+                .env("TILL_POS_PUBLIC_URL", format!("http://{pos}"))
+                .spawn()?,
+        ))
+    };
+    let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(45)).build()?;
+    let admin_url = |path: &str| format!("http://{admin}{path}");
+    let get = |path: &str| http.get(admin_url(path)).bearer_auth(&password);
+    let post = |path: &str| http.post(admin_url(path)).bearer_auth(&password);
+    let wait_for = |field: &'static str, expected: bool| {
+        let get = &get;
+        async move {
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    if let Ok(resp) = get("/admin/status").send().await
+                        && let Ok(body) = resp.json::<Value>().await
+                        && body[field] == expected
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+        }
+    };
+    let first = launch(dir.path())?;
+    wait_for("joined", false).await?;
+    assert_eq!(http.get(admin_url("/admin/payout")).send().await?.status(), 401);
+    assert!(http.get(admin_url("/")).send().await?.error_for_status()?.text().await?.contains("<form"));
+    post("/admin/join").json(&json!({"invite": fed.invite_code().to_string()})).send().await?.error_for_status()?;
+    wait_for("joined", true).await?;
+    let claim: Value = post("/admin/claim").json(&json!({"name":"Test counter"})).send().await?.error_for_status()?.json().await?;
+    assert_eq!(claim["code"], "K7QM-3XRP");
+    fake.lock().unwrap().approved = true;
+    wait_for("connected", true).await?;
+    let pos_url = format!("http://{pos}");
+    assert_eq!(get("/admin/status").send().await?.json::<Value>().await?["pos_url"], pos_url);
+    let pair: Value = post("/admin/pair").json(&json!({})).send().await?.error_for_status()?.json().await?;
+    let explicit: Value = post("/admin/pair").json(&json!({"url":pos_url})).send().await?.error_for_status()?.json().await?;
+    assert_eq!(pair["text"], explicit["text"]);
+    assert!(pair["text"].as_str().unwrap().contains(&pos_url));
+    let token = pair["text"].as_str().and_then(|s| s.split_once("?t=")).expect("pairing text").1;
+    assert!(pair["qr_svg"].as_str().unwrap().contains("<svg"));
+    assert_eq!(http.get(admin_url("/admin/payout")).bearer_auth(token).send().await?.status(), 401);
+    assert!(http.get(format!("{pos_url}/admin/payout")).bearer_auth(&password).send().await?.status().is_client_error());
+    http.get(format!("{pos_url}/v1/status")).bearer_auth(token).send().await?.error_for_status()?;
+    let settings = get("/admin/payout").send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(settings["settings"]["mode"], "auto");
+    assert!(settings["destination"].is_null());
+    drop(first);
+    // Fund only this disposable wallet while its service is stopped, as a merchant sale would.
+    use fedimint_client::transaction::TransactionBuilder;
+    use fedimint_core::{Amount, core::OperationId};
+    use fedimint_dummy_client::DummyClientModule;
+    let recipient = fed.new_client().await;
+    let dummy = recipient.get_first_module::<DummyClientModule>()?;
+    let op = OperationId::new_random();
+    let out = recipient
+        .finalize_and_submit_transaction(
+            op,
+            "fund",
+            |_| (),
+            TransactionBuilder::new().with_inputs(dummy.create_input(Amount::from_sats(100_000))),
+        )
+        .await?;
+    recipient.await_primary_bitcoin_module_outputs(op, out.into_iter().collect()).await?;
+    let recipient = Wallet::from_client(recipient).await?;
+    let (funding_notes, _) = recipient.export(65_536_000, false, false).await?;
+    let wallet = Wallet::open(dir.path()).await?;
+    wallet.import_notes(funding_notes).await?;
+    let client = wallet.client.clone();
+    drop(wallet);
+    if let Ok(handle) = Arc::try_unwrap(client) {
+        handle.shutdown().await;
+    }
+    let mut second = launch(dir.path())?;
+    wait_for("connected", true).await?;
+    http.get(format!("{pos_url}/v1/status")).bearer_auth(token).send().await?.error_for_status()?;
+    let withdrawal = |id: &str| post("/admin/payout/ecash").json(&json!({"request_id":id,"amount_sat":5_120}));
+    let first_notes = withdrawal("merchant-receive").send().await?.error_for_status()?.json::<Value>().await?;
+    let record = &first_notes["payout"];
+    assert_eq!(record["state"], "exported");
+    let notes = record["notes"].as_str().expect("exported bearer eCash");
+    recipient.import(notes).await?;
+    let repeated = withdrawal("merchant-receive").send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(repeated["payout"]["id"], record["id"]);
+    let unclaimed = withdrawal("merchant-reclaim").send().await?.error_for_status()?.json::<Value>().await?;
+    let id = unclaimed["payout"]["id"].as_str().expect("withdrawal id");
+    let reclaimed = post(&format!("/admin/payout/records/{id}/reclaim")).send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(reclaimed["payout"]["state"], "reclaimed");
+    let before_backup = get("/admin/status").send().await?.error_for_status()?.json::<Value>().await?;
+    // Stop the only writer, archive the entire test volume, then restore into a fresh directory.
+    assert!(Command::new("kill").args(["-TERM", &second.0.id().to_string()]).status()?.success());
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while second.0.try_wait().expect("query service").is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?;
+    drop(second);
+    let backup = tempfile::tempdir()?;
+    let archive = backup.path().join("till.tar");
+    let restored = tempfile::tempdir()?;
+    assert!(Command::new("tar").arg("-cf").arg(&archive).arg("-C").arg(dir.path()).arg(".").status()?.success());
+    assert!(Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(restored.path()).status()?.success());
+    let _restored = launch(restored.path())?;
+    wait_for("connected", true).await?;
+    let after = get("/admin/status").send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(after["wallet_balance_msat"], before_backup["wallet_balance_msat"]);
+    let history = get(&format!("/admin/payout/records/{id}")).send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(history["payout"]["state"], "reclaimed");
+    http.get(format!("{pos_url}/v1/status")).bearer_auth(token).send().await?.error_for_status()?;
+    Ok(())
+}

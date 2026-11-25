@@ -1,0 +1,1173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Fedimint Card Till</title>
+    <meta name="theme-color" content="#0B1530" />
+    <style>
+      /* Figtree is bundled under /assets/Figtree-OFL.txt.
+         The operator palette and controls come from Setup's theme.ts and ui.tsx.
+         The wallet uses the POS amount screen's blue gradient and gold balance. */
+      @font-face {
+        font-family: Figtree;
+        src: url("/assets/figtree.ttf") format("truetype");
+        font-weight: 300 900;
+        font-display: swap;
+      }
+      :root {
+        color-scheme: dark;
+        --bg: #0b1530;
+        --card: #14234b;
+        --raised: #1b2e5e;
+        --ink: #eef1f8;
+        --dim: #a9b4d0;
+        --accent: #e1cf89;
+        --on-accent: #12214a;
+        --danger: #f2958c;
+        --line: #2a3d72;
+        --control-line: #65779f;
+        font: 1rem/1.45 Figtree, system-ui, sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      body {
+        margin: 0 auto;
+        max-width: 62rem;
+        padding: 1rem clamp(1rem, 4vw, 2rem) 2.5rem;
+        overflow-wrap: anywhere;
+      }
+      header, .line, .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      header, .line { justify-content: space-between; }
+      header { min-height: 3rem; }
+      .brand { gap: 0.625rem; }
+      .brand svg {
+        width: 2.25rem;
+        height: 2.25rem;
+        border: 1px solid var(--line);
+        border-radius: 24%;
+        flex-shrink: 0;
+      }
+      .brand strong { font-size: 1.25rem; letter-spacing: -0.025em; }
+      .brand strong span { color: var(--accent); font-weight: 500; }
+      h1, h2, h3, p, dl, ul { margin: 0; }
+      h1 {
+        margin-top: 1.25rem;
+        font-size: 1.625rem;
+        line-height: 1.2;
+        font-weight: 600;
+      }
+      h2, h3 { font-size: 1.0625rem; line-height: 1.35; font-weight: 600; }
+      .section-label {
+        margin-bottom: 0.6rem;
+        color: var(--dim);
+        font-size: 0.75rem;
+        letter-spacing: 0.075rem;
+        text-transform: uppercase;
+      }
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 1rem;
+        padding: 1rem;
+      }
+      .tabs {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.25rem;
+        position: sticky;
+        top: 0.25rem;
+        z-index: 2;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 0.875rem;
+        padding: 0.25rem;
+        margin-bottom: 1rem;
+      }
+      .tabs button {
+        min-height: 2.75rem;
+        font-size: 0.9375rem;
+        padding: 0.5rem 0.25rem;
+        border-radius: 0.625rem;
+        background: transparent;
+        color: var(--dim);
+      }
+      .tabs [aria-selected="true"] { background: var(--accent); color: var(--on-accent); }
+      body:has(#live:not([hidden])) #notice { top: 3.875rem; }
+      .tab-panel, .stack { display: grid; align-items: start; gap: 1.25rem; }
+      .tab-panel > *, .stack > *, .grid > * { min-width: 0; }
+      .tab-panel { scroll-margin-top: 4rem; }
+      .panel > :first-child { margin-top: 0; }
+      #lightningHelp { margin-bottom: 0.875rem; color: var(--dim); font-size: 0.875rem; }
+      #lightningHelp p + p { margin-top: 0.25rem; }
+      .help-actions { display: flex; flex-wrap: wrap; gap: 0 0.75rem; }
+      .help-actions button, #changePair { padding-inline: 0; }
+      #pairField, #address { scroll-margin-top: 5rem; }
+      .settings-panel > details:first-child { border-top: 0; }
+      #reviewAddress, #remove, #resume { margin-top: 0.75rem; }
+      #withdraw { margin-top: 0; }
+      #withdrawalRecovery p { margin-top: 0.5rem; }
+      #destination { margin: 0 0 0.75rem; }
+      #sweepLimits { margin-top: 0; }
+      #sweepLimits[open] .grid { margin-top: 0.5rem; }
+      .line {
+        margin: 0.125rem 0 1rem;
+        color: var(--dim);
+        font-size: 0.875rem;
+      }
+      .summary {
+        padding: 1.5rem 1rem;
+        text-align: center;
+        border: 1px solid #4661a4;
+        background: radial-gradient(ellipse at 90% 0%, #4f7fe666, transparent 75%),
+          linear-gradient(#2a4fae, #1f3d8c, #1a3272);
+      }
+      .summary .section-label { color: #eef3ff; }
+      .balance {
+        display: block;
+        font-size: clamp(2.5rem, 8vw, 4rem);
+        line-height: 1.1;
+        letter-spacing: -0.025em;
+        font-weight: 800;
+        color: #f4e9b0;
+      }
+      .balance, dd, .entries strong { font-variant-numeric: tabular-nums; }
+      #federation { margin: 0.625rem 0 0.125rem; color: #eef3ff; font-weight: 500; }
+      #links { color: #cbd6f2; }
+      small, .entries, #destination, #dialogInfo {
+        color: var(--dim);
+        font-size: 0.875rem;
+        line-height: 1.45;
+      }
+      form, .grid { display: grid; gap: 1rem; }
+      form { margin: 1rem 0 0; }
+      label {
+        display: grid;
+        gap: 0.5rem;
+        align-content: start;
+        font-size: 0.8125rem;
+        font-weight: 500;
+      }
+      input, select, textarea, button { font: inherit; }
+      input, select, textarea {
+        min-width: 0;
+        width: 100%;
+        min-height: 3.25rem;
+        padding: 0.75rem 0.875rem;
+        border: 1px solid var(--control-line);
+        border-radius: 0.75rem;
+        font-size: 1rem;
+        color: var(--ink);
+        background: var(--card);
+      }
+      input::placeholder, textarea::placeholder { color: var(--dim); opacity: 1; }
+      input:focus, select:focus, textarea:focus { background: var(--raised); }
+      textarea { resize: vertical; }
+      button {
+        min-height: 3.25rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid transparent;
+        border-radius: 0.875rem;
+        background: var(--accent);
+        color: var(--on-accent);
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 1.0625rem;
+      }
+      button.secondary {
+        background: transparent;
+        color: var(--ink);
+        border-color: var(--control-line);
+        font-size: 1rem;
+        font-weight: 500;
+      }
+      button.quiet {
+        min-height: 2.75rem;
+        padding: 0.5rem;
+        background: transparent;
+        color: var(--accent);
+        font-size: 1rem;
+        font-weight: 500;
+      }
+      button.danger { background: var(--danger); }
+      #remove { color: var(--danger); }
+      button:disabled {
+        background: var(--raised);
+        color: var(--dim);
+        cursor: wait;
+      }
+      button:active:enabled { opacity: 0.85; }
+      .secondary:active:enabled, summary:active { background: var(--raised); }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      #notice:empty, #news:empty { display: none; }
+      #notice {
+        position: sticky;
+        z-index: 1;
+        top: 0.5rem;
+        background: var(--raised);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--accent);
+        border-radius: 0.75rem;
+        padding: 0.75rem 1rem;
+        margin: 0.75rem 0;
+      }
+      #notice.error { color: var(--danger); border-left-color: var(--danger); }
+      #news { color: var(--accent); font-size: 0.875rem; margin-top: 0.75rem; }
+      dl {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+        margin-top: 0.75rem;
+      }
+      dt, dd { padding: 0.625rem 0; border-bottom: 1px solid var(--line); }
+      dt { font-weight: 500; }
+      dd { margin: 0; padding-left: 0.75rem; text-align: right; }
+      details { margin-top: 1rem; border-top: 1px solid var(--line); }
+      summary {
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        min-height: 3.25rem;
+        cursor: pointer;
+        font-weight: 500;
+      }
+      summary::-webkit-details-marker { display: none; }
+      summary::after {
+        content: "";
+        width: 0.5rem;
+        height: 0.5rem;
+        border: solid var(--dim);
+        border-width: 2px 2px 0 0;
+        transform: rotate(45deg);
+        margin-right: 0.25rem;
+        flex-shrink: 0;
+      }
+      details[open] > summary::after { transform: rotate(135deg); }
+      details form, details button + h3, #address + button, #options + button { margin-top: 0.75rem; }
+      details form + h3, details button + h3 { margin-top: 1.25rem; }
+      #connection { margin: 0; }
+      #connection > summary { margin: -1rem; padding: 0.75rem 1rem; }
+      #connection[open] > summary { margin-bottom: 0.25rem; border-bottom: 1px solid var(--line); }
+      .entries { list-style: none; }
+      .entries li {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem 0.75rem;
+        padding: 0.75rem 0;
+        color: var(--ink);
+        font-size: 1rem;
+      }
+      .entries li:first-child { padding-top: 0; }
+      .entries li:last-child { padding-bottom: 0; }
+      .entries li + li { border-top: 1px solid var(--line); }
+      .entries li > span { flex: 1 1 7rem; min-width: 0; font-weight: 500; }
+      .entries small { display: block; font-size: 0.8125rem; font-weight: 400; }
+      .entries strong { max-width: 100%; font-weight: 600; }
+      .entries button { min-height: 2.75rem; padding: 0.5rem 0.75rem; }
+      #setup { max-width: 32rem; }
+      #setup h2, dialog h2 { font-size: 1.5rem; }
+      dialog {
+        margin: auto;
+        width: min(28rem, calc(100% - 2rem));
+        max-height: calc(100% - 2rem);
+        padding: 1.25rem;
+        border: 1px solid var(--control-line);
+        border-radius: 1rem;
+        background: var(--card);
+        color: var(--ink);
+      }
+      dialog::backdrop { background: rgb(4 9 23 / 80%); }
+      #dialogInfo, dialog label, .actions { margin-top: 0.875rem; }
+      #dialogInfo { white-space: pre-line; }
+      dialog img {
+        display: block;
+        width: min(18rem, 100%);
+        height: auto;
+        margin: 1rem auto 0;
+        background: white;
+        border-radius: 0.5rem;
+      }
+      .actions { display: grid; gap: 0.625rem; }
+      /* On sign-in, the lockup, eyebrow and form follow the Setup sign-in layout. */
+      body:has(#login:not([hidden])) {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        min-height: 100vh;
+        min-height: 100dvh;
+        max-width: 30rem;
+        padding: 1.75rem 1.25rem;
+      }
+      body:has(#login:not([hidden])) .brand { gap: 0.875rem; }
+      body:has(#login:not([hidden])) .brand svg { width: 3.25rem; height: 3.25rem; }
+      body:has(#login:not([hidden])) .brand strong { font-size: 1.6875rem; }
+      body:has(#login:not([hidden])) h1 {
+        margin-top: 1.875rem;
+        color: var(--dim);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.125rem;
+      }
+      #login h2 {
+        margin-top: 0.375rem;
+        font-size: 2.25rem;
+        font-weight: 600;
+        letter-spacing: -0.075rem;
+      }
+      #auth { margin-top: 1.625rem; gap: 1.5rem; }
+      #auth input { min-height: 3.375rem; }
+      #auth button {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 3.625rem;
+        padding-inline: 1.375rem;
+      }
+      #auth button span { font-size: 1.5rem; line-height: 1; }
+      @media (min-width: 38rem) {
+        .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (min-width: 52rem) {
+        .tab-panel { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+        .tabs { max-width: 26rem; }
+        .panel { padding: 1.25rem; }
+        #connection > summary { margin: -1.25rem; padding: 0.875rem 1.25rem; }
+        #connection[open] > summary { margin-bottom: 0.25rem; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <svg aria-hidden="true" focusable="false" viewBox="0 0 460 460">
+          <defs>
+            <linearGradient id="navy" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#24428E"/>
+              <stop offset="1" stop-color="#12214A"/>
+            </linearGradient>
+            <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#E1CF89"/>
+              <stop offset="1" stop-color="#AF9244"/>
+            </linearGradient>
+            <clipPath id="panel"><rect x="95" y="128" width="269" height="203" rx="30"/></clipPath>
+          </defs>
+          <rect width="460" height="460" fill="url(#navy)"/>
+          <g id="chip">
+            <rect x="95" y="128" width="269" height="203" rx="30" fill="url(#gold)"/>
+            <g clip-path="url(#panel)" fill="none" stroke="#24418C" stroke-width="7" stroke-linecap="butt">
+              <line x1="230" y1="186" x2="230" y2="128"/>
+              <line x1="264.4" y1="202.6" x2="365" y2="120"/>
+              <line x1="195.6" y1="202.6" x2="95" y2="120"/>
+              <line x1="272.9" y1="239.8" x2="370" y2="262"/>
+              <line x1="187.1" y1="239.8" x2="90" y2="262"/>
+              <line x1="249.1" y1="269.6" x2="283" y2="340"/>
+              <line x1="210.9" y1="269.6" x2="177" y2="340"/>
+              <polygon points="230,186 264.4,202.6 272.9,239.8 249.1,269.6 210.9,269.6 187.1,239.8 195.6,202.6"/>
+            </g>
+          </g>
+        </svg>
+        <strong>Fedimint <span>card</span></strong>
+      </div>
+      <button id="exit" class="quiet" hidden>Sign out</button>
+    </header>
+    <main>
+      <h1>Merchant till</h1>
+      <div id="notice" role="status" aria-live="polite"></div>
+      <section id="login">
+        <h2>Admin sign-in</h2>
+        <form id="auth">
+          <label
+            >Till admin password<input
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required /></label
+          ><button>Sign in <span aria-hidden="true">→</span></button>
+        </form>
+      </section>
+      <div id="console" hidden>
+        <div class="line"><span id="health"></span><button id="refresh" class="quiet">Refresh</button></div>
+        <section id="setup" class="panel">
+          <h2>Join your federation</h2>
+          <form id="join">
+            <label>Federation invite<textarea name="invite" required rows="3" spellcheck="false"></textarea></label
+            ><small>This till receives sales in this federation. Use Card 4.0 cards and a 4.0 registry.</small><button>Join federation</button>
+          </form>
+        </section>
+        <div id="live" hidden>
+          <div id="tabs" class="tabs" role="tablist" aria-label="Till sections">
+            <button id="overviewTab" role="tab" aria-selected="true" aria-controls="overview">Overview</button>
+            <button id="payoutsTab" role="tab" aria-selected="false" aria-controls="payouts" tabindex="-1">Payouts</button>
+            <button id="pairingTab" role="tab" aria-selected="false" aria-controls="pairing" tabindex="-1">Pairing</button>
+          </div>
+          <div id="overview" role="tabpanel" aria-labelledby="overviewTab" class="tab-panel" tabindex="0">
+            <section class="summary panel">
+              <h2 class="section-label">Wallet balance</h2>
+              <strong class="balance" id="balance"></strong>
+              <p id="federation"></p>
+              <small id="links"></small>
+            </section>
+            <section>
+              <h2 class="section-label">Recent sales</h2>
+              <ul class="entries panel" id="sales"></ul>
+            </section>
+          </div>
+          <div id="payouts" role="tabpanel" aria-labelledby="payoutsTab" class="tab-panel" tabindex="0" hidden>
+            <div class="stack">
+              <section>
+                <h2 class="section-label">Withdraw funds</h2>
+                <div class="panel">
+                  <div id="lightningHelp" hidden>
+                    <div id="lightningReason"></div>
+                    <div class="help-actions">
+                      <button id="toAddress" type="button" class="quiet" hidden>Add Lightning address</button>
+                      <button id="toMode" type="button" class="quiet" hidden>Change payout mode</button>
+                    </div>
+                  </div>
+                  <p id="destination" hidden></p>
+                  <div id="withdrawalRecovery" hidden>
+                    <h3>Previous withdrawal</h3>
+                    <p id="withdrawalOutcome" role="status"></p>
+                    <div class="actions">
+                      <button id="recoverWithdrawal" type="button">Retry this withdrawal</button>
+                      <button id="viewWithdrawal" type="button" class="secondary" hidden>View eCash</button>
+                      <button id="newWithdrawal" type="button" class="secondary" hidden>Start another withdrawal</button>
+                    </div>
+                  </div>
+                  <form id="withdraw">
+                    <div class="grid">
+                      <label>Withdraw with
+                        <select name="kind" aria-describedby="lightningReason">
+                          <option id="lnChoice" value="lightning">Lightning address</option>
+                          <option value="ecash">Same-federation eCash</option>
+                        </select>
+                      </label>
+                      <label>Amount in sats
+                        <input name="amount" type="number" min="1" step="1" inputmode="numeric" required />
+                      </label>
+                    </div>
+                    <button id="reviewWithdrawal" disabled>Review withdrawal</button>
+                  </form>
+                  <p id="news" role="status"></p>
+                  <dl id="funds"></dl>
+                </div>
+              </section>
+              <section>
+                <h2 class="section-label">Payout history</h2>
+                <ul class="entries panel" id="history"></ul>
+              </section>
+            </div>
+            <section>
+              <h2 class="section-label">Lightning payouts</h2>
+              <div class="panel settings-panel">
+                <details id="addressDetails">
+                  <summary>Lightning address</summary>
+                  <button id="reviewAddress" type="button" class="secondary" hidden>Review pending address</button>
+                  <form id="address">
+                    <label>Payout address
+                      <input name="address" type="email" required autocomplete="off" placeholder="name@example.com" />
+                    </label>
+                    <button>Check address</button>
+                  </form>
+                  <button id="remove" class="secondary" hidden>Remove destination</button>
+                </details>
+                <details id="payoutSettings">
+                  <summary>Payout settings</summary>
+                  <form id="options">
+                    <label>Lightning payout mode
+                      <select name="mode">
+                        <option value="auto">Automatic sweep</option>
+                        <option value="manual">Manual only</option>
+                        <option value="both">Automatic and manual</option>
+                        <option value="off">Off</option>
+                      </select>
+                    </label>
+                    <details id="sweepLimits">
+                      <summary>Sweep limits and fees</summary>
+                      <div class="grid" id="limits"></div>
+                    </details>
+                    <button>Save settings</button>
+                  </form>
+                  <button id="resume" class="secondary" hidden>Resume paused payouts</button>
+                </details>
+              </div>
+            </section>
+          </div>
+          <div id="pairing" role="tabpanel" aria-labelledby="pairingTab" class="tab-panel" tabindex="0" hidden>
+            <section>
+              <h2 class="section-label">POS phone</h2>
+              <div class="panel">
+                <p>Open Fedimint Card POS on the phone to scan a pairing code.</p>
+                <form id="pair">
+                  <label id="pairField" hidden>POS address
+                    <input name="url" type="url" placeholder="https://till.example.com" disabled />
+                    <small>Use the POS address from your till’s installation settings.</small>
+                  </label>
+                  <button>Pair a phone</button>
+                </form>
+                <button class="quiet" id="changePair" type="button" aria-expanded="false" aria-controls="pairField" hidden>Use a different address</button>
+              </div>
+            </section>
+            <section>
+              <h2 class="section-label">Registry</h2>
+              <details id="connection" class="panel">
+                <summary>Connect this till</summary>
+                <form id="claim">
+                  <label>Till name<input name="name" required maxlength="80" placeholder="Front counter" /></label>
+                  <button>Connect registry</button>
+                </form>
+              </details>
+            </section>
+          </div>
+        </div>
+      </div>
+      <dialog id="sheet" aria-labelledby="dialogTitle" aria-describedby="dialogInfo">
+        <h2 id="dialogTitle"></h2>
+        <p id="dialogInfo"></p>
+        <img id="qr" alt="Scannable code" hidden /><label id="codeBox" hidden
+          >Code<textarea id="code" readonly spellcheck="false" rows="3"></textarea>
+        </label>
+        <div class="actions">
+          <button id="agree" hidden>Confirm</button><button id="copy" class="secondary" hidden>Copy code</button
+          ><button id="dismiss" class="secondary">Close</button>
+        </div>
+      </dialog>
+    </main>
+    <script>
+      'use strict';
+      const el = (id) => document.getElementById(id),
+        sats = (n) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(n) + ' sats';
+      const limits = [
+        ['reserve_sat', 'Keep in till (sats)', 0],
+        ['threshold_sat', 'Sweep from (sats)', 1],
+        ['interval_minutes', 'Sweep interval (minutes)', 15],
+        ['max_fee_sat', 'Fee cap (sats)', 0],
+        ['max_fee_ppm', 'Fee cap (parts per million)', 0],
+      ];
+      for (const [name, title, min] of limits) {
+        const l = document.createElement('label'),
+          i = document.createElement('input');
+        l.textContent = title;
+        i.name = name;
+        i.type = 'number';
+        i.min = min;
+        i.step = 1;
+        i.required = true;
+        i.inputMode = 'numeric';
+        l.append(i);
+        el('limits').append(l);
+      }
+      let auth = '',
+        session = 0,
+        confirmed = '',
+        confirmedAt = null,
+        savedSettings = null,
+        proposed = null,
+        defaultPosUrl = null,
+        dialogAction = null,
+        pending = null,
+        receipt = null,
+        blob = null,
+        timer = null;
+      const tabs = Array.from(el('tabs').querySelectorAll('[role="tab"]'));
+      function selectTab(selected) {
+        for (const tab of tabs) {
+          const active = tab === selected;
+          tab.setAttribute('aria-selected', String(active));
+          tab.tabIndex = active ? 0 : -1;
+          el(tab.getAttribute('aria-controls')).hidden = !active;
+        }
+      }
+      for (const [index, tab] of tabs.entries()) {
+        tab.onclick = () => {
+          selectTab(tab);
+          notice('');
+          if (el('live').getBoundingClientRect().top < 0) el('live').scrollIntoView({ block: 'start' });
+        };
+        tab.onkeydown = (event) => {
+          const next = {
+            ArrowLeft: (index + tabs.length - 1) % tabs.length,
+            ArrowRight: (index + 1) % tabs.length,
+            Home: 0,
+            End: tabs.length - 1,
+          }[event.key];
+          if (next === undefined) return;
+          event.preventDefault();
+          tabs[next].click();
+          tabs[next].focus();
+        };
+      }
+      function showPairField(show) {
+        const field = el('pair').elements.url;
+        el('pairField').hidden = field.disabled = !show;
+        field.required = show;
+        if (!show) field.value = '';
+        el('changePair').hidden = !defaultPosUrl;
+        el('changePair').setAttribute('aria-expanded', String(show));
+        el('changePair').textContent = show ? 'Use saved address' : 'Use a different address';
+      }
+      el('changePair').onclick = () => {
+        showPairField(el('pairField').hidden);
+        if (!el('pairField').hidden) el('pair').elements.url.focus();
+      };
+      function notice(t, error = false) {
+        el('notice').classList.toggle('error', error);
+        el('notice').textContent = t;
+      }
+      function closeSheet() {
+        el('sheet').close();
+        if (blob) URL.revokeObjectURL(blob);
+        blob = null;
+        dialogAction = null;
+        el('qr').removeAttribute('src');
+        el('code').value = '';
+        el('dialogInfo').textContent = '';
+      }
+      function dialog(title, info, { action = null, label = 'Confirm', value = '', svg = '', danger = false } = {}) {
+        closeSheet();
+        el('dialogTitle').textContent = title;
+        el('dialogInfo').textContent = info;
+        el('agree').textContent = label;
+        el('agree').classList.toggle('danger', danger);
+        dialogAction = action;
+        el('agree').hidden = !action;
+        el('code').value = value;
+        el('copy').textContent = 'Copy code';
+        el('copy').hidden = el('codeBox').hidden = !value;
+        el('qr').hidden = !svg;
+        if (svg) {
+          blob = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+          el('qr').src = blob;
+        }
+        el('sheet').showModal();
+      }
+      el('dismiss').onclick = closeSheet;
+      el('sheet').addEventListener('cancel', (e) => {
+        e.preventDefault();
+        closeSheet();
+      });
+      el('copy').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(el('code').value);
+          el('copy').textContent = 'Copied';
+        } catch {
+          el('code').select();
+        }
+      };
+      function signout(event) {
+        if (event?.currentTarget === el('exit') && terminalStates.has(receipt?.state)) saveWithdrawal(null);
+        session++;
+        auth = '';
+        confirmed = '';
+        confirmedAt = null;
+        savedSettings = null;
+        proposed = null;
+        defaultPosUrl = null;
+        selectTab(tabs[0]);
+        for (const id of ['addressDetails', 'payoutSettings', 'sweepLimits', 'connection']) el(id).open = false;
+        el('reviewAddress').hidden = el('reviewWithdrawal').disabled = true;
+        el('federation').removeAttribute('title');
+        pending = receipt = null;
+        el('withdrawalRecovery').hidden = true;
+        el('withdrawalOutcome').textContent = '';
+        clearTimeout(timer);
+        closeSheet();
+        for (const f of document.forms) f.reset();
+        for (const k of [
+          'history',
+          'sales',
+          'health',
+          'funds',
+          'news',
+          'lightningReason',
+          'balance',
+          'destination',
+          'federation',
+          'links',
+        ])
+          el(k).replaceChildren();
+        el('login').hidden = false;
+        el('console').hidden = el('exit').hidden = true;
+        notice('');
+      }
+      el('exit').onclick = signout;
+      window.addEventListener('pagehide', signout);
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) closeSheet();
+      });
+      async function api(path, method = 'GET', data) {
+        const epoch = session,
+          r = await fetch('/admin/' + path, {
+            method,
+            cache: 'no-store',
+            credentials: 'omit',
+            redirect: 'error',
+            headers: { Authorization: 'Bearer ' + auth, ...(data ? { 'Content-Type': 'application/json' } : {}) },
+            body: data ? JSON.stringify(data) : undefined,
+          });
+        if (epoch !== session) throw new Error('Session closed.');
+        if (r.status === 401) {
+          signout();
+          throw new Error('Check your till admin password.');
+        }
+        const j = await r.json();
+        if (epoch !== session) throw new Error('Session closed.');
+        if (!r.ok || j.ok === false) {
+          const err = new Error(j.detail || j.error || 'The till could not complete this request.');
+          err.code = j.error;
+          err.payout = j.payout;
+          throw err;
+        }
+        return j;
+      }
+      const fields = (form) => Object.fromEntries(new FormData(form));
+      function perform(button, fn) {
+        if (button.disabled) return;
+        button.disabled = true;
+        const epoch = session;
+        notice('');
+        Promise.resolve()
+          .then(fn)
+          .catch((e) => {
+            if (epoch === session || !auth) notice(e.message, true);
+          })
+          .finally(() => {
+            button.disabled = false;
+          });
+      }
+      function form(id, fn) {
+        el(id).onsubmit = (e) => {
+          e.preventDefault();
+          const f = e.currentTarget;
+          perform(f.querySelector('button'), () => fn(fields(f)));
+        };
+      }
+      el('agree').onclick = () => {
+        const action = dialogAction;
+        closeSheet();
+        if (action) perform(el('agree'), action);
+      };
+      form('auth', async (d) => {
+        auth = d.password;
+        await refresh();
+        el('auth').reset();
+      });
+      el('refresh').onclick = () => perform(el('refresh'), refresh);
+      function entry(list, title, sub, amount, action) {
+        const li = document.createElement('li'),
+          left = document.createElement('span'),
+          extra = document.createElement('small'),
+          right = document.createElement('strong');
+        left.textContent = title;
+        extra.textContent = sub;
+        left.append(extra);
+        right.textContent = amount;
+        li.append(left, right);
+        if (action) {
+          const button = document.createElement('button');
+          button.className = 'secondary';
+          button.textContent = 'View';
+          button.onclick = () => perform(button, action);
+          li.append(button);
+        }
+        list.append(li);
+      }
+      const when = (n) => (n ? new Date(n).toLocaleString() : '');
+      async function refresh() {
+        clearTimeout(timer);
+        const st = await api('status');
+        el('login').hidden = true;
+        el('console').hidden = el('exit').hidden = false;
+        el('setup').hidden = st.joined || st.starting;
+        el('live').hidden = !st.joined;
+        el('health').textContent = st.starting
+          ? 'Starting till…'
+          : st.joined
+            ? st.connected
+              ? 'Registry connected'
+              : 'Registry setup pending'
+            : 'First setup';
+        if (st.starting) {
+          timer = setTimeout(() => perform(el('refresh'), refresh), 1200);
+          return;
+        }
+        if (!st.joined) return;
+        const posUrl = st.pos_url || '';
+        if (posUrl !== defaultPosUrl) {
+          defaultPosUrl = posUrl;
+          showPairField(!posUrl);
+        }
+        el('balance').textContent = sats(st.wallet_balance_msat / 1000);
+        const federationId = String(st.federation_id || '');
+        el('federation').textContent =
+          st.federation_name || 'Federation ' + federationId.slice(0, 8) + '…' + federationId.slice(-8);
+        el('federation').title = federationId;
+        el('links').textContent = [
+          st.federation_reachable ? 'Federation online' : 'Federation unreachable',
+          st.card_relay_ok ? 'Card relay online' : 'Card relay offline',
+        ].join(' · ');
+        const [p, s] = await Promise.all([api('payout'), api('sales')]);
+        renderPayout(p);
+        const list = el('sales');
+        list.replaceChildren();
+        for (const v of (s.sales || []).slice(-20).reverse())
+          entry(
+            list,
+            'Sale ' + v.id,
+            when(v.ts_unix_ms) +
+              (v.double_spent
+                ? ' · Double spend detected'
+                : v.collection_pending
+                  ? ' · Collection pending'
+                  : v.offline
+                    ? ' · Offline sale'
+                    : ''),
+            sats(v.price_msat / 1000),
+          );
+        if (!list.children.length) list.textContent = 'Sales will appear here.';
+        el('connection').open = !st.connected;
+      }
+      function setAmountStep() {
+        const form = el('withdraw').elements;
+        form.amount.step = form.kind.value === 'ecash' ? form.kind.dataset.ecashStep || '1' : '1';
+        form.amount.min = form.amount.step;
+      }
+      el('withdraw').elements.kind.onchange = setAmountStep;
+      function renderPayout(p) {
+        const s = p.settings;
+        for (const k of ['mode', ...limits.map((x) => x[0])]) {
+          const field = el('options').elements[k];
+          if (!savedSettings || field.value === String(savedSettings[k])) field.value = s[k];
+        }
+        savedSettings = s;
+        el('resume').hidden = p.blocked?.error !== 'halted';
+        // Reloads require a fresh sign-in. The tab keeps the original request until the
+        // merchant sees its outcome and explicitly starts a different withdrawal.
+        pending = history.state?.tillWithdrawal || null;
+        if (pending) {
+          const match = [p.open, ...(p.recent || [])].find((r) => r?.request_id === pending.id);
+          rememberReceipt(match);
+        }
+        renderRecovery();
+        confirmed = p.destination?.address || '';
+        confirmedAt = p.destination?.confirmed_at_ms;
+        proposed = p.pending_destination || null;
+        el('reviewAddress').hidden = !proposed;
+        el('remove').hidden = !confirmed;
+        el('destination').hidden = !confirmed;
+        el('destination').textContent = confirmed ? 'Lightning destination: ' + confirmed : '';
+        const previouslyDisabled = el('lnChoice').disabled;
+        const block = p.funds?.lightning_blocked;
+        const noModule = block?.reason === 'no_lightning_module' || block?.error === 'lightning_unavailable' ||
+          block?.detail?.includes('this federation has no Lightning module the till can use');
+        const addressNeeded = !confirmed || !Number.isSafeInteger(confirmedAt) || confirmedAt <= 0 || p.blocked?.error === 'destination_changed';
+        const manualOff = !['manual', 'both'].includes(s.mode);
+        const payoutsPaused = p.blocked?.error === 'halted';
+        const fundsUnavailable = !p.funds || (!!p.blocked && !payoutsPaused && p.blocked.error !== 'destination_changed');
+        const reasons = [];
+        el('toAddress').hidden = true;
+        el('toMode').hidden = true;
+        if (fundsUnavailable) {
+          reasons.push('The till cannot verify how much is available. Refresh to check again before withdrawing.');
+        } else if (payoutsPaused) {
+          reasons.push('Payouts are paused. Review the payout history, then resume in payout settings.');
+          el('toMode').textContent = 'Open payout settings';
+          el('toMode').hidden = false;
+        } else if (noModule) {
+          reasons.push('This federation does not support Lightning payouts. Withdraw eCash to a wallet in the same federation.');
+        } else if (block) {
+          reasons.push('The till cannot verify Lightning fees. You can withdraw eCash to a wallet in the same federation.');
+        } else {
+          if (addressNeeded) {
+            reasons.push(proposed ? 'Your Lightning address is waiting for confirmation.' :
+              confirmed ? 'Your Lightning address has changed. Check and confirm it again.' :
+              'Add and confirm a Lightning address to receive payouts.');
+            el('toAddress').textContent = proposed ? 'Review address' : confirmed ? 'Check address' : 'Add Lightning address';
+            el('toAddress').hidden = false;
+          }
+          if (manualOff) {
+            reasons.push((s.mode === 'off' ? 'Lightning payouts are off.' : 'Lightning is set to automatic sweeps only.') +
+              ' For manual withdrawals, choose Manual only or Automatic and manual.');
+            el('toMode').textContent = 'Change payout mode';
+            el('toMode').hidden = false;
+          }
+        }
+        el('lightningReason').replaceChildren(...reasons.map((reason) => {
+          const line = document.createElement('p');
+          line.textContent = reason;
+          return line;
+        }));
+        el('lightningHelp').hidden = !reasons.length;
+        el('reviewWithdrawal').disabled = payoutsPaused || fundsUnavailable;
+        el('lnChoice').disabled = reasons.length > 0;
+        if (el('lnChoice').disabled) el('withdraw').elements.kind.value = 'ecash';
+        else if (previouslyDisabled) el('withdraw').elements.kind.value = 'lightning';
+        el('withdraw').elements.kind.dataset.ecashStep = p.ecash_step_sat || 1;
+        setAmountStep();
+        const f = el('funds');
+        f.replaceChildren();
+        if (p.funds) {
+          for (const [name, key] of [
+            ['Available before withdrawal fees', 'before_withdrawal_fees_sat'],
+            ['Held for customers', 'obligations_sat'],
+            ['Operating reserve', 'reserve_sat'],
+          ]) {
+            const t = document.createElement('dt'),
+              d = document.createElement('dd');
+            t.textContent = name;
+            d.textContent = sats(p.funds[key]);
+            f.append(t, d);
+          }
+        }
+        el('news').textContent =
+          p.blocked?.detail ||
+          (confirmed && ['auto', 'both'].includes(s.mode) && p.next_auto_at_ms
+            ? 'Next sweep check: ' + when(p.next_auto_at_ms)
+            : '');
+        const h = el('history');
+        h.replaceChildren();
+        for (const r of p.recent || [])
+          entry(
+            h,
+            r.kind === 'ecash' ? 'eCash' : 'Lightning',
+            r.state + ' · ' + when(r.created_at_ms),
+            sats(r.amount_sat),
+            r.kind === 'ecash' && r.state === 'exported' ? () => showRecord(r.id) : null,
+          );
+        if (!h.children.length) h.textContent = 'No payouts yet.';
+      }
+      form('join', (d) =>
+        dialog('Join federation?', 'This federation will hold this till’s sales.', {
+          label: 'Join federation',
+          action: async () => {
+            await api('join', 'POST', d);
+            await refresh();
+          },
+        }),
+      );
+      for (const [id, title, help] of [
+        ['claim', 'Connect registry', 'Scan in the Setup app to approve this till.'],
+        ['pair', 'Pair a phone', 'Scan with Fedimint Card POS. Only share this code with the phone you want to pair.'],
+      ])
+        form(id, async (d) => {
+          const v = await api(id, 'POST', d);
+          dialog(title, help, { value: v.text, svg: v.qr_svg });
+        });
+      form('options', (d) => {
+        if (!savedSettings) throw Error('Refresh the till before changing payout settings.');
+        const patch = {}, changes = [];
+        const modeOptions = el('options').elements.mode.options;
+        const modeName = (value) => Array.from(modeOptions).find((o) => o.value === value)?.text || value;
+        for (const [key, label] of [['mode', 'Lightning payout mode'], ...limits]) {
+          const value = key === 'mode' ? d[key] : Number(d[key]);
+          const before = savedSettings[key];
+          if (value === before) continue;
+          patch[key] = value;
+          const format = key === 'mode' ? modeName : (n) => n.toLocaleString();
+          changes.push(label + ' changes from ' + format(before) + ' to ' + format(value) + '.');
+        }
+        if (!changes.length) return notice('There are no changes to save.');
+        dialog('Save payout settings?', changes.join('\n'), {
+          label: 'Save changes',
+          action: async () => {
+            await api('payout/settings', 'PUT', patch);
+            await refresh();
+            notice('Payout settings saved.');
+          },
+        });
+      });
+      function confirmDestination(p) {
+        dialog(
+          'Confirm Lightning destination',
+          p.address + ' · ' + p.callback_host + '. Automatic payouts can start once confirmed if enabled in settings.',
+          {
+            label: 'Confirm destination',
+            action: async () => {
+              await api('payout/destination/confirm', 'POST', { confirm_token: p.confirm_token });
+              await refresh();
+            },
+          },
+        );
+      }
+      form('address', async (d) => {
+        proposed = (await api('payout/destination', 'POST', d)).pending_destination;
+        el('reviewAddress').hidden = false;
+        confirmDestination(proposed);
+      });
+      el('reviewAddress').onclick = () => { if (proposed) confirmDestination(proposed); };
+      el('toAddress').onclick = () => {
+        if (proposed) return confirmDestination(proposed);
+        el('addressDetails').open = true;
+        el('address').elements.address.focus();
+      };
+      el('limits').addEventListener('invalid', () => { el('sweepLimits').open = true; }, true);
+      el('toMode').onclick = () => {
+        el('payoutSettings').open = true;
+        (el('resume').hidden ? el('options').elements.mode : el('resume')).focus();
+      };
+      el('resume').onclick = () =>
+        dialog('Resume payouts?', el('news').textContent, {
+          label: 'Resume payouts',
+          action: async () => {
+            await api('payout/settings', 'PUT', { resume: true });
+            await refresh();
+          },
+        });
+      el('remove').onclick = () =>
+        dialog('Remove destination?', confirmed, {
+          label: 'Remove destination',
+          danger: true,
+          action: async () => {
+            await api('payout/destination', 'DELETE');
+            await refresh();
+          },
+        });
+      function newId() {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        return [...bytes].map((n) => n.toString(16).padStart(2, '0')).join('');
+      }
+      async function showRecord(id) {
+        const v = await api('payout/records/' + encodeURIComponent(id)),
+          r = v.payout;
+        if (!r.notes) {
+          await refresh();
+          return;
+        }
+        dialog(
+          'Withdraw as eCash',
+          sats(r.amount_sat) + ' · Anyone with this code can claim it in the same federation.',
+          {
+            value: r.notes,
+            svg: r.qr_svg || v.qr_svg,
+            label: 'Reclaim unclaimed eCash',
+            action: () =>
+              dialog('Reclaim this withdrawal?', sats(r.amount_sat), {
+                label: 'Reclaim',
+                action: async () => {
+                  await api('payout/records/' + encodeURIComponent(id) + '/reclaim', 'POST', {});
+                  await refresh();
+                  notice('Reclaim request processed.');
+                },
+              }),
+          },
+        );
+      }
+      function saveWithdrawal(request) {
+        // The session-history entry survives a reload in this tab. Only the reviewed
+        // terms and idempotency key belong here, never bearer notes, tokens or passwords.
+        const state = { ...history.state };
+        if (request) state.tillWithdrawal = request;
+        else delete state.tillWithdrawal;
+        history.replaceState(state, '');
+        pending = request;
+      }
+      function rememberReceipt(record) {
+        if (record && pending?.id === record.request_id) {
+          // A full record may include bearer notes. Keep only the status used by this view.
+          receipt = {
+            id: record.id, kind: record.kind, state: record.state,
+            amount: record.amount_sat, to: record.kind === 'lightning' ? record.address : 'same-federation eCash',
+          };
+        }
+      }
+      const terminalStates = new Set(['paid', 'exported', 'failed', 'reclaimed']);
+      function renderRecovery() {
+        el('withdraw').hidden = !!pending;
+        el('withdrawalRecovery').hidden = !pending;
+        if (!pending) return;
+        const terminal = terminalStates.has(receipt?.state);
+        const terms = sats(receipt?.amount ?? pending.amount) + ' to ' + (receipt?.to || pending.to);
+        el('withdrawalOutcome').textContent = receipt
+          ? terms + ' · ' + receipt.state
+          : terms + '. The outcome is unconfirmed. Retry this same request to check it.';
+        el('recoverWithdrawal').hidden = terminal;
+        el('recoverWithdrawal').textContent = receipt ? 'Check withdrawal status' : 'Retry this withdrawal';
+        el('newWithdrawal').hidden = !terminal;
+        el('viewWithdrawal').hidden = receipt?.kind !== 'ecash' || receipt.state !== 'exported';
+      }
+      el('newWithdrawal').onclick = () => {
+        saveWithdrawal(null);
+        receipt = null;
+        el('withdraw').elements.amount.value = '';
+        renderRecovery();
+        notice('');
+        el('withdraw').elements.amount.focus();
+      };
+      el('viewWithdrawal').onclick = () => perform(el('viewWithdrawal'), () => showRecord(receipt.id));
+      el('recoverWithdrawal').onclick = () => {
+        if (receipt) {
+          perform(el('recoverWithdrawal'), async () => {
+            const { payout } = await api('payout/records/' + encodeURIComponent(receipt.id));
+            if (pending?.id === payout.request_id) {
+              rememberReceipt(payout);
+              renderRecovery();
+            }
+          });
+        } else if (pending) {
+          reviewWithdrawal(pending, true);
+        }
+      };
+      // The API names the checks that can refuse a new withdrawal before recording it.
+      // For other responses, keep the request available for reconciliation with the till.
+      const preflightRefusals = new Set([
+        'bad_amount', 'insufficient_available', 'mode_disallows', 'no_destination',
+        'destination_changed', 'below_min_sendable', 'above_max_sendable', 'fee_unbounded',
+        'obligations_unknown', 'lightning_unavailable', 'wallet_busy', 'fee_unknown', 'halted', 'payout_in_progress',
+      ]);
+      function reviewWithdrawal(request, retry) {
+        const { id, amount, kind, to, confirmedAt: reviewedAt } = request;
+        dialog(retry ? 'Retry this withdrawal?' : 'Confirm withdrawal', sats(amount) + ' to ' + to, {
+          label: retry ? 'Retry withdrawal' : kind === 'lightning' ? 'Pay Lightning address' : 'Export eCash',
+          action: async () => {
+            if (pending && pending.id !== id) throw Error('Check the previous withdrawal before starting another.');
+            saveWithdrawal(request);
+            renderRecovery();
+            const payload = { request_id: id, amount_sat: amount };
+            if (kind === 'lightning') {
+              payload.expected_destination = to;
+              payload.expected_confirmed_at_ms = reviewedAt;
+            }
+            try {
+              const { payout } = await api('payout/' + kind, 'POST', payload);
+              if (pending?.id !== id) return;
+              rememberReceipt(payout);
+            } catch (e) {
+              if (pending?.id === id) {
+                if (e.payout?.request_id === id) rememberReceipt(e.payout);
+                else if (preflightRefusals.has(e.code)) {
+                  saveWithdrawal(null);
+                  receipt = null;
+                }
+                renderRecovery();
+                if (e.code === 'destination_changed' && !pending) await refresh();
+              }
+              throw e;
+            }
+            renderRecovery();
+            await refresh();
+            if (pending?.id === id && receipt?.kind === 'ecash' && receipt.state === 'exported') await showRecord(receipt.id);
+          },
+        });
+      }
+      form('withdraw', (d) => {
+        if (pending) throw Error('Check the previous withdrawal before starting another.');
+        const amount = Number(d.amount), kind = d.kind;
+        if (!Number.isSafeInteger(amount) || amount < 1) throw Error('Enter a whole number of sats.');
+        reviewWithdrawal({
+          id: newId(), kind, amount,
+          to: kind === 'lightning' ? confirmed : 'same-federation eCash',
+          confirmedAt: kind === 'lightning' ? confirmedAt : null,
+        }, false);
+      });
+    </script>
+  </body>
+</html>

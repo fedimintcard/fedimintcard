@@ -216,3 +216,24 @@ and uploads nothing. The Setup cases run in a scratch git checkout. The suite's 
 script: it reads this checkout's own version files, and checks that they agree with each other and
 that each build is above its floor (Versions). CI runs the suite on macOS, where the scripts get
 `/bin/bash` 3.2 and the BSD tools as on the release Mac, and on Linux after `shellcheck`.
+
+## Till image and distribution
+
+The Card 4.0 till requires a Card 4.0 registry and accepts Card 4.0 and compatible later 4.x cards only. Merchants with 3.0 cards or a 3.0 registry should continue using their 3.0 till.
+
+The **Release till image** workflow also accepts a manual dispatch on `main`. Supply the full SHA at the head of `main` after review to publish the tested index as `ghcr.io/fedimintcard/till:sha-FULL_COMMIT_SHA`. The Git tag remains the owner’s release step.
+
+The till owner pushes the release tag `till-vX.Y.Z` at the reviewed source commit. The till image workflow builds native amd64 and arm64 images, runs the same offline startup and storage test against both, and publishes their index at `ghcr.io/fedimintcard/till:X.Y.Z`. Record the index digest from the release job summary. Confirm the package visibility permits anonymous pulls on both architectures before distributing packages. Update the Compose default to the version being released.
+
+Prepare the official Umbrel App Store PR from the package templates under `packaging/umbrel/fedimintcard-till/`. After the owner authorizes the submission and GitHub assigns the PR number, render the verified release files into a clean output directory, then copy the generated app directory into the store checkout:
+
+```sh
+python3 packaging/umbrel/prepare.py X.Y.Z /path/to/empty-output --digest sha256:RELEASE_INDEX_DIGEST \
+  --submission-url https://github.com/getumbrel/umbrel-apps/pull/PR_NUMBER
+```
+
+When distributing an already published commit image ahead of an owner tag, supply `--revision FULL_COMMIT_SHA` to the same command. Keep the package version in X.Y.Z form and use the digest of `ghcr.io/fedimintcard/till:sha-FULL_COMMIT_SHA`.
+
+Run the official package linter there with `npm run lint:apps -- fedimintcard-till --check-images`. Install the package on a disposable umbrelOS, launch the web page over HTTPS, sign in with Umbrel's displayed app password and test first setup, phone connectivity, restart and data persistence. The app proxy protects the admin listener. Umbrel supplies its LAN device domain to the till, and the POS pairing code uses that domain and the separately published TCP port 9877. Test the QR with a LAN phone. A remote deployment can set TILL_POS_PUBLIC_URL to the phone-facing HTTPS proxy origin. The host-facing admin port and POS port must both pass the official store's conflict checks. Attach screenshots to the submission. Official acceptance follows maintainer review.
+
+The StartOS package has an independent package revision. Follow its UPDATING.md to pin the same release index and test both architectures. Approve publication and production rollout separately.

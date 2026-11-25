@@ -1,0 +1,16 @@
+services:
+  till:
+    image: ${TILL_IMAGE:-ghcr.io/fedimintcard/till:0.1.0}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      TILL_POS_PUBLIC_URL: ${TILL_POS_PUBLIC_URL:-}
+      TILL_POS_LAN_ADDR: "${TILL_POS_BIND:-127.0.0.1}:${TILL_POS_PORT:-9877}"
+      TILL_ADMIN_PASSWORD: ${TILL_ADMIN_PASSWORD:?Choose a private password of at least 16 characters}
+    ports:
+      - "${TILL_ADMIN_BIND:-127.0.0.1}:9878:9878"
+      - "${TILL_POS_BIND:-127.0.0.1}:${TILL_POS_PORT:-9877}:9877"
+    volumes:
+      - wallet:/data
+volumes:
+  wallet:

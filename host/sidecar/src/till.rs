@@ -438,9 +438,12 @@ enum Job {
         pin: Option<Vec<u8>>,
         reply: oneshot::Sender<Reply>,
     },
+    /// `topups`, `pays`: what the wallet holds for holders, which an issue never spends.
     Issue {
         amounts: Vec<u64>,
         client_ref: Option<String>,
+        topups: Option<Arc<Topups>>,
+        pays: Option<Arc<crate::pay::Pays>>,
         reply: oneshot::Sender<Reply>,
     },
     /// Load a paid top-up's eCash onto the card (docs/TOPUP.md).
@@ -532,6 +535,16 @@ impl TillHandle {
     /// The pays, once [`Self::with_pays`] set them.
     pub fn pays(&self) -> Option<Arc<crate::pay::Pays>> {
         self.pays.clone()
+    }
+
+    pub(crate) fn topups(&self) -> Option<Arc<Topups>> {
+        self.topups.clone()
+    }
+
+    /// The `client_ref` of the job admitted and not yet finished, if it has one. Cleared by the
+    /// actor after the job's sale and the card state's refs are written.
+    pub(crate) fn inflight_ref(&self) -> Option<String> {
+        self.inflight.lock().unwrap().clone()
     }
 
     /// Whether an unresolved charge in the card state carries `client_ref` (as of the last job).
@@ -719,6 +732,12 @@ async fn actor(
         // Read per job: the claim poller may have put the till on ops since the last one.
         let ops = conn.lock().unwrap().ops.clone();
         let off = offline.lock().unwrap().clone();
+        // Every job holds the wallet's admission guard shared, once, for the whole job
+        // (`crate::wallet::SpendGuard`): an issue, a top-up load and a refund debit the wallet; a
+        // charge's or a balance's collection of the till's notes, and an offline send's, reissue
+        // them, and any transaction the mint balances may consolidate the wallet's notes and pay
+        // their fees. No job acquires it again, and no job waits for anything that waits for it.
+        let job_guard = cw.wallet.spend.debit().await;
         let (reply_tx, reply) = match job {
             Job::SendOffline { reply } => {
                 let r = match (ops.as_ref(), off.as_ref()) {
@@ -806,15 +825,16 @@ async fn actor(
                 };
                 (reply, r)
             }
-            Job::Issue { amounts, client_ref, reply } => {
+            Job::Issue { amounts, client_ref, topups, pays, reply } => {
                 let r = match on_card(&opener) {
                     Ok(card) => {
                         cw.card = card;
+                        let room = holder_room(&cw.wallet, &dir, topups.as_deref(), pays.as_deref()).await;
                         match ops.as_ref() {
-                            None => issue_job(&mut cw, &amounts, client_ref).await,
+                            None => issue_job(&mut cw, &amounts, client_ref, room).await,
                             Some(o) => match o.attach(&mut cw).await {
                                 Ok(base) => {
-                                    let r = issue_job(&mut cw, &amounts, client_ref).await;
+                                    let r = issue_job(&mut cw, &amounts, client_ref, room).await;
                                     Ops::finish(&mut cw, base).await;
                                     r
                                 }
@@ -859,6 +879,8 @@ async fn actor(
             *g = None;
             busy.store(false, Ordering::SeqCst);
         }
+        // The job's records (its sale, the card state's refs) are written: let a payout read.
+        drop(job_guard);
         let _ = reply_tx.send(reply);
     }
 }
@@ -962,7 +984,33 @@ fn open_for(opener: &CardOpener, link: Option<&Link>) -> Result<Box<dyn Card>> {
 /// state without touching the card; one whose notes are pending is `undecided`, never a second
 /// issue. A card already holding live notes on the keys this call would write to is refused —
 /// issuing again would double its value with no record of having done so.
-async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<String>) -> Reply {
+/// What a card issue may spend without touching what the wallet holds for holders (top-ups, pays,
+/// with the fees of paying them out: `crate::payout::funds`): `Ok(None)` when it holds nothing for
+/// anyone, so an issue goes on as it always did. Read under the wallet's admission guard.
+async fn holder_room(
+    w: &Wallet,
+    dir: &Path,
+    topups: Option<&Topups>,
+    pays: Option<&crate::pay::Pays>,
+) -> std::result::Result<Option<u64>, String> {
+    // A `not_charged` pay counts in full here: the evidence that releases one needs the handle,
+    // which the actor does not hold (and the job in flight is this issue).
+    let snap = crate::payout::funds::snapshot(w, dir, topups, pays, None).await.map_err(|e| format!("{e:#}"))?;
+    if snap.obligations.total() == 0 {
+        return Ok(None);
+    }
+    // The issue's own transaction: its card outputs are mint outputs, so its fees are bounded as
+    // any mint transaction from this balance (`crate::payout::fees`).
+    let fee = crate::payout::fees::mint_fee_bound(&snap.schedules.mint, snap.balance_msat, 0);
+    Ok(Some(snap.balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(fee)))
+}
+
+async fn issue_job(
+    cw: &mut CardWallet,
+    amounts: &[u64],
+    client_ref: Option<String>,
+    room: std::result::Result<Option<u64>, String>,
+) -> Reply {
     if let Some(cref) = client_ref.as_deref()
         && let Some(rec) = cw.store.state.issues.iter().find(|r| r.client_ref == cref).cloned()
     {
@@ -1010,6 +1058,27 @@ async fn issue_job(cw: &mut CardWallet, amounts: &[u64], client_ref: Option<Stri
         );
     }
 
+    // A new issue never spends what the wallet holds for holders.
+    let want = amounts.iter().fold(0u64, |a, x| a.saturating_add(*x));
+    match room {
+        Err(e) => {
+            return Reply::fail(
+                503,
+                "obligations_unknown",
+                format!("what the wallet holds for holders cannot be read, so no card is issued from it: {e}"),
+            );
+        }
+        Ok(Some(free)) if want > free => {
+            return Reply::fail(
+                409,
+                "holder_funds",
+                format!(
+                    "the wallet has {free} msat beyond what it holds for holders; issuing {want} msat (and its fees) would spend theirs"
+                ),
+            );
+        }
+        Ok(_) => {}
+    }
     match cw.topup_ref(amounts, client_ref.as_deref()).await {
         Ok(notes) => {
             let txid = client_ref
@@ -1745,7 +1814,7 @@ async fn health() -> Reply {
     Reply::ok(json!({"ok": true}))
 }
 
-async fn status(State(h): State<TillHandle>) -> Reply {
+pub(crate) async fn status(State(h): State<TillHandle>) -> Reply {
     let balance = match h.wallet.balance_msat().await {
         Ok(b) => b,
         Err(e) => return error_reply(&e),
@@ -1958,7 +2027,14 @@ async fn cards_issue(State(h): State<TillHandle>, body: Bytes) -> Reply {
         return r;
     }
     let cref = req.client_ref.clone();
-    run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue { amounts: req.amounts_msat, client_ref: req.client_ref, reply }).await
+    run_job(&h, cref.as_deref().map(|c| (c, 0)), |reply| Job::Issue {
+        amounts: req.amounts_msat,
+        client_ref: req.client_ref,
+        topups: h.topups.clone(),
+        pays: h.pays.clone(),
+        reply,
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ top-ups (docs/TOPUP.md)
@@ -2091,9 +2167,13 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         detail: None,
         for_card: req.short_id.as_ref().map(|c| c.to_ascii_lowercase()),
     };
+    // A new liability, recorded under the wallet's admission guard (after `create`): a payout's
+    // final snapshot sees it before the invoice can be paid.
+    let liability = h.wallet.spend.debit().await;
     if let Err(e) = t.store.lock().unwrap().insert(rec.clone()) {
         return error_reply(&e);
     }
+    drop(liability);
     t.watch(&rec);
     Reply::ok(rec.to_json())
 }
@@ -2142,7 +2222,7 @@ async fn topup_load_on(h: &TillHandle, id: &str, link: Option<Link>) -> Reply {
     .await
 }
 
-async fn sales_list(State(h): State<TillHandle>) -> Reply {
+pub(crate) async fn sales_list(State(h): State<TillHandle>) -> Reply {
     let s = h.sales.lock().unwrap();
     let list: Vec<Value> = s
         .file
@@ -2232,6 +2312,21 @@ pub async fn serve_opts(
     ops_token: Option<String>,
     require_pos_token: bool,
     opts: ServeOptions,
+) -> Result<()> {
+    serve_managed(cw, listen, relay, ops_url, ops_token, require_pos_token, opts, None).await
+}
+
+/// Run the POS listener and expose the initialized handle to the admin listener when configured.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_managed(
+    cw: CardWallet,
+    listen: SocketAddr,
+    relay: String,
+    ops_url: Option<String>,
+    ops_token: Option<String>,
+    require_pos_token: bool,
+    opts: ServeOptions,
+    admin: Option<crate::admin::AdminState>,
 ) -> Result<()> {
     let dir = cw.store.path().parent().map(|p| p.to_owned()).unwrap_or_default();
     // Off loopback the API needs the POS token (docs/POS-LINK.md); `till pair` makes it.
@@ -2380,28 +2475,23 @@ pub async fn serve_opts(
     eprintln!("till service listening on http://{} (card relay {relay}; {auth}{scoped})", listener.local_addr()?);
     // Ctrl-C, or SIGTERM from a service manager (StartOS, systemd): stop taking requests and
     // let the ones in flight finish.
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("installing the SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+    // A weak reference lets the admin listener borrow the live handle without holding the actor
+    // open after shutdown. Keep the strong reference in the server task's lifetime.
+    let active = admin.as_ref().map(|admin| admin.attach(&handle));
+    let stop = async move {
+        match admin {
+            Some(admin) => admin.stopping().await,
+            None => crate::admin::shutdown().await,
         }
     };
     let server = tokio::spawn(std::future::IntoFuture::into_future(
-        axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown),
+        axum::serve(listener, router(handle).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(stop),
     ));
     // The actor ends once the server has dropped the router (and with it every handle).
     // The sender holds a handle, so it stops with the server, or the actor would never end.
     let server = async {
         let r = server.await;
+        drop(active);
         sender.abort();
         if let Some(s) = &sweeper {
             s.abort();

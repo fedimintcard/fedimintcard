@@ -1,6 +1,6 @@
 # Till service API (v1)
 
-The till service is `card-sidecar till serve`. It owns the Fedimint client, the merchant wallet
+Both `card-sidecar till serve` and `card-sidecar till admin` serve the POS API. The service owns the Fedimint client, the merchant wallet
 and the card state, and drives the card through the phone's NFC relay (`POST /apdu` on port
 9876). The point-of-sale app on the phone owns the UI and calls this API. Default bind
 `127.0.0.1:9877`; the phone reaches it through `adb reverse tcp:9877 tcp:9877`, the laptop
@@ -9,7 +9,11 @@ reaches the phone through `adb forward tcp:9876 tcp:9876`.
 All responses are JSON. Failures are `{"ok":false,"error":"<code>","detail":"<text>"}`.
 Responses never contain ecash strings or secrets. Auth and POS phones on the LAN: see below and
 `docs/POS-LINK.md`.
-While `serve` runs it owns the data directory; do not run other `card-sidecar` commands.
+The serving process owns the data directory. Stop it before running wallet CLI commands.
+
+When you run `till admin`, the browser controls listen separately at `127.0.0.1:9878` by default.
+Only the merchant credential opens those controls, and the managed POS API requires its own bearer
+token for all requests, including loopback. See [Merchant till setup](TILL-DOCKER.md).
 
 ### On ops
 

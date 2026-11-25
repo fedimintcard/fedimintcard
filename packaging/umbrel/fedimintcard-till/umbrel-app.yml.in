@@ -1,0 +1,34 @@
+manifestVersion: 2.0
+id: fedimintcard-till
+storage:
+  dataRoot: data
+category: bitcoin
+name: Fedimint Card 4.0 Till
+version: "@VERSION@"
+tagline: Accept Fedimint Card 4.0 payments
+description: >-
+  Requires a Card 4.0 registry. This till accepts Card 4.0 and compatible later 4.x cards only.
+  Keep using a 3.0 till for Card 3.0 cards or a 3.0 registry.
+
+
+  Pair a point-of-sale phone to take card payments into your federation wallet.
+  Open the till, sign in with the password from Umbrel and enter your federation invite.
+  Connect the till to the card registry and scan the pairing code on your phone.
+
+
+  Review sales and set up payouts to a Lightning address. You can also withdraw eCash to a wallet in the same federation.
+releaseNotes: ""
+developer: Fedimint Card
+website: https://fedimintcard.org
+dependencies: []
+repo: https://github.com/fedimintcard/fedimintcard
+support: https://github.com/fedimintcard/fedimintcard/issues
+port: 19878
+gallery: []
+path: ""
+requiresHttps: true
+defaultUsername: ""
+defaultPassword: ""
+deterministicPassword: true
+submitter: Fedimint Card
+submission: "@SUBMISSION@"

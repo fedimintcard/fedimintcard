@@ -23,6 +23,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[expect(clippy::large_enum_variant, reason = "Clap creates this command once at process startup.")]
 enum Cmd {
     /// Join a federation by invite code (first run).
     Join { invite: String },
@@ -76,89 +77,110 @@ enum LnCmd {
     },
 }
 
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Address to listen on. Anything but loopback needs the POS token (`till pair`), and
+    /// every request not from loopback must then carry it (docs/POS-LINK.md).
+    #[arg(long, env = "TILL_LISTEN", default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
+    listen: std::net::SocketAddr,
+    /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
+    #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
+    relay: String,
+    /// The ops registry (docs/OPS-PLAN.md § 6). With it, each card's state comes from ops,
+    /// keyed by the card's short id, instead of card_state.json. The token is --ops-token, or
+    /// else the one an approved `till claim` left in <data_dir>/till-ops.json; with neither,
+    /// the till waits for a claim and refuses card jobs (docs/TILL-CLAIM.md).
+    #[arg(long, env = "OPS_URL")]
+    ops_url: Option<String>,
+    /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url. Takes precedence
+    /// over <data_dir>/till-ops.json.
+    #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
+    ops_token: Option<String>,
+    /// Require the POS token on every request, loopback included, and make the token now if
+    /// there is none. For a till behind a proxy (StartOS), where a phone's request can
+    /// arrive from a local address.
+    #[arg(long, env = "TILL_REQUIRE_POS_TOKEN", value_parser = clap::builder::BoolishValueParser::new())]
+    require_pos_token: bool,
+    /// Esplora API for Bitcoin block headers, the clock of a 3.0 card's daily offline limit
+    /// (fetched every 10 minutes; an empty value turns it off).
+    #[arg(long, env = "TILL_ESPLORA_URL", default_value = fedimint_card_sidecar::clock::DEFAULT_ESPLORA)]
+    esplora_url: String,
+    /// Most value, in msat, this till holds in offline charges not yet settled.
+    #[arg(long, env = "TILL_OFFLINE_CAP_MSAT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_MSAT)]
+    offline_cap_msat: u64,
+    /// Most offline charges this till holds not yet settled.
+    #[arg(long, env = "TILL_OFFLINE_CAP_COUNT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_COUNT)]
+    offline_cap_count: usize,
+    /// The fee margin of offline charges: they keep room for a fee schedule of this base fee
+    /// (msat per input and per output) plus --offline-fee-headroom-ppm, against a fee rise
+    /// before they are sent. Only on a federation at core consensus 2.1 or later; 0 and 0
+    /// turn the margin off. Default: fedimint's default mint fees (100 msat, 0 ppm).
+    #[arg(long, env = "TILL_OFFLINE_FEE_BASE_MSAT", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.base_msat)]
+    offline_fee_base_msat: u64,
+    /// The relative part of that fee schedule, parts per million of each note (fedimint
+    /// allows at most 1,000).
+    #[arg(long, env = "TILL_OFFLINE_FEE_HEADROOM_PPM", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.ppm)]
+    offline_fee_headroom_ppm: u64,
+    /// Fresh keyed slots an online tap keeps an applet 3.0 card at, so it can take change
+    /// offline (0 turns the reserve off).
+    #[arg(long, env = "TILL_SPARE_TARGET", default_value_t = fedimint_card_sidecar::ops::SPARE_TARGET)]
+    spare_target: usize,
+    /// Most slots one tap keys for that reserve (a key takes about 320 ms on the card).
+    #[arg(long, env = "TILL_SPARE_KEYS_PER_TAP", default_value_t = fedimint_card_sidecar::ops::MAX_KEY_PER_TAP)]
+    spare_keys_per_tap: usize,
+    /// How long a POS phone's offline kit lasts from the fetch that answered it, in hours
+    /// (`GET /v1/offline/kit`).
+    #[arg(long, env = "TILL_OFFLINE_KIT_TTL_HOURS", default_value_t = 168)]
+    offline_kit_ttl_hours: u64,
+    /// Days after a kit expires that the charges a phone took with it are still taken; then
+    /// its unused pool entries are dropped with their secrets.
+    #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
+    offline_kit_grace_days: u64,
+    /// Pay Lightning invoices with a card (`POST /v1/pay`): the till charges the card for the
+    /// invoice, its fee reserve and margin, then pays the invoice from its wallet. Off by default.
+    #[arg(long, env = "TILL_PAY_ENABLED", value_parser = clap::builder::BoolishValueParser::new())]
+    pay_enabled: bool,
+    /// Largest invoice paid with a card, in msat.
+    #[arg(long, env = "TILL_PAY_MAX_INVOICE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_INVOICE_MSAT)]
+    pay_max_invoice_msat: u64,
+    /// Cap on a pay's fee reserve, in msat: a larger `max_fee_msat` is lowered to it.
+    #[arg(long, env = "TILL_PAY_MAX_FEE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_FEE_MSAT)]
+    pay_max_fee_msat: u64,
+    /// The till's margin on each pay, in msat (added to --pay-margin-bps).
+    #[arg(long, env = "TILL_PAY_MARGIN_MSAT", default_value_t = 0)]
+    pay_margin_msat: u64,
+    /// The till's margin on each pay, in basis points of the invoice.
+    #[arg(long, env = "TILL_PAY_MARGIN_BPS", default_value_t = 0)]
+    pay_margin_bps: u64,
+    /// Most value, in msat, the till charges cards for pays in any 24 hours.
+    #[arg(long, env = "TILL_PAY_DAILY_CAP_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_DAILY_CAP_MSAT)]
+    pay_daily_cap_msat: u64,
+    /// Least time, in seconds, an invoice must have left before it expires.
+    #[arg(long, env = "TILL_PAY_MIN_EXPIRY_SECS", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MIN_EXPIRY_SECS)]
+    pay_min_expiry_secs: u64,
+}
+
+#[derive(clap::Args)]
+struct AdminArgs {
+    #[arg(long, env = "TILL_ADMIN_LISTEN", default_value = "127.0.0.1:9878")]
+    admin_listen: std::net::SocketAddr,
+    #[arg(long, env = "TILL_ADMIN_PASSWORD_FILE")]
+    admin_password_file: Option<PathBuf>,
+    /// Address the POS phones use, including the scheme and any published port.
+    #[arg(long, env = "TILL_POS_PUBLIC_URL")]
+    pos_public_url: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum TillCmd {
-    /// Serve the till API. Owns the data directory: do not run other commands meanwhile.
-    Serve {
-        /// Address to listen on. Anything but loopback needs the POS token (`till pair`), and
-        /// every request not from loopback must then carry it (docs/POS-LINK.md).
-        #[arg(long, env = "TILL_LISTEN", default_value = fedimint_card_sidecar::till::DEFAULT_LISTEN)]
-        listen: std::net::SocketAddr,
-        /// The phone's NFC relay (reach it with `adb forward tcp:9876 tcp:9876`).
-        #[arg(long, env = "CARD_BRIDGE_URL", default_value = "http://127.0.0.1:9876")]
-        relay: String,
-        /// The ops registry (docs/OPS-PLAN.md § 6). With it, each card's state comes from ops,
-        /// keyed by the card's short id, instead of card_state.json. The token is --ops-token, or
-        /// else the one an approved `till claim` left in <data_dir>/till-ops.json; with neither,
-        /// the till waits for a claim and refuses card jobs (docs/TILL-CLAIM.md).
-        #[arg(long, env = "OPS_URL")]
-        ops_url: Option<String>,
-        /// This till's token (`till_…`, from `POST /tills`). Needs --ops-url. Takes precedence
-        /// over <data_dir>/till-ops.json.
-        #[arg(long, env = "OPS_TILL_TOKEN", hide_env_values = true, requires = "ops_url")]
-        ops_token: Option<String>,
-        /// Require the POS token on every request, loopback included, and make the token now if
-        /// there is none. For a till behind a proxy (StartOS), where a phone's request can
-        /// arrive from a local address.
-        #[arg(long, env = "TILL_REQUIRE_POS_TOKEN", value_parser = clap::builder::BoolishValueParser::new())]
-        require_pos_token: bool,
-        /// Esplora API for Bitcoin block headers, the clock of a 3.0 card's daily offline limit
-        /// (fetched every 10 minutes; an empty value turns it off).
-        #[arg(long, env = "TILL_ESPLORA_URL", default_value = fedimint_card_sidecar::clock::DEFAULT_ESPLORA)]
-        esplora_url: String,
-        /// Most value, in msat, this till holds in offline charges not yet settled.
-        #[arg(long, env = "TILL_OFFLINE_CAP_MSAT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_MSAT)]
-        offline_cap_msat: u64,
-        /// Most offline charges this till holds not yet settled.
-        #[arg(long, env = "TILL_OFFLINE_CAP_COUNT", default_value_t = fedimint_card_sidecar::offline::DEFAULT_CAP_COUNT)]
-        offline_cap_count: usize,
-        /// The fee margin of offline charges: they keep room for a fee schedule of this base fee
-        /// (msat per input and per output) plus --offline-fee-headroom-ppm, against a fee rise
-        /// before they are sent. Only on a federation at core consensus 2.1 or later; 0 and 0
-        /// turn the margin off. Default: fedimint's default mint fees (100 msat, 0 ppm).
-        #[arg(long, env = "TILL_OFFLINE_FEE_BASE_MSAT", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.base_msat)]
-        offline_fee_base_msat: u64,
-        /// The relative part of that fee schedule, parts per million of each note (fedimint
-        /// allows at most 1,000).
-        #[arg(long, env = "TILL_OFFLINE_FEE_HEADROOM_PPM", default_value_t = fedimint_card_sidecar::plan::FeeHeadroom::DEFAULT.ppm)]
-        offline_fee_headroom_ppm: u64,
-        /// Fresh keyed slots an online tap keeps an applet 3.0 card at, so it can take change
-        /// offline (0 turns the reserve off).
-        #[arg(long, env = "TILL_SPARE_TARGET", default_value_t = fedimint_card_sidecar::ops::SPARE_TARGET)]
-        spare_target: usize,
-        /// Most slots one tap keys for that reserve (a key takes about 320 ms on the card).
-        #[arg(long, env = "TILL_SPARE_KEYS_PER_TAP", default_value_t = fedimint_card_sidecar::ops::MAX_KEY_PER_TAP)]
-        spare_keys_per_tap: usize,
-        /// How long a POS phone's offline kit lasts from the fetch that answered it, in hours
-        /// (`GET /v1/offline/kit`).
-        #[arg(long, env = "TILL_OFFLINE_KIT_TTL_HOURS", default_value_t = 168)]
-        offline_kit_ttl_hours: u64,
-        /// Days after a kit expires that the charges a phone took with it are still taken; then
-        /// its unused pool entries are dropped with their secrets.
-        #[arg(long, env = "TILL_OFFLINE_KIT_GRACE_DAYS", default_value_t = 30)]
-        offline_kit_grace_days: u64,
-        /// Pay Lightning invoices with a card (`POST /v1/pay`): the till charges the card for the
-        /// invoice, its fee reserve and margin, then pays the invoice from its wallet. Off by default.
-        #[arg(long, env = "TILL_PAY_ENABLED", value_parser = clap::builder::BoolishValueParser::new())]
-        pay_enabled: bool,
-        /// Largest invoice paid with a card, in msat.
-        #[arg(long, env = "TILL_PAY_MAX_INVOICE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_INVOICE_MSAT)]
-        pay_max_invoice_msat: u64,
-        /// Cap on a pay's fee reserve, in msat: a larger `max_fee_msat` is lowered to it.
-        #[arg(long, env = "TILL_PAY_MAX_FEE_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MAX_FEE_MSAT)]
-        pay_max_fee_msat: u64,
-        /// The till's margin on each pay, in msat (added to --pay-margin-bps).
-        #[arg(long, env = "TILL_PAY_MARGIN_MSAT", default_value_t = 0)]
-        pay_margin_msat: u64,
-        /// The till's margin on each pay, in basis points of the invoice.
-        #[arg(long, env = "TILL_PAY_MARGIN_BPS", default_value_t = 0)]
-        pay_margin_bps: u64,
-        /// Most value, in msat, the till charges cards for pays in any 24 hours.
-        #[arg(long, env = "TILL_PAY_DAILY_CAP_MSAT", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_DAILY_CAP_MSAT)]
-        pay_daily_cap_msat: u64,
-        /// Least time, in seconds, an invoice must have left before it expires.
-        #[arg(long, env = "TILL_PAY_MIN_EXPIRY_SECS", default_value_t = fedimint_card_sidecar::pay::PayConfig::DEFAULT_MIN_EXPIRY_SECS)]
-        pay_min_expiry_secs: u64,
+    /// Serve the POS API from a wallet that has already joined a federation.
+    Serve(ServeArgs),
+    /// Open merchant setup, sales and payouts alongside the POS API.
+    Admin {
+        #[command(flatten)]
+        admin: AdminArgs,
+        #[command(flatten)]
+        server: ServeArgs,
     },
     /// Ask the registry for this till's token (docs/TILL-CLAIM.md): print the QR code an operator
     /// scans in the provisioner app (Settings, Tills, Add a till), write the claim to
@@ -302,6 +324,73 @@ async fn card_wallet(cli: &Cli) -> Result<CardWallet> {
     Ok(cw)
 }
 
+async fn serve_till(dir: &std::path::Path, args: &ServeArgs, admin: Option<&AdminArgs>) -> Result<()> {
+    let ServeArgs {
+        listen,
+        relay,
+        ops_url,
+        ops_token,
+        require_pos_token,
+        esplora_url,
+        offline_cap_msat,
+        offline_cap_count,
+        offline_fee_base_msat,
+        offline_fee_headroom_ppm,
+        spare_target,
+        spare_keys_per_tap,
+        offline_kit_ttl_hours,
+        offline_kit_grace_days,
+        pay_enabled,
+        pay_max_invoice_msat,
+        pay_max_fee_msat,
+        pay_margin_msat,
+        pay_margin_bps,
+        pay_daily_cap_msat,
+        pay_min_expiry_secs,
+    } = args;
+    let opts = fedimint_card_sidecar::till::ServeOptions {
+        esplora_url: Some(esplora_url.clone()).filter(|u| !u.trim().is_empty()),
+        offline: fedimint_card_sidecar::offline::OfflineConfig {
+            cap_msat: *offline_cap_msat,
+            cap_count: *offline_cap_count,
+            fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom { base_msat: *offline_fee_base_msat, ppm: *offline_fee_headroom_ppm },
+        },
+        spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
+        kits: fedimint_card_sidecar::pool::KitConfig {
+            ttl_ms: offline_kit_ttl_hours.saturating_mul(3_600_000),
+            grace_ms: offline_kit_grace_days.saturating_mul(86_400_000),
+        },
+        pay: fedimint_card_sidecar::pay::PayConfig {
+            enabled: *pay_enabled,
+            max_invoice_msat: *pay_max_invoice_msat,
+            max_fee_msat: *pay_max_fee_msat,
+            margin_msat: *pay_margin_msat,
+            margin_bps: *pay_margin_bps,
+            daily_cap_msat: *pay_daily_cap_msat,
+            min_expiry_secs: *pay_min_expiry_secs,
+            ..Default::default()
+        },
+    };
+    if let Some(admin) = admin {
+        return fedimint_card_sidecar::admin::serve(
+            dir.to_owned(),
+            admin.admin_listen,
+            *listen,
+            relay.clone(),
+            ops_url.clone(),
+            ops_token.clone(),
+            opts,
+            admin.admin_password_file.as_deref(),
+            admin.pos_public_url.as_deref(),
+        )
+        .await;
+    }
+    let wallet = Wallet::open(dir).await?;
+    let store = StateStore::open(state_path(dir))?;
+    let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
+    fedimint_card_sidecar::till::serve_opts(cw, *listen, relay.clone(), ops_url.clone(), ops_token.clone(), *require_pos_token, opts).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).with_writer(std::io::stderr).init();
@@ -430,68 +519,9 @@ async fn main() -> Result<()> {
                 qr(&notes.to_string())?;
             }
         }
-        Cmd::Till(TillCmd::Serve {
-            listen,
-            relay,
-            ops_url,
-            ops_token,
-            require_pos_token,
-            esplora_url,
-            offline_cap_msat,
-            offline_cap_count,
-            offline_fee_base_msat,
-            offline_fee_headroom_ppm,
-            spare_target,
-            spare_keys_per_tap,
-            offline_kit_ttl_hours,
-            offline_kit_grace_days,
-            pay_enabled,
-            pay_max_invoice_msat,
-            pay_max_fee_msat,
-            pay_margin_msat,
-            pay_margin_bps,
-            pay_daily_cap_msat,
-            pay_min_expiry_secs,
-        }) => {
-            let wallet = Wallet::open(&cli.data_dir).await?;
-            let store = StateStore::open(state_path(&cli.data_dir))?;
-            let cw = CardWallet::new(wallet, store, Box::new(fedimint_card_sidecar::till::NoCard));
-            let opts = fedimint_card_sidecar::till::ServeOptions {
-                esplora_url: Some(esplora_url.clone()).filter(|u| !u.trim().is_empty()),
-                offline: fedimint_card_sidecar::offline::OfflineConfig {
-                    cap_msat: *offline_cap_msat,
-                    cap_count: *offline_cap_count,
-                    fee_headroom: fedimint_card_sidecar::plan::FeeHeadroom {
-                        base_msat: *offline_fee_base_msat,
-                        ppm: *offline_fee_headroom_ppm,
-                    },
-                },
-                spares: fedimint_card_sidecar::ops::SpareConfig { target: *spare_target, max_per_tap: *spare_keys_per_tap },
-                kits: fedimint_card_sidecar::pool::KitConfig {
-                    ttl_ms: offline_kit_ttl_hours.saturating_mul(3_600_000),
-                    grace_ms: offline_kit_grace_days.saturating_mul(86_400_000),
-                },
-                pay: fedimint_card_sidecar::pay::PayConfig {
-                    enabled: *pay_enabled,
-                    max_invoice_msat: *pay_max_invoice_msat,
-                    max_fee_msat: *pay_max_fee_msat,
-                    margin_msat: *pay_margin_msat,
-                    margin_bps: *pay_margin_bps,
-                    daily_cap_msat: *pay_daily_cap_msat,
-                    min_expiry_secs: *pay_min_expiry_secs,
-                    ..Default::default()
-                },
-            };
-            fedimint_card_sidecar::till::serve_opts(
-                cw,
-                *listen,
-                relay.clone(),
-                ops_url.clone(),
-                ops_token.clone(),
-                *require_pos_token,
-                opts,
-            )
-            .await?;
+        Cmd::Till(TillCmd::Serve(args)) => serve_till(&cli.data_dir, args, None).await?,
+        Cmd::Till(TillCmd::Admin { server, admin }) => {
+            serve_till(&cli.data_dir, server, Some(admin)).await?;
         }
         Cmd::Till(TillCmd::Claim { ops_url, name, text: text_only, replace }) => {
             use fedimint_card_sidecar::claim;
@@ -688,4 +718,46 @@ async fn run_card(cw: &mut CardWallet, cmd: &CardCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    #[test]
+    fn serve_and_admin_accept_the_same_pos_settings() {
+        for command in ["admin", "serve"] {
+            let cli = Cli::try_parse_from([
+                "card-sidecar",
+                "till",
+                command,
+                "--listen",
+                "127.0.0.1:16721",
+                "--require-pos-token",
+                "--pay-enabled",
+            ])
+            .unwrap();
+            let args = match cli.cmd {
+                Cmd::Till(TillCmd::Admin { server, .. }) | Cmd::Till(TillCmd::Serve(server)) => server,
+                _ => panic!("expected the POS service flags"),
+            };
+            assert_eq!(args.listen.port(), 16721);
+            assert!(args.require_pos_token && args.pay_enabled);
+        }
+        let cli = Cli::try_parse_from([
+            "card-sidecar",
+            "till",
+            "admin",
+            "--admin-listen",
+            "127.0.0.1:17654",
+            "--admin-password-file",
+            "admin-password",
+            "--pos-public-url",
+            "https://pos.example",
+        ])
+        .unwrap();
+        let Cmd::Till(TillCmd::Admin { admin, .. }) = cli.cmd else { panic!("expected admin") };
+        assert_eq!(admin.admin_listen.port(), 17654);
+        assert_eq!(admin.pos_public_url.as_deref(), Some("https://pos.example"));
+        assert_eq!(admin.admin_password_file, Some(PathBuf::from("admin-password")));
+    }
 }

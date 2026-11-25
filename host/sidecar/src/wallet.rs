@@ -160,6 +160,34 @@ fn wants_lnv2(cfg: &ClientConfig) -> bool {
     !has(&fedimint_ln_common::KIND) && has(&fedimint_lnv2_client::common::KIND)
 }
 
+/// The wallet's admission guard: every clone of a [`Wallet`] shares one.
+///
+/// - **Shared** ([`Self::debit`]): a wallet debit together with the record transition that goes
+///   with it (a top-up's load and `loaded`, a pay's funding and its outcome, a refund load, a
+///   card issue, an offline send), and the insert of a new liability (a pay's `charging`, a
+///   top-up's `waiting`). Many at once.
+/// - **Exclusive** ([`Self::exclusive`]): a merchant payout's final read of the balance and the
+///   obligations together with its own funding, so no debit or liability change lands between
+///   them.
+///
+/// Lock order: an outer lock of a caller (the admin payout lock, a pay's admission, a top-up's
+/// create lock, the till's actor) comes first, this guard next, and the stores' `std` mutexes
+/// last (held only without an await). Never acquire it while holding it: tokio's lock is fair,
+/// so a nested shared acquire behind a waiting payout deadlocks. It is taken at the lowest level,
+/// around the wallet call itself, and nothing awaited under it acquires it again.
+#[derive(Clone, Debug, Default)]
+pub struct SpendGuard(Arc<tokio::sync::RwLock<()>>);
+
+impl SpendGuard {
+    pub async fn debit(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.0.clone().read_owned().await
+    }
+
+    pub async fn exclusive(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.0.clone().write_owned().await
+    }
+}
+
 #[derive(Clone)]
 pub struct Wallet {
     pub client: ClientHandleArc,
@@ -169,6 +197,8 @@ pub struct Wallet {
     pub invite: Option<InviteCode>,
     /// The federation's core consensus version, from its client config.
     pub consensus_version: CoreConsensusVersion,
+    /// Shared by every clone ([`SpendGuard`]).
+    pub spend: SpendGuard,
 }
 
 /// The first core consensus version whose guardians take a transaction that pays more than its
@@ -191,7 +221,103 @@ impl Wallet {
         let cfg = client.config().await;
         let (mint_id, mint_cfg) =
             cfg.get_first_module_by_kind::<MintClientConfig>(fedimint_mint_common::KIND).context("federation has no mint (v1) module")?;
-        Ok(Self { client, mint_id, mint_cfg: mint_cfg.clone(), invite: None, consensus_version: cfg.global.consensus_version })
+        Ok(Self {
+            client,
+            mint_id,
+            mint_cfg: mint_cfg.clone(),
+            invite: None,
+            consensus_version: cfg.global.consensus_version,
+            spend: SpendGuard::default(),
+        })
+    }
+
+    /// The federation's fee schedules, read from its modules' own fee functions
+    /// (`crate::payout::fees`). `Err` when the mint's cannot be bounded: nothing may be spent on a
+    /// bound then. A Lightning schedule that cannot be bounded is `ln: None` with the reason in
+    /// `ln_problem`: Lightning funding is refused for it.
+    pub async fn fee_schedules(&self) -> std::result::Result<crate::payout::fees::Schedules, String> {
+        use crate::payout::fees::{Linear, LnSchedule, Schedules};
+        let mint = Linear::from_fee_fn(|x| self.fee(x)).map_err(|e| format!("the mint's fees cannot be bounded: {e}"))?;
+        let cfg = self.client.config().await;
+        let (ln, ln_problem) = if self.lightning().is_ok() {
+            match cfg.get_first_module_by_kind::<fedimint_ln_common::config::LightningClientConfig>(fedimint_ln_common::KIND) {
+                Ok((_, c)) => (
+                    Some(LnSchedule::V1 {
+                        contract_input_msat: c.fee_consensus.contract_input.msats,
+                        contract_output_msat: c.fee_consensus.contract_output.msats,
+                    }),
+                    None,
+                ),
+                Err(_) => (None, Some("the ln module's configuration cannot be read".to_owned())),
+            }
+        } else if self.lightning_v2().is_ok() {
+            match cfg
+                .get_first_module_by_kind::<fedimint_lnv2_client::common::config::LightningClientConfig>(fedimint_lnv2_client::common::KIND)
+            {
+                Ok((_, c)) => {
+                    let f = c.fee_consensus.clone();
+                    match Linear::from_fee_fn(|x| f.fee(Amount::from_msats(x)).msats) {
+                        Ok(l) => (Some(LnSchedule::V2(l)), None),
+                        Err(e) => (None, Some(format!("the lnv2 module's fees cannot be bounded: {e}"))),
+                    }
+                }
+                Err(_) => (None, Some("the lnv2 module's configuration cannot be read".to_owned())),
+            }
+        } else {
+            (None, None)
+        };
+        Ok(Schedules { mint, ln, ln_problem })
+    }
+
+    /// The client's own quote of the federation fees of funding an outgoing contract worth
+    /// `contract_msat` now (`send_fee_quote` of ln, else lnv2: a dry run over the inventory).
+    pub async fn ln_send_fee_quote(&self, contract_msat: u64) -> Result<u64> {
+        let amount = Amount::from_msats(contract_msat);
+        if let Ok(ln) = self.lightning() {
+            return Ok(ln.send_fee_quote(amount).await?.total().get_bitcoin().msats);
+        }
+        if let Ok(ln) = self.lightning_v2() {
+            return Ok(ln.send_fee_quote(amount).await?.total().get_bitcoin().msats);
+        }
+        bail!("this federation has no Lightning module the till can use")
+    }
+
+    /// What the ln receive `operation_id` (hex) came to, from the client's own state machine,
+    /// followed for up to `wait`: `Some(false)` when it ended canceled (terminal: nothing was or
+    /// will be credited), `Some(true)` when it was claimed (the value is in the wallet), `None`
+    /// while it could still be paid or cannot be told.
+    pub async fn ln_receive_settled(&self, operation_id: &str, wait: Duration) -> Result<Option<bool>> {
+        use fedimint_ln_client::LnReceiveState;
+        let bytes: [u8; 32] = hex::decode(operation_id.trim()).ok().and_then(|b| b.try_into().ok()).context("not an operation id")?;
+        let ln = self.lightning()?;
+        let mut stream = ln.subscribe_ln_receive(OperationId(bytes)).await?.into_stream();
+        let mut last = None;
+        let _ = tokio::time::timeout(wait, async {
+            while let Some(state) = stream.next().await {
+                let end = matches!(state, LnReceiveState::Canceled { .. } | LnReceiveState::Claimed);
+                last = Some(state);
+                if end {
+                    break;
+                }
+            }
+        })
+        .await;
+        Ok(match last {
+            Some(LnReceiveState::Canceled { .. }) => Some(false),
+            Some(LnReceiveState::Claimed) => Some(true),
+            _ => None,
+        })
+    }
+
+    /// The mint's own quote of the fees `send_oob_notes` pays for `amount_msat` now.
+    pub async fn export_fee_quote(&self, amount_msat: u64) -> Result<u64> {
+        Ok(self.mint()?.send_fee_quote(Amount::from_msats(amount_msat)).await?.total().get_bitcoin().msats)
+    }
+
+    /// The federation fees operation `operation_id` (hex) paid, from the client's own record.
+    pub async fn operation_fees_msat(&self, operation_id: &str) -> Result<Option<u64>> {
+        let bytes: [u8; 32] = hex::decode(operation_id.trim()).ok().and_then(|b| b.try_into().ok()).context("not an operation id")?;
+        Ok(self.client.get_operation_fees(OperationId(bytes)).await.ok().flatten().map(|a| a.get_bitcoin().msats))
     }
 
     /// Join the federation behind `invite` (first run). Creates the mnemonic file if missing.
@@ -223,6 +349,23 @@ impl Wallet {
         let mut w = Self::from_client(Arc::new(client)).await?;
         w.invite = Some(invite_code);
         Ok(w)
+    }
+
+    /// A failed join can leave a mnemonic and an empty RocksDB. Only a stored federation
+    /// configuration means a join committed. An established installation missing its seed or
+    /// database needs repair, so refuse to initialize a replacement wallet in its place.
+    pub(crate) async fn joined(data_dir: &Path) -> Result<bool> {
+        let database = data_dir.join(DB_DIR).try_exists()?;
+        let invite = data_dir.join(INVITE_FILE).try_exists()?;
+        if !database {
+            ensure!(!invite, "the federation invite exists but the wallet database is missing");
+            return Ok(false);
+        }
+        ensure!(data_dir.join(MNEMONIC_FILE).try_exists()?, "the wallet database exists but the mnemonic is missing");
+        let db = open_db(data_dir).await?;
+        let joined = Client::get_config_from_db(&db).await.is_some();
+        ensure!(joined || !invite, "the federation invite exists but the wallet database has no federation config");
+        Ok(joined)
     }
 
     /// Re-open a client joined earlier.

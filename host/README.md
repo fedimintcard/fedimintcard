@@ -71,6 +71,11 @@ funded).
 
 ## Till service
 
+For setup and payouts through a browser, use `card-sidecar till admin`. Set `TILL_ADMIN_PASSWORD_FILE` to
+a private file containing the admin password. Open `http://127.0.0.1:9878` to join the federation,
+connect the registry, pair a POS phone, view sales and configure payouts. This command also serves the
+POS API on port 9877. See the [merchant installation and backup guide](../docs/TILL-DOCKER.md).
+
 A card on a USB reader can stand in for one behind a phone: `card-sidecar relay` (a build with
 `--features pcsc`; loopback only; `--listen`, default 127.0.0.1:9876, `--reader` or
 `CARD_PCSC_READER`) serves the reader over the bridge protocol, and `till serve --relay
