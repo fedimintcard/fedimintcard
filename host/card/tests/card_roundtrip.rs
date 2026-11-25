@@ -6,6 +6,7 @@
 
 use fedimint_card_host_card::v3;
 use fedimint_card_host_card::*;
+use fedimint_card_old_card_pin::{ClearPin, open_pin_session_with};
 use secp256k1::{Message, SECP256K1, XOnlyPublicKey};
 
 /// Tests that touch the shared bridge card (one resets it, one uses it) must not interleave.
@@ -21,17 +22,30 @@ const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be9603409601000
 
 /// Open a session, provisioning the PIN on a card that has none: `SIGN` needs both, as on the
 /// applet. A 4.0 card with no PIN first takes the test registry's key and the anchor, in the same
-/// selection as its SET_PIN, which then gives the PIN to that selection; an old card's SET_PIN
-/// is followed by VERIFY_PIN ([`open_pin_session_with`] does both).
+/// selection as its SET_PIN, which then gives the PIN to that selection; a 4.0 card gets a
+/// certificate first and its PIN sealed; an old card's SET_PIN is followed by VERIFY_PIN
+/// ([`open_pin_session_with`] does both).
 fn open_session(card: &mut dyn Card) {
-    if card.applet_version().unwrap().is_current() && !card.get_state().unwrap().pin_set {
+    let current = card.applet_version().unwrap().is_current();
+    if current && !card.get_state().unwrap().pin_set {
+        // The sealed PIN (§ 9) needs a certified attestation key: the test registry's.
+        if card.get_cert().is_err() {
+            let k0 = card.get_or_gen(0).unwrap();
+            let w = card.attest_init().unwrap();
+            card.set_cert(&Certificate::sign(&v3::test_registry_key(), &k0.serialize(), &w).unwrap().to_bytes()).unwrap();
+        }
         if !card.get_state().unwrap().registry_key {
             card.set_registry_key(&v3::registry_point(&v3::test_registry_key())).expect("SET_REGISTRY_KEY");
         }
         let h: [u8; 80] = hex::decode(H900000).unwrap().try_into().unwrap();
         card.set_header(&h).expect("the anchor");
     }
-    open_pin_session_with(card, PIN).expect("PIN session");
+    if current {
+        let t = trust_card(card, &v3::registry_point(&v3::test_registry_key())).expect("the test registry's card");
+        open_pin_session_held(card, &t, PIN, &mut |_| {}).expect("PIN session");
+    } else {
+        open_pin_session_with(card, PIN).expect("PIN session");
+    }
 }
 
 fn roundtrip(card: &mut dyn Card, slot: u8) {

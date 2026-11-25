@@ -9,19 +9,24 @@
  * card is finished with no laptop and no relay, on iOS as on Android.
  *
  * The APDUs are the host's (`host/card/src/lib.rs`): CLA B0, `GEN_KEY` 10 and
- * `GET_PUB` 11 with P1 = slot and Le 00, `SET_PIN` 41 and `VERIFY_PIN` 40 with
- * the PIN's ASCII digits as data. Existing keys are kept, as the sidecar keeps
+ * `GET_PUB` 11 with P1 = slot and Le 00. On applet 4.0 `SET_PIN` 41 and
+ * `VERIFY_PIN` 40 are sealed (P1 = 01, docs/OFFLINE-PROTOCOL.md § 9,
+ * `sealedPin.ts`): GET_NONCE first, the card's certificate and PIN key checked,
+ * then one envelope. Only the reset of an applet before 4.0 still sends the
+ * PIN's ASCII digits as data (`oldCardResetPinApdu`, the reset of an old card only). Existing keys are kept, as the sidecar keeps
  * them, except on a resume (`rekey`): a card an earlier tap left keyed with no
  * PIN gets every slot generated again with P2 = 01, which the applet
  * allows only while no PIN is set (FedimintCardApplet.genKey). Nothing here
  * sends P2 = 01 to a card with a PIN.
  *
- * The PIN is a parameter and nothing else: it goes to the card in one APDU
- * (SET_PIN, whose selection counts as having the PIN, so no VERIFY_PIN
- * follows) and is not kept, logged or returned.
+ * The PIN is a parameter and nothing else: it goes to the card sealed in one
+ * APDU (SET_PIN, whose selection counts as having the PIN, so no VERIFY_PIN
+ * follows) and is not kept, logged or returned. No PIN is sealed to a key that
+ * has not been checked under the registry's certificate key.
  */
 import {CARD_AID, type Transceiver} from './cardkit';
 import {checkHeader, HEADER_LEN} from './header';
+import {CheckedPinKey, pinBlock, sealedPinApdu, TrustedCard} from './sealedPin';
 
 /**
  * The slot counts an applet can have: 8 before applet 2.1, 32 from 2.1 on.
@@ -165,9 +170,11 @@ export const PIN_STRETCH = 16;
 const MOST_KEEP_HOLDING = 0x4000 + 0x4000 / PIN_STRETCH + 1;
 
 /**
- * Applet 4.0's VERIFY_PIN with its wait served in this selection: the same
- * VERIFY_PIN is sent again, with nothing in between, while the card answers
- * `6A98`. `owed` is GET_STATE's count, read in this selection before the first
+ * Applet 4.0's VERIFY_PIN, sealed, with its wait served in this selection:
+ * GET_NONCE and the PIN key checked under `trust`, one envelope sealed, and
+ * the same bytes sent again, with nothing in between, while the card answers
+ * `6A98` (a nonce asked mid-wait would make the old envelope a wrong try). A
+ * PIN key that does not check sends nothing: `refused` says why. `owed` is GET_STATE's count, read in this selection before the first
  * VERIFY_PIN. The card counts the askings of a stretch only within one
  * selection, so a stretch cut by lifting the card starts again on the next
  * tap; only finished stretches stay served. `onWait` gets about how many
@@ -177,9 +184,24 @@ const MOST_KEEP_HOLDING = 0x4000 + 0x4000 / PIN_STRETCH + 1;
  */
 export async function verifyPinHeld(
   tx: Transceiver,
+  trust: TrustedCard,
   pin: string,
   owed: number,
   onWait: (seconds: number) => void = () => undefined,
+): Promise<{body: number[]; sw: number | null; refused?: string}> {
+  const asked = await CheckedPinKey.ask(apdu => exchange(tx, apdu), trust);
+  if (!asked.ok) {
+    return {body: [], sw: asked.sw, refused: asked.reason};
+  }
+  const verify = sealedPinApdu(INS_VERIFY_PIN, asked.key, pinBlock(pin));
+  return serveWait(tx, verify, owed, onWait);
+}
+
+async function serveWait(
+  tx: Transceiver,
+  verify: readonly number[],
+  owed: number,
+  onWait: (seconds: number) => void,
 ): Promise<{body: number[]; sw: number | null}> {
   let left = owed;
   let asked = 0;
@@ -187,7 +209,7 @@ export async function verifyPinHeld(
     onWait(waitSeconds(left));
   }
   for (let i = 0; i <= MOST_KEEP_HOLDING; i++) {
-    const reply = await exchange(tx, pinApdu(INS_VERIFY_PIN, pin));
+    const reply = await exchange(tx, verify);
     if (reply.sw !== SW_KEEP_HOLDING) {
       return reply;
     }
@@ -303,7 +325,13 @@ export function limitApdu(msat: number): number[] {
   return [CLA, INS_SET_LIMIT, 0x00, 0x00, 8, ...bytes];
 }
 
-export function pinApdu(ins: number, pin: string): number[] {
+/**
+ * The PIN in an older applet's form (P1 00), for one use only: the holder's
+ * consent in the reset of a card older than 4.0 (`reset.ts`). First PIN, resume
+ * and every other PIN in this app are sealed, and the till and the POS phones
+ * send no PIN to a card older than 4.0. A 4.x card refuses P1 = 00 (6B00) and is never sent it.
+ */
+export function oldCardResetPinApdu(ins: number, pin: string): number[] {
   return [CLA, ins, 0x00, 0x00, pin.length, ...Array.from(pin, c => c.charCodeAt(0))];
 }
 
@@ -590,8 +618,20 @@ export async function finishCard(
   }
 
   // SET_PIN's selection counts as having the PIN, so no VERIFY_PIN follows.
+  // It is sealed to the PIN key, checked first: the certificate just written,
+  // under the registry's key this tap gave the card, over this card's slot 0;
+  // then GET_NONCE's binding under that certificate's attestation key.
   onStep('setPin');
-  const set = await exchange(tx, pinApdu(INS_SET_PIN, pin));
+  const send = (apdu: readonly number[]) => exchange(tx, apdu);
+  const trusted = await TrustedCard.check(send, offline.registryKey);
+  if (!trusted.ok) {
+    return {ok: false, step: 'setPin', sw: trusted.sw, reason: trusted.reason};
+  }
+  const asked = await CheckedPinKey.ask(send, trusted.trust);
+  if (!asked.ok) {
+    return {ok: false, step: 'setPin', sw: asked.sw, reason: asked.reason};
+  }
+  const set = await exchange(tx, sealedPinApdu(INS_SET_PIN, asked.key, pinBlock(pin)));
   if (set.sw !== SW_OK) {
     return {
       ok: false,
@@ -602,7 +642,9 @@ export async function finishCard(
           ? 'the card already has a PIN'
           : set.sw === SW_NOT_ANCHORED
             ? 'the card did not keep the block header as its anchor'
-            : `SET_PIN answered ${hex(set.sw)}`,
+            : set.sw === SW_WRONG_LENGTH
+              ? 'the card did not open the sealed PIN; ask for a new nonce and set it again'
+              : `SET_PIN answered ${hex(set.sw)}`,
     };
   }
 
@@ -752,10 +794,13 @@ async function certificateStep(
  * it, the keys read back. SET_PIN is sent only after every keyed slot answered
  * a key in the same selection, so a card with a PIN has its whole key set;
  * nothing is generated here. A wrong PIN spends that one try and is never retried.
+ * The PIN is sealed, so the card's certificate is checked under `certKey`
+ * first; without the key, no PIN is sent.
  */
 export async function finishVerified(
   tx: Transceiver,
   pin: string,
+  certKey: readonly number[] | null,
   onStep: (step: SetupStep) => void = () => undefined,
   onWait?: (seconds: number) => void,
 ): Promise<SetupResult> {
@@ -783,18 +828,22 @@ export async function finishVerified(
       reason: `GET_STATE answered ${hex(read.sw)} with ${read.body.length} bytes, not ${STATE_LEN}`,
     };
   }
-  const verified = await verifyPinHeld(tx, pin, state.owed, onWait);
+  const trusted = await TrustedCard.check(apdu => exchange(tx, apdu), certKey);
+  if (!trusted.ok) {
+    return {ok: false, step: 'verifyPin', sw: trusted.sw, reason: trusted.reason};
+  }
+  const verified = await verifyPinHeld(tx, trusted.trust, pin, state.owed, onWait);
   if (verified.sw !== SW_OK) {
     return {
       ok: false,
       step: 'verifyPin',
       sw: verified.sw,
-      reason:
-        verified.sw !== null && verified.sw >> 4 === 0x63c
+      reason: verified.refused ??
+        (verified.sw !== null && verified.sw >> 4 === 0x63c
           ? `the PIN this phone sent was not the card's; ${verified.sw & 0x0f} wrong tries in a row`
           : verified.sw === SW_KEEP_HOLDING
             ? 'the card asked for a longer wait than it owes'
-            : `VERIFY_PIN answered ${hex(verified.sw)}`,
+            : `VERIFY_PIN answered ${hex(verified.sw)}`),
     };
   }
   onStep('keys');

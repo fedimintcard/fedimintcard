@@ -121,13 +121,13 @@ class NoteSignatureTest {
 
     @Test
     void aReKeyedSlotRefusesTheNoteForItsOldKey() {
-        CardTestSupport c = keyed(0);
-        byte[] old = c.note(0, 1000);
+        CardTestSupport c = keyed(1);
+        byte[] old = c.note(1, 1000);
         c.verifyPin(PIN);
-        assertSw(0x9000, c.tx(CLA, GEN_KEY, 0, 1, null));
-        assertSw(0x6982, c.tx(SET_NOTE, 0, old));
-        assertEquals(ST_KEYED, c.slotState(0));
-        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
+        assertSw(0x9000, c.tx(CLA, GEN_KEY, 1, 1, null));
+        assertSw(0x6982, c.tx(SET_NOTE, 1, old));
+        assertEquals(ST_KEYED, c.slotState(1));
+        assertSw(0x9000, c.tx(SET_NOTE, 1, c.note(1, 1000)));
     }
 
     @Test

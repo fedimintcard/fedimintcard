@@ -85,19 +85,22 @@ final class CardTestSupport {
      */
     CardTestSupport powerCycle() {
         sim.reset();
+        sealer.forget();
         select();
         return this;
     }
 
     /** SELECT the applet by AID, the way a reader does. */
     ResponseAPDU select() {
+        sealer.forget();
         return sim.transmitCommand(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, Bip340.hex(AID_HEX)));
     }
 
+    /** The host's side of the sealed PIN: the PIN commands a test sends in their P1 00 form go sealed (Sealer). */
+    final Sealer sealer = new Sealer(sim::transmitCommand);
+
     ResponseAPDU tx(int cla, int ins, int p1, int p2, byte[] data) {
-        return sim.transmitCommand(data == null || data.length == 0
-            ? new CommandAPDU(cla, ins, p1, p2)
-            : new CommandAPDU(cla, ins, p1, p2, data));
+        return sealer.send(cla, ins, p1, p2, data);
     }
 
     ResponseAPDU tx(int ins, int p1, byte[] data) { return tx(CLA, ins, p1, 0, data); }
@@ -118,9 +121,27 @@ final class CardTestSupport {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(e);
         }
-        if (pinState() == 0) anchor();
+        if (pinState() == 0) {
+            certify();
+            anchor();
+        }
         return tx(SET_PIN, 0, pin);
     }
+
+    /** ATTEST_INIT (once) and a stand-in SET_CERT on a card with no certificate: the provisioning a sealed SET_PIN needs. */
+    void certify() {
+        try {
+            if (((byte[]) field("cert"))[0] != 0) return;
+            if (!(Boolean) field("attestMade")) assertSw(0x9000, tx(0x30, 0, null), "ATTEST_INIT");
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        assertSw(0x9000, tx(0x31, 0, TEST_CERT), "SET_CERT");
+    }
+
+    /** A stand-in certificate for tests that never check one: GET_NONCE, so a sealed SET_PIN, needs the card to hold one. */
+    static final byte[] TEST_CERT = fill(16, 0xCE);
+
 
     /** SET_HEADER with the set-up's anchor (Headers.anchor), answered 9000. */
     void anchor() { assertSw(0x9000, tx(SET_HEADER, 0, Headers.anchor()), "the set-up's anchor"); }

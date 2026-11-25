@@ -12,14 +12,14 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use fedimint_card_host_card::{Card, SoftCard, StatusWord};
+use fedimint_card_host_card::{Card, SlotState, SoftCard, StatusWord};
 use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::holder::{CardFull, Loader};
 use fedimint_card_sidecar::ops::{Ops, OpsClient, OpsConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Conn, OpsState};
-use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, TopupStore, Topups};
+use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, TopupState, TopupStore, Topups};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
@@ -275,7 +275,7 @@ async fn start(setup: Setup) -> anyhow::Result<(Fx, impl std::future::Future<Out
             keys.push(c.gen_key(s)?);
         }
         fedimint_card_host_card::softkit::ready_for_pin(&mut *c)?;
-        fedimint_card_host_card::open_pin_session(&mut *c)?;
+        fedimint_card_host_card::softkit::open_test_session(&mut *c)?;
     }
     let short_id = short_id_of(&keys[0]);
     let registry = Arc::new(FakeRegistry::new(wallet.federation_id().to_string(), keys.iter().map(|k| k.to_string()).collect(), 7));
@@ -360,6 +360,15 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 
 /// Open a phone's card link; the task answers APDUs until the till closes it.
 async fn open_link(addr: SocketAddr, card: Arc<Mutex<SoftCard>>) -> (String, tokio::task::JoinHandle<()>) {
+    open_link_logged(addr, card, Arc::new(Mutex::new(vec![]))).await
+}
+
+/// [`open_link`], keeping the INS byte of every APDU the card received in `heard`.
+async fn open_link_logged(
+    addr: SocketAddr,
+    card: Arc<Mutex<SoftCard>>,
+    heard: Arc<Mutex<Vec<u8>>>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let (mut ws, _): (Ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/card/link")).await.unwrap();
     let ready: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     let id = ready["link"].as_str().unwrap().to_owned();
@@ -368,6 +377,7 @@ async fn open_link(addr: SocketAddr, card: Arc<Mutex<SoftCard>>) -> (String, tok
             let Message::Text(t) = msg else { continue };
             let v: Value = serde_json::from_str(t.as_str()).unwrap();
             let apdu = hex::decode(v["apdu"].as_str().unwrap()).unwrap();
+            heard.lock().unwrap().push(apdu[1]);
             let frame = json!({"type": "rapdu", "id": v["id"], "rapdu": hex::encode(answer(&card, &apdu))}).to_string();
             if ws.send(Message::Text(frame.into())).await.is_err() {
                 break;
@@ -452,6 +462,48 @@ async fn a_paid_top_up_loads_the_card_once() -> anyhow::Result<()> {
         let v = until_state(addr, &id, "loaded").await;
         assert_eq!(v["load_txid"], txid);
         assert_eq!(topups.get(&id).unwrap().short_id.as_deref(), Some(short_id.as_str()));
+    })
+    .await;
+    Ok(())
+}
+
+/// A paid top-up tapped with a card older than 4.0 (2.0, 2.1, 3.0): 409 `old_card` at the tap, and
+/// the card hears only the probe and the SELECT that refuse it. No load is made, the top-up stays
+/// `paid` and is still offered, and a 4.0 card's tap loads it. A balance tap of the old card gets
+/// the same refusal. The invoice was made before any card was read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_older_than_4_0_takes_no_top_up_and_the_top_up_stays_paid() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        let (s, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        assert_eq!(s, 200, "{created}");
+        let id = created["topup_id"].as_str().unwrap().to_owned();
+        ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
+        until_state(addr, &id, "paid").await;
+        for (which, old) in [("2.0", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+            let old = Arc::new(Mutex::new(old));
+            for path in [format!("/v1/topup/{id}/load"), "/v1/card/balance".to_owned()] {
+                let heard = Arc::new(Mutex::new(vec![]));
+                let (link, phone) = open_link_logged(addr, old.clone(), heard.clone()).await;
+                let (s, v) = call(addr, "POST", &path, Some(&link), None).await;
+                phone.abort();
+                assert_eq!((s, v["error"].as_str()), (409, Some("old_card")), "{which} {path}: {v}");
+                assert_eq!(v["detail"].as_str(), Some(fedimint_card_host_card::OLD_CARD_MESSAGE), "{which} {path}: {v}");
+                let heard = heard.lock().unwrap().clone();
+                assert!(heard.iter().all(|i| [0xCA, 0xA4].contains(i)), "{which} {path}: the card received INS {heard:02x?}");
+            }
+            assert!(registry.loads.lock().unwrap().is_empty(), "{which}: no load");
+            assert!(topups.get(&id).unwrap().state == TopupState::Paid, "{which}: the top-up stays paid");
+        }
+        let (s, w) = call(addr, "GET", "/v1/topups/waiting", None, None).await;
+        assert_eq!((s, w["topups"][0]["topup_id"].as_str()), (200, Some(id.as_str())), "still offered: {w}");
+        let (link, phone) = open_link(addr, card.clone()).await;
+        let (s, loaded) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, loaded["state"].as_str()), (200, Some("loaded")), "{loaded}");
+        tokio::time::timeout(Duration::from_secs(5), phone).await.expect("the till closes the link").unwrap();
+        assert_eq!(registry.loads.lock().unwrap().len(), 1);
+        assert_eq!(ln.invoices.load(Ordering::SeqCst), 1, "one invoice");
     })
     .await;
     Ok(())
@@ -751,7 +803,7 @@ async fn holder_on(card: &mut SoftCard, funds: u64) -> anyhow::Result<(Federatio
 /// 50,000 sats is twelve notes: a fresh 32-slot card takes them in one load.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_50k_holder_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     assert_eq!(card.slot_len(), 32);
     let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
     let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await?;
@@ -761,21 +813,21 @@ async fn a_50k_holder_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same load on a 2.0 card (eight slots, seven free) is refused before anything is built, as
-/// it always was.
+/// A load onto a card older than 4.0 (2.0 with eight slots, 2.1, 3.0) is refused with the
+/// old-card error before any command of the load reaches the card: nothing is paid and no slot
+/// holds a note.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_50k_holder_load_is_refused_on_an_eight_slot_card() -> anyhow::Result<()> {
-    let mut card = SoftCard::with_slots(8);
-    let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
-    let before = wallet.balance_msat().await?;
-    let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("twelve notes, seven slots");
-    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
-    assert_eq!((full.free, full.needed), (7, 12));
-    assert_eq!(wallet.balance_msat().await?, before, "nothing was paid");
-    // A load that fits still loads.
-    let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
-    assert_eq!(r.notes.len(), 3);
-    assert!(r.notes.iter().all(|(s, _)| (1..8).contains(s)), "{:?}", r.notes);
+async fn a_holder_load_onto_a_card_older_than_4_0_is_refused() -> anyhow::Result<()> {
+    for (which, mut card) in [("2.0", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+        let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
+        let before = wallet.balance_msat().await?;
+        card.forget_received();
+        let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[1 << 20]).await.expect_err(which);
+        assert!(fedimint_card_host_card::is_old_card(&err), "{which}: {err:#}");
+        assert!(card.received_ins().is_empty(), "{which}: the card received {:02x?}", card.received_ins());
+        assert_eq!(wallet.balance_msat().await?, before, "{which}: nothing was paid");
+        assert!((0..card.slot_len()).all(|s| !matches!(card.slot_state(s), Some(SlotState::Note))), "{which}: no note on the card");
+    }
     Ok(())
 }
 
@@ -943,7 +995,7 @@ async fn holder_on_split(
 /// refused and says why; the till's loader keys slots 8-15 (5 short plus `KEY_AHEAD`) and loads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("seven keyed slots");
     let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
@@ -967,7 +1019,7 @@ async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result
 /// unkeyed 22, 23 and 25-31, a 12-note load is refused as full and nothing is keyed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_till_keys_and_loads_no_slot_from_24_up() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
     let k24 = card.gen_key(24)?.to_string();
@@ -986,7 +1038,7 @@ async fn a_till_keys_and_loads_no_slot_from_24_up() -> anyhow::Result<()> {
 /// slots keys nothing either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_till_keys_only_when_keying_makes_the_load_fit() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
     *registry.unkeyed.lock().unwrap() = vec![8, 9];

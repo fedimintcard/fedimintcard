@@ -4,12 +4,15 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.bobodread876.fedimintcard.applet.Bip340;
 import io.github.bobodread876.fedimintcard.applet.Registry;
+import io.github.bobodread876.fedimintcard.applet.Sealer;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.smartcardio.CommandAPDU;
+import javax.smartcardio.ResponseAPDU;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -72,10 +75,24 @@ class BridgeHttpTest {
         assertEquals("68427f939000", apdu("b0190000" + "50"
             + "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e5951"
             + "18ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92"));
-        assertEquals("9000", apdu("b04100000431323334"));
+        // Applet 4.0 takes the PIN only sealed (OFFLINE-PROTOCOL.md section 9), and GET_NONCE needs a certificate:
+        // ATTEST_INIT, then a stand-in SET_CERT (the bridge never checks one; a host does). SET_PIN with P1 00 is 6B00.
+        assertEquals("6b00", apdu("b04100000431323334"));
+        assertTrue(apdu("b0300000").endsWith("9000"), "ATTEST_INIT");
+        assertEquals("9000", apdu("b0310000" + "10" + "ce".repeat(16)), "SET_CERT");
+        // The tests' host side of the seal, every GET_NONCE and envelope carried over HTTP like any APDU.
+        Sealer sealer = new Sealer(c -> {
+            try {
+                return new ResponseAPDU(Bip340.hex(apdu(Bip340.hex(c.getBytes()))));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        assertEquals(0x9000, sealer.send(0xB0, 0x41, 0, 0, "1234".getBytes()).getSW(), "sealed SET_PIN");
         assertEquals("04009000", apdu("00a4040008f0464d4341524401")); // a new selection: the PIN is not given
+        sealer.forget();
         assertEquals("6a94", apdu(sign));
-        assertEquals("9000", apdu("b04000000431323334"));
+        assertEquals(0x9000, sealer.send(0xB0, 0x40, 0, 0, "1234".getBytes()).getSW(), "sealed VERIFY_PIN");
         // the card signs only a slot holding a note: 1000 msat, 48 bytes standing for its federation signature, and
         // the registry's signature over the slot's key and the note (the generator's private key, 1, a stand-in)
         byte[] note = Registry.signed(pub, Bip340.hex("00000000000003e8" + "aa".repeat(48)));

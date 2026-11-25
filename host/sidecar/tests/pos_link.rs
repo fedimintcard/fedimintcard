@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
-use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
+use fedimint_card_host_card::{Card, SoftCard};
 use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::pos;
 use fedimint_card_sidecar::sales::SalesStore;
@@ -82,10 +82,11 @@ async fn fx(notes: &[u64]) -> anyhow::Result<Fx> {
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
     let card = Arc::new(Mutex::new(SoftCard::v4()));
-    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone())));
+    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     cw.card_setup(false)?;
     fedimint_card_host_card::softkit::ready_for_pin(cw.card.as_mut())?;
-    open_pin_session(cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
     if !notes.is_empty() {
         cw.topup(notes).await?;
         // This till has no registry: the test stands in for it, signing each new note under the

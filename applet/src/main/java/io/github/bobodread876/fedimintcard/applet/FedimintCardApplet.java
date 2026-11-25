@@ -15,7 +15,9 @@ import javacard.security.ECPublicKey;
 import javacard.security.KeyBuilder;
 import javacard.security.KeyPair;
 import javacard.security.MessageDigest;
+import javacard.security.RSAPrivateKey;
 import javacard.security.Signature;
+import javacardx.crypto.Cipher;
 
 /**
  * Fedimint spend-key applet. Holds up to {@link #SLOTS} secp256k1 keys, one per Fedimint
@@ -35,7 +37,8 @@ import javacard.security.Signature;
  * <pre>
  * CLA B0
  * 10 GEN_KEY     P1=slot P2=0|1 Lc=0  -> 32 bytes x-only pubkey. P2=1 re-keys a KEYED or SPENT slot (after VERIFY_PIN once a
- *                                        PIN is set); a slot holding a note or owed change is never re-keyed (6985)
+ *                                        PIN is set); a slot holding a note or owed change is never re-keyed (6985),
+ *                                        nor slot 0 once SET_CERT has taken a certificate (6985)
  * 11 GET_PUB     P1=slot Lc=0         -> 32 bytes x-only pubkey
  * 12 SIGN        P1=slot Lc=32 (hash) -> 64 bytes R.x || s (after VERIFY_PIN). A NOTE slot: counted against the day's limit,
  *                                        then spent. A SPENT slot: the same hash only, answered with the signature it
@@ -57,7 +60,8 @@ import javacard.security.Signature;
  * 19 SET_HEADER  Lc=80                a Bitcoin block header -> now (4). Moves the clock if later, with enough work and
  *                                        not weak (6A93, nothing written). Before SET_PIN on a card with no value it is
  *                                        an anchor: the clock at its time, the day's window and spent cleared
- * 30 ATTEST_INIT                      -> P-256 public key (65). Makes the attestation key; only before SET_PIN and the certificate
+ * 30 ATTEST_INIT                      -> P-256 public key (65). Makes the PIN key, then the attestation key; only before SET_PIN
+ *                                        and the certificate
  * 31 SET_CERT    Lc=1..160            the registry's certificate over this card; once, before SET_PIN
  * 32 GET_CERT                         -> the certificate
  * 33 ATTEST      Lc=32 (challenge)    -> ECDSA-SHA256 (DER) over "fedimintcard/at1" || challenge || slot 0's x-only pubkey
@@ -67,14 +71,28 @@ import javacard.security.Signature;
  *                                        back to NOTE; a CHANGE slot owed by txid goes back to KEYED. -> the new state (1).
  *                                        The registry signs one only for a transaction the federation refused, or whose
  *                                        report it refused as a double spend (docs/OFFLINE-PROTOCOL.md § 6)
- * 40 VERIFY_PIN  P1=P2=0 Lc=4..8      -> the session may SIGN. After wrong tries the next try first owes a wait,
- *                                        served by sending the same VERIFY_PIN again while it answers 6A98
- * 41 SET_PIN     P1=P2=0 Lc=4..8      -> once per card, after an anchor in the same selection (6A96), on a card with
- *                                        the registry key and no value (6985); the selection that sent it counts as
+ * 40 VERIFY_PIN  P1=01 P2=0 Lc=90     a sealed PIN block -> the session may SIGN. After wrong tries the next try first owes
+ *                                        a wait, served by sending the same VERIFY_PIN again while it answers 6A98. No live
+ *                                        nonce 6985; an envelope that does not open is a wrong try (63CX)
+ * 41 SET_PIN     P1=01 P2=0 Lc=90     a sealed PIN block -> once per card, after an anchor in the same selection (6A96), on
+ *                                        a card with the registry key and no value, under a live nonce (6985); an envelope
+ *                                        that does not open 6700, nothing written. The selection that sent it counts as
  *                                        having the PIN
- * 42 CHANGE_PIN  P1=old length P2=0   old PIN (4..8) || new PIN (4..8); P1=0: two halves of the same length. After
- *                                        VERIFY_PIN; closes the session. A wrong old PIN counts as a try
+ * 42 CHANGE_PIN  P1=01 P2=0 Lc=99     a sealed old PIN block || new PIN block. After VERIFY_PIN; closes the session. A wrong
+ *                                        old PIN, or an envelope that does not open, counts as a try
+ * 44 GET_NONCE   P1=01 P2=0           -> nonce (16) || PIN key (33, compressed) || binding (DER, 8..72): ECDSA-SHA256 by
+ *                                        the attestation key over "fedimintcard/pin1" || the PIN key. After SET_CERT (6985).
+ *                                        No PIN. The nonce opens one sealed PIN command
  * </pre>
+ *
+ * <p>The PIN is sealed (docs/OFFLINE-PROTOCOL.md § 9, Cashu Card 1.9's sealed PIN, MIT, see NOTICE): every PIN
+ * command is sealed. VERIFY_PIN, SET_PIN and CHANGE_PIN take only P1 = 01, any other P1 or P2 (00 among
+ * them) 6B00. Their data is an envelope, E (65, the sender's secp256k1 key for this message) || ct ||
+ * tag (16), sealed to the card's PIN key under the nonce of the last GET_NONCE: x the X of the point E and the PIN key
+ * share, block(i, m) = SHA-256("fedimintcard/seal1" || i || x || E || nonce || INS || m), the tag the first 16 bytes of
+ * block(0, ct), the keystream blocks 1, 2, ... The clear data is a PIN block, the PIN's length (1) || the PIN || zeros
+ * to 8 bytes. The nonce is RAM and opens at most one envelope: the first sealed command to reach its opening spends
+ * it, opened or not; a GET_NONCE replaces it and a SELECT ends it. An asking of the wait does not spend it.
  *
  * <p>Slot states: EMPTY 0, KEYED 1 (a key, no note), NOTE 2, CHANGE 3 (a key owed change), SPENT 4.
  * The day's limit counts what a note signs away whole: the card cannot see a transaction's
@@ -115,6 +133,7 @@ public final class FedimintCardApplet extends Applet {
     static final byte INS_VERIFY_PIN = (byte) 0x40;
     static final byte INS_SET_PIN = (byte) 0x41;
     static final byte INS_CHANGE_PIN = (byte) 0x42;
+    static final byte INS_GET_NONCE = (byte) 0x44;
     static final short SLOTS = 32;
 
     /** SELECT answers this major and {@link #VERSION_MINOR}; see the class javadoc. */
@@ -125,6 +144,23 @@ public final class FedimintCardApplet extends Applet {
     static final byte PIN_MIN = 4;
     static final byte PIN_MAX = 8;
     static final byte PIN_TRIES = 3;
+
+    /** The sealed form's P1, the only one the PIN commands take. */
+    static final byte SEALED = 0x01;
+    /** A sealed PIN command's Lc: E (65) || the sealed PIN block (9) || tag (16); CHANGE_PIN's carries two blocks. */
+    static final short SEAL_LC = 90;
+    static final short SEAL_LC_CHANGE = 99;
+    static final short E_LEN = 65;
+    static final short TAG_LEN = 16;
+    static final short PIN_BLOCK = 9;
+    static final short NONCE_LEN = 16;
+    /**
+     * The curve check's 128 bytes of field room in the APDU buffer: past the longest envelope (5 + 99 = 104), and below
+     * 240, the highest byte any command already uses (SET_NOTE's message). A buffer shorter than that is refused (6F00)
+     * before anything is written past it.
+     */
+    static final short FIELD = 112;
+    static final short FIELD_END = 240;
 
     /** Keep holding: a wait is owed before the next PIN try; send the same VERIFY_PIN again. */
     static final short SW_KEEP_HOLDING = 0x6A98;
@@ -199,6 +235,41 @@ public final class FedimintCardApplet extends Applet {
     /** ATTEST's label: ASCII "fedimintcard/at1", 16 bytes. */
     private static final byte[] ATTEST_LABEL = {
         'f','e','d','i','m','i','n','t','c','a','r','d','/','a','t','1' };
+    /** The seal's label: ASCII "fedimintcard/seal1", 18 bytes (Cashu's "CashuCard/seal"). */
+    private static final byte[] SEAL_LABEL = {
+        'f','e','d','i','m','i','n','t','c','a','r','d','/','s','e','a','l','1' };
+    /** The PIN key's binding: ASCII "fedimintcard/pin1", 17 bytes (Cashu's "CashuCard/pinkey"). */
+    private static final byte[] PIN_LABEL = {
+        'f','e','d','i','m','i','n','t','c','a','r','d','/','p','i','n','1' };
+
+    /**
+     * The field's arithmetic for the curve check, by the chip's RSA (Cashu's p*p path, its applet's RSA_PP): the
+     * modulus p*p, 64 bytes, and the exponents 3 (x^3), (p-1)/2 (Euler's test) and (p+1)/4 + (p-1)/2 (the root). Each
+     * answer is taken mod p after (reduceModP).
+     */
+    private static final byte[] RSA_PP = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,(byte)0xFF,(byte)0xFF,(byte)0xFC,(byte)0x2F,
+        (byte)0x00,(byte)0x00,(byte)0x03,(byte)0xCF,(byte)0xFF,(byte)0xFF,(byte)0xFC,(byte)0x2E,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,
+        (byte)0xFF,(byte)0xFF,(byte)0xFC,(byte)0x2F,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,(byte)0x00,(byte)0x00,(byte)0x03,(byte)0xD1
+    };
+    private static final byte[] RSA_D_CUBE = { (byte) 0x03 };
+    private static final byte[] RSA_D_ROOT = {
+        (byte)0xBF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x3F,(byte)0xFF,(byte)0xFD,(byte)0x23
+    };
+    private static final byte[] RSA_D_EULER = {
+        (byte)0x7F,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x7F,(byte)0xFF,(byte)0xFE,(byte)0x17
+    };
 
     // P-256, for the attestation key (native ECDSA on the chip, not our software Schnorr).
     private static final byte[] R1_P = {
@@ -247,6 +318,8 @@ public final class FedimintCardApplet extends Applet {
     static final short H_PIN_GIVEN = 0;
     static final short H_ANCHORED = 1;
     static final short H_ASKED = 2;
+    // ... and whether the nonce of the last GET_NONCE is live (one opening at most)
+    static final short H_NONCE = 3;
 
     private final ECPrivateKey[] privs = new ECPrivateKey[SLOTS];
     private final ECPublicKey[] pubs = new ECPublicKey[SLOTS];
@@ -279,6 +352,13 @@ public final class FedimintCardApplet extends Applet {
     private static final short X_FLOOR = 112;  // 32
     private static final short X_LEN = 144;
     private static final short X_REC = 0;      // 28, SET_HEADER's new clock record (an anchor)
+    // x inside a sealed PIN command (unused there otherwise): the seal's room, the point the two keys share (65), a
+    // block of the hash (32), the counter (1) and the INS (1); then reduceModP's 40 bytes, apart from it
+    private static final short S_POINT = 0;
+    private static final short S_HASH = 65;
+    private static final short S_I = 97;
+    private static final short S_INS = 98;
+    private static final short X_RED = 100;    // 40
     private final KeyPair gen;
     private final byte[] tmp;
     /**
@@ -305,6 +385,20 @@ public final class FedimintCardApplet extends Applet {
      * derived from it does.
      */
     private final AESKey secret;
+    /**
+     * The PIN key (secp256k1): it agrees with readers' points and does nothing else (never a slot key, never the work
+     * keys). Built and made at ATTEST_INIT, before the attestation key; fixed from SET_CERT for the card's life.
+     */
+    private KeyPair pinKey;
+    /** The PIN key's binding: the DER's length (1, 0 = none yet), then the DER (up to 72); made at the first GET_NONCE after SET_CERT. */
+    private final byte[] pinKeySig;
+    /** The nonce of the last GET_NONCE (CLEAR_ON_DESELECT); live while held[H_NONCE] is set. */
+    private final byte[] nonce;
+    /** The chip's RSA for the curve check's field arithmetic, and its three powers mod p*p; built at the first ATTEST_INIT. */
+    private Cipher rsa;
+    private RSAPrivateKey rsaCube;
+    private RSAPrivateKey rsaRoot;
+    private RSAPrivateKey rsaEuler;
 
     private FedimintCardApplet() {
         // A slot's key objects are built at its first GEN_KEY (keysFor), not here: the J3R180
@@ -322,7 +416,9 @@ public final class FedimintCardApplet extends Applet {
         pin = new OwnerPIN(PIN_TRIES, PIN_MAX);
         pinState = PIN_STATE_NOT_SET;
         pinMarks = new byte[3];
-        held = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
+        held = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        nonce = JCSystem.makeTransientByteArray(NONCE_LEN, JCSystem.CLEAR_ON_DESELECT);
+        pinKeySig = new byte[73];
         attest = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         p256((javacard.security.ECKey) attest.getPrivate());
         p256((javacard.security.ECKey) attest.getPublic());
@@ -366,7 +462,7 @@ public final class FedimintCardApplet extends Applet {
 
     /**
      * What a selection begins and ends with: no PIN given, no anchor, no stretch of the wait under
-     * way, and nothing in the working arrays. They are CLEAR_ON_DESELECT, and are zeroed here as
+     * way, no live nonce, and nothing in the working arrays. They are CLEAR_ON_DESELECT, and are zeroed here as
      * well for a chip that keeps a same-package applet's transient memory across a SELECT.
      * {@link #newPin} is persistent and zeroed at the end of every call that writes it; a PIN
      * write torn inside the call can leave it, so it is zeroed here too, only when it is not
@@ -377,6 +473,7 @@ public final class FedimintCardApplet extends Applet {
         Util.arrayFillNonAtomic(held, (short) 0, (short) held.length, (byte) 0);
         Util.arrayFillNonAtomic(x, (short) 0, X_LEN, (byte) 0);
         Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+        Util.arrayFillNonAtomic(nonce, (short) 0, NONCE_LEN, (byte) 0);
         for (short i = 0; i < PIN_MAX; i++) {
             if (newPin[i] != 0) {
                 Util.arrayFillNonAtomic(newPin, (short) 0, PIN_MAX, (byte) 0);
@@ -442,6 +539,9 @@ public final class FedimintCardApplet extends Applet {
                 break;
             case INS_CHANGE_PIN:
                 changePin(apdu, buf);
+                break;
+            case INS_GET_NONCE:
+                getNonce(apdu, buf);
                 break;
             case INS_SET_NOTE:
                 setNote(apdu, buf);
@@ -598,37 +698,48 @@ public final class FedimintCardApplet extends Applet {
     }
 
     /**
-     * Opens this session for SIGN. Also starts a fresh one, so a wrong PIN leaves nothing open.
-     * The frame is checked first and costs nothing; then the wait owed, before the data is read;
-     * then the try.
+     * Opens this session for SIGN, from a sealed PIN block (docs/OFFLINE-PROTOCOL.md § 9). Also starts a fresh session,
+     * so a wrong PIN leaves nothing open. The frame is checked first, then the length, then the live nonce, all before
+     * any receive and writing nothing; then the wait owed, before the data is read; then the opening, which spends the
+     * nonce, and the try. An envelope that does not open is a wrong try ({@link #openingFailed}).
      */
     private void verifyPin(APDU apdu, byte[] buf) {
         short len = lcOf(buf);
         if (pinState != PIN_STATE_SET) {
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
-        if (len < PIN_MIN || len > PIN_MAX) {
+        // The frame before the length: a host that still sends the clear form (P1 = 00) is told 6B00.
+        if (buf[ISO7816.OFFSET_P1] != SEALED || buf[ISO7816.OFFSET_P2] != 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
+        }
+        if (len != SEAL_LC) {
             // Refused before any receive, so a wrong length costs neither a try nor a read.
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
-            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
+        if (held[H_NONCE] == 0) {
+            // Before the wait: an envelope no nonce can open is served no wait.
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
         try {
             waitOwed(buf);
             if (apdu.setIncomingAndReceive() < len) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
-            tryPin(buf, len);
+            if (unseal(buf, len) < 0) {
+                openingFailed(buf);
+            }
+            tryPin(buf, unblockPin(buf, ISO7816.OFFSET_CDATA));
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
+            forgetSeal();
         }
     }
 
     /**
-     * The one-time PIN write, on a card with the registry key and no value, in a selection whose
-     * SET_HEADER anchored the clock (an anchor made in an earlier selection does not count). The
-     * selection that sends it counts as having the PIN, so the host need not send VERIFY_PIN after it.
+     * The one-time PIN write, from a sealed PIN block, on a card with the registry key and no value, in a selection whose
+     * SET_HEADER anchored the clock (an anchor made in an earlier selection does not count), under a live nonce. The
+     * selection that sends it counts as having the PIN, so the host need not send VERIFY_PIN after it. An envelope that
+     * does not open answers 6700, as a bad PIN block does, and writes nothing: no PIN is set, so there is no try to count.
      *
      * Before anything is written, the signer's check of the chip's engines (6F00 for a chip that
      * answers otherwise: such a card never takes a PIN, so never takes value). Just before the
@@ -636,19 +747,23 @@ public final class FedimintCardApplet extends Applet {
      */
     private void setPin(APDU apdu, byte[] buf) {
         short len = lcOf(buf);
-        if (buf[ISO7816.OFFSET_P1] != 0 || buf[ISO7816.OFFSET_P2] != 0) {
+        if (buf[ISO7816.OFFSET_P1] != SEALED || buf[ISO7816.OFFSET_P2] != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
         if (pinState == PIN_STATE_SET) {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
-        if (len < PIN_MIN || len > PIN_MAX) {
+        if (len != SEAL_LC) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         if (held[H_ANCHORED] == 0) {
             ISOException.throwIt(SW_NOT_ANCHORED);
         }
         if (!registryKeySet || holdsValue()) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+        if (held[H_NONCE] == 0) {
+            // Every refusal above leaves the nonce live.
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
         try {
@@ -658,8 +773,12 @@ public final class FedimintCardApplet extends Applet {
             if (apdu.setIncomingAndReceive() < len) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
+            if (unseal(buf, len) < 0) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            short pl = unblockPin(buf, ISO7816.OFFSET_CDATA);
             // The same buffer as CHANGE_PIN's new half, which is only live inside a call.
-            Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, newPin, (short) 0, len);
+            Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, newPin, (short) 0, pl);
             // The signer's test of the chip's product, once a life: a card takes SET_PIN once
             // (a PIN set is never unset), and this is chipMul's one writer. Before the commit
             // point, so a SET_PIN torn after it runs it again and none is set without it.
@@ -674,18 +793,20 @@ public final class FedimintCardApplet extends Applet {
             workKeys.genKeyPair();
             // The PIN write first, the state byte second: the state byte is the commit point, so
             // a tear before it leaves the card reading as not set and SET_PIN can run again.
-            pin.update(newPin, (short) 0, (byte) len);
+            pin.update(newPin, (short) 0, (byte) pl);
             pinState = PIN_STATE_SET;
             held[H_PIN_GIVEN] = 1;
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
             Util.arrayFillNonAtomic(newPin, (short) 0, (short) newPin.length, (byte) 0);
+            forgetSeal();
         }
     }
 
     /**
-     * Lc = old PIN || new PIN, each 4..8 bytes; P1 = the old PIN's length, or 0 for two halves of
-     * the same length. Requires this session's PIN, and ends it.
+     * A sealed old PIN block || new PIN block, each carrying its own length. Requires this session's PIN, and ends it.
+     * An envelope that does not open is a wrong try, as a wrong old PIN is; a block whose length is not 4..8 is 6700
+     * and no try.
      */
     private void changePin(APDU apdu, byte[] buf) {
         short lc = lcOf(buf);
@@ -693,30 +814,23 @@ public final class FedimintCardApplet extends Applet {
             // And not-set outranks a bad frame, as in VERIFY_PIN: there is no old PIN to change.
             ISOException.throwIt(SW_PIN_NOT_SET);
         }
-        short old = buf[ISO7816.OFFSET_P1];
-        if ((old != 0 && (old < PIN_MIN || old > PIN_MAX)) || buf[ISO7816.OFFSET_P2] != 0) {
+        if (buf[ISO7816.OFFSET_P1] != SEALED || buf[ISO7816.OFFSET_P2] != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
         if (!pinGiven()) {
             ISOException.throwIt(SW_PIN_NEEDED);
         }
-        if (old == 0) {
-            // An odd Lc cannot be two PINs of the same length.
-            if ((lc & 1) != 0) {
-                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-            }
-            old = (short) (lc / 2);
-        }
-        short young = (short) (lc - old);
-        if (lc > 2 * PIN_MAX || old > lc || young < PIN_MIN || young > PIN_MAX || old < PIN_MIN) {
+        if (lc != SEAL_LC_CHANGE) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (held[H_NONCE] == 0) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
         try {
             // The whole data field is received here, before anything reads or wipes the buffer:
             // `setIncomingAndReceive` may be called only once per process() (APDU spec), and on
-            // T=0 it "may return less than a full buffer of bytes". Reading only the new half
-            // below would copy bytes the card has not received yet (stale buffer content) and
-            // make it the new PIN. So take all `lc` bytes first, then split them in newPin.
+            // T=0 it "may return less than a full buffer of bytes". Reading only part of it would
+            // open bytes the card has not received yet (stale buffer content).
             //
             // Not covered by a test: jCardSim is T=1 and always delivers the full field, and it
             // answers 6F00 to a command that ends with the APDU still partially received, so the
@@ -724,10 +838,20 @@ public final class FedimintCardApplet extends Applet {
             if (apdu.setIncomingAndReceive() < lc) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
+            if (unseal(buf, lc) < 0) {
+                openingFailed(buf);
+            }
+            short oldAt = ISO7816.OFFSET_CDATA;
+            short newAt = (short) (oldAt + PIN_BLOCK);
+            short old = (short) (buf[oldAt] & 0xFF);
+            short young = (short) (buf[newAt] & 0xFF);
+            if (old < PIN_MIN || old > PIN_MAX || young < PIN_MIN || young > PIN_MAX) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
             // The new PIN is copied before the old PIN's check wipes the APDU buffer and tmp.
             // Into newPin, not tmp, because tryPin wipes tmp on its way out.
-            Util.arrayCopyNonAtomic(buf, (short) (ISO7816.OFFSET_CDATA + old), newPin,
-                (short) 0, young);
+            Util.arrayCopyNonAtomic(buf, (short) (newAt + 1), newPin, (short) 0, young);
+            unblockPin(buf, oldAt);
             // The old PIN is a try like VERIFY_PIN's, comparing exactly its `old` bytes: counted
             // before the compare, and a wrong one answers 63CX, ends the session and leaves the
             // next try its wait (none is served here: a session with the PIN has nothing owed).
@@ -740,6 +864,7 @@ public final class FedimintCardApplet extends Applet {
         } finally {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) buf.length, (byte) 0);
             Util.arrayFillNonAtomic(newPin, (short) 0, (short) newPin.length, (byte) 0);
+            forgetSeal();
         }
     }
 
@@ -832,6 +957,12 @@ public final class FedimintCardApplet extends Applet {
         boolean overwrite = buf[ISO7816.OFFSET_P2] == 1;
         if (apdu.setIncomingAndReceive() != 0) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        // Slot 0's key is the one the certificate names, and a certificate is taken only once, before
+        // the first SET_PIN. Re-keying slot 0 after SET_CERT would leave a card no host trusts and no
+        // registry can certify again, so the re-key form refuses it, before anything is written.
+        if (overwrite && s == 0 && cert[0] != 0) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
         byte st = state[s];
         if (st != ST_EMPTY) {
@@ -1344,6 +1475,32 @@ public final class FedimintCardApplet extends Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         beforePinAndCert();
+        // The PIN key and the field keys of its curve check: built at the first ATTEST_INIT, not at install, for the
+        // reason in the constructor (the J3R180's bounded install). Each is built once. Then the PIN key is made and its
+        // binding cleared, and only then the attestation key, so a torn ATTEST_INIT never leaves attestMade set over a
+        // PIN key built but not made.
+        if (pinKey == null) {
+            pinKey = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+        }
+        setParams((ECPrivateKey) pinKey.getPrivate(), (ECPublicKey) pinKey.getPublic());
+        if (rsa == null) {
+            rsa = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);
+        }
+        if (rsaCube == null) {
+            rsaCube = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+        }
+        if (rsaRoot == null) {
+            rsaRoot = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+        }
+        if (rsaEuler == null) {
+            rsaEuler = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+        }
+        // set at every ATTEST_INIT, so a key built by one torn before its modulus is set is set by the next
+        fieldKey(rsaCube, RSA_D_CUBE);
+        fieldKey(rsaRoot, RSA_D_ROOT);
+        fieldKey(rsaEuler, RSA_D_EULER);
+        pinKey.genKeyPair();
+        pinKeySig[0] = 0;
         attest.genKeyPair();
         attestMade = true;
         short n = ((ECPublicKey) attest.getPublic()).getW(buf, (short) 0);
@@ -1479,5 +1636,319 @@ public final class FedimintCardApplet extends Applet {
         }
         buf[0] = state[s];
         apdu.setOutgoingAndSend((short) 0, (short) 1);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The sealed PIN (docs/OFFLINE-PROTOCOL.md § 9). Ported from Cashu Card's applet (MIT, see NOTICE):
+    // processGetPinKey, unseal, sealBlock, unblockPin, and the curve check requireFullPoint with its
+    // field code on the chip's RSA. Ours differs in the labels, in the binding (ECDSA P-256 by the
+    // attestation key, not BIP-340 by a payment key), in where the working room is, and in taking
+    // the sealed form only.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * GET_NONCE: a fresh nonce, the PIN key and its binding. The binding is ECDSA-SHA256 by the attestation key over
+     * "fedimintcard/pin1" || the PIN key (33, compressed), made at the first asking after SET_CERT and kept: its length
+     * and the DER are written in one transaction, so a torn first asking leaves no binding (made again) or the whole
+     * one. With no certificate the attestation key may still change (ATTEST_INIT), so no binding is given (6985). No PIN.
+     * Like any instruction but VERIFY_PIN it ends a stretch of the wait (process).
+     */
+    private void getNonce(APDU apdu, byte[] buf) {
+        if (buf[ISO7816.OFFSET_P1] != SEALED || buf[ISO7816.OFFSET_P2] != 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
+        }
+        if (cert[0] == 0) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+        if (apdu.setIncomingAndReceive() != 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        short keyAt = NONCE_LEN;
+        short sigAt = (short) (keyAt + 33);
+        try {
+            short w = ((ECPublicKey) pinKey.getPublic()).getW(tmp, (short) 0);
+            if (w != E_LEN || tmp[0] != (byte) 0x04) {
+                ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+            }
+            buf[keyAt] = (byte) (0x02 | (tmp[64] & 0x01));
+            Util.arrayCopyNonAtomic(tmp, (short) 1, buf, (short) (keyAt + 1), (short) 32);
+        } finally {
+            Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+        }
+        short sl = (short) (pinKeySig[0] & 0xFF);
+        if (sl == 0) {
+            // label (17) || the PIN key (33), assembled from byte 128 of the buffer, past the answer's 121
+            short m = (short) 128;
+            Util.arrayCopyNonAtomic(PIN_LABEL, (short) 0, buf, m, (short) 17);
+            Util.arrayCopyNonAtomic(buf, keyAt, buf, (short) (m + 17), (short) 33);
+            ecdsa.init(attest.getPrivate(), Signature.MODE_SIGN);
+            sl = ecdsa.sign(buf, m, (short) 50, buf, sigAt);
+            if (sl < 8 || sl > 72) {
+                ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+            }
+            JCSystem.beginTransaction();
+            Util.arrayCopy(buf, sigAt, pinKeySig, (short) 1, sl);
+            pinKeySig[0] = (byte) sl;
+            JCSystem.commitTransaction();
+        } else {
+            Util.arrayCopyNonAtomic(pinKeySig, (short) 1, buf, sigAt, sl);
+        }
+        schnorr.random(nonce, (short) 0, NONCE_LEN);
+        held[H_NONCE] = 1;
+        Util.arrayCopyNonAtomic(nonce, (short) 0, buf, (short) 0, NONCE_LEN);
+        apdu.setOutgoingAndSend((short) 0, (short) (sigAt + sl));
+    }
+
+    /**
+     * A sealed command's data, `len` bytes at OFFSET_CDATA (E || ct || tag), opened in place: the clear data is left at
+     * OFFSET_CDATA and its length returned, or -1 where the envelope does not open (E no point of the curve, or the tag
+     * not this sum's). The nonce is spent here, opened or not: one nonce opens at most one envelope. E is held to the
+     * curve ({@link #requireFullPoint}) before it reaches the key agreement, and the tag is checked before anything is
+     * opened. The INS is the command's own, so an envelope sealed for one command does not open as another.
+     */
+    private short unseal(byte[] buf, short len) {
+        if ((short) buf.length < FIELD_END) {
+            // the curve check's field room would run past the buffer
+            ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+        }
+        held[H_NONCE] = 0;
+        short e = ISO7816.OFFSET_CDATA;
+        short n = (short) (len - E_LEN - TAG_LEN);
+        short ct = (short) (e + E_LEN);
+        short tag = (short) (ct + n);
+        boolean good = false;
+        try {
+            requireFullPoint(buf, e);
+            // after the curve check, so its working room cannot reach it
+            x[S_INS] = buf[ISO7816.OFFSET_INS];
+            short got = schnorr.agree((ECPrivateKey) pinKey.getPrivate(), buf, e, E_LEN, x, S_POINT);
+            if (got == E_LEN && x[S_POINT] == (byte) 0x04) {
+                sealBlock(buf, e, (byte) 0, buf, ct, n);
+                good = sameBytes(x, S_HASH, buf, tag, TAG_LEN);
+            }
+        } catch (RuntimeException ex) {
+            // Whatever the curve check or the key agreement throws for a point that is no point, the envelope does
+            // not open: it is not an error of the card's.
+            good = false;
+        }
+        if (!good) {
+            return (short) -1;
+        }
+        byte i = 1;
+        for (short at = 0; at < n; at += (short) 32) {
+            sealBlock(buf, e, i, buf, (short) 0, (short) 0);
+            for (short k = 0; k < (short) 32 && (short) (at + k) < n; k++) {
+                buf[(short) (ct + at + k)] ^= x[(short) (S_HASH + k)];
+            }
+            i++;
+        }
+        moveDown(buf, ct, e, n);
+        return n;
+    }
+
+    /**
+     * One block of a sealed command's sum, into x[S_HASH]: SHA-256("fedimintcard/seal1" || i (1) || the shared X (32) ||
+     * E (65) || the nonce (16) || the INS (1) || more). The shared point is in x[S_POINT], the INS in x[S_INS].
+     */
+    private void sealBlock(byte[] buf, short e, byte i, byte[] more, short moreAt, short moreLen) {
+        x[S_I] = i;
+        sha.reset();
+        sha.update(SEAL_LABEL, (short) 0, (short) SEAL_LABEL.length);
+        sha.update(x, S_I, (short) 1);
+        sha.update(x, (short) (S_POINT + 1), (short) 32);
+        sha.update(buf, e, E_LEN);
+        sha.update(nonce, (short) 0, NONCE_LEN);
+        sha.update(x, S_INS, (short) 1);
+        sha.doFinal(more, moreAt, moreLen, x, S_HASH);
+    }
+
+    /**
+     * The PIN block at buf[at] (its length, the PIN, zeros to eight) taken apart: the PIN moved down to `at` and its
+     * length returned; 6700 for a length that is not 4..8.
+     */
+    private static short unblockPin(byte[] buf, short at) {
+        short len = (short) (buf[at] & 0xFF);
+        if (len < PIN_MIN || len > PIN_MAX) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        moveDown(buf, (short) (at + 1), at, len);
+        return len;
+    }
+
+    /**
+     * An envelope that did not open, in VERIFY_PIN or CHANGE_PIN: a wrong try, as in Cashu's applet, so every
+     * envelope counts against the PIN's tries. Through {@link #tryPin}, so the try is counted with its wait
+     * before the compare and this selection's PIN session ends (the first SET_PIN's included). The PIN is shown eight
+     * random bytes.
+     */
+    private void openingFailed(byte[] buf) {
+        schnorr.random(buf, ISO7816.OFFSET_CDATA, (short) 8);
+        tryPin(buf, (short) 8);
+        // eight random bytes that were the PIN: the envelope still did not open
+        pin.reset();
+        ISOException.throwIt((short) (0x63C0 | pinMarks[PM_WRONG]));
+    }
+
+    /** The seal's room and the curve check's: nothing of a sealed command outlives it. */
+    private void forgetSeal() {
+        Util.arrayFillNonAtomic(x, (short) 0, X_LEN, (byte) 0);
+        Util.arrayFillNonAtomic(tmp, (short) 0, (short) tmp.length, (byte) 0);
+    }
+
+    /**
+     * 6A80 unless the 65 bytes at a[at] are a point of the curve in the 04 form: x and y under p, x^3 + 7 a square, and
+     * y one of its two roots. The field room is the APDU buffer's [FIELD, FIELD_END), x^3 + 7 is kept in tmp[0..32)
+     * between the two powers, and reduceModP works in x[X_RED..X_RED + 40).
+     */
+    private void requireFullPoint(byte[] a, short at) {
+        short py = (short) (at + 33);
+        requireFullForm(a, at);
+        curveSide(a, (short) (at + 1), a, FIELD);
+        Util.arrayCopyNonAtomic(a, (short) (FIELD + 96), tmp, (short) 0, (short) 32);
+        Util.arrayCopyNonAtomic(a, (short) (FIELD + 96), a, (short) (FIELD + 32), (short) 32);
+        if (!isSquareModP(a, FIELD)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        Util.arrayCopyNonAtomic(tmp, (short) 0, a, (short) (FIELD + 32), (short) 32);
+        powModP(rsaRoot, a, FIELD);
+        if ((short) (a[(short) (FIELD + 127)] & 1) != (short) (a[(short) (py + 31)] & 1)) {
+            negateModP(a, (short) (FIELD + 96));
+        }
+        if (!sameBytes(a, (short) (FIELD + 96), a, py, (short) 32)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+    }
+
+    /** 6A80 unless the 65 bytes at a[at] are 04, then an x under p and a y under p. */
+    private static void requireFullForm(byte[] a, short at) {
+        if (a[at] != (byte) 0x04
+            || SchnorrHW.cmp32(a, (short) (at + 1), Secp256k1.SECP256K1_P, (short) 0) >= 0
+            || SchnorrHW.cmp32(a, (short) (at + 33), Secp256k1.SECP256K1_P, (short) 0) >= 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+    }
+
+    /** x^3 + 7 mod p, for the x at a[xAt] (32 bytes, under p), into room[off + 96 .. off + 128): 128 bytes of room. */
+    private void curveSide(byte[] a, short xAt, byte[] room, short off) {
+        Util.arrayFillNonAtomic(room, off, (short) 32, (byte) 0);
+        Util.arrayCopyNonAtomic(a, xAt, room, (short) (off + 32), (short) 32);
+        powModP(rsaCube, room, off);
+        add7ModP(room, (short) (off + 96));
+    }
+
+    /** Euler's test of the value at room[off + 32 .. off + 64): true where it is a square mod p and not zero. */
+    private boolean isSquareModP(byte[] room, short off) {
+        powModP(rsaEuler, room, off);
+        return isZero(room, (short) (off + 96), (short) 31) && room[(short) (off + 127)] == (byte) 1;
+    }
+
+    /**
+     * The power of the 64 bytes at a[off] by the chip's RSA mod p*p, into a[off + 64 .. off + 128), then taken mod p:
+     * the answer is the last 32 of those 64.
+     */
+    private void powModP(RSAPrivateKey key, byte[] a, short off) {
+        rsa.init(key, Cipher.MODE_DECRYPT);
+        short out = (short) (off + 64);
+        short n = rsa.doFinal(a, off, (short) 64, a, out);
+        if (n < (short) 64) {
+            // an answer without its leading zeros (the simulator's): set right-aligned
+            Util.arrayCopyNonAtomic(a, out, a, (short) (out + 64 - n), n);
+            Util.arrayFillNonAtomic(a, out, (short) (64 - n), (byte) 0);
+        }
+        reduceModP(a, out, x, X_RED);
+    }
+
+    /** `k` made the 512-bit RSA key of one power mod p*p, exponent d. */
+    private static void fieldKey(RSAPrivateKey k, byte[] d) {
+        k.setModulus(RSA_PP, (short) 0, (short) 64);
+        k.setExponent(d, (short) 0, (short) d.length);
+    }
+
+    /**
+     * The 64-byte number at v[off] taken mod p, in place (the answer in its last 32 bytes). 2^256 is 2^32 + 977 mod p,
+     * so the high half times that, added to the low half, is the same number mod p and 223 bits shorter; twice over it
+     * is under 2^257, and then p is taken off while it is p or more. `w`: 40 bytes of working room.
+     */
+    private static void reduceModP(byte[] v, short off, byte[] w, short wOff) {
+        for (short pass = 0; pass < 2; pass++) {
+            Util.arrayFillNonAtomic(w, wOff, (short) 40, (byte) 0);
+            Util.arrayCopyNonAtomic(v, (short) (off + 32), w, (short) (wOff + 8), (short) 32);
+            mulAddByte(w, (short) (wOff + 36), v, off, (short) 32, (byte) 0x01);
+            mulAddByte(w, (short) (wOff + 40), v, off, (short) 32, (byte) 0xD1);
+            mulAddByte(w, (short) (wOff + 39), v, off, (short) 32, (byte) 0x03);
+            Util.arrayFillNonAtomic(v, off, (short) 24, (byte) 0);
+            Util.arrayCopyNonAtomic(w, wOff, v, (short) (off + 24), (short) 40);
+        }
+        while (!isZero(v, off, (short) 32) || SchnorrHW.cmp32(v, (short) (off + 32), Secp256k1.SECP256K1_P, (short) 0) >= 0) {
+            subP64(v, off);
+        }
+        Util.arrayFillNonAtomic(w, wOff, (short) 40, (byte) 0);
+    }
+
+    /** w, ending at `wEnd` (exclusive), += a (`len` bytes) times the byte m; the carry runs left as far as it goes. */
+    private static void mulAddByte(byte[] w, short wEnd, byte[] a, short aOff, short len, byte m) {
+        short mm = (short) (m & 0xFF);
+        short carry = 0;
+        short pos = (short) (wEnd - 1);
+        for (short i = (short) (len - 1); i >= 0; i--, pos--) {
+            short prod = (short) ((short) ((short) (a[(short) (aOff + i)] & 0xFF) * mm) + (short) (w[pos] & 0xFF) + carry);
+            w[pos] = (byte) (prod & 0xFF);
+            carry = (short) ((prod >> 8) & 0xFF);
+        }
+        while (carry != 0 && pos >= 0) {
+            short sum = (short) ((short) (w[pos] & 0xFF) + carry);
+            w[pos] = (byte) (sum & 0xFF);
+            carry = (short) ((sum >> 8) & 0xFF);
+            pos--;
+        }
+    }
+
+    /** v[off..off+64) -= p, as one 64-byte number. */
+    private static void subP64(byte[] v, short off) {
+        short borrow = SchnorrHW.sub32(v, (short) (off + 32), Secp256k1.SECP256K1_P, (short) 0, v, (short) (off + 32));
+        for (short i = (short) (off + 31); borrow != 0 && i >= off; i--) {
+            short d = (short) ((short) (v[i] & 0xFF) - borrow);
+            if (d < 0) {
+                d += (short) 256;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            v[i] = (byte) d;
+        }
+    }
+
+    /** The 32 bytes at off, under p: += 7, mod p. */
+    private static void add7ModP(byte[] v, short off) {
+        short carry = 7;
+        for (short i = 31; i >= 0 && carry != 0; i--) {
+            short sum = (short) ((short) (v[(short) (off + i)] & 0xFF) + carry);
+            v[(short) (off + i)] = (byte) (sum & 0xFF);
+            carry = (short) ((sum >> 8) & 0xFF);
+        }
+        if (SchnorrHW.cmp32(v, off, Secp256k1.SECP256K1_P, (short) 0) >= 0) {
+            SchnorrHW.sub32(v, off, Secp256k1.SECP256K1_P, (short) 0, v, off);
+        }
+    }
+
+    /** The 32 bytes at off, under p and not zero: p - v. */
+    private static void negateModP(byte[] v, short off) {
+        SchnorrHW.sub32(Secp256k1.SECP256K1_P, (short) 0, v, off, v, off);
+    }
+
+    /** `len` bytes moved from `from` down to `to` (to < from), a byte at a time: the two ranges may overlap. */
+    private static void moveDown(byte[] buf, short from, short to, short len) {
+        for (short k = 0; k < len; k++) {
+            buf[(short) (to + k)] = buf[(short) (from + k)];
+        }
+    }
+
+    /** Whether `len` bytes agree; every byte is read, whatever the first difference. */
+    private static boolean sameBytes(byte[] a, short aOff, byte[] b, short bOff, short len) {
+        byte d = 0;
+        for (short k = 0; k < len; k++) {
+            d |= (byte) (a[(short) (aOff + k)] ^ b[(short) (bOff + k)]);
+        }
+        return d == 0;
     }
 }

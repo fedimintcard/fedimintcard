@@ -16,10 +16,47 @@ use crate::{BridgeError, Card, SoftCard, StatusWord, Transport};
 /// Mainnet block 900000's header: real work, above the built floor, so a 4.0 card anchors on it.
 pub const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92";
 
-/// Make a fresh 4.0 card ready for its first SET_PIN in this selection, as set-up does: the test
-/// registry's key if it has none, then the anchor (SET_HEADER with [`H900000`]). The card must
+/// The test registry's certificate key ([`crate::v3::test_registry_key`]), hex SEC1: what a till
+/// in a test checks the cards [`ready_for_pin`] certified under.
+pub fn test_cert_key_hex() -> String {
+    hex::encode(crate::v3::registry_point(&crate::v3::test_registry_key()))
+}
+
+/// The test registry's trust in `card` ([`crate::trust_card`] under [`test_cert_key_hex`]).
+pub fn test_trust(card: &mut dyn Card) -> Result<crate::TrustedCard> {
+    crate::trust_card(card, &crate::v3::registry_point(&crate::v3::test_registry_key()))
+}
+
+/// The test PIN's session ([`crate::pin_from_env`]) on any card, as a till opens it: on applet
+/// 4.x sealed to the card checked under `cert_key` (hex-decoded SEC1, the registry a test's card
+/// was certified by). A card older than 4.0 gets the old-card refusal and no PIN, as at a till
+/// (P1 00 is the test-only `fedimint-card-old-card-pin`'s).
+pub fn open_test_session_under(card: &mut dyn Card, cert_key: &[u8]) -> Result<()> {
+    let v = card.applet_version()?;
+    if !v.is_current() {
+        return Err(anyhow::Error::new(crate::UnsupportedApplet::Old { answer: vec![v.major, v.minor] }).context(format!("applet {v}")));
+    }
+    let trust = crate::trust_card(card, cert_key)?;
+    crate::open_pin_session_held(card, &trust, &crate::pin_from_env(), &mut |_| {})
+}
+
+/// [`open_test_session_under`] the test registry's key ([`test_cert_key_hex`]).
+pub fn open_test_session(card: &mut dyn Card) -> Result<()> {
+    open_test_session_under(card, &crate::v3::registry_point(&crate::v3::test_registry_key()))
+}
+
+/// Make a fresh 4.0 card ready for its first SET_PIN in this selection, as set-up does: a certificate from the test registry
+/// if it has none, the test registry's key if it has none, then the anchor (SET_HEADER with [`H900000`]). The card must
 /// hold no value and no PIN.
 pub fn ready_for_pin(card: &mut dyn Card) -> Result<()> {
+    // The sealed PIN needs a certified attestation key: a card with no certificate gets one from
+    // the test registry, over slot 0's key (made here if the slot is empty).
+    if card.get_cert().is_err() {
+        let k0 = card.get_or_gen(0)?;
+        let w = card.attest_init()?;
+        let cert = crate::Certificate::sign(&crate::v3::test_registry_key(), &k0.serialize(), &w)?;
+        card.set_cert(&cert.to_bytes())?;
+    }
     if !card.get_state()?.registry_key {
         card.set_registry_key(&crate::v3::registry_point(&crate::v3::test_registry_key()))?;
     }
@@ -159,7 +196,7 @@ impl SoftMint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CardClient, SlotState, TEST_PIN, open_pin_session_with};
+    use crate::{CardClient, SlotState, TEST_PIN};
 
     #[test]
     fn a_soft_card_answers_through_a_transport_as_a_reader_would() {
@@ -173,7 +210,8 @@ mod tests {
         let e = c.sign(3, &[1; 32]).unwrap_err();
         assert_eq!(crate::status_word(&e), Some(crate::SW_NO_PIN_SET));
         ready_for_pin(&mut c).unwrap();
-        open_pin_session_with(&mut c, TEST_PIN).unwrap();
+        let t = test_trust(&mut c).unwrap();
+        crate::open_pin_session_held(&mut c, &t, TEST_PIN, &mut |_| {}).unwrap();
         assert_eq!(c.get_slot(3).unwrap().state, SlotState::Keyed);
     }
 

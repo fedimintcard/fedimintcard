@@ -71,7 +71,7 @@ import {
   INS_GET_PUB,
   INS_VERIFY_PIN,
   keyApdu,
-  pinApdu,
+  oldCardResetPinApdu,
   pinStatusApdu,
   selectApdu,
   SW_BLOCKED,
@@ -82,6 +82,7 @@ import {
   type PinStatus,
 } from './cardSetup';
 import {isCurrentApplet, readPinStatus, verifyPinHeld} from './cardSetup';
+import {TrustedCard} from './sealedPin';
 import {chipAndKeys, forget} from './installTap';
 import type {CardOps, ResetCheck, ResetCompletion, ResetRecorded} from './ops';
 import {shortIdOf} from './store';
@@ -297,6 +298,8 @@ export type Identified =
       readonly pin: PinStatus;
       /** The chip's CPLC id, which ops finds a card by when it has no row for the short id. */
       readonly chip: string;
+      /** The card's SELECT says it is older than 4.0: its reset sends the holder's PIN unprotected. */
+      readonly older: boolean;
     }
   | {
       readonly ok: false;
@@ -336,7 +339,7 @@ export async function identifyCard(tx: Transceiver): Promise<Identified> {
     }
     throw e;
   }
-  return {ok: true, shortId: shortIdOf(slot0.body), pin, chip};
+  return {ok: true, shortId: shortIdOf(slot0.body), pin, chip, older: !isCurrentApplet(selected)};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -402,6 +405,12 @@ export interface ResetTapOptions {
   readonly expectedChip?: string | null;
   /** The holder's PIN, typed for this tap only; null on the blocked path. */
   readonly holderPin: string | null;
+  /**
+   * The registry's certificate key (`GET /registry/cert-key`, 65 bytes), to
+   * check a 4.0 card before the holder's PIN is sealed to it. Null: a 4.0
+   * card's PIN cannot be sent, and the reset stops before it.
+   */
+  readonly certKey: readonly number[] | null;
   /** The operator confirmed the second warning for a blocked (or unset) PIN. */
   readonly blockedConfirmed: boolean;
   readonly ops: Pick<CardOps, 'managerKeys' | 'resetCheck'>;
@@ -461,7 +470,7 @@ async function consent(
   if (options.holderPin !== null) {
     const verified = await exchange(
       tx,
-      pinApdu(INS_VERIFY_PIN, options.holderPin),
+      oldCardResetPinApdu(INS_VERIFY_PIN, options.holderPin),
     );
     if (verified.sw === SW_OK) {
       return null;
@@ -516,7 +525,14 @@ async function consentCurrent(
   if (options.holderPin === null) {
     return {kind: 'pinRequired'};
   }
-  const verified = await verifyPinHeld(tx, options.holderPin, read.state.owed, options.onPinWait);
+  const trusted = await TrustedCard.check(apdu => exchange(tx, apdu), options.certKey);
+  if (!trusted.ok) {
+    return {kind: 'refused', sw: trusted.sw, reason: trusted.reason};
+  }
+  const verified = await verifyPinHeld(tx, trusted.trust, options.holderPin, read.state.owed, options.onPinWait);
+  if (verified.refused !== undefined) {
+    return {kind: 'refused', sw: verified.sw, reason: verified.refused};
+  }
   if (verified.sw === SW_OK) {
     return null;
   }

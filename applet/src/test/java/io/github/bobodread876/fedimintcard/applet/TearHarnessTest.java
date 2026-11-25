@@ -60,20 +60,45 @@ class TearHarnessTest {
             applet = rt.appletAt(aid);
             TearHook.attach(applet);
             select();
+            // the provisioning a sealed SET_PIN needs: the PIN key (ATTEST_INIT) and a certificate (GET_NONCE)
+            assertEquals(0x9000, tx(0x30, 0, null).getSW(), "ATTEST_INIT");
+            assertEquals(0x9000, tx(0x31, 0, new byte[] { (byte) 0xCE, (byte) 0xCE }).getSW(), "SET_CERT");
         }
 
+        /** The host's side of the sealed PIN (Sealer): a test's P1 00 PIN commands go sealed. */
+        final Sealer sealer = new Sealer(this::send);
+        /** Whether a sweep tears GET_NONCE too; otherwise its writes are neither counted nor torn. */
+        boolean sweepNonce;
+
         void select() {
+            sealer.forget();
             assertEquals(0x9000, sim.transmitCommand(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, Bip340.hex(AID_HEX))).getSW());
         }
 
         ResponseAPDU tx(int ins, int p1, byte[] data) {
+            return sealer.send(CLA, ins, p1, 0, data);
+        }
+
+        ResponseAPDU send(CommandAPDU c) {
+            boolean aside = c.getINS() == Sealer.GET_NONCE && !sweepNonce;
+            int count = TearHook.count, target = TearHook.target;
+            List<String> trace = TearHook.trace;
+            if (aside) {
+                TearHook.target = 0;
+                TearHook.trace = null;
+            }
             TearHook.refresh();
-            ResponseAPDU r = sim.transmitCommand(data == null ? new CommandAPDU(CLA, ins, p1, 0) : new CommandAPDU(CLA, ins, p1, 0, data));
+            ResponseAPDU r = sim.transmitCommand(c);
             if (TearHook.depth > 0 && TearHook.tornAt == null) {
                 // a command that left process() with a transaction open: a chip rolls it back
-                TearHook.leftOpen.add(String.format("INS %02X answered %04X", ins, r.getSW()));
+                TearHook.leftOpen.add(String.format("INS %02X answered %04X", c.getINS(), r.getSW()));
                 TearHook.rollback();
                 rt.clearTx();
+            }
+            if (aside) {
+                TearHook.count = count;
+                TearHook.target = target;
+                TearHook.trace = trace;
             }
             return r;
         }

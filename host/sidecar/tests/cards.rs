@@ -94,6 +94,10 @@ impl Card for Shared {
     fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.0.borrow_mut().apdu(apdu)
     }
+    // What the card's SELECT answers, as a till's transport reads it.
+    fn applet_version(&mut self) -> anyhow::Result<fedimint_card_host_card::AppletVersion> {
+        self.0.borrow_mut().applet_version()
+    }
 }
 
 /// Build the till handle over `f`, and return it with the actor future the caller must poll.
@@ -181,19 +185,38 @@ async fn precheck_on_an_installed_card_reports_keys_and_refuses_replace() -> any
     Ok(())
 }
 
+/// `f` as a till for a 4.0 card: it checks the card under the test registry's certificate key
+/// and holds a recent header.
+fn till_for_v4(f: Fx) -> anyhow::Result<Fx> {
+    let Fx { _fed, cw, _dir } = f;
+    let mut cw = cw.with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
+    let headers = fedimint_card_sidecar::clock::Headers::new(None, _dir.path());
+    headers.offer(hex::decode(H900000)?.try_into().unwrap())?;
+    cw.headers = Some(headers);
+    Ok(Fx { _fed, cw, _dir })
+}
+
+/// Bitcoin block 900,000's header: the till's newest, which anchors the card's clock.
+const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn key_setup_is_idempotent() -> anyhow::Result<()> {
-    let (shared, card) = blank_card();
-    let f = fx_with(card, Amount::from_sats(10_000)).await?;
+    // A 4.0 card keyed by this wallet, then certified by the test registry over slot 0's key,
+    // given the registry's key and anchored, as before its first PIN.
+    let shared = Rc::new(RefCell::new(SoftCard::v4()));
+    let mut f = fx_with(Box::new(Shared(shared.clone())), Amount::from_sats(10_000)).await?;
+    installed_card(&mut f);
+    fedimint_card_host_card::softkit::ready_for_pin(&mut *shared.borrow_mut())?;
+    let f = till_for_v4(f)?;
     let (h, actor) = serve(f, shared.clone()).await;
     let mut actor = Box::pin(actor);
 
     let (code, first) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
     assert_eq!(code, 200, "{first}");
-    assert_eq!(first["keys"].as_array().unwrap().len(), 32, "a 2.1 card registers 32 keys");
+    assert_eq!(first["keys"].as_array().unwrap().len(), 32, "a 4.0 card registers 32 keys");
     assert_eq!(first["pin_set"], true, "{first}");
     assert_eq!(first["pin"], "set_now");
-    assert_eq!(first["generated"], serde_json::json!((0..32).collect::<Vec<u8>>()));
+    assert_eq!(first["generated"], serde_json::json!([]), "every slot was keyed before the certificate");
     let short = first["short_id"].as_str().unwrap().to_string();
     assert_eq!(short.len(), 8);
 
@@ -208,34 +231,29 @@ async fn key_setup_is_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A 2.0 card (eight slots, like prod card `15989f91`): precheck reports its size, and key setup
-/// keys and registers eight slots without reading slot 8's `6B00` as a foreign key.
+/// The till's PIN set-up takes no card older than 4.0: a 2.0 card with eight slots (precheck
+/// still reports its size), a 2.1 card and a 3.0 card each get 409 `old_card` from `keySetup`,
+/// and no PIN command reaches them, sealed or not.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_eight_slot_card_is_set_up_with_eight_keys() -> anyhow::Result<()> {
-    let shared = Rc::new(RefCell::new(SoftCard::with_slots(8)));
-    let f = fx_with(Box::new(Shared(shared.clone())), Amount::from_sats(10_000)).await?;
-    let (h, actor) = serve(f, shared.clone()).await;
-    let mut actor = Box::pin(actor);
+async fn key_setup_refuses_an_older_card_before_any_pin_command() -> anyhow::Result<()> {
+    for (which, old) in [("2.0 with eight slots", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+        let eight = old.slot_len() == 8;
+        let shared = Rc::new(RefCell::new(old));
+        let f = fx_with(Box::new(Shared(shared.clone())), Amount::from_sats(10_000)).await?;
+        let (h, actor) = serve(f, shared.clone()).await;
+        let mut actor = Box::pin(actor);
 
-    let (code, pre) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/precheck", "");
-    assert_eq!(code, 200, "{pre}");
-    assert_eq!(pre["kind"], "blank", "{pre}");
-    assert_eq!(pre["slots"], 8, "{pre}");
-    assert_eq!(pre["empty_slots"], serde_json::json!((0..8).collect::<Vec<u8>>()));
-
-    let (code, first) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
-    assert_eq!(code, 200, "{first}");
-    assert_eq!(first["keys"].as_array().unwrap().len(), 8);
-    assert_eq!(first["generated"], serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7]));
-    let (code, second) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
-    assert_eq!(code, 200, "{second}");
-    assert_eq!(second["keys"], first["keys"]);
-    assert_eq!(second["generated"], serde_json::json!([]));
-
-    let (code, pre) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/precheck", "");
-    assert_eq!(code, 200, "{pre}");
-    assert_eq!(pre["kind"], "installed", "{pre}");
-    assert_eq!(pre["slots"], 8);
+        if eight {
+            let (code, pre) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/precheck", "");
+            assert_eq!(code, 200, "{pre}");
+            assert_eq!(pre["slots"], 8, "{pre}");
+        }
+        let (code, body) = call_with_actor!(&mut actor, h, "POST", "/v1/cards/keySetup", r#"{"pin":"1234"}"#);
+        assert_eq!((code, body["error"].as_str()), (409, Some("old_card")), "{which}: {body}");
+        assert_eq!(body["detail"].as_str(), Some(fedimint_card_host_card::OLD_CARD_MESSAGE), "{which}: {body}");
+        let c = shared.borrow();
+        assert!(!c.heard_a_pin_command(), "{which}: the card received {:02x?}", c.received_ins());
+    }
     Ok(())
 }
 

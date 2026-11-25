@@ -4,10 +4,12 @@
 //! `CARD_BACKEND` like everywhere else (soft by default). Real cards persist keys across tests, so
 //! run a pcsc pass with `--test-threads=1`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Duration;
 
-use fedimint_card_host_card::{Card, SLOTS, SoftCard, open_from_env, open_pin_session};
+use fedimint_card_host_card::{Card, SLOTS, SoftCard, open_from_env};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, nonce_for, on_card};
 use fedimint_card_sidecar::plan;
 use fedimint_card_sidecar::state::{HostKind, NoteStatus, StateStore};
@@ -48,8 +50,68 @@ async fn fund(client: &ClientHandleArc, amount: Amount) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cw.topup`, and on a 4.x card (the bridge's applet) the registry this suite does not have,
+/// stood in for as `till_service.rs` `load` does: each new note signed under the test registry
+/// key the card was set up with, then written to the card. A 2.1 card (the soft backend here)
+/// takes its notes as before.
+async fn topup(cw: &mut CardWallet, amounts: &[u64]) -> anyhow::Result<Vec<(u8, u64)>> {
+    let done = cw.topup(amounts).await?;
+    registry_signs(cw)?;
+    Ok(done)
+}
+
+/// The registry this suite does not have, on a 4.x card: every note the card holds without the
+/// registry's signature (a load's notes, and a spend's change) is signed under the test registry
+/// key and written to the card, as ops does for a till (`till_service.rs` `load`).
+fn registry_signs(cw: &mut CardWallet) -> anyhow::Result<()> {
+    if on_card(|| cw.card.applet_version())?.is_current() {
+        let key = fedimint_card_host_card::v3::test_registry_key();
+        for n in cw.store.state.notes.iter_mut().filter(|n| n.reg_sig.is_none() && n.signature.is_some()) {
+            let x: [u8; 32] = hex::decode(&n.nonce[2..])?.try_into().unwrap();
+            let sig48 = fedimint_card_sidecar::glue::sig48_of(n.signature.as_deref().unwrap()).unwrap();
+            n.reg_sig = Some(hex::encode(fedimint_card_host_card::v3::sign_note(&key, &x, n.amount_msat, &sig48)));
+        }
+        cw.store.save()?;
+        cw.sync_card_notes();
+    }
+    Ok(())
+}
+
+/// A persistent card (`CARD_BACKEND` bridge or pcsc) for the fixture. The bridge's jCardSim card
+/// is reset first, so every fixture starts from a blank applet, and a 4.0 card without a
+/// certificate is then set up as the Setup app leaves one before its PIN
+/// ([`softkit::ready_for_pin`](fedimint_card_host_card::softkit::ready_for_pin): certified by the
+/// test registry, its key, the anchor); the fixture's `open_test_session` sets the PIN, sealed. A
+/// pcsc card is taken as it is.
+fn persistent_card() -> anyhow::Result<Box<dyn Card>> {
+    if std::env::var("CARD_BACKEND").as_deref() == Ok("bridge") {
+        fedimint_card_host_card::BridgeTransport::new(&fedimint_card_host_card::bridge::url_from_env()).reset()?;
+    }
+    let mut card = open_from_env()?;
+    if card.applet_version()?.is_current() && card.get_cert().is_err() {
+        fedimint_card_host_card::softkit::ready_for_pin(card.as_mut())?;
+    }
+    Ok(card)
+}
+
+/// Whether the fixture re-keys the card (`card_setup(true)`): only a pcsc card, which keeps keys
+/// from earlier runs. The reset bridge card is blank, and a certified 4.x card refuses a re-key of
+/// slot 0 by design.
+fn rekey_backend() -> bool {
+    std::env::var("CARD_BACKEND").as_deref() == Ok("pcsc")
+}
+
 async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
-    fx_card(fees, funds, open_from_env()?).await
+    let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
+    fx_card(fees, funds, if soft { soft_v4()? } else { persistent_card()? }).await
+}
+
+/// The soft backend's card: a 4.0 SoftCard ready for its first PIN (certified by the test
+/// registry, its key, the anchor). The till sends no PIN to a card older than 4.0.
+fn soft_v4() -> anyhow::Result<Box<dyn Card>> {
+    let mut card: Box<dyn Card> = Box::new(SoftCard::v4());
+    fedimint_card_host_card::softkit::ready_for_pin(card.as_mut())?;
+    Ok(card)
 }
 
 /// [`fx`] on a card of the caller's choosing, such as a soft 2.0 card with eight slots.
@@ -69,14 +131,15 @@ async fn fx_card(fees: bool, funds: Amount, card: Box<dyn Card>) -> anyhow::Resu
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let mut cw = CardWallet::new(wallet, store, card);
+    let mut cw = CardWallet::new(wallet, store, card).with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     on_card(|| ()); // keep the helper exercised on every backend
     // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
     // behaves like a new one.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
-    cw.card_setup(!soft)?;
+    cw.card_setup(!soft && rekey_backend())?;
     // SIGN needs a PIN on the card and this selection's VERIFY_PIN; card_setup does not open one.
-    open_pin_session(cw.card.as_mut())?;
+    // It is sealed: a card older than 4.0 gets the old-card refusal here, before any PIN.
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
     Ok(Fx { fed, cw, _dir: dir })
 }
 
@@ -99,7 +162,7 @@ async fn topup_to_card_key_verifies() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     let before = f.cw.wallet.balance_msat().await?;
     // 0b1010: two notes, 2^3 and 2^1 ... use real sizes: 2^17 + 2^15.
-    let done = f.cw.topup(&[(1 << 17) + (1 << 15)]).await?;
+    let done = topup(&mut f.cw, &[(1 << 17) + (1 << 15)]).await?;
     assert_eq!(done.len(), 2);
 
     let st = &f.cw.store.state;
@@ -133,8 +196,11 @@ fn hex_of(b: [u8; 33]) -> String {
 /// One spend with the card signature; checks the accounting identity to the msat.
 async fn spend_exact(fees: bool) -> anyhow::Result<()> {
     let mut f = fx(fees, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
-    let old_slot_key = f.cw.store.state.slot_pubkey(0).unwrap().to_owned();
+    topup(&mut f.cw, &[1 << 20]).await?;
+    // On applet 4.0 slot 0 holds the certified attestation key and takes no load: the note is in
+    // the first load slot.
+    let in_slot = f.cw.store.state.live_notes()[0].slot;
+    let old_slot_key = f.cw.store.state.slot_pubkey(in_slot).unwrap().to_owned();
     let till_before = f.cw.wallet.balance_msat().await?;
 
     let price = 100_000;
@@ -170,8 +236,8 @@ async fn spend_exact(fees: bool) -> anyhow::Result<()> {
     let st = &f.cw.store.state;
     assert_eq!(st.live_total_msat(), change);
     assert_eq!(st.live_notes().len(), r.change.len());
-    assert_eq!(r.renewed_slots, vec![0], "input slot renewed");
-    assert_ne!(st.slot_pubkey(0).unwrap(), old_slot_key, "slot 0 has a fresh key");
+    assert_eq!(r.renewed_slots, vec![in_slot], "input slot renewed");
+    assert_ne!(st.slot_pubkey(in_slot).unwrap(), old_slot_key, "the input slot has a fresh key");
     let spent = st.notes.iter().filter(|n| n.status == NoteStatus::Spent).count();
     assert_eq!(spent, 1);
 
@@ -195,8 +261,9 @@ async fn spend_with_card_signature_is_exact_fees_off() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn change_note_is_spendable() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 17]).await?;
+    topup(&mut f.cw, &[1 << 17]).await?;
     let r1 = f.cw.spend(100_000).await?;
+    registry_signs(&mut f.cw)?;
     let change1: u64 = r1.change.iter().map(|(_, a)| a).sum();
     assert!(change1 > 0);
     let live_before: Vec<String> = f.cw.store.state.live_notes().iter().map(|n| n.nonce.clone()).collect();
@@ -222,7 +289,7 @@ async fn change_note_is_spendable() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn cashout_produces_ecash_the_stock_client_reissues() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 18]).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
     let slot = f.cw.store.state.live_notes()[0].slot;
 
     let r = f.cw.cashout(slot).await?;
@@ -270,7 +337,7 @@ async fn cashout_produces_ecash_the_stock_client_reissues() -> anyhow::Result<()
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_key_signature_is_rejected() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 18]).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
     let note_rec = f.cw.store.state.live_notes()[0].clone();
     let other_slot = f.cw.store.state.free_slots()[0];
     let mint_id = f.cw.wallet.mint_id;
@@ -292,10 +359,13 @@ async fn wrong_key_signature_is_rejected() -> anyhow::Result<()> {
     };
     let digest = tx.tx_hash().to_byte_array();
 
-    // Signed by another key on the card, and by a key the host made up: both rejected.
-    let wrong_card = on_card(|| f.cw.card.sign(other_slot, &digest))?;
+    // Another key on the card: applet 4.0 signs only with a slot holding its note, so the card
+    // itself refuses (6985) and no wrong signature exists. A key the host made up: the federation
+    // rejects it.
+    let wrong_card = on_card(|| f.cw.card.sign(other_slot, &digest)).expect_err("a slot with no note does not sign");
+    assert_eq!(fedimint_card_host_card::status_word(&wrong_card), Some(0x6985), "{wrong_card:#}");
     let wrong_host = SECP256K1.sign_schnorr(&Message::from_digest(digest), &throwaway);
-    for bad in [wrong_card, wrong_host] {
+    for bad in [wrong_host] {
         tx.signatures = TransactionSignature::NaiveMultisig(vec![bad]);
         let client = &f.cw.wallet.client;
         let TransactionSubmissionOutcome(res) = client.api().submit_transaction(tx.clone()).await.try_into_inner(client.decoders())?;
@@ -314,7 +384,7 @@ async fn wrong_key_signature_is_rejected() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn state_file_survives_a_restart() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 18]).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
     f.cw.spend(30_000).await?;
     let path = f.cw.store.path().to_owned();
     let state = f.cw.store.state.clone();
@@ -339,7 +409,7 @@ async fn state_file_survives_a_restart() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_fails_cleanly_when_card_cannot_cover_it() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 16]).await?;
+    topup(&mut f.cw, &[1 << 16]).await?;
     let err = f.cw.spend(1 << 20).await.expect_err("insufficient");
     assert!(err.to_string().contains("insufficient"), "{err}");
     assert_eq!(f.cw.store.state.live_total_msat(), 1 << 16, "nothing was touched");
@@ -357,11 +427,12 @@ fn restart(f: &mut Fx) -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_signed_but_not_submitted_is_abandoned() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     let before = f.cw.store.state.live_total_msat();
 
     f.cw.crash_point = Some(CrashPoint::BeforeSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
+    let signed_slot = f.cw.store.state.live_notes()[0].slot;
     // The crash left records for a transaction that never left the host.
     let st = &f.cw.store.state;
     assert_eq!(st.pending_txs.len(), 1);
@@ -377,8 +448,17 @@ async fn spend_signed_but_not_submitted_is_abandoned() -> anyhow::Result<()> {
     assert!(st.pending_txs.is_empty() && st.host_pending.is_empty());
     assert!(!st.notes.iter().any(|n| n.status == NoteStatus::Pending));
     assert_eq!(st.live_total_msat(), before, "the input note is untouched");
-    // And the card is usable again.
-    f.cw.spend(100_000).await?;
+    // A 4.0 slot signs once: the slot that signed the abandoned transaction signs no other, so
+    // its note cannot pay a new one, and the refusal records nothing.
+    let err = f.cw.spend(100_000).await.expect_err("the slot signed another transaction");
+    assert!(err.to_string().contains("has already signed another transaction"), "{err:#}");
+    let st = &f.cw.store.state;
+    assert!(st.pending_txs.is_empty() && st.host_pending.is_empty());
+    assert_eq!(st.live_total_msat(), before);
+    // And the card is usable again: it takes a new load, which pays.
+    topup(&mut f.cw, &[1 << 18]).await?;
+    let r = f.cw.spend(100_000).await?;
+    assert!(r.inputs.iter().all(|(slot, _)| *slot != signed_slot), "{r:?}");
     drop(f.fed);
     Ok(())
 }
@@ -386,7 +466,7 @@ async fn spend_signed_but_not_submitted_is_abandoned() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_accepted_but_not_collected_is_collected_by_out_idx() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     let till_before = f.cw.wallet.balance_msat().await?;
 
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
@@ -417,7 +497,7 @@ async fn spend_accepted_but_not_collected_is_collected_by_out_idx() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn undecided_submission_is_resubmitted_idempotently() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
     // Pretend the answer never arrived: submitted, not known to be accepted.
@@ -435,7 +515,7 @@ async fn undecided_submission_is_resubmitted_idempotently() -> anyhow::Result<()
 #[tokio::test(flavor = "multi_thread")]
 async fn cashout_interrupted_after_submit_ends_in_the_wallet() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 18]).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
     let slot = f.cw.store.state.live_notes()[0].slot;
     let wallet_before = f.cw.wallet.balance_msat().await?;
 
@@ -464,7 +544,7 @@ async fn cashout_interrupted_after_submit_ends_in_the_wallet() -> anyhow::Result
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_cashout_records_go_to_the_log_before_they_are_removed() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
     // Rewrite the host records the way an older build left them.
@@ -505,7 +585,7 @@ async fn export_never_rounds_up_silently() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn topup_rejects_dust_amounts() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let err = f.cw.topup(&[1000]).await.expect_err("not a multiple of 512");
+    let err = topup(&mut f.cw, &[1000]).await.expect_err("not a multiple of 512");
     assert!(err.to_string().contains("multiples of 512"), "{err}");
     drop(f.fed);
     Ok(())
@@ -525,7 +605,7 @@ fn store_tx(f: &mut Fx, tx: &Transaction) -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn rejected_resubmission_does_not_abandon_a_confirmed_original() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
     // The stored bytes now describe a different transaction (new txid, same input): resubmitting
@@ -548,7 +628,7 @@ async fn rejected_resubmission_does_not_abandon_a_confirmed_original() -> anyhow
 #[tokio::test(flavor = "multi_thread")]
 async fn rejected_resubmission_with_an_unspent_input_is_abandoned() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 20]).await?;
+    topup(&mut f.cw, &[1 << 20]).await?;
     let before = f.cw.store.state.live_total_msat();
     f.cw.crash_point = Some(CrashPoint::BeforeSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
@@ -571,13 +651,23 @@ async fn rejected_resubmission_with_an_unspent_input_is_abandoned() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 17]).await?;
+    topup(&mut f.cw, &[1 << 17]).await?;
     let spent_slot = f.cw.store.state.live_notes()[0].slot;
     f.cw.crash_point = Some(CrashPoint::AfterSubmit);
     assert!(f.cw.spend(100_000).await.is_err());
     restart(&mut f)?;
-    // No `balance` first: the spend itself must recover, mark the old note spent, and plan from
-    // the change only.
+    // No `balance` first: the spend itself must recover and mark the old note spent. On a 4.0 card
+    // the change it then holds waits for the registry's signature, so this spend finds nothing to
+    // pay with: the spent note is not planned again.
+    let err = f.cw.spend(10_000).await.expect_err("only change waiting for the registry");
+    assert!(err.to_string().contains("insufficient funds on the card: have 0 msat"), "{err:#}");
+    assert!(f.cw.store.state.pending_txs.is_empty(), "recovered");
+    assert!(
+        f.cw.store.state.notes.iter().filter(|n| n.slot == spent_slot).all(|n| n.status != NoteStatus::Live),
+        "the spent note is not live"
+    );
+    // Once the registry has signed the change, the spend plans from the change only.
+    registry_signs(&mut f.cw)?;
     let r = f.cw.spend(10_000).await?;
     assert!(r.inputs.iter().all(|(slot, _)| *slot != spent_slot), "{r:?}");
     assert!(f.cw.store.state.pending_txs.is_empty());
@@ -589,70 +679,133 @@ async fn spend_right_after_a_crash_does_not_replan_the_spent_note() -> anyhow::R
 async fn slot_limits_follow_the_card_size() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     assert_eq!(SLOTS, 32);
-    // Loads take slots 0 to 23; 24 to 31 are for offline change.
-    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (24, 8));
-    f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
-    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (21, 8));
+    // Loads take slots 1 to 23 (applet 4.0: slot 0 holds the certified attestation key); 24 to 31
+    // are for offline change.
+    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (23, 8));
+    topup(&mut f.cw, &[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
+    assert_eq!((f.cw.store.state.free_slots().len(), f.cw.store.state.free_change_slots().len()), (20, 8));
     drop(f.fed);
     Ok(())
 }
 
-/// A 2.0 card (prod card `15989f91` is one): the slot walk stops at its 6B00, so the wallet sees
-/// eight slots, loads and charges as before, and refuses a load that needs more notes than that.
+/// The card as the till's opener hands it over, shared with the test so it can read what the
+/// card received.
+struct Shared(Rc<RefCell<SoftCard>>);
+
+impl Card for Shared {
+    fn gen_key(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key(slot)
+    }
+    fn gen_key_overwrite(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().gen_key_overwrite(slot)
+    }
+    fn get_pub(&mut self, slot: u8) -> anyhow::Result<XOnlyPublicKey> {
+        self.0.borrow_mut().get_pub(slot)
+    }
+    fn sign(&mut self, slot: u8, msg32: &[u8; 32]) -> anyhow::Result<fedimint_core::secp256k1::schnorr::Signature> {
+        self.0.borrow_mut().sign(slot, msg32)
+    }
+    fn apdu(&mut self, apdu: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.borrow_mut().apdu(apdu)
+    }
+    // What the card's SELECT answers, as a till's transport reads it.
+    fn applet_version(&mut self) -> anyhow::Result<fedimint_card_host_card::AppletVersion> {
+        self.0.borrow_mut().applet_version()
+    }
+}
+
+/// A card older than 4.0 (a 2.0 card with eight slots, a 2.1 card, a 3.0 card), keyed and with
+/// its PIN as such a card carries them: a top-up, the PIN session a sale opens and the sale itself
+/// get the old-card refusal (409 `old_card`). The top-up sends the card no command and records no
+/// note; no PIN command reaches the card, sealed or not; the refused sale records nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_eight_slot_card_behaves_as_before() -> anyhow::Result<()> {
-    let mut f = fx_card(false, Amount::from_sats(60_000), Box::new(SoftCard::with_slots(8))).await?;
-    let slots: Vec<u8> = f.cw.store.state.slots.iter().map(|s| s.slot).collect();
-    assert_eq!(slots, (0..8).collect::<Vec<u8>>(), "one key per slot the card has, no more");
-    assert_eq!(f.cw.store.state.free_slots().len(), 8);
-    // A repeat setup finds the same eight keys and does not trip over slot 8.
-    assert_eq!(f.cw.card_setup(false)?.len(), 8);
-
-    // 50,000 sats is twelve notes: more than the card can hold, so nothing is issued.
-    let err = f.cw.topup(&[50_000_000]).await.expect_err("twelve notes on eight slots");
-    assert!(matches!(err.downcast_ref::<plan::PlanError>(), Some(plan::PlanError::NoFreeSlots { need: 12, free: 8 })), "{err:#}");
-    assert_eq!(f.cw.store.state.live_total_msat(), 0);
-
-    f.cw.topup(&[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
-    assert_eq!(f.cw.store.state.free_slots().len(), 5);
-    let r = f.cw.spend(100_000).await?;
-    assert!(r.inputs.iter().chain(&r.change).all(|(slot, _)| *slot < 8), "{r:?}");
+async fn an_older_card_is_refused_before_any_pin_command() -> anyhow::Result<()> {
+    let f = fx(true, Amount::from_sats(10_000)).await?;
+    for (which, old) in [("2.0 with eight slots", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+        let card = Rc::new(RefCell::new(old));
+        {
+            let mut c = card.borrow_mut();
+            for slot in 0..c.slot_len() {
+                c.gen_key(slot)?;
+            }
+            if !c.version().sign_once() {
+                fedimint_card_old_card_pin::open_pin_session(&mut *c)?;
+            }
+            c.forget_received();
+        }
+        let dir = tempfile::tempdir()?;
+        let store = StateStore::open(dir.path().join("card_state.json"))?;
+        let mut cw = CardWallet::new(f.cw.wallet.clone(), store, Box::new(Shared(card.clone())))
+            .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
+        cw.pin = Some(b"1234".to_vec());
+        let e = cw.verify_pin_session().expect_err(which);
+        assert!(fedimint_card_host_card::is_old_card(&e), "{which}: {e:#}");
+        cw.card_setup(false)?;
+        card.borrow_mut().forget_received();
+        let e = cw.topup(&[1 << 18]).await.expect_err(which);
+        assert!(fedimint_card_host_card::is_old_card(&e), "{which}: {e:#}");
+        assert!(card.borrow().received_ins().is_empty(), "{which}: the top-up sent {:02x?}", card.borrow().received_ins());
+        assert!(cw.store.state.notes.is_empty(), "{which}: the top-up recorded no note");
+        let live = cw.store.state.live_total_msat();
+        let e = cw.spend(10_000).await.expect_err(which);
+        assert!(fedimint_card_host_card::is_old_card(&e), "{which}: {e:#}");
+        let c = card.borrow();
+        assert!(!c.heard_a_pin_command(), "{which}: the card received {:02x?}", c.received_ins());
+        assert!(cw.store.state.pending_txs.is_empty() && cw.store.state.live_total_msat() == live, "{which}: nothing recorded");
+    }
     drop(f.fed);
     Ok(())
 }
 
-/// A fresh 2.1 card: 32 keys, and a 50,000-sat load (twelve notes) fits with room to spare.
+/// A fresh 4.0 card: 32 keys, and a 50,000-sat load (twelve notes) fits with room to spare.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_50k_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
-    let mut f = fx_card(false, Amount::from_sats(60_000), Box::new(SoftCard::new())).await?;
+    let mut f = fx(false, Amount::from_sats(60_000)).await?;
     assert_eq!(f.cw.store.state.slots.len(), 32, "a key in every slot");
-    assert_eq!(f.cw.store.state.free_slots().len(), 24, "slots 0 to 23 take loads");
+    assert_eq!(f.cw.store.state.free_slots().len(), 23, "slots 1 to 23 take loads");
     assert_eq!(plan::binary(50_000_000).len(), 12);
-    let notes = f.cw.topup(&[50_000_000]).await?;
+    let notes = topup(&mut f.cw, &[50_000_000]).await?;
     assert_eq!(notes.len(), 12);
     assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000);
-    assert_eq!(f.cw.store.state.free_slots().len(), 12);
-    // And it spends: the change lands in slots past the old eighth.
+    assert_eq!(f.cw.store.state.free_slots().len(), 11);
+    // And it spends: the change lands in slots past the eighth.
     let r = f.cw.spend(12_345_000).await?;
     assert_eq!(f.cw.store.state.live_total_msat(), 50_000_000 - 12_345_000 - r.overpay_msat, "{r:?}");
     drop(f.fed);
     Ok(())
 }
 
+fn slot_keys(cw: &CardWallet) -> Vec<String> {
+    cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect()
+}
+
+/// `--fresh` replaces every key of a 4.0 card not yet certified, and refuses while the state file
+/// holds a live note. A certified card keeps slot 0, whose key its certificate names: there
+/// `--fresh` is refused and no key changes.
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_setup_rekeys_and_refuses_with_live_notes() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let old: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
-    f.cw.card_setup(true)?;
-    let new: Vec<String> = f.cw.store.state.slots.iter().map(|s| s.pubkey.clone()).collect();
+    let certified = slot_keys(&f.cw);
+    let err = f.cw.card_setup(true).expect_err("a certified card keeps slot 0");
+    assert!(err.to_string().contains("re-key slot 0"), "{err}");
+    assert_eq!(slot_keys(&f.cw), certified, "no key changed");
+
+    let dir = tempfile::tempdir()?;
+    let mut cw = CardWallet::new(f.cw.wallet.clone(), StateStore::open(dir.path().join("card_state.json"))?, Box::new(SoftCard::v4()));
+    cw.card_setup(false)?;
+    let old = slot_keys(&cw);
+    cw.card_setup(true)?;
+    let new = slot_keys(&cw);
     assert_eq!(new.len(), SLOTS as usize);
     assert!(old.iter().zip(&new).all(|(a, b)| a != b), "every slot has a new key");
-    assert_eq!(f.cw.store.state.free_slots().len() + f.cw.store.state.free_change_slots().len(), SLOTS as usize);
-    f.cw.topup(&[1 << 18]).await?;
-    let err = f.cw.card_setup(true).expect_err("live note");
+    assert_eq!(cw.store.state.free_slots().len() + cw.store.state.free_change_slots().len(), SLOTS as usize);
+
+    // A live note in the state file: `--fresh` would destroy its key, so it is refused.
+    topup(&mut f.cw, &[1 << 18]).await?;
+    cw.store.state.notes = f.cw.store.state.notes.clone();
+    let err = cw.card_setup(true).expect_err("live note");
     assert!(err.to_string().contains("live or pending"), "{err}");
-    // Nothing was touched.
-    assert_eq!(f.cw.store.state.live_total_msat(), 1 << 18);
+    assert_eq!(slot_keys(&cw), new, "nothing was touched");
     drop(f.fed);
     Ok(())
 }
@@ -661,20 +814,21 @@ async fn fresh_setup_rekeys_and_refuses_with_live_notes() -> anyhow::Result<()> 
 async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     // A card whose slots all hold keys this state file never saw.
-    let mut card = open_from_env()?;
+    let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
+    let mut card = if soft { soft_v4()? } else { persistent_card()? };
     let mut foreign = vec![];
     for slot in 0..SLOTS {
         foreign.push(on_card(|| card.get_or_gen(slot))?.to_string());
     }
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    f.cw = CardWallet::new(f.cw.wallet.clone(), store, card);
+    f.cw = CardWallet::new(f.cw.wallet.clone(), store, card).with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     f.cw.card_setup(false)?;
-    open_pin_session(f.cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
     assert!(f.cw.store.state.free_slots().is_empty(), "unknown keys are not free");
     assert_eq!(f.cw.store.state.overwritable_slots().len(), SLOTS as usize);
 
-    f.cw.topup(&[1 << 18]).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
     let used = f.cw.store.state.live_notes()[0].slot;
     assert_ne!(f.cw.store.state.slot_pubkey(used).unwrap(), foreign[used as usize], "the old key was replaced");
     assert!(f.cw.store.state.notes.iter().all(|n| !foreign.iter().any(|k| n.nonce.ends_with(k.as_str()))));
@@ -688,7 +842,7 @@ async fn keys_of_unknown_provenance_are_renewed_lazily_never_used() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spent_slot_is_renewed_only_once_the_federation_reports_its_note_spent() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let slot = f.cw.topup(&[1 << 20]).await?[0].0;
+    let slot = topup(&mut f.cw, &[1 << 20]).await?[0].0;
     let key = f.cw.card.get_pub(slot)?;
     let held_spent = |f: &mut Fx, status: NoteStatus| {
         let n = f.cw.store.state.notes.iter_mut().find(|n| n.slot == slot && n.nonce == hex_of(nonce_for(key).0.serialize())).unwrap();

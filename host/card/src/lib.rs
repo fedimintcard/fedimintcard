@@ -14,6 +14,7 @@ use secp256k1::{Keypair, Message, SECP256K1, XOnlyPublicKey};
 pub mod bridge;
 #[cfg(feature = "pcsc")]
 pub mod pcsc_backend;
+pub mod sealed;
 #[cfg(feature = "softkit")]
 pub mod softkit;
 pub mod v3;
@@ -21,6 +22,7 @@ pub mod v3;
 pub use v3::{AppletVersion, CardStatus, Certificate, Opening, SlotInfo, SlotState};
 
 pub use bridge::{BridgeError, BridgeTransport};
+pub use sealed::{ClearPinRefused, PinKey, SealedCommand, TrustedCard, UntrustedCard, trust_card};
 
 /// The most key slots an applet has (applet 2.1). The host never asks beyond it.
 ///
@@ -82,7 +84,8 @@ const INS_GEN_KEY: u8 = 0x10;
 const INS_GET_PUB: u8 = 0x11;
 /// `SELECT` and `GET DATA` are ISO interindustry commands: CLA `00`.
 const CLA_ISO: u8 = 0x00;
-const CLA: u8 = 0xB0;
+/// The applet's CLA.
+pub const CLA: u8 = 0xB0;
 pub const INS_VERIFY_PIN: u8 = 0x40;
 pub const INS_SET_PIN: u8 = 0x41;
 pub const INS_CHANGE_PIN: u8 = 0x42;
@@ -232,22 +235,16 @@ pub fn pin_from_env() -> Vec<u8> {
     }
 }
 
-/// VERIFY_PIN with its wait served (DESIGN § 3, what a host does). On applet 4.0 a try after
-/// wrong ones first owes askings: the card answers `6A98` ([`v3::SW_KEEP_HOLDING`]) to each, and
-/// this resends the same VERIFY_PIN, with nothing between, until it answers anything else, which
-/// it returns: `Ok` for the right PIN, `63CX` for a wrong one (X the wrong tries in a row), or the
-/// error that ended it (a pulled card: tap again to finish the wait).
-///
-/// `progress` is called before the first asking and after each `6A98` with the askings still
-/// owed (about 0.5 s each on a J3R180), so a caller can show "hold the card". The count is read
-/// from GET_STATE once, before any asking: a GET_STATE between askings would begin the stretch
-/// again.
-pub fn verify_pin_held(card: &mut dyn Card, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
-    let mut owed = if card.applet_version()?.is_current() { card.get_state()?.owed } else { 0 };
+/// The wait, served (DESIGN § 3, what a host does): `send` is the same VERIFY_PIN each time. On
+/// applet 4.0 a try after wrong ones first owes askings: the card answers `6A98`
+/// ([`v3::SW_KEEP_HOLDING`]) to each, and this sends again, with nothing between, until it answers
+/// anything else, which it returns. `owed` is what GET_STATE said before the first asking.
+#[doc(hidden)]
+pub fn serve_wait(mut owed: u16, progress: &mut dyn FnMut(u16), send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let mut asked = 0u16;
     progress(owed);
     for _ in 0..=MOST_KEEP_HOLDING {
-        match card.verify_pin(pin) {
+        match send() {
             Err(e) if status_word(&e) == Some(v3::SW_KEEP_HOLDING) => {
                 // The card's `waitOwed`, mirrored: askings 1..stretch, then the one that writes
                 // what is left.
@@ -269,38 +266,74 @@ pub fn verify_pin_held(card: &mut dyn Card, pin: &[u8], progress: &mut dyn FnMut
     bail!("the card kept answering 6A98 past the longest wait a PIN can owe")
 }
 
-/// Provision the PIN if the card has none, then open this selection's session with it, the wait
-/// served by [`verify_pin_held`] with `progress`.
+/// The sealed PIN's paths take only a 4.x card. No P1 00 PIN is built here: a card older than 4.0
+/// gets none from this library (the test-only `fedimint-card-old-card-pin` keeps that form).
+fn require_current(card: &mut dyn Card) -> Result<()> {
+    let v = card.applet_version()?;
+    ensure!(v.is_current(), "the sealed PIN is applet 4.x's; this card's applet is {v}");
+    Ok(())
+}
+
+/// VERIFY_PIN, sealed, with its wait served (applet 4.x, docs/OFFLINE-PROTOCOL.md § 9): GET_STATE
+/// for the askings owed, then GET_NONCE and the PIN key checked under `trust`'s certificate, the
+/// PIN sealed **once**, and the same bytes sent at every `6A98` until the card answers anything
+/// else, which it returns: `Ok` for the right PIN, `63CX` for a wrong one (X the wrong tries in a
+/// row), or the error that ended it (a pulled card: tap again, which seals again).
+///
+/// `progress` is called before the first asking and after each `6A98` with the askings still
+/// owed (about 0.5 s each on a J3R180), so a caller can show "hold the card". The count is read
+/// from GET_STATE once, before any asking: a command between askings would begin the stretch
+/// again, which is also why nothing asks a new nonce during the wait.
+pub fn verify_pin_held(card: &mut dyn Card, trust: &TrustedCard, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
+    require_current(card)?;
+    let owed = card.get_state()?.owed;
+    let mut block = sealed::pin_block(pin)?;
+    let cmd = SealedCommand::new(card, trust, INS_VERIFY_PIN, &block);
+    block.fill(0);
+    let cmd = cmd?;
+    serve_wait(owed, progress, &mut || cmd.send(card))
+}
+
+/// SET_PIN, sealed (applet 4.x): GET_NONCE, the check under `trust`, one envelope. On applet 4.0
+/// the first SET_PIN needs this selection's anchor, the registry key and an empty card, and it
+/// gives the PIN to the selection that sent it.
+pub fn set_pin_sealed(card: &mut dyn Card, trust: &TrustedCard, pin: &[u8]) -> Result<()> {
+    require_current(card)?;
+    let mut block = sealed::pin_block(pin)?;
+    let cmd = SealedCommand::new(card, trust, INS_SET_PIN, &block);
+    block.fill(0);
+    cmd?.send(card)
+}
+
+/// CHANGE_PIN, sealed (applet 4.x): old block ‖ new block in one envelope. Needs this session's
+/// PIN and ends it. The old PIN is a try like VERIFY_PIN's: a wrong one answers `63CX`.
+pub fn change_pin_sealed(card: &mut dyn Card, trust: &TrustedCard, old: &[u8], new: &[u8]) -> Result<()> {
+    require_current(card)?;
+    let (mut o, mut n) = (sealed::pin_block(old).context("the old PIN")?, sealed::pin_block(new).context("the new PIN")?);
+    let mut clear = [0u8; 2 * sealed::PIN_BLOCK_LEN];
+    clear[..9].copy_from_slice(&o);
+    clear[9..].copy_from_slice(&n);
+    let cmd = SealedCommand::new(card, trust, INS_CHANGE_PIN, &clear);
+    o.fill(0);
+    n.fill(0);
+    clear.fill(0);
+    cmd?.send(card)
+}
+
+/// Provision the PIN if the card has none, then open this selection's session with it, sealed
+/// (applet 4.x), the wait served by [`verify_pin_held`] with `progress`.
 ///
 /// `SIGN` refuses until both are true, so anything that spends must call this after `SELECT` and
-/// after the keys are in place. On applet 4.0 the first SET_PIN needs this selection's anchor, the
-/// registry key and an empty card, and it gives the PIN to the selection that sent it, so no
-/// VERIFY_PIN follows it. A card that already holds a different PIN answers `63 CX` and counts a
-/// wrong try, so only call it on a card whose PIN you own.
-pub fn open_pin_session_held(card: &mut dyn Card, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
-    match verify_pin_held(card, pin, progress) {
+/// after the keys are in place. The first SET_PIN gives the PIN to the selection that sent it, so
+/// no VERIFY_PIN follows it. A card that already holds a different PIN answers `63 CX` and counts
+/// a wrong try, so only call it on a card whose PIN you own.
+pub fn open_pin_session_held(card: &mut dyn Card, trust: &TrustedCard, pin: &[u8], progress: &mut dyn FnMut(u16)) -> Result<()> {
+    match verify_pin_held(card, trust, pin, progress) {
         // Already verified: the session is open.
         Ok(()) => Ok(()),
-        Err(e) if status_word(&e) == Some(SW_NO_PIN_SET) => {
-            card.set_pin(pin).context("SET_PIN on a fresh card")?;
-            if card.applet_version()?.is_current() {
-                return Ok(());
-            }
-            // An old card's SET_PIN opens nothing.
-            card.verify_pin(pin).context("VERIFY_PIN after SET_PIN")
-        }
+        Err(e) if status_word(&e) == Some(SW_NO_PIN_SET) => set_pin_sealed(card, trust, pin).context("SET_PIN on a fresh card"),
         Err(e) => Err(e).context("VERIFY_PIN"),
     }
-}
-
-/// [`open_pin_session_held`] without progress.
-pub fn open_pin_session_with(card: &mut dyn Card, pin: &[u8]) -> Result<()> {
-    open_pin_session_held(card, pin, &mut |_| {})
-}
-
-/// [`open_pin_session_with`] using [`pin_from_env`].
-pub fn open_pin_session(card: &mut dyn Card) -> Result<()> {
-    open_pin_session_with(card, &pin_from_env())
 }
 
 pub trait Card {
@@ -360,25 +393,10 @@ pub trait Card {
         self.apdu(&[CLA_ISO, 0xCA, 0xFF, 0x21, 0x00])
     }
 
-    /// `SET_PIN` (once per card). `6985` when a PIN is already set. On applet 4.0: `6A96` without
-    /// this selection's anchor, `6985` without the registry key or on a card holding value; once
-    /// set, this selection has the PIN.
-    fn set_pin(&mut self, pin: &[u8]) -> Result<()> {
-        self.apdu(&pin_apdu(INS_SET_PIN, pin)?).map(|_| ())
-    }
-
-    /// One `VERIFY_PIN` for this session. `6984` when no PIN is set. On applet 4.0 `6A98` while a
-    /// wait is owed (send it again: [`verify_pin_held`] does) and `63CX` for a wrong PIN, X the
-    /// wrong tries in a row; it never blocks. A 2.x card answers `63CX` with X tries left and
-    /// `6983` when blocked. `6A94` is what `SIGN` answers once the session has no PIN.
-    fn verify_pin(&mut self, pin: &[u8]) -> Result<()> {
-        self.apdu(&pin_apdu(INS_VERIFY_PIN, pin)?).map(|_| ())
-    }
-
-    /// `CHANGE_PIN` (applet 4.0): P1 the old PIN's length, data old ‖ new. Needs this session's
-    /// PIN and ends it. The old PIN is a try like VERIFY_PIN's: a wrong one answers `63CX`.
-    fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<()> {
-        self.apdu(&change_pin_apdu(old, new)?).map(|_| ())
+    /// `GET_NONCE` (applet 4.x): nonce (16) ‖ PIN key (33) ‖ binding (DER). `6985` with no
+    /// certificate on the card. Parse and check it with [`PinKey`]; [`SealedCommand`] does both.
+    fn get_nonce(&mut self) -> Result<Vec<u8>> {
+        self.apdu(&sealed::GET_NONCE_APDU)
     }
 
     // ------------------------------------------------------------ applet 3.0 (v3.rs)
@@ -504,36 +522,6 @@ pub fn v3_apdu(ins: u8, p1: u8, data: &[u8]) -> Vec<u8> {
     }
     a.push(0x00);
     a
-}
-
-/// `SET_PIN`/`VERIFY_PIN` APDU: the applet's CLA `B0` (not ISO `00`), P1 = P2 = 0, the PIN as Lc
-/// bytes, Le = 0.
-///
-/// The CLA is load-bearing: `FedimintCardApplet.process` refuses anything but `B0` before it looks
-/// at the INS, so an ISO-CLA PIN command gets `6E00` on a card that has the PIN applet installed —
-/// indistinguishable from a card that does not. Measured on a J3R180 on 2026-10-28.
-///
-/// The bounds are the applet's (`PIN_MIN`..`PIN_MAX`), not a preference: an out-of-range length is
-/// refused here so the card is never asked and cannot burn a try.
-pub fn pin_apdu(ins: u8, pin: &[u8]) -> Result<Vec<u8>> {
-    ensure!((PIN_MIN..=PIN_MAX).contains(&pin.len()), "PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}", pin.len());
-    let mut apdu = vec![CLA, ins, 0x00, 0x00, pin.len() as u8];
-    apdu.extend_from_slice(pin);
-    apdu.push(0x00);
-    Ok(apdu)
-}
-
-/// `CHANGE_PIN` APDU: P1 = the old PIN's length, P2 = 0, data old ‖ new, Le = 0. Both PINs are
-/// held to the applet's bounds here, so a malformed one never reaches the card.
-pub fn change_pin_apdu(old: &[u8], new: &[u8]) -> Result<Vec<u8>> {
-    for (what, p) in [("old", old), ("new", new)] {
-        ensure!((PIN_MIN..=PIN_MAX).contains(&p.len()), "{what} PIN must be {PIN_MIN} to {PIN_MAX} bytes, not {}", p.len());
-    }
-    let mut apdu = vec![CLA, INS_CHANGE_PIN, old.len() as u8, 0x00, (old.len() + new.len()) as u8];
-    apdu.extend_from_slice(old);
-    apdu.extend_from_slice(new);
-    apdu.push(0x00);
-    Ok(apdu)
 }
 
 /// Sends one APDU and returns `data || SW1 SW2`.
@@ -665,6 +653,10 @@ impl<T: Transport> Card for CardClient<T> {
         if pin_cmd && self.selected.is_none() {
             return Err(self.not_selected());
         }
+        // A card SELECT showed as 4.x takes the sealed form only (§ 9): a P1 00 PIN never leaves.
+        if pin_cmd && self.selected.is_some_and(|v| v.is_current()) && apdu.get(2) != Some(&sealed::P1_SEALED) {
+            return Err(ClearPinRefused.into());
+        }
         let out = self.exchange(apdu)?;
         if ours {
             let _ = self.took_select(&out);
@@ -750,6 +742,19 @@ pub struct SoftCard {
     anchored: bool,
     /// Tests: the floor in place of [`v3::FLOOR_BITS`] ([`SoftCard::use_floor`]).
     floor: Option<[u8; 4]>,
+    /// 4.x: the PIN key, built and generated at each ATTEST_INIT (`pinKey`).
+    pin_key: Option<secp256k1::SecretKey>,
+    /// 4.x: the PIN key's binding by the attestation key, made at the first GET_NONCE after
+    /// SET_CERT and kept (`pinKeySig`); empty until then.
+    pin_binding: Vec<u8>,
+    /// 4.x: the live nonce (RAM): GET_NONCE makes it, the first sealed command that reaches its
+    /// opening spends it, SELECT clears it.
+    nonce: Option<[u8; sealed::NONCE_LEN]>,
+    /// Tests: GET_NONCE answers this key in place of the PIN key, with the PIN key's binding
+    /// ([`SoftCard::spoof_pin_key`]).
+    spoofed_pin_key: Option<secp256k1::SecretKey>,
+    /// The INS of every APDU the card took, in order ([`SoftCard::received_ins`]).
+    ins_log: Vec<u8>,
 }
 
 impl Default for AppletVersion {
@@ -810,6 +815,23 @@ impl SoftCard {
     /// A card with no applet on it: SELECT answers `6A82`, and every slot is empty.
     pub fn blank() -> Self {
         Self { installed: false, ..Self::new() }
+    }
+
+    /// The INS byte of every APDU this card took through its APDU layer, in order. (GEN_KEY,
+    /// GET_PUB and SIGN called as [`Card`] methods are not APDUs and are not listed.)
+    pub fn received_ins(&self) -> &[u8] {
+        &self.ins_log
+    }
+
+    /// Empty [`Self::received_ins`], so a test can look only at what comes next.
+    pub fn forget_received(&mut self) {
+        self.ins_log.clear();
+    }
+
+    /// Whether any PIN command reached this card: VERIFY_PIN, SET_PIN, CHANGE_PIN (sealed or
+    /// not) or GET_NONCE, which opens a sealed one.
+    pub fn heard_a_pin_command(&self) -> bool {
+        self.ins_log.iter().any(|i| [INS_VERIFY_PIN, INS_SET_PIN, INS_CHANGE_PIN, sealed::INS_GET_NONCE].contains(i))
     }
 
     /// How many key slots this card has.
@@ -890,6 +912,7 @@ impl SoftCard {
         Self {
             slots: self.slots.clone(),
             pin: self.pin.clone(),
+            ins_log: vec![],
             tries_left: 3,
             validated: false,
             given_by_set: false,
@@ -919,6 +942,74 @@ impl SoftCard {
             registry_key: self.registry_key,
             anchored: false,
             floor: self.floor,
+            // The PIN key never leaves a card: the clone makes its own, which only its own
+            // (uncertified) attestation key binds. GET_NONCE answers it (the applet refuses GET_NONCE only without a
+            // certificate, FCA getNonce), and the host's check under the certificate refuses it.
+            pin_key: Some(secp256k1::SecretKey::new(&mut rand::thread_rng())),
+            pin_binding: vec![],
+            nonce: None,
+            spoofed_pin_key: None,
+        }
+    }
+
+    /// Tests: GET_NONCE answers a key of the card's choosing in place of its PIN key, with the
+    /// PIN key's own binding. A host refuses it before it seals.
+    pub fn spoof_pin_key(&mut self) {
+        self.spoofed_pin_key = Some(secp256k1::SecretKey::new(&mut rand::thread_rng()));
+    }
+
+    /// Tests: the PIN key's scalar in place of the one ATTEST_INIT made (the vectors' card, as the
+    /// applet's tests set `ownPinKey`). The binding is made again at the next GET_NONCE.
+    pub fn use_pin_key(&mut self, d: secp256k1::SecretKey) {
+        self.pin_key = Some(d);
+        self.pin_binding.clear();
+    }
+
+    /// Tests: make `nonce` the live nonce, as a GET_NONCE that drew it would.
+    pub fn use_nonce(&mut self, nonce: [u8; sealed::NONCE_LEN]) {
+        self.nonce = Some(nonce);
+    }
+
+    /// Tests: whether the card holds a live nonce.
+    pub fn nonce_live(&self) -> bool {
+        self.nonce.is_some()
+    }
+
+    /// 4.x GET_NONCE (`B0 44 01 00`): 6B00 for another P1 or P2, 6985 with no certificate; then
+    /// the binding, made once, and a fresh nonce, live from here.
+    fn get_nonce_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+        use p256::ecdsa::signature::Signer as _;
+        if apdu[2] != sealed::P1_SEALED || apdu[3] != 0 {
+            return Err(StatusWord(SW_WRONG_P1P2).into());
+        }
+        let (false, Some(d), Some(att)) = (self.cert.is_empty(), self.pin_key, &self.attest) else {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        };
+        let key = d.public_key(SECP256K1).serialize();
+        if self.pin_binding.is_empty() {
+            let sig: p256::ecdsa::Signature = att.sign(&sealed::binding_message(&key));
+            self.pin_binding = sig.to_der().as_bytes().to_vec();
+        }
+        let nonce: [u8; sealed::NONCE_LEN] = rand::random();
+        self.nonce = Some(nonce);
+        let shown = self.spoofed_pin_key.map_or(key, |k| k.public_key(SECP256K1).serialize());
+        Ok([&nonce[..], &shown, &self.pin_binding].concat())
+    }
+
+    /// The opening (`unseal`): spends the live nonce, opened or not, and answers the clear data,
+    /// or `None` for an envelope that does not open.
+    fn open_sealed(&mut self, ins: u8, data: &[u8]) -> Option<Vec<u8>> {
+        let nonce = self.nonce.take()?;
+        sealed::open_with(sealed::SEAL_LABEL, self.pin_key.as_ref()?, &nonce, ins, data)
+    }
+
+    /// A failed opening on VERIFY_PIN or CHANGE_PIN: 8 random bytes tried as a PIN, so it counts
+    /// a wrong try with its wait and ends the session (§ 9: a try like any other, `63CX`).
+    fn failed_opening(&mut self) -> anyhow::Error {
+        let r: [u8; 8] = rand::random();
+        match self.try_pin(&r) {
+            Ok(()) => StatusWord(0x63C0 | u16::from(self.wrong)).into(),
+            Err(e) => e,
         }
     }
 
@@ -979,86 +1070,104 @@ impl SoftCard {
         Ok(())
     }
 
-    /// 4.0 VERIFY_PIN: the frame (no PIN 6984, length 6700, P1/P2 6B00), which costs nothing, then
-    /// the wait, then the data, then the try.
+    /// 4.x VERIFY_PIN, sealed only (§ 9's order): no PIN 6984, P1/P2 6B00 (P1 00
+    /// included), Lc 6700, no live nonce 6985 (nothing written), the wait, a short field 6700,
+    /// then the opening, which spends the nonce: an envelope that does not open is a wrong try;
+    /// a block whose length is not 4 to 8 is 6700 with no try; then the try.
     fn verify_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         let len = lc_of(apdu);
         if self.pin.is_none() {
             return Err(StatusWord(SW_NO_PIN_SET).into());
         }
-        if !(PIN_MIN..=PIN_MAX).contains(&len) {
-            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
-        }
-        if apdu[2] != 0 || apdu[3] != 0 {
+        if apdu[2] != sealed::P1_SEALED || apdu[3] != 0 {
             return Err(StatusWord(SW_WRONG_P1P2).into());
         }
+        if len != sealed::SEALED_LC {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        }
+        if self.nonce.is_none() {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
         self.wait_owed()?;
-        let got = received(apdu);
+        let got = received(apdu).to_vec();
         if got.len() < len {
             return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
         }
-        let candidate = got[..len].to_vec();
+        let Some(clear) = self.open_sealed(INS_VERIFY_PIN, &got) else {
+            return Err(self.failed_opening());
+        };
+        let Some(candidate) = sealed::unblock(&clear).map(<[u8]>::to_vec) else {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        };
         self.try_pin(&candidate).map(|()| vec![])
     }
 
-    /// 4.0 SET_PIN, in the applet's order: P1/P2 6B00, a PIN set 6985, length 6700, no anchor in
-    /// this selection 6A96, no registry key or a slot holding value 6985. The selection that sets
-    /// the PIN has it.
+    /// 4.x SET_PIN, sealed only, in the applet's order: P1/P2 6B00, a PIN set 6985, Lc 6700, no
+    /// anchor in this selection 6A96, no registry key or a slot holding value 6985, no live nonce
+    /// 6985, a short field 6700; an envelope that does not open, or a bad block, 6700 with
+    /// nothing written. The selection that sets the PIN has it.
     fn set_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         let len = lc_of(apdu);
-        if apdu[2] != 0 || apdu[3] != 0 {
+        if apdu[2] != sealed::P1_SEALED || apdu[3] != 0 {
             return Err(StatusWord(SW_WRONG_P1P2).into());
         }
         if self.pin.is_some() {
             return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
         }
-        if !(PIN_MIN..=PIN_MAX).contains(&len) {
+        if len != sealed::SEALED_LC {
             return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
         }
         if !self.anchored {
             return Err(StatusWord(v3::SW_NOT_ANCHORED).into());
         }
-        if self.registry_key.is_none() || self.holds_value() {
+        if self.registry_key.is_none() || self.holds_value() || self.nonce.is_none() {
             return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
         }
-        let got = received(apdu);
+        let got = received(apdu).to_vec();
         if got.len() < len {
             return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
         }
-        self.pin = Some(got[..len].to_vec());
+        let pin = self.open_sealed(INS_SET_PIN, &got).and_then(|c| sealed::unblock(&c).map(<[u8]>::to_vec));
+        let Some(pin) = pin else {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        };
+        self.pin = Some(pin);
         self.given_by_set = true;
         Ok(vec![])
     }
 
-    /// 4.0 CHANGE_PIN: data old ‖ new, P1 the old length (4..8) or 0 for equal halves. No PIN
-    /// 6984; another P1 or P2 6B00; no PIN in this session 6A94; lengths 6700 at no try; then the
-    /// old PIN is a try, and a right one ends the session and sets the new PIN.
+    /// 4.x CHANGE_PIN, sealed only: data old block ‖ new block. No PIN 6984; P1/P2 6B00; no PIN in
+    /// this session 6A94; Lc 6700; no live nonce 6985; a short field 6700; an envelope that does
+    /// not open is a wrong try and ends the session; a bad block 6700 at no try; then the old PIN
+    /// is a try, and a right one ends the session and sets the new PIN.
     fn change_pin_v4(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         let lc = lc_of(apdu);
         if self.pin.is_none() {
             return Err(StatusWord(SW_NO_PIN_SET).into());
         }
-        let mut old = apdu[2] as usize;
-        if (old != 0 && !(PIN_MIN..=PIN_MAX).contains(&old)) || apdu[3] != 0 {
+        if apdu[2] != sealed::P1_SEALED || apdu[3] != 0 {
             return Err(StatusWord(SW_WRONG_P1P2).into());
         }
         if !self.pin_given() {
             return Err(StatusWord(SW_PIN_REQUIRED).into());
         }
-        if old == 0 {
-            if !lc.is_multiple_of(2) {
-                return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
-            }
-            old = lc / 2;
-        }
-        if lc > 2 * PIN_MAX || old > lc || !(PIN_MIN..=PIN_MAX).contains(&(lc - old)) || old < PIN_MIN {
+        if lc != sealed::SEALED_CHANGE_LC {
             return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
         }
-        let got = received(apdu);
+        if self.nonce.is_none() {
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
+        let got = received(apdu).to_vec();
         if got.len() < lc {
             return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
         }
-        let (was, new) = (got[..old].to_vec(), got[old..lc].to_vec());
+        let Some(clear) = self.open_sealed(INS_CHANGE_PIN, &got) else {
+            return Err(self.failed_opening());
+        };
+        let (Some(was), Some(new)) = (sealed::unblock(&clear[..9]), sealed::unblock(&clear[9..])) else {
+            return Err(StatusWord(v3::SW_WRONG_LENGTH).into());
+        };
+        let (was, new) = (was.to_vec(), new.to_vec());
         self.try_pin(&was)?;
         // A change ends the session: the next CHANGE_PIN needs its own VERIFY_PIN.
         self.validated = false;
@@ -1233,6 +1342,9 @@ impl SoftCard {
                 if !self.pin_not_set() || !self.cert.is_empty() {
                     return Err(refuse());
                 }
+                // The PIN key first, its binding cleared, then the attestation key (§ 4's order).
+                self.pin_key = Some(secp256k1::SecretKey::new(&mut rand::thread_rng()));
+                self.pin_binding.clear();
                 let key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
                 let w = key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
                 self.attest = Some(key);
@@ -1313,6 +1425,7 @@ impl SoftCard {
                 }
                 Ok(vec![v.state.byte()])
             }
+            sealed::INS_GET_NONCE => self.get_nonce_v4(apdu),
             _ => Err(StatusWord(SW_INS_NOT_SUPPORTED).into()),
         }
     }
@@ -1368,6 +1481,12 @@ impl Card for SoftCard {
         self.require_installed()?;
         self.not_an_asking();
         let occupied = self.slot(slot)?.is_some();
+        if slot == 0 && !self.cert.is_empty() {
+            // As the applet: slot 0's key is the one the certificate names, and a certificate is
+            // taken only once, so the re-key form refuses slot 0 after SET_CERT, before anything
+            // is written.
+            return Err(StatusWord(SW_CONDITIONS_NOT_SATISFIED).into());
+        }
         if self.is_v3() {
             // 3.0: a slot holding a note, or owed change, holds value and is never re-keyed; a
             // KEYED or SPENT one takes the PIN once the card has one. An empty slot is keyed as
@@ -1451,6 +1570,7 @@ impl Card for SoftCard {
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
         ensure!(apdu.len() >= 4, "APDU shorter than its header");
         let (cla, ins) = (apdu[0], apdu[1]);
+        self.ins_log.push(ins);
         if ins != INS_VERIFY_PIN {
             self.not_an_asking();
         }
@@ -1468,6 +1588,7 @@ impl Card for SoftCard {
                 self.validated = false;
                 self.given_by_set = false;
                 self.anchored = false;
+                self.nonce = None;
                 // A 3.0 or later applet answers its version. The 2.x stand-in has always answered
                 // no data, and the hosts take that for 2.x.
                 Ok(if self.is_v3() { vec![self.version.major, self.version.minor] } else { vec![] })

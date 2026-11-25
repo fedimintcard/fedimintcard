@@ -346,8 +346,8 @@ the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an e
 | `ops_not_connected` | 503 | the till belongs on ops but has no token yet (no claim, a claim waiting for approval, or an expired one); nothing ran | connect the till (Connect to registry), approve it in the provisioner app |
 | `card_limit` | 402 | a 3.0 card's daily limit (`6A95`) does not take this charge; checked before anything is signed or recorded | decline; the card pays again once a later block header starts its next day |
 | `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is one this till takes only online; nothing moved | decline, or retry once the till is online |
-| `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online) | retry once the till is online |
-| `card_not_genuine` | 403 | offline: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
+| `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online); online or offline, a 4.0 card's sealed PIN when the till holds no certificate key and cannot fetch one: no PIN was sent | retry once the till is online |
+| `card_not_genuine` | 403 | offline, or before an online sealed PIN to a 4.0 card: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
 | `offline_no_change_room` | 409 | offline: the price needs change and the card has no fresh keyed slot from 24 to 31 (or too few) for it; an online till keys more. The body adds `suggested_msat`, `suggest_below_msat` and `suggest_above_msat`, prices in whole sats the card pays exactly now (each may be null); nothing moved | show "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_cap_reached` | 503 | offline: this till's unsettled offline total or count would pass its cap; nothing moved | decline, or retry once the till is online and has sent its queue |
 | `offline_note_invalid` | 403 | offline: some of the card's notes do not check against the federation's keys (no denomination of its, or a signature that does not verify) and the rest do not pay the price; nothing was signed | decline: the card cannot be checked offline; it pays online |
@@ -474,7 +474,8 @@ when no gateway made an invoice.
 `POST /v1/topup/{topup_id}/load` with `X-Card-Link` loads a `paid` top-up onto the card and
 answers it with `"state":"loaded"` and `"load_txid"`. A `loaded` top-up answers again without a
 card. `409 not_paid`, `410 expired`, `409 topup_failed`, `409 card_full` (too few free slots below 24 even
-after keying unkeyed ones; the top-up stays `paid` and loads at a later tap), and the card and ops errors of `/v1/charge`.
+after keying unkeyed ones; the top-up stays `paid` and loads at a later tap), `409 old_card` (the card is older than 4.0; nothing
+reaches it, the top-up stays `paid` and loads at the tap of a 4.x card), and the card and ops errors of `/v1/charge`.
 Keying a split-keyed card's slots at this tap can also answer `502 ops_unreachable` or
 `409 card_changed` when the registry does not take the keys. The top-up then stays `paid`, and
 the next tap retries. Shares the job slot with charges.
@@ -648,7 +649,8 @@ INSTALL.
 * `live_msat` is in satoshi, `live_notes[].msat` in millisatoshis, as everywhere else here.
 
 ## POST /v1/cards/keySetup
-`{"pin":"<4-8 digits>"}` — `pin` is optional; without it the card is keyed and left unpinned.
+`{"pin":"<4-8 digits>"}` — `pin` is optional; without it the card is keyed and left unpinned. The
+PIN is sealed (applet 4.x); a card older than 4.0 answers 409 `old_card` and is sent no PIN.
 Runs `card setup` (never `--fresh`: re-keying destroys live notes) then `SET_PIN`, then
 `VERIFY_PIN`. Shares the single job slot with charges.
 

@@ -716,6 +716,8 @@ impl Ops {
     pub async fn attach(&self, cw: &mut CardWallet) -> Result<StateStore> {
         let pk = on_card(|| cw.card.get_pub(0)).context("reading the card's slot 0 key")?;
         let base = self.attach_id(cw, &short_id_of(&pk)).await?;
+        // A 4.x card that fails under the kept certificate key: the registry may have rotated it.
+        self.check_cert_key(cw).await;
         // Live notes the registry has not signed yet (its key was off, or its signing failed):
         // asked for again now, so this tap can write them to the card.
         let asked = cw.ops_ask_reg_sigs().await;
@@ -762,6 +764,81 @@ impl Ops {
         Ok(base)
     }
 
+    /// The registry's certificate key the sealed PIN checks a 4.x card under: the one this till
+    /// keeps (`cert_key` in `till-ops.json`), else asked of the registry now (`GET
+    /// /registry/cert-key`, a public route: any session, the till's included, may call it) and
+    /// kept. The reachability probe ([`crate::offline::Reach::probe`]) refreshes the kept copy
+    /// each time it runs. `None` when the registry has none or does not answer: the PIN is then
+    /// refused unsent ([`crate::glue::NoCertKey`]), never sealed to an unchecked key.
+    pub async fn kept_cert_key(&self) -> Option<String> {
+        let dir = self.cards_dir.parent()?;
+        if let Ok(Some(k)) = crate::claim::read_cert_key(dir) {
+            return Some(k);
+        }
+        match self.client.cert_key(crate::offline::PROBE_TIMEOUT).await {
+            Ok(Some(k)) => {
+                if let Err(e) = crate::claim::write_cert_key(dir, &k) {
+                    tracing::warn!("keeping the registry's certificate key: {e:#}");
+                }
+                Some(k)
+            }
+            Ok(None) => {
+                tracing::warn!("the registry has no certificate key: no PIN goes to a 4.0 card until it has one");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("the registry's certificate key could not be fetched ({e}): no PIN goes to a 4.0 card this tap");
+                None
+            }
+        }
+    }
+
+    /// Settle which certificate key this tap checks a 4.x card under. The key in use is
+    /// `cw.cert_key`, else the ops link's, else [`kept_cert_key`](Self::kept_cert_key). When the
+    /// card in the field fails [`trust_card`](fedimint_card_host_card::trust_card) under it (or the
+    /// kept key is not hex), the registry this till is configured with is asked once for its key
+    /// (`GET /registry/cert-key`, the same [`OpsClient`] as every other call; no other URL is
+    /// asked); a key that differs is kept (`till-ops.json`, the job, the link) and the card is
+    /// checked again when its PIN is opened. The same key, no key, or no answer: the old key
+    /// stays, and a card that still fails is refused `card_not_genuine` (403) with no PIN sent.
+    /// Runs once a tap (`cw.cert_checked`, cleared in [`finish`](Self::finish)); a card that
+    /// passes, or a card older than 4.0, costs no fetch.
+    pub async fn check_cert_key(&self, cw: &mut CardWallet) {
+        if cw.cert_key.is_none() && cw.ops.as_ref().and_then(|l| l.cert_key.as_ref()).is_none() {
+            cw.cert_key = self.kept_cert_key().await;
+        }
+        if cw.cert_checked {
+            return;
+        }
+        let Some(old) = cw.cert_key.clone().or_else(|| cw.ops.as_ref().and_then(|l| l.cert_key.clone())) else { return };
+        if !on_card(|| cw.card.applet_version()).is_ok_and(|v| v.is_current()) {
+            return;
+        }
+        cw.cert_checked = true;
+        if hex::decode(&old).is_ok() {
+            match cw.trusted_card() {
+                Err(e) if e.chain().any(|c| c.downcast_ref::<fedimint_card_host_card::UntrustedCard>().is_some()) => {}
+                _ => return,
+            }
+        }
+        match self.client.cert_key(crate::offline::PROBE_TIMEOUT).await {
+            Ok(Some(k)) if k != old => {
+                tracing::warn!("the registry's certificate key changed: this till keeps the new one");
+                if let Some(dir) = self.cards_dir.parent()
+                    && let Err(e) = crate::claim::write_cert_key(dir, &k)
+                {
+                    tracing::warn!("keeping the registry's certificate key: {e:#}");
+                }
+                if let Some(l) = cw.ops.as_mut() {
+                    l.cert_key = Some(k.clone());
+                }
+                cw.cert_key = Some(k);
+            }
+            Ok(_) => tracing::warn!("a 4.0 card does not verify under the registry's certificate key: no PIN goes to it"),
+            Err(e) => tracing::warn!("the registry's certificate key could not be fetched ({e}): the till keeps the key it has"),
+        }
+    }
+
     /// [`attach`](Self::attach) for a card named by its short id, without reading the card.
     pub async fn attach_id(&self, cw: &mut CardWallet, short_id: &str) -> Result<StateStore> {
         let card = StateStore::open(self.card_path(short_id))?;
@@ -775,7 +852,7 @@ impl Ops {
             open: vec![],
             releases: vec![],
             stranded: vec![],
-            cert_key: self.cards_dir.parent().and_then(|d| crate::claim::read_cert_key(d).ok().flatten()),
+            cert_key: self.kept_cert_key().await,
             dead_change: vec![],
         });
         match cw.ops_load().await {
@@ -792,6 +869,7 @@ impl Ops {
     /// queued in the card's file), report the slots it held ([`CardWallet::ops_report_strands`]),
     /// then give `cw` its own store back.
     pub async fn finish(cw: &mut CardWallet, base: StateStore) {
+        cw.cert_checked = false;
         cw.ops_sync().await;
         cw.ops_report_strands().await;
         cw.ops = None;
@@ -1576,6 +1654,9 @@ impl CardWallet {
 
     /// Whether this card's slot may be re-keyed. On ops, slot 0's key names the card (its short
     /// id), so it is never renewed: a renewed slot 0 would make the card unknown to every till.
+    /// Off ops, slot 0 of a certified 4.x card is refused where the key is replaced
+    /// ([`CardWallet::slot0_certified`], checked by `overwrite_slot`, `renew_spent_slots` and
+    /// `card_setup`), since that asks the card and this does not.
     pub(crate) fn may_renew(&self, slot: u8) -> bool {
         self.ops.is_none() || slot != 0
     }
@@ -1722,6 +1803,15 @@ pub fn pin_refused(err: &anyhow::Error) -> bool {
     err.chain().any(|c| {
         c.downcast_ref::<fedimint_card_host_card::StatusWord>().is_some_and(|s| matches!(s.0, 0x63C0..=0x63CF))
             || c.downcast_ref::<fedimint_card_pos_core::PinWait>().is_some()
+    })
+}
+
+/// Whether `err` is a PIN the till would not send a 4.x card: no certificate key to check the card
+/// under ([`crate::glue::NoCertKey`], 503 `offline_not_ready`) or a card that failed the check
+/// ([`fedimint_card_host_card::UntrustedCard`], 403 `card_not_genuine`). No PIN was sent.
+pub fn pin_unsendable(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<crate::glue::NoCertKey>().is_some() || c.downcast_ref::<fedimint_card_host_card::UntrustedCard>().is_some()
     })
 }
 

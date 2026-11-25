@@ -218,8 +218,11 @@ impl<'w> Loader<'w> {
     }
 
     /// Put `amounts` on the card in the field, one note per set bit of each, paid by the wallet.
-    /// Finishes any load an earlier run left first.
+    /// Finishes any load an earlier run left first. A card older than 4.0 is refused (409
+    /// `old_card`) before any command of the load reaches it and before anything is paid: a 4.x
+    /// till's sale refuses such a card, so value put on it could not be spent here.
     pub async fn load(&self, card: &mut dyn Card, amounts: &[u64]) -> Result<LoadReport> {
+        crate::glue::require_current_card(card)?;
         let resumed = self.resume().await?;
         let notes: Vec<u64> = amounts.iter().flat_map(|a| plan::binary(*a)).collect();
         ensure!(!notes.is_empty(), "nothing to load");

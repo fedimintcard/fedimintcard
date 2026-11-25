@@ -67,10 +67,16 @@ class StrangerNoteRefusedTest {
         assertEquals(0x9000, c.sw(VERIFY_PIN, 0, PIN));
         for (int s = 0; s < 32; s++) {
             if (s == 3) continue;
+            if (s == 0) {
+                // Slot 0 is the key the certificate names (this fixture's stand-in certificate is set
+                // with the PIN): the re-key form never takes it after SET_CERT.
+                assertEquals(0x6985, c.tx(CLA, GEN_KEY, 0, 1, null).getSW(), "slot 0 is the certificate's");
+                continue;
+            }
             assertEquals(0x9000, c.tx(CLA, GEN_KEY, s, 1, null).getSW(), "slot " + s + " is re-keyed");
         }
-        assertEquals(0x9000, c.sw(SET_NOTE, 0, c.note(0, 2_000_000L)), "a top-up loads");
+        assertEquals(0x9000, c.sw(SET_NOTE, 1, c.note(1, 2_000_000L)), "a top-up loads");
         assertEquals(0x9000, c.sw(SIGN, 3, SimCard.sha256(new byte[] { 3 })), "the real note still spends");
-        assertEquals(0x9000, c.sw(SIGN, 0, SimCard.sha256(new byte[] { 0 })), "and so does the top-up");
+        assertEquals(0x9000, c.sw(SIGN, 1, SimCard.sha256(new byte[] { 1 })), "and so does the top-up");
     }
 }

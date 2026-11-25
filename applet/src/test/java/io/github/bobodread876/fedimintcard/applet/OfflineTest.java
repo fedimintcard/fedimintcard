@@ -114,16 +114,16 @@ class OfflineTest {
 
     @Test
     void aSpentSlotIsReKeyedAndForgetsItsTransaction() {
-        CardTestSupport c = card(1, 1000, 0);
-        assertSw(0x9000, c.tx(SIGN, 0, h(1)));
-        byte[] before = c.getPub(0);
-        assertSw(0x9000, c.tx(CLA, GEN_KEY, 0, 1, null));
-        assertEquals(ST_KEYED, c.slotState(0));
-        assertFalse(Arrays.equals(before, c.getPub(0)));
-        byte[] slot = c.tx(GET_SLOT, 0, null).getData();
+        CardTestSupport c = card(2, 1000, 0);
+        assertSw(0x9000, c.tx(SIGN, 1, h(1)));
+        byte[] before = c.getPub(1);
+        assertSw(0x9000, c.tx(CLA, GEN_KEY, 1, 1, null));
+        assertEquals(ST_KEYED, c.slotState(1));
+        assertFalse(Arrays.equals(before, c.getPub(1)));
+        byte[] slot = c.tx(GET_SLOT, 1, null).getData();
         assertArrayEquals(new byte[32], Arrays.copyOfRange(slot, 89, 121), "the spent hash is gone");
-        assertSw(0x9000, c.tx(SET_NOTE, 0, c.note(0, 1000)));
-        assertSw(0x9000, c.tx(SIGN, 0, h(2)), "the new note signs its own transaction");
+        assertSw(0x9000, c.tx(SET_NOTE, 1, c.note(1, 1000)));
+        assertSw(0x9000, c.tx(SIGN, 1, h(2)), "the new note signs its own transaction");
     }
 
     // ── notes and change ────────────────────────────────────────────────

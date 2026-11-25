@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["card", "fed-tests", "pos-core", "sidecar"]
+members = ["card", "fed-tests", "old-card-pin", "pos-core", "sidecar"]
 
 [workspace.package]
 edition = "2024"

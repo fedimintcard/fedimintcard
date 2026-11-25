@@ -1,4 +1,6 @@
 import {FACTORY_KEYS, fromHex} from './cardkit';
+import {NEEDS_CERT_KEY, NOT_GENUINE} from './sealedPin';
+import {otherCertify, TEST_CERT_KEY} from './testing/sealedCard';
 import {testOffline} from './testing/anchor';
 import type {ManagerKeysReply, ResetCheck, ResetCompletion} from './ops';
 import {
@@ -104,6 +106,7 @@ function setup(
     operatorId: 1,
     expected: oldId,
     holderPin: HOLDER_PIN,
+    certKey: TEST_CERT_KEY,
     blockedConfirmed: false,
     ops,
     journal,
@@ -144,13 +147,14 @@ describe('identify', () => {
       shortId: shortIdOf(card.applet!.slots[0]!),
       pin: 'set',
       chip: J3R180_CHIP,
+      older: false,
     });
     expect(card.applet!.tries).toBe(3);
     // A blocked PIN exists only on an applet before 4.0, whose reset this app still offers.
     card.appletVersion = [0x03, 0x00];
     card.applet!.blocked = true;
     expect(await identifyCard(card.transceive)).toEqual(
-      expect.objectContaining({ok: true, pin: 'blocked'}),
+      expect.objectContaining({ok: true, pin: 'blocked', older: true}),
     );
     expect(await identifyCard(new FakeGpCard().transceive)).toEqual(
       expect.objectContaining({ok: false, why: 'noApplet'}),
@@ -765,5 +769,36 @@ describe('applet 4.0: the holder’s PIN with its wait', () => {
     const r = await resetTap(card.transceive, options);
     expect(r).toEqual({ok: false, stop: {kind: 'pinRequired'}, resumable: false});
     expect(card.ins()).not.toContain(VERIFY);
+  });
+});
+
+describe('the holder’s PIN is sealed only to a card that checks', () => {
+  it('with no certificate key, a 4.0 card’s reset stops before the PIN: no VERIFY_PIN, nothing written', async () => {
+    const card = ownCard();
+    const {options} = setup(card, {certKey: null});
+    expect(await resetTap(card.transceive, options)).toEqual(
+      expect.objectContaining({ok: false, stop: expect.objectContaining({kind: 'refused', reason: NEEDS_CERT_KEY})}),
+    );
+    expect(card.sealedSent).toEqual([]);
+    expect(card.applet!.wrong ?? 0).toBe(0);
+    expect(card.packages.has(PKG)).toBe(true);
+  });
+
+  it('a card whose certificate the registry did not sign gets no PIN', async () => {
+    const card = ownCard();
+    card.applet!.cert = otherCertify(card.applet!.attest!, card.applet!.slots[0]!);
+    const {options} = setup(card);
+    expect(await resetTap(card.transceive, options)).toEqual(
+      expect.objectContaining({ok: false, stop: expect.objectContaining({kind: 'refused', reason: NOT_GENUINE})}),
+    );
+    expect(card.sealedSent).toEqual([]);
+    expect(card.packages.has(PKG)).toBe(true);
+  });
+
+  it('a good card takes the holder’s PIN as one sealed VERIFY_PIN', async () => {
+    const card = ownCard();
+    const {options} = setup(card);
+    expect((await resetTap(card.transceive, options)).ok).toBe(true);
+    expect(card.sealedSent).toEqual([0x40]);
   });
 });

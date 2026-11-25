@@ -25,8 +25,8 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, SW_OVER_LIMIT, header_time};
 use fedimint_card_host_card::{
-    Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, UnsupportedApplet, is_change_slot, open_pin_session_held,
-    status_word, verify_pin_held,
+    Card, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, TrustedCard, UnsupportedApplet, UntrustedCard, is_change_slot,
+    open_pin_session_held, status_word, trust_card, verify_pin_held,
 };
 use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -198,7 +198,8 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
             "no certificate key from the registry yet (a till fetches one while online, a phone gets it in its offline kit), so no card can be checked offline".into()
         ));
     };
-    let slot0 = attest_card(card, cert_key)?;
+    let trust = attest_card(card, cert_key)?;
+    let slot0 = trust.slot0();
     let short_id = short_id_of(&slot0);
     // The clock first: a header a day later starts the card's new day.
     let card_now = if env.header.is_some() || env.expires_at_ms.is_some() { sync_clock(card, env.header) } else { None };
@@ -210,7 +211,7 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         )));
     }
     // The PIN, before anything on the card changes: a wrong one leaves the card as it was.
-    open_pin(card, &env.pin, env.holding)?;
+    open_pin(card, &trust, &env.pin, env.holding)?;
 
     // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
     // stored signatures, never a second transaction. Another card for it waits for the first.
@@ -258,21 +259,16 @@ fn cap_reached(s: &Stats, cfg: &OfflineConfig) -> OfflineError {
 }
 
 /// The card is one the registry certified (§ 2): its certificate under `cert_key_hex`, for this
-/// card's slot-0 key, and a fresh attestation under the certified key. Answers slot 0's key.
-pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<XOnlyPublicKey> {
+/// card's slot-0 key ([`trust_card`]), and a fresh attestation under the certified key. Answers the
+/// [`TrustedCard`] the sealed PIN needs; slot 0's key is [`TrustedCard::slot0`].
+pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<TrustedCard> {
     let not_genuine = |m: String| anyhow::Error::new(OfflineError::NotGenuine(m));
     let cert_key = hex::decode(cert_key_hex).context("the kept certificate key is not hex")?;
-    let slot0 = card.get_pub(0).context("reading the card's slot 0 key")?;
-    let raw = match card.get_cert() {
-        Ok(c) => c,
-        Err(e) if status_word(&e).is_some() => return Err(not_genuine(format!("the card has no certificate ({e:#})"))),
-        Err(e) => return Err(e),
-    };
-    let cert = Certificate::parse(&raw).map_err(|e| not_genuine(format!("{e:#}")))?;
-    cert.verify(&cert_key).map_err(|e| not_genuine(format!("{e:#}")))?;
-    if cert.slot0 != slot0.serialize() {
-        return Err(not_genuine("the certificate is for another card".into()));
-    }
+    let trust = trust_card(card, &cert_key).map_err(|e| match e.downcast_ref::<UntrustedCard>() {
+        Some(u) => not_genuine(u.0.clone()),
+        None => e,
+    })?;
+    let cert = trust.certificate();
     let challenge: [u8; 32] = rand::thread_rng().r#gen();
     let der = match card.attest(&challenge) {
         Ok(d) => d,
@@ -280,7 +276,7 @@ pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<XOnlyPubli
         Err(e) => return Err(e),
     };
     cert.verify_attest(&challenge, &der).map_err(|e| not_genuine(format!("{e:#}")))?;
-    Ok(slot0)
+    Ok(trust)
 }
 
 /// Show a card whose clock is older the header (`SET_HEADER`). Answers the card's clock, or
@@ -300,7 +296,18 @@ fn sync_clock(card: &mut dyn Card, header: Option<[u8; HEADER_LEN]>) -> Option<u
 /// as the card library serves it: the same VERIFY_PIN resent while the card answers `6A98`, with
 /// nothing between, `holding` told the seconds left. A wait cut short (the card left, or an
 /// asking the wait did not owe) is [`PinWait`] with what was still owed: no PIN was tried.
-pub fn open_pin(card: &mut dyn Card, pin: &Pin, holding: Option<&dyn Fn(u32)>) -> Result<()> {
+///
+/// Applet 4.x: sealed to the PIN key of `trust`, the card checked under the registry's key.
+pub fn open_pin(card: &mut dyn Card, trust: &TrustedCard, pin: &Pin, holding: Option<&dyn Fn(u32)>) -> Result<()> {
+    serve_pin(card, holding, &mut |card, progress| match pin {
+        Pin::Verify(p) => verify_pin_held(card, trust, p, progress).context("verifying the holder's PIN"),
+        Pin::OpenWith(p) => open_pin_session_held(card, trust, p, progress).context("opening the PIN session"),
+    })
+}
+
+type PinRun<'a> = dyn FnMut(&mut dyn Card, &mut dyn FnMut(u16)) -> Result<()> + 'a;
+
+fn serve_pin(card: &mut dyn Card, holding: Option<&dyn Fn(u32)>, run: &mut PinRun<'_>) -> Result<()> {
     let mut left = 0u16;
     let r = {
         let mut progress = |askings: u16| {
@@ -309,10 +316,7 @@ pub fn open_pin(card: &mut dyn Card, pin: &Pin, holding: Option<&dyn Fn(u32)>) -
                 h(wait_seconds(askings));
             }
         };
-        match pin {
-            Pin::Verify(p) => verify_pin_held(card, p, &mut progress).context("verifying the holder's PIN"),
-            Pin::OpenWith(p) => open_pin_session_held(card, p, &mut progress).context("opening the PIN session"),
-        }
+        run(card, &mut progress)
     };
     let cut_short = |e: anyhow::Error| anyhow::Error::new(PinWait { askings: left.max(1) }).context(format!("{e:#}"));
     r.map_err(|e| match status_word(&e) {

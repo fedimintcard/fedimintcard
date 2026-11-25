@@ -10,6 +10,20 @@ use fedimint_card_host_card::v3::{self, Opening, SlotState};
 use fedimint_card_host_card::*;
 use secp256k1::{Keypair, SECP256K1};
 
+/// SET_PIN or VERIFY_PIN as a host seals it (§ 9). A card with no certificate first gets one from
+/// the test registry over slot 0's key, as set-up gives it one before its first PIN.
+fn sealed_pin(c: &mut dyn Card, ins: u8, pin: &[u8]) -> anyhow::Result<()> {
+    if c.get_cert().is_err() {
+        let k0 = c.get_or_gen(0)?;
+        let w = c.attest_init()?;
+        c.set_cert(&Certificate::sign(&v3::test_registry_key(), &k0.serialize(), &w)?.to_bytes())?;
+    }
+    let pk = fedimint_card_host_card::sealed::PinKey::parse(&c.get_nonce()?)?;
+    let block = fedimint_card_host_card::sealed::pin_block(pin)?;
+    let env = fedimint_card_host_card::sealed::seal(&pk.key, &pk.nonce, ins, &block)?;
+    c.apdu(&fedimint_card_host_card::sealed::sealed_apdu(ins, &env)).map(|_| ())
+}
+
 const PIN: &[u8] = b"1234";
 /// The tests' floor: a target of about 2^255.
 const TEST_FLOOR: u32 = 0x207F_FFFF;
@@ -187,7 +201,7 @@ fn get_state_is_65_bytes_and_says_the_pin_and_the_anchor() {
     c.set_header(&mine(T0, CLOCK, 0)).unwrap();
     let st = c.get_state().unwrap();
     assert!(st.registry_key && st.anchored && st.anchors());
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     let st = c.get_state().unwrap();
     assert!(st.pin_set && !st.anchors());
 }
@@ -297,7 +311,7 @@ fn an_anchor_sets_the_clock_even_back_keeps_the_limit_and_marks_only_its_selecti
     let mut c = card();
     c.set_registry_key(&v3::registry_point(&reg())).unwrap();
     c.set_header(&mine(T0 + 5, CLOCK, 6)).unwrap();
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     c.apdu(&SELECT_APDU).unwrap();
     assert_eq!(c.set_header(&mine(T0 + 10, CLOCK, 7)).unwrap(), T0 + 10);
     assert_eq!(c.set_header(&mine(T0, CLOCK, 8)).unwrap(), T0 + 10);
@@ -465,18 +479,18 @@ fn set_change_after_set_pin_needs_the_pin_in_this_selection() {
     let open = Opening { txid: [5; 32], out_idx: 0, blinding_key: [6; 32] };
     c.set_registry_key(&v3::registry_point(&reg())).unwrap();
     c.set_header(&mine(T0, CLOCK, 0)).unwrap();
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     c.set_change(0, 1024, &open).unwrap();
     c.apdu(&SELECT_APDU).unwrap();
     // Without the PIN the gate comes first, before the length and the state.
     assert_eq!(sw(c.set_change(1, 1024, &open)), SW_PIN_REQUIRED);
     assert_eq!(sw(c.apdu(&v3_apdu(v3::INS_SET_CHANGE, 1, &[1, 2, 3]))), SW_PIN_REQUIRED);
     assert_eq!(c.slot_state(1), Some(SlotState::Keyed));
-    c.verify_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_VERIFY_PIN, PIN).unwrap();
     c.set_change(1, 1024, &open).unwrap();
     c.apdu(&SELECT_APDU).unwrap();
     assert_eq!(sw(c.set_change(2, 1024, &open)), SW_PIN_REQUIRED, "a new selection");
-    c.verify_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_VERIFY_PIN, PIN).unwrap();
     c.set_change(2, 1024, &open).unwrap();
     assert_eq!(c.get_state().unwrap().slots_in(SlotState::Change), vec![0, 1, 2]);
 }
@@ -487,4 +501,30 @@ fn an_iso_command_but_select_is_refused_for_its_class() {
     assert_eq!(sw(c.apdu(&[0x00, 0xB0, 0x00, 0x00, 0x00])), SW_CLA_NOT_SUPPORTED, "READ BINARY");
     assert_eq!(sw(c.apdu(&[0x00, 0x20, 0x00, 0x00, 0x00])), SW_CLA_NOT_SUPPORTED, "ISO VERIFY");
     assert_eq!(sw(c.apdu(&[0xB0, 0x7F, 0x00, 0x00, 0x00])), SW_INS_NOT_SUPPORTED, "its own class, no such INS");
+}
+
+#[test]
+fn the_re_key_form_refuses_slot_0_once_a_certificate_is_set_as_the_applet_does() {
+    let mut c = card();
+    c.gen_key(0).unwrap();
+    c.gen_key(1).unwrap();
+    let before = c.get_pub(0).unwrap();
+    assert_ne!(c.gen_key_overwrite(0).unwrap(), before, "before SET_CERT slot 0 may be re-keyed");
+    let k0 = c.get_pub(0).unwrap();
+    let w = c.attest_init().unwrap();
+    c.set_cert(&Certificate::sign(&reg(), &k0.serialize(), &w).unwrap().to_bytes()).unwrap();
+    let state = c.slot_state(0);
+    assert_eq!(sw(c.gen_key_overwrite(0)), 0x6985, "after SET_CERT slot 0 is never re-keyed");
+    assert_eq!(c.get_pub(0).unwrap(), k0, "the key the certificate names is kept");
+    assert_eq!(c.slot_state(0), state, "nothing is written");
+    c.gen_key_overwrite(1).unwrap();
+    c.set_registry_key(&v3::registry_point(&reg())).unwrap();
+    c.set_header(&mine(T0, CLOCK, 0)).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
+    c.apdu(&SELECT_APDU).unwrap();
+    sealed_pin(&mut c, INS_VERIFY_PIN, PIN).unwrap();
+    assert_eq!(sw(c.gen_key_overwrite(0)), 0x6985, "nor under the PIN");
+    assert_eq!(c.get_pub(0).unwrap(), k0);
+    c.gen_key_overwrite(1).unwrap();
+    trust_card(&mut c, &v3::registry_point(&reg())).expect("the card still checks under its certificate");
 }

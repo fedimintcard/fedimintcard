@@ -479,7 +479,13 @@ async function resumeTap(
         resumedFrom: oldId,
       };
     }
-    const setup = await finishVerified(tx, sentPin, options.onSetupStep, options.onPinWait);
+    const setup = await finishVerified(
+      tx,
+      sentPin,
+      options.offline?.registryKey ?? null,
+      options.onSetupStep,
+      options.onPinWait,
+    );
     if (!setup.ok && setup.step === 'verifyPin') {
       return {
         installed: {

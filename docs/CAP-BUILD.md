@@ -271,3 +271,15 @@ package `fedimint-card-4.0.cap`:
 
 At 600 ms an asking, the longest wait (16,384 askings) is about 2.7 hours. Not measured on a chip:
 a torn tap, the hash-round form of an asking (this chip takes the signature path), and the J3R452.
+
+## Applet 4.0 with the sealed PIN (2026-11-24)
+
+With the sealed PIN (OFFLINE-PROTOCOL § 9) and the rule that GEN_KEY P2=1 never re-keys slot 0
+after SET_CERT, the load file is **17,228 bytes**, 70 LOAD commands at 247 bytes, sha256
+`1c37437e40693233bf8b562567c1e6026c719bab47775178e69b989481398211` (+2,476 bytes on the 14,752 above).
+Built from `card-4.0` with the jc305u4 kit as above; a second build gave the same load file, and
+`make-assets.py --check` passes. The CLEAR_ON_DESELECT arrays come to 773 bytes (756 before): the
+applet's `x` 144, `tmp` 65, `held` 4, `nonce` 16, SchnorrHW's `sc` 256 and `work` 288. The PIN key,
+the RSA cipher and the three field keys are not in that sum. None of the chip figures in the table
+above was measured on this build: install, free memory (with the cipher's RAM), the J3R452's command
+buffer (the applet refuses one under 240 bytes) and the sealed VERIFY's time are for the chip day.

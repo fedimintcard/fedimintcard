@@ -335,6 +335,8 @@ export const RESET = {
   holderPinHelp:
     'The holder types their PIN here. It is sent to the card once, to show they agree, and is not kept. A wrong PIN counts against the card: an older card blocks after three wrong tries, a newer one asks for a longer wait before each next try.',
   holderPinPlaceholder: 'Holder\'s PIN',
+  olderCardPin:
+    'This card is older than 4.0, so its PIN is sent unprotected: reset old cards away from other people\'s phones and readers.',
   blockedTitle: (pin: 'blocked' | 'notSet') =>
     pin === 'blocked' ? 'This card\'s PIN is blocked' : 'This card never had a PIN set',
   blockedBody:

@@ -2416,6 +2416,7 @@ dependencies = [
  "anyhow",
  "fedimint-api-client",
  "fedimint-card-host-card",
+ "fedimint-card-old-card-pin",
  "fedimint-client",
  "fedimint-core",
  "fedimint-dummy-client",
@@ -2436,6 +2437,7 @@ name = "fedimint-card-host-card"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fedimint-card-old-card-pin",
  "fedimint-core",
  "fedimint-tbs",
  "hex",
@@ -2446,6 +2448,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ureq",
+]
+
+[[package]]
+name = "fedimint-card-old-card-pin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fedimint-card-host-card",
 ]
 
 [[package]]
@@ -2479,6 +2489,7 @@ dependencies = [
  "fedimint-api-client",
  "fedimint-bip39",
  "fedimint-card-host-card",
+ "fedimint-card-old-card-pin",
  "fedimint-card-pos-core",
  "fedimint-client",
  "fedimint-connectors",

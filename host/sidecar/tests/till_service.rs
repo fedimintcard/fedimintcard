@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env, open_pin_session};
+use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
 use fedimint_card_sidecar::ops::OpsError;
 use fedimint_card_sidecar::plan::PlanError;
@@ -70,16 +70,40 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
     // behaves like a new one. The soft one is a 4.0 card, as every reader now meets.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
-    let card: Box<dyn Card> = if soft { Box::new(card4()) } else { open_from_env()? };
-    let mut cw = CardWallet::new(wallet, store, card);
-    cw.card_setup(!soft)?;
+    let card: Box<dyn Card> = if soft { Box::new(card4()) } else { persistent_card()? };
+    let mut cw = CardWallet::new(wallet, store, card).with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
+    cw.card_setup(rekey_backend())?;
     // `topup` and every charge sign, and SIGN needs a PIN in this selection.
-    open_pin_session(cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
     Ok(Fx { _fed: fed, cw, _dir: dir })
 }
 
+/// A persistent card (`CARD_BACKEND` bridge or pcsc) for the fixture. The bridge's jCardSim card
+/// is reset first, so every fixture starts from a blank applet, and a 4.0 card without a
+/// certificate is then set up as the Setup app leaves one before its PIN
+/// ([`softkit::ready_for_pin`](fedimint_card_host_card::softkit::ready_for_pin): certified by the
+/// test registry, its key, the anchor); the fixture's `open_test_session` sets the PIN, sealed. A
+/// pcsc card is taken as it is.
+fn persistent_card() -> anyhow::Result<Box<dyn Card>> {
+    if std::env::var("CARD_BACKEND").as_deref() == Ok("bridge") {
+        fedimint_card_host_card::BridgeTransport::new(&fedimint_card_host_card::bridge::url_from_env()).reset()?;
+    }
+    let mut card = open_from_env()?;
+    if card.applet_version()?.is_current() && card.get_cert().is_err() {
+        fedimint_card_host_card::softkit::ready_for_pin(card.as_mut())?;
+    }
+    Ok(card)
+}
+
+/// Whether the fixture re-keys the card (`card_setup(true)`): only a pcsc card, which keeps keys
+/// from earlier runs. The reset bridge card is blank, and a certified 4.x card refuses a re-key of
+/// slot 0 by design.
+fn rekey_backend() -> bool {
+    std::env::var("CARD_BACKEND").as_deref() == Ok("pcsc")
+}
+
 /// A 4.0 soft card as the Setup app leaves one before its PIN: the test registry's key and the
-/// anchor. Its first `open_pin_session` sets the PIN.
+/// anchor. Its first `softkit::open_test_session` sets the PIN, sealed.
 fn card4() -> SoftCard {
     let mut c = SoftCard::v4();
     fedimint_card_host_card::softkit::ready_for_pin(&mut c).unwrap();
@@ -283,7 +307,7 @@ async fn fx_counted() -> anyhow::Result<Counted> {
     f.cw.card = Box::new(CountCard(card.clone(), signs.clone()));
     f.cw.card_setup(false)?;
     // A fresh card has no PIN session, and this one replaces the card fx() already opened.
-    open_pin_session(f.cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
     load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     Ok((f, card, signs))
 }
@@ -335,7 +359,8 @@ async fn restart_after_crash_finds_the_transaction_through_card_state() -> anyho
     // Restart: everything is read back from disk.
     drop(sales);
     let store = StateStore::open(f._dir.path().join("card_state.json"))?;
-    let mut cw2 = CardWallet::new(f.cw.wallet.clone(), store, Box::new(CountCard(card.clone(), signs.clone())));
+    let mut cw2 = CardWallet::new(f.cw.wallet.clone(), store, Box::new(CountCard(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     let sales2 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales.json"))?));
     let r = charge_with(&mut cw2, 20_000, Some("c".into()), &sales2).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
@@ -525,13 +550,15 @@ async fn a_hookless_cli_balance_cannot_turn_a_sale_into_a_second_charge() -> any
 
     // The CLI (no sales hook) resolves the transaction, as `card balance` does.
     let state_path = f._dir.path().join("card_state.json");
-    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())));
+    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     cli.balance().await?;
     assert!(cli.pending_for_ref("t").is_none());
     assert_eq!(cli.store.state.tombstones.len(), 1, "the sale must not vanish");
 
     // The service, with a ledger that never heard of it, must not charge again.
-    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())));
+    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     let sales3 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales3.json"))?));
     let r = charge_with(&mut cw3, 20_000, Some("t".into()), &sales3).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
@@ -550,7 +577,7 @@ async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card()
     f.cw.card = Box::new(LostAnswerCard(card.clone(), mode.clone()));
     f.cw.card_setup(false)?;
     // Each of these swaps in a fresh card, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
     load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     mode.set(1);
@@ -561,6 +588,40 @@ async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card()
     // The card now holds a key the state file has not adopted yet. The next charge must work.
     let second = charge_with(&mut f.cw, 10_000, Some("o2".into()), &sales).await;
     assert_eq!(second.status, 200, "{:?}", second.body);
+    Ok(())
+}
+
+/// A till with no registry never re-keys slot 0 of a certified 4.x card: the certificate names
+/// that key and the card takes SET_CERT only once, so a renewed slot 0 would leave a card no host
+/// seals a PIN to again. After a sale spends slot 0 the card still passes `trust_card` and the
+/// next sale takes its PIN; an explicit overwrite of slot 0 and a `card_setup(fresh)` are refused
+/// before anything is written. (A 2.x card's slot 0 is still renewed off ops: card_wallet.rs.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_without_the_registry_never_re_keys_a_certified_cards_slot_0() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    assert!(f.cw.ops.is_none(), "this till has no registry");
+    let slot0 = f.cw.card.get_pub(0)?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("a".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(f.cw.store.state.overwritable_slots().contains(&0), "the sale spent slot 0 and left it for renewal");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0, "slot 0 keeps the key its certificate names");
+    fedimint_card_host_card::softkit::test_trust(f.cw.card.as_mut())?;
+
+    let e = f.cw.overwrite_slot(0).unwrap_err();
+    assert!(format!("{e:#}").contains("certificate names"), "{e:#}");
+    assert!(f.cw.store.state.pending_overwrites.is_empty(), "refused before anything was written");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0);
+    assert!(!f.cw.renew_spent_slots().await?.contains(&0), "renewal passes slot 0 by");
+
+    let e = f.cw.card_setup(true).unwrap_err();
+    assert!(format!("{e:#}").contains("--fresh would re-key slot 0"), "{e:#}");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0);
+    fedimint_card_host_card::softkit::test_trust(f.cw.card.as_mut())?;
+
+    let second = charge_with(&mut f.cw, 10_000, Some("b".into()), &sales).await;
+    assert_eq!(second.status, 200, "the card still takes its PIN: {:?}", second.body);
     Ok(())
 }
 
@@ -766,7 +827,7 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
     // Each of these swaps in a fresh card, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
     load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
@@ -834,7 +895,7 @@ async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
     // Each of these swaps in a fresh card, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
     load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();

@@ -22,12 +22,18 @@ major version is below 4. Slots: 32.
 | 31 | SET_CERT | certificate (≤ 160) | once, before SET_PIN |
 | 32 | GET_CERT | – | the certificate |
 | 33 | ATTEST | challenge (32) | → ECDSA-SHA256, DER, over `"fedimintcard/at1"` (16 ASCII) ‖ challenge ‖ slot 0's x-only key |
-| 40 | VERIFY_PIN | PIN (4..8) | 9000 opens the PIN session; 63CX a wrong PIN, X tries left; 6A98 while a wait is owed: send the same command again (see the wait below); 6984 no PIN set. The card never answers 6983 |
-| 41 | SET_PIN | PIN (4..8) | once. 6A96 until the anchor is set in this selection; 6985 if a PIN is set, there is no registry key, or a slot holds value. Opens the PIN session |
-| 42 | CHANGE_PIN | P1 = old PIN length (4..8; 0 = equal halves) ‖ old PIN ‖ new PIN (new 4..8, Lc ≤ 16) | the old PIN is checked as VERIFY_PIN checks it, wrong tries counted with their wait; the session ends. 6700 for a new PIN outside 4..8, 6B00 for a bad P1 or P2 |
+| 40 | VERIFY_PIN P1=01 | sealed PIN block (90, § 9) | 9000 opens the PIN session; 63CX a wrong PIN or an envelope that does not open, X the wrong tries in a row; 6A98 while a wait is owed: send the same command again (see the wait below); 6985 no live nonce; 6984 no PIN set. The card never answers 6983 |
+| 41 | SET_PIN P1=01 | sealed PIN block (90, § 9) | once. 6A96 until the anchor is set in this selection; 6985 if a PIN is set, there is no registry key, a slot holds value, or there is no live nonce; 6700 for an envelope that does not open. Opens the PIN session |
+| 42 | CHANGE_PIN P1=01 | sealed old PIN block ‖ new PIN block (99, § 9) | needs the PIN session; the old PIN is checked as VERIFY_PIN checks it, wrong tries counted with their wait; the session ends. 63CX for an envelope that does not open |
+| 44 | GET_NONCE P1=01 | – | → nonce (16) ‖ PIN key, secp256k1 compressed (33) ‖ binding (DER, 8..72). 6985 with no certificate. No PIN. § 9 |
+
+**The PIN is sealed (§ 9).** VERIFY_PIN, SET_PIN and CHANGE_PIN take only their sealed form, P1 = 01; any other P1, the clear form's 00 among them, is 6B00. The rows above are the sealed PIN as specified on 2026-11-24 (P1 slice S0); the applet takes them since slice A1 (merged into `card-4.0` on 2026-11-24), and its class comment says the same.
 
 States: EMPTY 0, KEYED 1, NOTE 2, CHANGE 3, SPENT 4. GEN_KEY P2=1 re-keys only KEYED or SPENT, in a
-PIN session once a PIN is set.
+PIN session once a PIN is set. It never re-keys slot 0 once SET_CERT has taken a certificate: `6985`,
+before anything is written. Slot 0's key is the one the certificate (§ 2) names, and a card takes a
+certificate only once, before its first SET_PIN, so a re-keyed slot 0 would leave a card no host
+trusts. The hosts refuse it on their side too.
 
 **Signed notes.** The registry signs each note it issues: ECDSA P-256, SHA-256, by `CERT_SIGNING_KEY`
 (the key SET_REGISTRY_KEY holds), over `"fedimintcard/note1"` (18 ASCII) ‖ the x-only key of the
@@ -335,3 +341,94 @@ charge, a phone's or the till's own.
   A charge the card's other notes pay goes ahead around them. A charge they do not pay, but
   would with the held notes, is refused 402 `notes_held`, its detail naming the held amount;
   nothing is signed.
+
+## 9. The sealed PIN (Fedimint Card 4.0)
+
+Every PIN command crosses the air sealed. The card has a secp256k1 key of its own for nothing else,
+the **PIN key**; a host seals each PIN command to it under a fresh card nonce, and the card opens
+it. This is Cashu Card 1.9's sealed PIN as cashucard ships it (MIT; its applet's `unseal`,
+`sealBlock`, `unblockPin` and `processGetPinKey`), with three changes: our labels; the PIN key bound
+by the card's **attestation key**, the key the certificate (§ 2) already certifies, since no slot
+key signs anything but SIGN; and every other form of the PIN commands refused. The
+vectors every implementation must pass are `spec/vectors/sealed-pin.json`, made by
+`host/card/tests/sealed_pin_vectors.rs`, which first reproduces three of Cashu's own envelopes
+byte for byte.
+
+**Applets below 4.0.** Applets below 4.0 take the PIN unsealed. A host learns the version from
+the card's own SELECT, and no till, POS phone or command line of ours sends a PIN to a card whose
+SELECT does not answer major 4: such a card gets the old-card refusal (409 `old_card`) before any
+PIN command, and a 4.x card gets no PIN command with P1 ≠ 01. The Setup app's reset of a card older
+than 4.0 sends the holder's VERIFY_PIN in that applet's form, and its PIN screen tells the operator
+so. In Rust the builders of that form live only in the test-only
+`host/old-card-pin` crate, which no product crate may depend on.
+
+**Labels.** `fedimintcard/seal1` (18 ASCII) for the seal, `fedimintcard/pin1` (17 ASCII) for the
+binding. They differ from `fedimintcard/at1` (ATTEST) at byte 13, so no attestation is a binding.
+
+**The PIN key.** Built and generated at each ATTEST_INIT, before the attestation key; fixed from
+SET_CERT for the card's life (ATTEST_INIT is refused after SET_CERT). It agrees with readers'
+points and does nothing else.
+
+**GET_NONCE** `B0 44 01 00 00`. Answers nonce (16) ‖ PIN key, compressed (33) ‖ binding, where the
+binding is ECDSA P-256 with SHA-256 by the attestation key over `fedimintcard/pin1` ‖ the 33 bytes
+of the PIN key, DER, 8 to 72 bytes (the answer's length less 49). The binding is made at the first
+GET_NONCE after SET_CERT and kept; the nonce is new at every GET_NONCE, from the card's RNG. No PIN
+is needed. 6985 with no certificate on the card; 6B00 for P1 ≠ 01 or P2 ≠ 00. Like any instruction
+but VERIFY_PIN it ends a stretch of the wait.
+
+**The nonce** is RAM. It is live from GET_NONCE until the first sealed command that reaches its
+opening (opened or not), a new GET_NONCE (which replaces it), or the next SELECT, reset or tear.
+One nonce opens at most one envelope. An asking of the wait (6A98) does not spend it.
+
+**The envelope**, the whole data field of a sealed command: E (65, `04` ‖ X ‖ Y, the sender's
+secp256k1 key for this message only) ‖ ct (n) ‖ tag (16).
+- x = the X coordinate of the point the sender's key and the PIN key share (e·P at the host, d·E on
+  the card). The card holds E to the curve (`04`, X and Y under p, Y² = X³ + 7) before it agrees.
+- block(i, m) = SHA-256(`fedimintcard/seal1` ‖ i (1 byte) ‖ x (32) ‖ E (65) ‖ nonce (16) ‖ INS
+  (1) ‖ m).
+- ct = the clear data XOR block(1, ""), block(2, ""), …, 32 bytes each.
+- tag = the first 16 bytes of block(0, ct). The card checks it before it opens anything.
+- The INS is the command's own: an envelope sealed for one command does not open as another.
+
+**The PIN block**: the PIN's length (1, 4 to 8) ‖ the PIN ‖ zeros to 8 bytes: always 9 bytes, so
+its length says nothing of the PIN's.
+
+| Command | Clear data | Lc |
+|---|---|---|
+| VERIFY_PIN `B0 40 01 00` | PIN block (9) | 90 |
+| SET_PIN `B0 41 01 00` | PIN block (9) | 90 |
+| CHANGE_PIN `B0 42 01 00` | old PIN block (9) ‖ new PIN block (9) | 99 |
+
+**The card's checks, in order** (the vectors' `refusals` say the same):
+- **VERIFY_PIN**: 6984 no PIN set; 6B00 P1 ≠ 01 or P2 ≠ 00; 6700 Lc ≠ 90; 6985 no live nonce
+  (nothing written); 6A98 a wait owed; 6700 data short; then the opening, which spends the nonce.
+  An envelope that does not open is a wrong try, counted with its wait as any other, and answers
+  63CX: nothing tells it apart from a wrong PIN. A block whose length is not 4 to 8: 6700, no try.
+  Then the PIN: 9000 or 63CX.
+- **SET_PIN**: 6B00; 6985 PIN already set; 6700 Lc ≠ 90; 6A96 not anchored in this selection;
+  6985 no registry key or a slot holds value; 6985 no live nonce; 6F00 the signer's engine check;
+  6700 data short; 6700 an envelope that does not open or a bad block length, nothing written; 9000.
+- **CHANGE_PIN**: 6984; 6B00; 6A94 this selection does not have the PIN; 6700 Lc ≠ 99; 6985 no live
+  nonce; 6700 data short; an envelope that does not open is a wrong try, 63CX, and ends the
+  session; 6700 either block's length not 4 to 8, no try; the old PIN as VERIFY_PIN checks it; 9000
+  sets the new PIN and ends the session.
+
+A wrong try of either kind ends the selection's PIN session, the first SET_PIN's included.
+
+**Hosts.**
+- **Check before sealing.** A host seals only to a PIN key it has checked: the certificate (GET_CERT)
+  verifies under the registry's certificate key (§ 2) and names this card's slot 0 (GET_PUB 0);
+  the 33 bytes are a compressed secp256k1 point; and the binding verifies under the certificate's
+  attestation key, with a high or a low s (the card does not normalise s). A host without the
+  registry's certificate key gets it (`GET /registry/cert-key`) or sends no PIN. An envelope opens
+  only on the card whose PIN key it was sealed to.
+- **One envelope per tap.** GET_NONCE, then seal once, then send the same bytes again at every
+  6A98 until the card answers otherwise. Never ask for a nonce while an envelope is unanswered:
+  GET_NONCE in a wait begins the stretch again, and the old envelope, served the wait again, then
+  fails its tag under the new nonce, which is a wrong try. A new SELECT means a new GET_NONCE.
+- **A fresh sender key for every envelope**, from a good RNG, and the PIN, the key and x are wiped
+  after use.
+- An envelope answered 6985 was not opened: ask for a nonce and seal again.
+
+**Set-up order**, in one selection, extending § 1: … SET_CERT, SET_REGISTRY_KEY, SET_HEADER (the
+anchor), GET_STATE byte 63 = 1, GET_NONCE with the checks above, sealed SET_PIN.

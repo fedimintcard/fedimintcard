@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
+use fedimint_card_host_card::{Card, SoftCard};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
 use fedimint_card_sidecar::pay::{self, PayConfig, PayCrash, PayLightning, PayState, PayStore, Pays};
 use fedimint_card_sidecar::sales::SalesStore;
@@ -290,7 +290,7 @@ async fn fx_with(cfg: PayConfig, crash: Option<CrashPoint>) -> anyhow::Result<Fx
 }
 
 /// A 4.0 soft card as the Setup app leaves one before its PIN: the test registry's key and the
-/// anchor. Its first `open_pin_session` sets the PIN.
+/// anchor. Its first `softkit::open_test_session` sets the PIN, sealed.
 fn card4() -> SoftCard {
     let mut c = SoftCard::v4();
     fedimint_card_host_card::softkit::ready_for_pin(&mut c).unwrap();
@@ -320,9 +320,10 @@ async fn till_on(wallet: Wallet, cfg: PayConfig, ln: Arc<dyn PayLightning>, cras
     let store = StateStore::open(dir.path().join("card_state.json"))?;
     let card = Rc::new(RefCell::new(card4()));
     let signs = Rc::new(Cell::new(0));
-    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone(), signs.clone())));
+    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     cw.card_setup(false)?;
-    open_pin_session(cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
     // More notes than a 2.x card needed: with no registry to sign them, change and refunds stay
     // waiting on a 4.0 card, so each later charge spends a note loaded here.
     load(&mut cw, &[1 << 17, 1 << 16, 1 << 15, 1 << 14, 1 << 14, 1 << 14]).await?;
@@ -405,7 +406,8 @@ impl Fx {
     /// (the federation, the card and the wallet side are the same), no crash point.
     async fn reopen(&mut self, cfg: PayConfig) -> anyhow::Result<()> {
         let store = StateStore::open(self.dir.path().join("card_state.json"))?;
-        let cw = CardWallet::new(self.wallet.clone(), store, Box::new(Shared(self.card.clone(), self.signs.clone())));
+        let cw = CardWallet::new(self.wallet.clone(), store, Box::new(Shared(self.card.clone(), self.signs.clone())))
+            .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
         let sales = SalesStore::open(self.dir.path().join("sales.json"))?;
         let (o, s, c) = (self.opens.clone(), self.signs.clone(), self.card.clone());
         let opener = Box::new(move || {

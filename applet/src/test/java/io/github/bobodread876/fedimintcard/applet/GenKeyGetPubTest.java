@@ -148,28 +148,28 @@ class GenKeyGetPubTest {
     @Test
     void failedOverwriteLeavesSlotEmpty() throws Exception {
         CardTestSupport c = new CardTestSupport();
-        c.genKey(0);
+        c.genKey(2);
         c.setPin(CardTestSupport.DEFAULT_PIN);
         c.verifyPin(CardTestSupport.DEFAULT_PIN);
         javacard.security.ECPrivateKey[] privs = (javacard.security.ECPrivateKey[]) c.field("privs");
-        javacard.security.ECPrivateKey real = privs[0];
-        privs[0] = new SchnorrHWSignTest.LyingKey(real, false, (short) 32) {
+        javacard.security.ECPrivateKey real = privs[2];
+        privs[2] = new SchnorrHWSignTest.LyingKey(real, false, (short) 32) {
             @Override public void setS(byte[] b, short o, short l) {
                 javacard.framework.ISOException.throwIt((short) 0x6F00);
             }
         };
-        assertSw(0x6F00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null));
+        assertSw(0x6F00, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 2, 1, null));
         assertFalse(real.isInitialized(), "old private key must be wiped");
-        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
+        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 2, null));
     }
 
     @Test
     void overwriteWhereGenKeyPairThrowsLeavesSlotEmpty() throws Exception {
         CardTestSupport c = new CardTestSupport();
-        c.genKey(0);
+        c.genKey(2);
         c.setPin(CardTestSupport.DEFAULT_PIN);
         c.verifyPin(CardTestSupport.DEFAULT_PIN);
-        javacard.security.ECPrivateKey real = ((javacard.security.ECPrivateKey[]) c.field("privs"))[0];
+        javacard.security.ECPrivateKey real = ((javacard.security.ECPrivateKey[]) c.field("privs"))[2];
         java.lang.reflect.Field f = FedimintCardApplet.class.getDeclaredField("gen");
         f.setAccessible(true);
         // KeyPair is final and jCardSim's genKeyPair cannot be made to throw, so break the generator
@@ -177,13 +177,13 @@ class GenKeyGetPubTest {
         f.set(c.runtime.appletAt(c.aid), null);
         boolean refused;
         try {
-            refused = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null).getSW() != 0x9000;
+            refused = c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 2, 1, null).getSW() != 0x9000;
         } catch (RuntimeException e) {
             refused = true;
         }
         assertTrue(refused, "genKeyPair must fail");
         assertFalse(real.isInitialized(), "old private key must be wiped");
-        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 0, null));
+        assertSw(0x6985, c.tx(CardTestSupport.GET_PUB, 2, null));
     }
 
     /** Once a PIN is set, replacing a used key needs it: not entered, the key stays. */
@@ -248,5 +248,29 @@ class GenKeyGetPubTest {
         assertSw(0x6985, c.tx(CardTestSupport.SET_NOTE, 3, c.note(3, 1000)), "and takes no note");
         privs[3] = real;
         c.genKey(3);
+    }
+
+    @Test
+    void reKeyOfSlot0IsRefusedOnceACertificateIsSetAndNothingIsWritten() throws Exception {
+        CardTestSupport c = new CardTestSupport();
+        c.genKey(0);
+        c.genKey(1);
+        byte[] before = c.getPub(0);
+        assertSw(0x9000, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null), "before SET_CERT slot 0 may be re-keyed");
+        assertFalse(java.util.Arrays.equals(before, c.getPub(0)));
+        c.certify();
+        byte[] pub0 = c.getPub(0);
+        BigInteger d0 = c.scalar(0);
+        byte st0 = ((byte[]) c.field("state"))[0];
+        assertSw(0x6985, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null), "after SET_CERT slot 0 is never re-keyed");
+        assertArrayEquals(pub0, c.getPub(0), "the key the certificate names is kept");
+        assertEquals(d0, c.scalar(0));
+        assertEquals(st0, ((byte[]) c.field("state"))[0], "nothing is written");
+        assertSw(0x9000, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 1, 1, null), "another slot still re-keys");
+        c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.verifyPin(CardTestSupport.DEFAULT_PIN);
+        assertSw(0x6985, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 0, 1, null), "nor under the PIN");
+        assertArrayEquals(pub0, c.getPub(0));
+        assertSw(0x9000, c.tx(CardTestSupport.CLA, CardTestSupport.GEN_KEY, 1, 1, null), "while another slot re-keys under the PIN");
     }
 }

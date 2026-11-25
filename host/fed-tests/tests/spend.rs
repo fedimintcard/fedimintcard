@@ -3,7 +3,8 @@
 //! Runs against `CARD_BACKEND` (soft by default; bridge and pcsc without code changes).
 
 use fedimint_card_fed_tests::*;
-use fedimint_card_host_card::{Card, open_from_env, open_pin_session};
+use fedimint_card_host_card::{Card, open_from_env};
+use fedimint_card_old_card_pin::open_pin_session;
 use fedimint_core::Amount;
 use fedimint_core::encoding::Decodable;
 use fedimint_core::secp256k1::XOnlyPublicKey;

@@ -7,11 +7,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+/// The holder's PIN session on a card of `fx`'s, sealed to its checked PIN key (§ 9).
+fn sealed_session(c: &mut dyn Card, fx: &Fx) {
+    let t = fedimint_card_host_card::trust_card(c, &hex::decode(fx.cert_key_hex()).unwrap()).unwrap();
+    fedimint_card_host_card::open_pin_session_held(c, &t, TEST_PIN, &mut |_| {}).unwrap();
+}
+
 use common::{DAY_MS, Fx, now_ms, slots_in, spent_hashes};
 use fedimint_card_host_card::softkit::{PullTransport, SoftMint, SoftTransport};
-use fedimint_card_host_card::{
-    BridgeError, CHANGE_SLOTS_FROM, Card, CardClient, SlotState, TEST_PIN, Transport, is_change_slot, open_pin_session_with,
-};
+use fedimint_card_host_card::{BridgeError, CHANGE_SLOTS_FROM, Card, CardClient, SlotState, TEST_PIN, Transport, is_change_slot};
 use fedimint_card_pos_core::charge::{Env, Pin, Taken, TillOuts, charge};
 use fedimint_card_pos_core::queue::{ChargeState, QUEUE_FILE, Queue};
 use fedimint_card_pos_core::refusal;
@@ -526,7 +530,8 @@ fn a_card_taken_away_during_its_pin_wait_is_pin_wait_and_the_held_retap_pays() {
     c.select().unwrap();
     let heard = std::cell::RefCell::new(vec![]);
     let holding = |sec: u32| heard.borrow_mut().push(sec);
-    fedimint_card_pos_core::charge::open_pin(&mut c, &Pin::Verify(TEST_PIN.to_vec()), Some(&holding)).unwrap();
+    let t = fedimint_card_host_card::trust_card(&mut c, &hex::decode(fx.cert_key_hex()).unwrap()).unwrap();
+    fedimint_card_pos_core::charge::open_pin(&mut c, &t, &Pin::Verify(TEST_PIN.to_vec()), Some(&holding)).unwrap();
     let heard = heard.into_inner();
     assert_eq!((heard.first(), heard.last(), heard.len()), (Some(&6), Some(&0), 9), "{heard:?}");
     assert!(heard.windows(2).all(|w| w[0] >= w[1]), "{heard:?}");
@@ -550,8 +555,11 @@ fn an_old_card_is_refused_with_the_old_card_message_before_any_pin_command() {
         assert_eq!((f.status, f.code, f.detail.as_str()), (409, "old_card", fedimint_card_host_card::OLD_CARD_MESSAGE));
         assert_eq!(*n.lock().unwrap(), 0, "no PIN command reached the card");
     }
-    let mut direct = fedimint_card_host_card::SoftCard::new();
-    assert_eq!(code(&s.charge(&mut direct, &json, 20_000, "old", b"1234")), "old_card");
+    // The card itself, with no transport's check in between: the refusal is pos-core's own.
+    for mut direct in [fedimint_card_host_card::SoftCard::v3(), fedimint_card_host_card::SoftCard::new()] {
+        assert_eq!(code(&s.charge(&mut direct, &json, 20_000, "old", b"1234")), "old_card");
+        assert!(!direct.heard_a_pin_command(), "no PIN command reached the card: {:02x?}", direct.received_ins());
+    }
 }
 
 /// Counts the PIN commands (`INS 40`, `41`, `42`) that reach the card.
@@ -680,7 +688,7 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
         // transaction; then, perhaps, its slot is renewed and loaded again.
         {
             let mut c = card.0.lock().unwrap();
-            open_pin_session_with(&mut *c, TEST_PIN).unwrap();
+            sealed_session(&mut *c, &fx);
             c.sign(unsigned, &[7; 32]).unwrap();
             if rekeyed {
                 c.gen_key_overwrite(unsigned).unwrap();
@@ -724,7 +732,7 @@ fn a_charge_left_signing_that_can_never_be_sent_is_abandoned_and_the_retap_pays(
     let slots: Vec<u8> = left.inputs.iter().map(|i| i.slot).collect();
     {
         let mut c = card.0.lock().unwrap();
-        open_pin_session_with(&mut *c, TEST_PIN).unwrap();
+        sealed_session(&mut *c, &fx);
         c.sign(slots[1], &[7; 32]).unwrap();
     }
     // The retap abandons it; the two notes the card has left do not make the sale.
@@ -1012,7 +1020,8 @@ fn a_charge_left_signing_is_resumed_with_no_env_and_no_second_charge() {
     // The till's tap: the card's short id, the holder's PIN, then the finisher.
     let mut c = client(card.clone());
     let short_id = fedimint_card_pos_core::short_id_of(&c.get_pub(0).unwrap());
-    c.verify_pin(TEST_PIN).unwrap();
+    let t = fedimint_card_host_card::trust_card(&mut c, &hex::decode(fx.cert_key_hex()).unwrap()).unwrap();
+    fedimint_card_host_card::verify_pin_held(&mut c, &t, TEST_PIN, &mut |_| {}).unwrap();
     let done = fedimint_card_pos_core::charge::resume_signing(&mut c, &queue, &keys.decoders, now, &short_id).unwrap();
     assert_eq!(
         done.iter().map(|d| (d.txid.as_str(), d.state)).collect::<Vec<_>>(),

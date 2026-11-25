@@ -268,8 +268,9 @@ describe.each([2, 3] as const)('SCP0%i', scp => {
     const finish = clean.log.slice(put).filter(a => a[0] === 0xb0).length;
     // The slot-count probe (GET_PUB past slot 7, and past 31 on a 32-slot card),
     // GET_PUB + GEN_KEY per slot the install tap keys (0-7), SET_PIN, VERIFY_PIN.
-    // ... then SET_LIMIT, GET_STATE, ATTEST_INIT, SET_CERT, SET_REGISTRY_KEY, SET_HEADER, GET_STATE, SET_PIN.
-    expect(finish).toBe((slots === 8 ? 1 : 2) + 8 * 2 + 8);
+    // ... then SET_LIMIT, GET_STATE, ATTEST_INIT, SET_CERT, SET_REGISTRY_KEY, SET_HEADER, GET_STATE,
+    // and the sealed PIN's GET_PUB 0, GET_CERT, GET_NONCE before SET_PIN.
+    expect(finish).toBe((slots === 8 ? 1 : 2) + 8 * 2 + 11);
 
     for (let k = 0; k < finish; k++) {
       for (const when of ['before', 'after'] as const) {

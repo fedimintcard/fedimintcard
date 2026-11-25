@@ -286,6 +286,13 @@ pub struct CardWallet {
     /// The holder's PIN for this job (`POST /v1/charge` `pin`). When unset the PIN session uses
     /// `CARD_PIN`, which is for the CLI and the tests.
     pub pin: Option<Vec<u8>>,
+    /// The registry's certificate key (hex SEC1) the sealed PIN checks a 4.x card under; when
+    /// unset, the one the ops link keeps (`till-ops.json`). Neither: no PIN is sent to a 4.x card.
+    pub cert_key: Option<String>,
+    /// Whether this tap has already checked the card under `cert_key` and, if it failed, asked the
+    /// registry once for a rotated key ([`crate::ops::Ops::check_cert_key`]). Cleared when the tap
+    /// ends ([`crate::ops::Ops::finish`]), so a card that fails costs at most one fetch a tap.
+    pub cert_checked: bool,
     /// The newest block header the till keeps, shown to a 3.0 card whose clock is older
     /// (`crate::clock`). `None`: the card's clock is left alone.
     pub headers: Option<std::sync::Arc<crate::clock::Headers>>,
@@ -295,6 +302,22 @@ pub struct CardWallet {
     /// The spare reserve an online tap keeps a 3.0 card at ([`CardWallet::card_spares`]).
     pub spares: crate::ops::SpareConfig,
 }
+
+/// A 4.x card's PIN was not sent: the till holds no registry certificate key to check the card
+/// under (none kept in `till-ops.json`, and the registry gave none at this tap). The till answers
+/// `offline_not_ready` (503): retry once the till has reached the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoCertKey;
+
+impl std::fmt::Display for NoCertKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this till needs the registry's certificate key (GET /registry/cert-key, kept in till-ops.json) before it sends a 4.0 card a PIN; no PIN was sent",
+        )
+    }
+}
+
+impl std::error::Error for NoCertKey {}
 
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
@@ -307,6 +330,8 @@ impl CardWallet {
             on_promote: None,
             ops: None,
             pin: None,
+            cert_key: None,
+            cert_checked: false,
             headers: None,
             abandoned: vec![],
             spares: crate::ops::SpareConfig::default(),
@@ -325,6 +350,25 @@ impl CardWallet {
     ///
     /// The first Ok in a job also releases and re-keys the card's dead change slots
     /// ([`card_dead_change`](Self::card_dead_change)).
+    /// Keep `key` (hex SEC1) as the registry's certificate key the sealed PIN checks cards under.
+    pub fn with_cert_key(mut self, key: Option<String>) -> Self {
+        self.cert_key = key;
+        self
+    }
+
+    /// The card in the field checked under the registry's certificate key this till keeps
+    /// ([`fedimint_card_host_card::trust_card`]): what the sealed PIN (applet 4.x) needs. A till
+    /// with no key sends no PIN.
+    pub fn trusted_card(&mut self) -> Result<fedimint_card_host_card::TrustedCard> {
+        let Some(key) = self.cert_key.clone().or_else(|| self.ops.as_ref().and_then(|l| l.cert_key.clone())) else {
+            return Err(NoCertKey.into());
+        };
+        // A kept key that is not hex is no key: `offline_not_ready` (503), no PIN sent.
+        let key = hex::decode(&key).map_err(|_| anyhow::Error::new(NoCertKey).context("the kept certificate key is not hex"))?;
+        let card = self.card.as_mut();
+        on_card(|| fedimint_card_host_card::trust_card(card, &key))
+    }
+
     pub fn verify_pin_session(&mut self) -> Result<()> {
         // VERIFY_PIN with the card's wait served (applet 4.0): the same command resent while the
         // card answers `6A98`; a card taken away during the wait is `pin_wait`.
@@ -334,8 +378,12 @@ impl CardWallet {
             None => Pin::OpenWith(fedimint_card_host_card::pin_from_env()),
         };
         let holding = |s: u32| tracing::debug!("the card serves a PIN wait: about {s} s left");
+        // A card whose SELECT answers older than 4.0 gets the old-card refusal (409 `old_card`)
+        // and no PIN command.
+        self.require_current_card()?;
+        let trust = self.trusted_card()?;
         let card = self.card.as_mut();
-        on_card(|| open_pin(card, &pin, Some(&holding)))?;
+        on_card(|| open_pin(card, &trust, &pin, Some(&holding)))?;
         self.card_dead_change();
         Ok(())
     }
@@ -371,6 +419,10 @@ impl CardWallet {
     pub fn card_setup(&mut self, fresh: bool) -> Result<Vec<(u8, XOnlyPublicKey)>> {
         self.recover_overwrites()?;
         if fresh {
+            ensure!(
+                !self.slot0_certified()?,
+                "--fresh would re-key slot 0, whose key this card's certificate names; a certified 4.x card keeps it, so it cannot be issued afresh here"
+            );
             let st = &self.store.state;
             ensure!(
                 !st.notes.iter().any(|n| matches!(n.status, NoteStatus::Live | NoteStatus::Pending))
@@ -492,6 +544,7 @@ impl CardWallet {
         );
         let old = self.store.state.slot_pubkey(slot).expect("overwritable implies cached").to_owned();
         ensure!(self.may_renew(slot), "slot {slot}'s key names the card in ops and is never renewed");
+        ensure!(slot != 0 || !self.slot0_certified()?, "slot 0's key is the one this card's certificate names; it is never renewed");
         let rec = PendingOverwrite { slot, old_pubkey: old };
         self.store.state.pending_overwrites.push(rec.clone());
         self.store.save()?;
@@ -515,7 +568,11 @@ impl CardWallet {
     /// Returns the slots renewed. Failures are reported, not fatal.
     pub async fn renew_spent_slots(&mut self) -> Result<Vec<u8>> {
         let mut done = vec![];
-        let slots: Vec<u8> = self.store.state.overwritable_slots().into_iter().filter(|s| self.may_renew(*s)).collect();
+        let mut slots: Vec<u8> = self.store.state.overwritable_slots().into_iter().filter(|s| self.may_renew(*s)).collect();
+        // A card that cannot say whether slot 0 is certified keeps its slot 0 key.
+        if slots.contains(&0) && self.slot0_certified().unwrap_or(true) {
+            slots.retain(|s| *s != 0);
+        }
         for slot in slots {
             if !self.renewable(slot).await? {
                 continue;
@@ -530,6 +587,23 @@ impl CardWallet {
 
     /// Whether every spent note on `slot`'s current key is spent on the federation too, so the
     /// key holds nothing and may be overwritten.
+    /// Whether slot 0's key is the one a certificate on the card names: a 4.x card that holds
+    /// one (GET_CERT answers). The card takes SET_CERT once, before its first SET_PIN, so a
+    /// re-keyed slot 0 would leave it certified for a key it no longer has, and no host would
+    /// seal a PIN to it again (`trust_card`). Such a slot 0 is never re-keyed, with the registry
+    /// or without it. A card older than 4.0 answers `false` and keeps its rules; so does a 4.x
+    /// card not yet certified, whose certificate will name whatever key slot 0 then holds.
+    pub(crate) fn slot0_certified(&mut self) -> Result<bool> {
+        if !self.card_sign_once()? {
+            return Ok(false);
+        }
+        match on_card(|| self.card.get_cert()) {
+            Ok(_) => Ok(true),
+            Err(e) if status_word(&e) == Some(fedimint_card_host_card::v3::SW_RECORD_NOT_FOUND) => Ok(false),
+            Err(e) => Err(e.context("asking the card for its certificate")),
+        }
+    }
+
     pub(crate) async fn renewable(&self, slot: u8) -> Result<bool> {
         let notes: Vec<NoteRec> = self.store.state.notes_on_current_key(slot).cloned().collect();
         for n in &notes {
@@ -574,7 +648,11 @@ impl CardWallet {
     /// notes — before anything is signed or submitted — so a repeat of the ref can be answered
     /// from state even if the process dies mid-call. The transaction id is filled in as soon as
     /// the wallet has built it.
+    ///
+    /// A card older than 4.0 is refused (409 `old_card`) before anything is read from it or
+    /// recorded: a 4.x till's sale refuses such a card, so value put on it could not be spent here.
     pub async fn topup_ref(&mut self, amounts: &[u64], client_ref: Option<&str>) -> Result<Vec<(u8, u64)>> {
+        self.require_current_card()?;
         self.recover_overwrites()?;
         let notes: Vec<u64> = amounts.iter().flat_map(|a| plan::binary(*a)).collect();
         ensure!(!notes.is_empty(), "nothing to top up");
@@ -1452,6 +1530,8 @@ impl CardWallet {
     /// [`spend`](Self::spend) for the till service: `client_ref` is stored on the `PendingTx`, in
     /// the save that creates it, before anything is signed or submitted.
     pub async fn spend_ref(&mut self, price_msat: u64, client_ref: Option<&str>) -> Result<SpendReport> {
+        // A card older than 4.0 is refused first, whatever it holds: no change is written to it.
+        self.require_current_card()?;
         self.start_clean().await?;
         // Change made live just now (a sale this tap sent): its outcome goes to ops first, whose
         // answer carries the registry's signatures, so this charge can write it to the card and
@@ -1780,21 +1860,45 @@ pub fn forget_refused_reg_sigs(st: &mut CardState, refused: &[(u8, String)], now
     }
 }
 
+/// The old-card refusal (409 `old_card`) for `card`, any card in the field: applet 4.x passes;
+/// an older card, or one whose SELECT did not pass, is refused. Every PIN path and every path that
+/// puts value on a card (a load, a top-up, an issue) runs it before anything else reaches the card.
+pub fn require_current_card(card: &mut dyn Card) -> Result<()> {
+    if card_sign_once(card)? {
+        return Ok(());
+    }
+    let v = on_card(|| card.applet_version())?;
+    Err(anyhow::Error::new(fedimint_card_host_card::UnsupportedApplet::Old { answer: vec![v.major, v.minor] })
+        .context(format!("applet {v}: this till takes no card older than 4.0")))
+}
+
+/// [`CardWallet::card_sign_once`] for any card in the field.
+pub fn card_sign_once(card: &mut dyn Card) -> Result<bool> {
+    match on_card(|| card.applet_version()) {
+        Ok(v) => Ok(v.is_current()),
+        Err(e) if fedimint_card_host_card::is_old_card(&e) => Err(e),
+        Err(e) if e.downcast_ref::<fedimint_card_host_card::NotSelected>().is_some() => {
+            Err(anyhow::Error::new(fedimint_card_host_card::UnsupportedApplet::Old { answer: vec![] }).context(format!("{e:#}")))
+        }
+        Err(e) => Err(e.context("asking the card for its version")),
+    }
+}
+
 impl CardWallet {
     /// Whether the card in the field is applet 4.0 (each slot signs once; notes on the card). A
     /// card that says it is older answers `false`; a card the till opened is never one, because
     /// `open_card_over` refuses it. When the version check itself fails, because the last SELECT
     /// did not pass the rule for every reader, the answer is the old-card error
     /// ([`fedimint_card_host_card::is_old_card`]), never "2.x": such a card is not charged.
+    /// The old-card refusal ([`fedimint_card_host_card::UnsupportedApplet::Old`], 409 `old_card`)
+    /// for a card whose applet is not 4.x, before any PIN: what every PIN path of the till runs
+    /// first. A card whose SELECT did not pass answers the same refusal ([`Self::card_sign_once`]).
+    pub fn require_current_card(&mut self) -> Result<()> {
+        require_current_card(self.card.as_mut())
+    }
+
     pub fn card_sign_once(&mut self) -> Result<bool> {
-        match on_card(|| self.card.applet_version()) {
-            Ok(v) => Ok(v.is_current()),
-            Err(e) if fedimint_card_host_card::is_old_card(&e) => Err(e),
-            Err(e) if e.downcast_ref::<fedimint_card_host_card::NotSelected>().is_some() => {
-                Err(anyhow::Error::new(fedimint_card_host_card::UnsupportedApplet::Old { answer: vec![] }).context(format!("{e:#}")))
-            }
-            Err(e) => Err(e.context("asking the card for its version")),
-        }
+        card_sign_once(self.card.as_mut())
     }
 
     /// The nonces of live notes a charge cannot spend yet: on a card that holds its notes, a note
@@ -1949,8 +2053,7 @@ mod tests {
     /// 1024 msat for each, signed by `registry` when given.
     fn card_and_notes(slots: &[u8], registry: Option<&p256::ecdsa::SigningKey>) -> (SoftCard, Vec<CardNote>) {
         let mut card = SoftCard::v4();
-        ready_for_pin(&mut card).unwrap();
-        let notes = slots
+        let notes: Vec<CardNote> = slots
             .iter()
             .map(|&slot| {
                 let key = card.gen_key(slot).unwrap();
@@ -1963,6 +2066,8 @@ mod tests {
                 }
             })
             .collect();
+        // After the keys: a card with no certificate is certified over slot 0's key, made here.
+        ready_for_pin(&mut card).unwrap();
         (card, notes)
     }
 

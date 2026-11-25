@@ -4,12 +4,13 @@
 //! step for step: this is what makes the SoftCard a stand-in for the card in the hosts' tests.
 //!
 //! Paths: set-up (registry key and anchor in SET_PIN's selection), a weak header, GEN_KEY and its
-//! overwrite, a registry-signed note and a wrongly signed one, the change gate, a right PIN, a
+//! overwrite (never of the certified slot 0, even spent and under the PIN), a registry-signed note and a wrongly signed one, the change gate, a right PIN, a
 //! wrong PIN and the wait it owes served by `verify_pin_held`, SIGN and SIGN again, GET_STATE's
 //! 65 bytes, CHANGE_PIN with the old PIN's length.
 
 use fedimint_card_host_card::v3::{self, Opening};
 use fedimint_card_host_card::*;
+use fedimint_card_old_card_pin::ClearPin;
 use secp256k1::{Message, SECP256K1};
 
 const PIN: &[u8] = b"1234";
@@ -67,9 +68,9 @@ fn mine(time: u32, bits: u32) -> [u8; 80] {
 }
 
 /// The 6A98s `verify_pin_held` served, and its answer.
-fn held(c: &mut dyn Card, pin: &[u8]) -> String {
+fn held(c: &mut dyn Card, t: &TrustedCard, pin: &[u8]) -> String {
     let mut calls = 0;
-    let r = verify_pin_held(c, pin, &mut |_| calls += 1);
+    let r = verify_pin_held(c, t, pin, &mut |_| calls += 1);
     format!("{} after {} waits", sw(r), calls - 1)
 }
 
@@ -93,19 +94,28 @@ fn paths<T: Transport>(c: &mut CardClient<T>) -> Vec<String> {
     let st = state(c);
     step("fresh: pin, anchored, registry", format!("{} {} {}", st.pin_set, st.anchored, st.registry_key));
 
+    // The sealed PIN (§ 9): a PIN key bound by a certified attestation key, before any PIN.
+    let x0 = c.gen_key(0).unwrap();
+    step("GET_NONCE before the certificate", sw(c.get_nonce()));
+    let w = c.attest_init().unwrap();
+    step("SET_CERT", sw(c.set_cert(&Certificate::sign(&registry, &x0.serialize(), &w).unwrap().to_bytes())));
+    let t = trust_card(c, &v3::registry_point(&registry)).unwrap();
+    let clear = c.set_pin(PIN).unwrap_err().downcast_ref::<ClearPinRefused>().is_some();
+    step("SET_PIN with P1 00", if clear { "refused unsent" } else { "sent" }.to_string());
+
     // Set-up: SET_PIN needs this selection's anchor, then the registry key.
-    step("SET_PIN before the anchor", sw(c.set_pin(PIN)));
+    step("SET_PIN before the anchor", sw(set_pin_sealed(c, &t, PIN)));
     step("SET_HEADER weak, before any anchor", sw(c.set_header(&mine(1_700_000_000, 0x207F_FFFF))));
     step("SET_HEADER anchor", c.set_header(&anchor).map(|now| now.to_string()).unwrap_or_else(|e| sw::<()>(Err(e))));
-    step("SET_PIN before the registry key", sw(c.set_pin(PIN)));
+    step("SET_PIN before the registry key", sw(set_pin_sealed(c, &t, PIN)));
     step("SET_REGISTRY_KEY", sw(c.set_registry_key(&v3::registry_point(&registry))));
     step("SET_HEADER weak, after the anchor", sw(c.set_header(&mine(1_800_000_000, 0x207F_FFFF))));
-    let x0 = c.gen_key(0).unwrap();
     step("GEN_KEY 0 again", sw(c.gen_key(0)));
     c.gen_key(1).unwrap();
     c.gen_key(2).unwrap();
-    step("SET_PIN", sw(c.set_pin(PIN)));
-    step("SET_PIN again", sw(c.set_pin(PIN)));
+    let x3 = c.gen_key(3).unwrap().serialize();
+    step("SET_PIN", sw(set_pin_sealed(c, &t, PIN)));
+    step("SET_PIN again", sw(set_pin_sealed(c, &t, PIN)));
     let st = state(c);
     step("after SET_PIN: pin, anchored, wrong, owed", format!("{} {} {} {}", st.pin_set, st.anchored, st.wrong_tries, st.owed));
 
@@ -117,7 +127,10 @@ fn paths<T: Transport>(c: &mut CardClient<T>) -> Vec<String> {
     step("SET_NOTE", sw(c.set_note(0, 1000, &sig48, &v3::sign_note(&registry, &x, 1000, &sig48))));
     let s0 = c.get_slot(0).unwrap();
     step("slot 0", format!("{:?} {}", s0.state, s0.amount_msat));
-    step("GEN_KEY overwrite of a NOTE slot", sw(c.gen_key_overwrite(0)));
+    // A NOTE slot other than 0, so the refusal is the NOTE state's and not slot 0's certificate.
+    step("SET_NOTE slot 3", sw(c.set_note(3, 500, &sig48, &v3::sign_note(&registry, &x3, 500, &sig48))));
+    step("GEN_KEY overwrite of a NOTE slot", sw(c.gen_key_overwrite(3)));
+    step("slot 3 after the refusal", format!("{:?} {}", c.get_slot(3).unwrap().state, c.get_pub(3).unwrap().serialize() == x3));
 
     // A new selection: no PIN in it, so the change gate and SIGN refuse.
     let opening = Opening { txid: [3; 32], out_idx: 1, blinding_key: [4; 32] };
@@ -127,13 +140,13 @@ fn paths<T: Transport>(c: &mut CardClient<T>) -> Vec<String> {
     step("GEN_KEY overwrite without the PIN", sw(c.gen_key_overwrite(2)));
 
     // The right PIN, then a wrong one and the waits it owes.
-    step("VERIFY_PIN right", held(c, PIN));
-    step("VERIFY_PIN wrong", sw(c.verify_pin(WRONG)));
+    step("VERIFY_PIN right", held(c, &t, PIN));
+    step("VERIFY_PIN wrong", sw(verify_pin_held(c, &t, WRONG, &mut |_| {})));
     let st = state(c);
     step("after one wrong: wrong, owed", format!("{} {}", st.wrong_tries, st.owed));
-    step("VERIFY_PIN wrong, held", held(c, WRONG));
+    step("VERIFY_PIN wrong, held", held(c, &t, WRONG));
     step("SIGN after a wrong PIN", sw(c.sign(0, &[0x5A; 32])));
-    step("VERIFY_PIN right, held", held(c, PIN));
+    step("VERIFY_PIN right, held", held(c, &t, PIN));
     let st = state(c);
     step("after the right PIN: wrong, owed", format!("{} {}", st.wrong_tries, st.owed));
 
@@ -162,17 +175,22 @@ fn paths<T: Transport>(c: &mut CardClient<T>) -> Vec<String> {
     step("SIGN another hash", sw(c.sign(0, &[0x5B; 32])));
     let s0 = c.get_slot(0).unwrap();
     step("slot 0 after SIGN", format!("{:?} spent hash is the message {}", s0.state, s0.spent_hash == msg));
+    // Slot 0 is spent and the PIN is held, which would let any other slot re-key; the certificate
+    // names slot 0's key, so its re-key form is refused before anything is written.
+    step("GEN_KEY overwrite of the certified slot 0, spent, with the PIN", sw(c.gen_key_overwrite(0)));
+    let s0 = c.get_slot(0).unwrap();
+    step("slot 0 after the refusal: state, same key", format!("{:?} {}", s0.state, c.get_pub(0).unwrap() == x0));
     let raw = c.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])).unwrap();
     step("GET_STATE bytes", raw.len().to_string());
     let st = state(c);
     step("GET_STATE slots 0..3", format!("{:?}", &st.states[..3]));
 
     // CHANGE_PIN: P1 is the old PIN's length; it needs this session's PIN and ends it.
-    step("CHANGE_PIN", sw(c.change_pin(PIN, NEW_PIN)));
+    step("CHANGE_PIN", sw(change_pin_sealed(c, &t, PIN, NEW_PIN)));
     step("SIGN after CHANGE_PIN", sw(c.sign(0, &msg)));
-    step("CHANGE_PIN without the session", sw(c.change_pin(NEW_PIN, PIN)));
-    step("VERIFY_PIN the old PIN", held(c, PIN));
-    step("VERIFY_PIN the new PIN", held(c, NEW_PIN));
+    step("CHANGE_PIN without the session", sw(change_pin_sealed(c, &t, NEW_PIN, PIN)));
+    step("VERIFY_PIN the old PIN", held(c, &t, PIN));
+    step("VERIFY_PIN the new PIN", held(c, &t, NEW_PIN));
     let st = state(c);
     step("at the end: pin, wrong, owed", format!("{} {} {}", st.pin_set, st.wrong_tries, st.owed));
     step("GET_STATE at the end", format!("{st:?}"));
@@ -186,6 +204,9 @@ const EXPECTED: &[&str] = &[
     "version: Some(AppletVersion { major: 4, minor: 0 })",
     "GET_STATE fresh, bytes: 65",
     "fresh: pin, anchored, registry: false false false",
+    "GET_NONCE before the certificate: 6985",
+    "SET_CERT: 9000",
+    "SET_PIN with P1 00: refused unsent",
     "SET_PIN before the anchor: 6A96",
     "SET_HEADER weak, before any anchor: 6A93",
     "SET_HEADER anchor: 1749188499",
@@ -201,7 +222,9 @@ const EXPECTED: &[&str] = &[
     "slot 0 after the refusals: Keyed",
     "SET_NOTE: 9000",
     "slot 0: Note 1000",
+    "SET_NOTE slot 3: 9000",
     "GEN_KEY overwrite of a NOTE slot: 6985",
+    "slot 3 after the refusal: Note true",
     "select again: 9000",
     "SET_CHANGE without the PIN: 6A94",
     "SIGN without the PIN: 6A94",
@@ -220,6 +243,8 @@ const EXPECTED: &[&str] = &[
     "SIGN the same hash again: 9000 verifies true",
     "SIGN another hash: 6985",
     "slot 0 after SIGN: Spent spent hash is the message true",
+    "GEN_KEY overwrite of the certified slot 0, spent, with the PIN: 6985",
+    "slot 0 after the refusal: state, same key: Spent true",
     "GET_STATE bytes: 65",
     "GET_STATE slots 0..3: [Spent, Change, Keyed]",
     "CHANGE_PIN: 9000",
@@ -228,7 +253,7 @@ const EXPECTED: &[&str] = &[
     "VERIFY_PIN the old PIN: 63C1 after 0 waits",
     "VERIFY_PIN the new PIN: 9000 after 1 waits",
     "at the end: pin, wrong, owed: true 0 0",
-    "GET_STATE at the end: CardStatus { states: [Spent, Change, Keyed, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty], now: 1749188499, window: 1749188499, limit_msat: 0, spent_msat: 1000, cert_len: 0, attest_key: false, registry_key: true, pin_set: true, wrong_tries: 0, owed: 0, anchored: false, chip_mul: false, key_in_ram: false }",
+    "GET_STATE at the end: CardStatus { states: [Spent, Change, Keyed, Note, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty], now: 1749188499, window: 1749188499, limit_msat: 0, spent_msat: 1000, cert_len: 130, attest_key: true, registry_key: true, pin_set: true, wrong_tries: 0, owed: 0, anchored: false, chip_mul: false, key_in_ram: false }",
 ];
 
 #[test]

@@ -102,6 +102,7 @@ class SetPinTest {
         assertEquals(0, c.pinState());
         assertNull(c.field("workKeys"), "a refused SET_PIN makes nothing");
         assertFalse(signer(c).chipMul);
+        c.certify();
         assertSw(0x9000, c.tx(SET_PIN, 0, PIN), "a keyed slot holds no value");
         assertSw(0x6985, c.tx(SET_PIN, 0, PIN), "a PIN is set");
     }
@@ -115,6 +116,7 @@ class SetPinTest {
         Object ecdh = get(s, SchnorrHW.class, "ecdh");
         Lying lying = new Lying(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY);
         set(s, SchnorrHW.class, "ecdh", lying);
+        c.certify();
         assertSw(0x6F00, c.tx(SET_PIN, 0, PIN), "a chip whose key agreement answers otherwise takes no PIN");
         assertTrue(lying.calls > 0, "the check asked the engine");
         assertEquals(0, c.pinState());
@@ -142,6 +144,7 @@ class SetPinTest {
             Lying lying = new Lying(alg);
             lying.onFirst = () -> { seen[0] = newPin.clone(); seen[1] = eng.powers; seen[2] = sq.mod; };
             set(s, SchnorrHW.class, which, lying);
+            c.certify();
             assertSw(0x6F00, c.tx(SET_PIN, 0, PIN), which + ": a chip whose engine answers otherwise takes no PIN");
             assertTrue(lying.calls > 0, which + ": the check asked the engine");
             for (byte b : (byte[]) seen[0]) assertEquals(0, b, which + ": the PIN was not copied in before the check");

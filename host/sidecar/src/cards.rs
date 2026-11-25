@@ -360,34 +360,14 @@ pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutc
     Ok(KeySetupOutcome { keys, short_id: sid, pin: pin_state, pin_verified, generated })
 }
 
-/// `SET_PIN` then `VERIFY_PIN` on a 2.x card (`6985`: a PIN already exists, the idempotent
-/// case). On applet 4.0 see [`set_pin_v4`].
+/// The till's PIN set-up (`keySetup` with a PIN): applet 4.x only, sealed ([`set_pin_v4`]). A card
+/// older than 4.0 gets the old-card refusal before any PIN goes out.
 fn set_pin(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>)> {
     if !(PIN_MIN..=PIN_MAX).contains(&pin.len()) {
         return Err(anyhow!("PIN must be {PIN_MIN} to {PIN_MAX} digits, not {}", pin.len()));
     }
-    if cw.card_sign_once()? {
-        return set_pin_v4(cw, pin);
-    }
-    let existing = match on_card(|| cw.card.set_pin(pin)) {
-        Ok(()) => PinState::SetNow,
-        Err(e) => match status_word(&e) {
-            // The applet answers 6985 when a PIN already exists: nothing to do, and the card is
-            // unchanged, which is what makes a re-run of keySetup safe.
-            Some(SW_CONDITIONS_NOT_SATISFIED) => PinState::AlreadySet,
-            w => return Err(e.context(format!("SET_PIN answered {}", w.map(|w| format!("{w:04X}")).unwrap_or_default()))),
-        },
-    };
-    let verified = match on_card(|| cw.card.verify_pin(pin)) {
-        Ok(()) => true,
-        Err(e) => match status_word(&e) {
-            // A wrong PIN or another refusal: the card exists and is programmed, but it cannot
-            // spend. Reported, not raised: the plan records `pinNotSet`.
-            Some(_) => false,
-            None => return Err(e).context("VERIFY_PIN"),
-        },
-    };
-    Ok((existing, Some(verified)))
+    cw.require_current_card()?;
+    set_pin_v4(cw, pin)
 }
 
 /// Applet 4.0 (DESIGN § 4): a card with a PIN is only verified, its wait served. A card without
@@ -396,9 +376,11 @@ fn set_pin(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>)> 
 /// SET_PIN still needs the registry's key on the card and no value, which the Setup app sees to.
 fn set_pin_v4(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>)> {
     use fedimint_card_pos_core::charge::{Pin, open_pin};
+    // The sealed PIN goes only to a card checked under the registry's key (§ 9).
+    let trust = cw.trusted_card()?;
     if on_card(|| cw.card.get_state())?.pin_set {
         let card = cw.card.as_mut();
-        let verified = match on_card(|| open_pin(card, &Pin::Verify(pin.to_vec()), None)) {
+        let verified = match on_card(|| open_pin(card, &trust, &Pin::Verify(pin.to_vec()), None)) {
             Ok(()) => true,
             // A wrong PIN, or a wait the card was taken from: reported, not raised.
             Err(e) if status_word(&e).is_some() || e.downcast_ref::<fedimint_card_pos_core::PinWait>().is_some() => false,
@@ -411,9 +393,12 @@ fn set_pin_v4(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>
     };
     on_card(|| cw.card.set_header(&h)).context("SET_HEADER, the anchor before SET_PIN")?;
     ensure!(on_card(|| cw.card.get_state())?.anchored, "the card did not anchor its clock at the till's header; no PIN was set");
-    on_card(|| cw.card.set_pin(pin)).map_err(|e| {
+    let card = cw.card.as_mut();
+    on_card(|| fedimint_card_host_card::set_pin_sealed(card, &trust, pin)).map_err(|e| {
         let w = status_word(&e).map(|w| format!("{w:04X}")).unwrap_or_default();
-        e.context(format!("SET_PIN answered {w} (6985: the card has no registry key or holds value; set it up with the Setup app)"))
+        e.context(format!(
+            "SET_PIN answered {w} (6985: the card has no registry key, holds value, or has no live nonce; set it up with the Setup app)"
+        ))
     })?;
     Ok((PinState::SetNow, Some(true)))
 }

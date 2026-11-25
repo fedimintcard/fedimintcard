@@ -23,7 +23,18 @@ default 0, none; set one for a village batch that pays offline), `ATTEST_INIT` (
 answers the certificate), `SET_CERT`, `SET_REGISTRY_KEY` (the registry's certificate
 key from the public `GET /registry/cert-key`, fetched once per batch before the first
 tap so the NFC session makes no network call for it; skipped when `GET_STATE` byte 58
-is already 1, and on a card whose `GET_STATE` is 58 bytes), then `SET_PIN` and `VERIFY_PIN`. A tap lifted
+is already 1, and on a card whose `GET_STATE` is 58 bytes), then `SET_HEADER` (the anchor),
+`GET_STATE`, and the sealed PIN (applet 4.0, `docs/OFFLINE-PROTOCOL.md` § 9, `src/sealedPin.ts`):
+`GET_PUB 0` and `GET_CERT`, the certificate checked under the registry's certificate key
+and against slot 0, `GET_NONCE` with the PIN key's binding checked under the
+certificate's attestation key, then one sealed `SET_PIN` (P1 01, a 90-byte envelope). Every
+PIN command is sealed, and none is sealed to a card that fails a check:
+the tap stops at `setPin` with "the card did not prove it is a genuine card of this
+registry". The reset of a 4.0 card seals the holder's `VERIFY_PIN` the same way, with the
+certificate key fetched before the tap; without it the reset stops before the PIN. Only
+the reset of an applet before 4.0 sends that applet's form (`oldCardResetPinApdu`, P1 00),
+and the PIN screen warns the operator; nothing else in the app does, and the till and the
+POS phones send no PIN to such a card at all. A tap lifted
 anywhere in it is finished by the next tap of the same card: the offline steps are
 idempotent before the PIN (`SET_LIMIT` again, `ATTEST_INIT` again until `SET_CERT`
 took, `SET_REGISTRY_KEY` until byte 58 says it is set), and a card that already holds its certificate keeps its keys, because the
@@ -109,6 +120,7 @@ src/cardkit.ts       the only import of @fedimintcard/cardkit, plus FEDIMINT_PLA
 src/settings.tsx     build-time constants (frozen) and runtime settings (persisted)
 src/store.tsx        the batch state machine: phases, stops, PIN policy, loop index
 src/pin.ts           PIN entry, generation and the wipe-on-leave rules
+src/sealedPin.ts     the sealed PIN: the envelope, the certificate and binding checks
 src/api.ts           RegistryClient, LocalClient (sidecar), RegistryOutbox
 src/session.ts       withCard: the ISO-DEP transceiver over react-native-nfc-manager
 src/demo/            the fake card and its scripted stops (store review)

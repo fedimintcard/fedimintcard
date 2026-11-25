@@ -16,6 +16,11 @@ PinWaitTest and WeakClockTest (adapted), all in applet/src/test. Opener.java and
 follow cashucard/javacard. registry/src/auth.ts, backup.ts and managerKeys.ts follow the shape of
 cashucard's ops. Same licence.
 
+The sealed PIN in FedimintCardApplet.java (GET_NONCE, unseal, sealBlock, unblockPin, and
+requireFullPoint with its field code: isSquareModP, powModP, reduceModP and their helpers) is
+ported from the same applet (Cashu Card 1.9, its unseal, sealBlock, unblockPin and
+processGetPinKey), and SealedPinTest in applet/src/test ports its sealed-PIN tests. Same licence.
+
 tools/cardkit is ported from cashucard's tools/cardkit. Its own NOTICE, in
 that directory, names what was copied and carries the same licence.
 

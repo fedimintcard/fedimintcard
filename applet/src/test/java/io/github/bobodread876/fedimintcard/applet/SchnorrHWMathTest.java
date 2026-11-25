@@ -298,6 +298,11 @@ class SchnorrHWMathTest {
      */
     private static final String[][] ONCE_ONLY_ALLOCATIONS = {
         { "FedimintCardApplet.java", "private void setPin(", "workKeys = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);" },
+        { "FedimintCardApplet.java", "private void attestInit(", "pinKey = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);" },
+        { "FedimintCardApplet.java", "private void attestInit(", "rsa = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);" },
+        { "FedimintCardApplet.java", "private void attestInit(", "rsaCube = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
+        { "FedimintCardApplet.java", "private void attestInit(", "rsaRoot = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
+        { "FedimintCardApplet.java", "private void attestInit(", "rsaEuler = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
     };
 
     /**

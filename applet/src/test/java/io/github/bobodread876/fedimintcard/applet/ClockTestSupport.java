@@ -36,6 +36,7 @@ final class ClockTestSupport {
     /** A set-up as the Setup app sends it, in one selection: the registry key, the anchor, SET_PIN. */
     static void setUp(CardTestSupport c, byte[] tip) {
         c.select();
+        c.certify();
         if (!registryKeySet(c)) assertSw(0x9000, c.tx(SET_REGISTRY_KEY, 0, TEST_REGISTRY_KEY));
         assertEquals(0x9000, header(c, tip), "the set-up's anchor");
         assertEquals(1, anchored(c));

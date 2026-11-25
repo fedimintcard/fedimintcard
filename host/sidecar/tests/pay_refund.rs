@@ -190,7 +190,7 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
             keys.push(c.gen_key(s)?);
         }
         fedimint_card_host_card::softkit::ready_for_pin(&mut *c)?;
-        fedimint_card_host_card::open_pin_session(&mut *c)?;
+        fedimint_card_host_card::softkit::open_test_session(&mut *c)?;
     }
     let short_id = short_id_of(&keys[0]);
     let registry = Arc::new(FakeRegistry {

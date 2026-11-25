@@ -5,7 +5,22 @@
 
 use fedimint_card_host_card::v3::{self, Certificate};
 use fedimint_card_host_card::*;
+use fedimint_card_old_card_pin::ClearPin;
 use secp256k1::{Message, SECP256K1};
+
+/// SET_PIN or VERIFY_PIN as a host seals it (§ 9). A card with no certificate first gets one from
+/// the test registry over slot 0's key, as set-up gives it one before its first PIN.
+fn sealed_pin(c: &mut dyn Card, ins: u8, pin: &[u8]) -> anyhow::Result<()> {
+    if c.get_cert().is_err() {
+        let k0 = c.get_or_gen(0)?;
+        let w = c.attest_init()?;
+        c.set_cert(&Certificate::sign(&v3::test_registry_key(), &k0.serialize(), &w)?.to_bytes())?;
+    }
+    let pk = fedimint_card_host_card::sealed::PinKey::parse(&c.get_nonce()?)?;
+    let block = fedimint_card_host_card::sealed::pin_block(pin)?;
+    let env = fedimint_card_host_card::sealed::seal(&pk.key, &pk.nonce, ins, &block)?;
+    c.apdu(&fedimint_card_host_card::sealed::sealed_apdu(ins, &env)).map(|_| ())
+}
 
 // Real mainnet headers: 900000, then 900200 (121 243 s later) and 900201 (553 s after that).
 const H900000: &str = "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92";
@@ -66,9 +81,9 @@ fn card(n: u8, msat: u64, limit: u64) -> SoftCard {
         c.set_limit(limit).unwrap();
     }
     ready_for_pin(&mut c);
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     for s in 0..n {
-        c.gen_key(s).unwrap();
+        c.get_or_gen(s).unwrap();
         note(&mut c, s, msat).unwrap();
     }
     c
@@ -106,7 +121,7 @@ fn only_a_note_is_signed() {
     c.gen_key(0).unwrap();
     c.gen_key(1).unwrap();
     ready_for_pin(&mut c);
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     c.set_change(1, 4096, &change(4096)).unwrap();
     assert_eq!(sw(c.sign(0, &h(1))), 0x6985, "a key with no note");
     assert_eq!(sw(c.sign(1, &h(1))), 0x6985, "a key owed change");
@@ -130,16 +145,16 @@ fn a_key_that_holds_value_is_never_replaced() {
 
 #[test]
 fn a_spent_slot_is_re_keyed_and_forgets_its_transaction() {
-    let mut c = card(1, 1000, 0);
-    c.sign(0, &h(1)).unwrap();
-    let before = c.get_pub(0).unwrap();
-    c.gen_key_overwrite(0).unwrap();
-    let slot = c.get_slot(0).unwrap();
+    let mut c = card(2, 1000, 0);
+    c.sign(1, &h(1)).unwrap();
+    let before = c.get_pub(1).unwrap();
+    c.gen_key_overwrite(1).unwrap();
+    let slot = c.get_slot(1).unwrap();
     assert_eq!(slot.state, SlotState::Keyed);
-    assert_ne!(before, c.get_pub(0).unwrap());
+    assert_ne!(before, c.get_pub(1).unwrap());
     assert_eq!(slot.spent_hash, [0; 32], "the spent hash is gone");
-    note(&mut c, 0, 1000).unwrap();
-    assert_eq!(sw(c.sign(0, &h(2))), 0x9000, "the new note signs its own transaction");
+    note(&mut c, 1, 1000).unwrap();
+    assert_eq!(sw(c.sign(1, &h(2))), 0x9000, "the new note signs its own transaction");
 }
 
 #[test]
@@ -178,7 +193,7 @@ fn the_limit_is_set_only_before_the_pin() {
     let mut c = SoftCard::v4();
     c.set_limit(5000).unwrap();
     ready_for_pin(&mut c);
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     assert_eq!(sw(c.set_limit(1 << 40)), 0x6985);
     assert_eq!(c.get_state().unwrap().limit_msat, 5000);
 }
@@ -272,7 +287,7 @@ fn the_card_attests_over_the_challenge_and_its_own_key() {
 fn attestation_key_is_not_made_after_the_pin() {
     let mut c = SoftCard::v4();
     ready_for_pin(&mut c);
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     assert_eq!(sw(c.attest_init()), 0x6985);
 }
 
@@ -333,7 +348,7 @@ fn client_speaks_4_0() {
     c.set_registry_key(&v3::registry_point(&v3::test_registry_key())).unwrap();
     assert_eq!(c.set_header(&header(H900000)).unwrap(), v3::header_time(&header(H900000)));
     // The first SET_PIN gives this selection the PIN: no VERIFY_PIN before the change or SIGN.
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     note(&mut c, 0, 4096).unwrap();
     let open = change(1);
     c.set_change(1, 1024, &open).unwrap();
@@ -345,7 +360,7 @@ fn client_speaks_4_0() {
     assert_eq!(st.states[..3], [SlotState::Note, SlotState::Change, SlotState::Empty]);
     c.sign(0, &h(9)).unwrap();
     assert_eq!(c.get_slot(0).unwrap().state, SlotState::Spent);
-    assert_eq!(sw(c.get_cert()), 0x6A83);
+    assert_eq!(c.get_cert().unwrap().len(), v3::CERT_LEN, "the sealed PIN's certificate, from set-up");
 
     let mut old = CardClient::new(Direct(SoftCard::new()));
     assert_eq!(old.applet_version().unwrap(), AppletVersion::V2_1, "a 2.1 card refuses GET_STATE");
@@ -373,7 +388,7 @@ fn released_card(k: &p256::ecdsa::SigningKey) -> (SoftCard, [u8; 32]) {
     c.gen_key(2).unwrap();
     c.set_registry_key(&point(k)).unwrap();
     c.set_header(&header(H900000)).unwrap();
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     note_by(&mut c, k, 1, 2048).unwrap();
     (c, slot0)
 }
@@ -442,9 +457,9 @@ fn the_registry_key_is_set_before_the_pin_and_without_it_no_note_loads() {
     assert_eq!(sw(c.set_note(1, 2048, &sig48(), &reg_sig)), 0x6985, "no registry key: no note");
     assert_eq!(c.slot_state(1), Some(SlotState::Keyed));
     c.set_header(&header(H900000)).unwrap();
-    assert_eq!(sw(c.set_pin(PIN)), 0x6985, "no registry key: no PIN either");
+    assert_eq!(sw(sealed_pin(&mut c, INS_SET_PIN, PIN)), 0x6985, "no registry key: no PIN either");
     c.set_registry_key(&point(&k)).unwrap();
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     assert_eq!(sw(c.set_registry_key(&point(&registry()))), 0x6985, "only before the PIN");
     c.set_note(1, 2048, &sig48(), &reg_sig).unwrap();
     assert_eq!(c.apdu(&v3_apdu(v3::INS_GET_STATE, 0, &[])).unwrap().len(), 65);
@@ -477,7 +492,7 @@ fn client_speaks_release() {
     c.set_registry_key(&point(&k)).unwrap();
     assert!(c.get_state().unwrap().registry_key);
     c.set_header(&header(H900000)).unwrap();
-    c.set_pin(PIN).unwrap();
+    sealed_pin(&mut c, INS_SET_PIN, PIN).unwrap();
     note_by(&mut c, &k, 1, 2048).unwrap();
     c.sign(1, &h(3)).unwrap();
     assert_eq!(c.release(1, &h(3), &release(&k, &slot0, 1, &h(3))).unwrap(), SlotState::Note);

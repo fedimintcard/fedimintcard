@@ -12,6 +12,8 @@ import {holdsPlace, installTap, type TapOptions} from './installTap';
 import {shortIdOf} from './store';
 import {FakeGpCard, J3R180_CHIP} from './testing/fakeGpCard';
 import type {ManagerKeysReply} from './ops';
+import {NOT_GENUINE} from './sealedPin';
+import {otherCertify, TEST_CERT_KEY, testCertify} from './testing/sealedCard';
 
 /**
  * Applet 3.0's offline steps in the install tap (docs/OFFLINE-PROTOCOL.md § 5):
@@ -37,17 +39,11 @@ const SET_PIN = 0x41;
 const SET_HEADER = 0x19;
 const GEN_KEY = 0x10;
 
-/** The registry's certificate for a key, in the protocol's shape: 01 ‖ slot 0 ‖ compressed attest ‖ r‖s. */
-const certFor = (attestPub: readonly number[], slot0: readonly number[]) => [
-  0x01,
-  ...slot0,
-  0x02 + (attestPub[64] & 1),
-  ...attestPub.slice(1, 33),
-  ...new Array(64).fill(0xab),
-];
+/** The registry's certificate for a key: 01 ‖ slot 0 ‖ compressed attest ‖ r‖s, signed by the test registry. */
+const certFor = (attestPub: readonly number[], slot0: readonly number[]) => testCertify(attestPub, slot0);
 
-/** The registry's certificate key: 04 and a 64-byte body. */
-const REGISTRY_KEY = [0x04, ...Array.from({length: 64}, (_, i) => (i * 5 + 3) & 0xff)];
+/** The test registry's certificate key, 65 bytes uncompressed. */
+const REGISTRY_KEY = [...TEST_CERT_KEY];
 
 function setup(over: Partial<OfflineSetup> = {}) {
   const certify = jest.fn(async (attestPub: readonly number[], slot0: readonly number[]) =>
@@ -116,7 +112,8 @@ test('a blank card: keys, then limit, attestation, certificate, and only then th
   expect(at(SET_REGISTRY_KEY)).toBeLessThan(at(SET_HEADER));
   // the anchor, then GET_STATE showing it, then SET_PIN; no VERIFY_PIN after it
   expect(at(SET_HEADER)).toBeLessThan(ins.lastIndexOf(GET_STATE));
-  expect(ins.lastIndexOf(GET_STATE)).toBe(at(SET_PIN) - 1);
+  // then the sealed PIN's checks (GET_PUB 0, GET_CERT, GET_NONCE) and the sealed SET_PIN
+  expect(ins.slice(ins.lastIndexOf(GET_STATE) + 1, at(SET_PIN))).toEqual([0x11, 0x32, 0x44]);
   expect(ins).not.toContain(0x40);
   expect(a.now).toBe(T900000);
   expect(a.registryKey).toEqual(REGISTRY_KEY);
@@ -416,4 +413,37 @@ test('a card that refuses its anchor keeps its place, says so, and its next tap 
 test('a lost card whose wait was being served is held with the wait copy', () => {
   expect(registryHeldWhat({wait: true})).toBe(WAIT.lifted);
   expect(WAIT.lifted).toMatch(/Tap it again to finish the wait/);
+});
+
+describe('the sealed SET_PIN: no PIN is sealed to a card that does not check', () => {
+  test('a certificate the registry did not sign stops at setPin: GET_NONCE is never asked, no PIN set', async () => {
+    const card = new FakeGpCard();
+    const r = await installTap(card.transceive, tapOptions(setup({certify: async (a, s0) => otherCertify(a, s0)}).offline));
+    expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'setPin', reason: NOT_GENUINE}));
+    expect(card.applet!.pin).toBeNull();
+    expect(card.applet!.sealed!.live).toBe(false);
+    expect(card.sealedSent).toEqual([]);
+  });
+
+  test('a PIN key whose binding is not the attestation key’s stops at setPin, no PIN sealed', async () => {
+    const card = new FakeGpCard();
+    const first = setup({certify: async () => {
+      card.applet!.sealed!.forgeBinding = true;
+      throw new Error('the registry is away');
+    }});
+    await installTap(card.transceive, tapOptions(first.offline));
+    card.reset();
+    const r = await installTap(card.transceive, tapOptions(setup().offline));
+    expect(r.setup).toEqual(expect.objectContaining({ok: false, step: 'setPin', reason: NOT_GENUINE}));
+    expect(card.applet!.pin).toBeNull();
+    expect(card.sealedSent).toEqual([]);
+  });
+
+  test('a good card takes one sealed SET_PIN, and its PIN is the one typed', async () => {
+    const card = new FakeGpCard();
+    const r = await installTap(card.transceive, tapOptions(setup().offline));
+    expect(r.setup?.ok).toBe(true);
+    expect(card.sealedSent).toEqual([SET_PIN]);
+    expect(card.applet!.pin).toBe(PIN);
+  });
 });

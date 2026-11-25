@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use fedimint_card_host_card::softkit::{SoftMint, SoftTransport, ready_for_pin};
-use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, TEST_PIN, Transport, open_pin_session_with};
+use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, TEST_PIN, Transport};
 use fedimint_card_pos_core::kit::{KIT_VERSION, Kit, PoolTier};
 use fedimint_card_pos_core::plan::{self, FeeHeadroom};
 use fedimint_core::encoding::Encodable;
@@ -64,7 +64,8 @@ impl Fx {
         c.set_cert(&cert.to_bytes()).unwrap();
         c.set_registry_key(&self.registry.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap()).unwrap();
         ready_for_pin(&mut c).unwrap();
-        open_pin_session_with(&mut c, TEST_PIN).unwrap();
+        let t = fedimint_card_host_card::trust_card(&mut c, self.registry.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+        fedimint_card_host_card::open_pin_session_held(&mut c, &t, TEST_PIN, &mut |_| {}).unwrap();
         for (slot, amount) in notes.iter().enumerate() {
             self.mint.load_with(&mut c, slot as u8, *amount, &self.registry).unwrap();
         }

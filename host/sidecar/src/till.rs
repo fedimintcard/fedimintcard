@@ -109,6 +109,14 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 OpsError::Refused(..) => c(502, "ops_refused"),
             };
         }
+        // The sealed PIN (applet 4.x): no key to check the card under, or a card that failed the
+        // check. Neither sent a PIN.
+        if cause.downcast_ref::<crate::glue::NoCertKey>().is_some() {
+            return c(503, "offline_not_ready");
+        }
+        if cause.downcast_ref::<fedimint_card_host_card::UntrustedCard>().is_some() {
+            return c(403, "card_not_genuine");
+        }
         if let Some(f) = cause.downcast_ref::<SpendFault>() {
             return match f {
                 SpendFault::Declined(_) => c(402, "declined"),
@@ -841,6 +849,7 @@ async fn actor(
         cw.card = Box::new(NoCard);
         // The holder's PIN lives for one job.
         cw.pin = None;
+        cw.cert_checked = false;
         *pending_refs.lock().unwrap() = refs_now(&cw, ops.as_ref());
         // Free the service before answering, so a client that retries at once is not told
         // "busy". Both are cleared under the lock admission takes, so no request can see "busy"
@@ -1106,6 +1115,12 @@ pub async fn charge_job_for(
         if reg != Some(true) || !fed {
             return offline_charge(cw, ops, off, price, client_ref, sales).await;
         }
+        // Settling a charge the card left signing sends the holder's PIN before the attach that
+        // gives the job the registry's certificate key; a 4.x card's PIN is sealed only to a card
+        // checked under it, so the job takes the kept key (or fetches it) first.
+        // A new tap: the key is checked against this card, and a rotated one fetched.
+        cw.cert_checked = false;
+        ops.check_cert_key(cw).await;
         if let Some(held) = left_signing(off, client_ref.as_deref()) {
             return finish_left_signing(cw, ops, off, price, client_ref, sales, held).await;
         }
@@ -1114,7 +1129,10 @@ pub async fn charge_job_for(
         let left = crate::offline::settle_left_signing(cw, off);
         record_finished_sales(sales, &left.finished);
         if let Some(e) = left.error {
-            if crate::ops::pin_refused(&e) {
+            // A refused PIN, or one the till would not send (no certificate key: 503; a card that
+            // fails the check: 403). The sale must not go on: it would plan from the note the card
+            // already signed, and a 500 reads to the app as "may have charged".
+            if crate::ops::pin_refused(&e) || crate::ops::pin_unsendable(&e) {
                 return error_reply(&e);
             }
             tracing::warn!("a charge a card left signing was not settled at this tap: {e:#}");

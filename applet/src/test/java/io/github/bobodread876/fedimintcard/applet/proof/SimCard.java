@@ -42,20 +42,23 @@ final class SimCard {
     }
 
     ResponseAPDU select() {
+        sealer.forget();
         return sim.transmitCommand(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, Bip340.hex(AID_HEX)));
     }
 
     /** Power off and on: persistent state stays, transient state goes. Leaves the applet selected. */
     SimCard powerCycle() {
         sim.reset();
+        sealer.forget();
         select();
         return this;
     }
 
+    /** The host's side of the sealed PIN: the PIN commands a test sends in their P1 00 form go sealed (Sealer). */
+    final io.github.bobodread876.fedimintcard.applet.Sealer sealer = new io.github.bobodread876.fedimintcard.applet.Sealer(sim::transmitCommand);
+
     ResponseAPDU tx(int cla, int ins, int p1, int p2, byte[] data) {
-        return sim.transmitCommand(data == null || data.length == 0
-            ? new CommandAPDU(cla, ins, p1, p2)
-            : new CommandAPDU(cla, ins, p1, p2, data));
+        return sealer.send(cla, ins, p1, p2, data);
     }
 
     ResponseAPDU tx(int ins, int p1, byte[] data) { return tx(CLA, ins, p1, 0, data); }
@@ -69,6 +72,8 @@ final class SimCard {
     int setPin() {
         int r = sw(0x34, 0, TEST_REGISTRY_KEY);
         if (r != 0x9000) return r;
+        if (sw(0x30, 0, null) != 0x9000) throw new IllegalStateException("ATTEST_INIT");
+        if (sw(0x31, 0, new byte[] { (byte) 0xCE, (byte) 0xCE }) != 0x9000) throw new IllegalStateException("SET_CERT");
         r = sw(SET_HEADER, 0, io.github.bobodread876.fedimintcard.applet.Headers.anchor());
         if (r != 0x9000) return r;
         return sw(SET_PIN, 0, PIN);

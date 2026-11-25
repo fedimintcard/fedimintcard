@@ -21,12 +21,13 @@
 //! provisioner registers one, and loaded through the till's
 //! own `topup` (a load, recorded in ops as an intent with no inputs).
 
+use fedimint_card_old_card_pin::open_pin_session;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
+use fedimint_card_host_card::{Card, SoftCard};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
 use fedimint_card_sidecar::holder::{LoadCrash, Loader, outcome_body};
 use fedimint_card_sidecar::ops::{FederationReport, Ops, OpsConfig, report_federation, short_id_of};

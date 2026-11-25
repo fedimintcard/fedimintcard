@@ -1,4 +1,4 @@
-import {selectApdu as select4, verifyPinHeld} from './cardSetup';
+import {exchange, selectApdu as select4, verifyPinHeld} from './cardSetup';
 import {CARD_AID} from './cardkit';
 import {FakeGpCard} from './testing/fakeGpCard';
 import {
@@ -9,7 +9,7 @@ import {
   OLD_APPLET,
   parseState,
   waitSeconds,
-  pinApdu,
+  oldCardResetPinApdu,
   keyApdu,
   probeApplet,
   probeCard,
@@ -18,6 +18,8 @@ import {
 } from './cardSetup';
 import {shortIdOf} from './store';
 import {H900000, NOW_MS, testOffline} from './testing/anchor';
+import {NEEDS_CERT_KEY, TrustedCard} from './sealedPin';
+import {SealedPinCard, TEST_CERT_KEY} from './testing/sealedCard';
 
 /**
  * Applet 4.0's key, PIN, offline and clock commands as FedimintCardApplet.java
@@ -46,6 +48,9 @@ function applet(
   let anchored = false;
   let now = 0;
   let registryKey = false;
+  // The PIN key, the attestation key and the nonce (testing/sealedCard.ts), and SET_CERT's certificate.
+  const sealed = new SealedPinCard('inline applet');
+  let cert: number[] | null = null;
   const log: number[][] = [];
   const ok = (body: number[] = []) => [...body, 0x90, 0x00];
   const sw = (n: number) => [n >> 8, n & 0xff];
@@ -58,6 +63,7 @@ function applet(
       const aid = apdu.slice(5, 5 + apdu[4]);
       selected = aid.length === CARD_AID.length && aid.every((b, i) => b === CARD_AID[i]);
       anchored = false;
+      sealed.forget();
       return selected ? ok(opts.version ?? [0x04, 0x00]) : sw(0x6a82);
     }
     if (!selected || cla !== 0xb0) {
@@ -87,10 +93,22 @@ function applet(
         return ok(out);
       }
       case 0x18:
-      case 0x31:
         return pin === null ? ok() : sw(0x6985);
+      case 0x31:
+        if (pin !== null) {
+          return sw(0x6985);
+        }
+        cert = data;
+        return ok();
       case 0x30:
-        return ok([0x04, ...new Array(64).fill(7)]);
+        return ok(sealed.attestInit());
+      case 0x32:
+        return cert ? ok(cert) : sw(0x6a83);
+      case 0x44:
+        if (p1 !== 0x01 || p2 !== 0x00) {
+          return sw(0x6b00);
+        }
+        return cert ? ok(sealed.getNonce()!) : sw(0x6985);
       case 0x34:
         registryKey = true;
         return ok();
@@ -106,17 +124,34 @@ function applet(
         return ok(be(now));
       }
       case 0x41: {
+        if (p1 !== 0x01 || p2 !== 0x00) {
+          return sw(0x6b00);
+        }
         if (pin !== null) {
           return sw(0x6985);
         }
         if (!anchored) {
           return sw(0x6a96);
         }
-        pin = String.fromCharCode(...apdu.slice(5));
+        if (!sealed.live) {
+          return sw(0x6985);
+        }
+        const opened = sealed.open(0x41, data);
+        const pins = opened && opened.length === 9 ? SealedPinCard.pins(opened) : null;
+        if (!pins) {
+          return sw(0x6700);
+        }
+        pin = pins[0];
         return ok();
       }
-      case 0x40:
-        return String.fromCharCode(...apdu.slice(5)) === pin ? ok() : sw(0x63c2);
+      case 0x40: {
+        if (p1 !== 0x01 || p2 !== 0x00) {
+          return sw(0x6b00);
+        }
+        const opened = sealed.open(0x40, data);
+        const pins = opened === null ? null : SealedPinCard.pins(opened);
+        return pins !== null && pins[0] === pin ? ok() : sw(0x63c2);
+      }
       default:
         return sw(0x6d00);
     }
@@ -129,7 +164,7 @@ const offline = testOffline();
 test('the APDUs are the host card client\'s', () => {
   expect(selectApdu()).toEqual([0x00, 0xa4, 0x04, 0x00, 8, ...CARD_AID, 0x00]);
   expect(keyApdu(0x10, 3)).toEqual([0xb0, 0x10, 0x03, 0x00, 0x00]);
-  expect(pinApdu(0x41, '1234')).toEqual([0xb0, 0x41, 0x00, 0x00, 4, 0x31, 0x32, 0x33, 0x34]);
+  expect(oldCardResetPinApdu(0x41, '1234')).toEqual([0xb0, 0x41, 0x00, 0x00, 4, 0x31, 0x32, 0x33, 0x34]);
 });
 
 test('a fresh applet gets its keys, the anchor and the PIN, and no VERIFY_PIN after it', async () => {
@@ -149,7 +184,11 @@ test('a fresh applet gets its keys, the anchor and the PIN, and no VERIFY_PIN af
   expect(card.pin()).toBe('482916');
   expect(steps).toEqual(['select', 'keys', 'attest', 'anchor', 'setPin']);
   // SET_PIN's selection has the PIN: it is the last APDU, and no VERIFY_PIN is sent.
-  expect(card.log[card.log.length - 1].slice(0, 2)).toEqual([0xb0, 0x41]);
+  // Sealed: P1 = 01, a 90-byte envelope, and no PIN digit anywhere in the clear.
+  const set = card.log[card.log.length - 1];
+  expect(set.slice(0, 5)).toEqual([0xb0, 0x41, 0x01, 0x00, 90]);
+  expect(set).toHaveLength(95);
+  expect(card.log.some(a => a.join(',').includes([0x34, 0x38, 0x32, 0x39, 0x31, 0x36].join(',')))).toBe(false);
   expect(card.log.some(a => a[0] === 0xb0 && a[1] === 0x40)).toBe(false);
 });
 
@@ -199,6 +238,9 @@ test('probeApplet tells a blank card, an unkeyed applet and a keyed one apart', 
 
 test('a re-key is refused by a card with a PIN, and probeCard reads the PIN state without a try', async () => {
   const card = new FakeGpCard().withFinishedApplet('2468');
+  // With no certificate, so the re-key is tried and the applet itself refuses
+  // it (a certificate on the card makes finishCard keep the keys unasked).
+  card.applet!.cert = null;
   const before = card.applet!.slots.map(s => s!.join(','));
   const probe = await probeCard(card.transceive);
   expect(probe).toEqual(expect.objectContaining({kind: 'keyed', pin: 'set'}));
@@ -259,8 +301,9 @@ test('an 8-slot card is keyed exactly as before split keying: all 8 slots, then 
   expect(r).toEqual(expect.objectContaining({ok: true, slotCount: 8, generated: range(8)}));
   expect(r.ok && r.keys).toHaveLength(8);
   // SELECT, the probe (GET_PUB 8), GET_PUB + GEN_KEY per slot, SET_LIMIT,
-  // GET_STATE, ATTEST_INIT, SET_CERT, SET_REGISTRY_KEY, SET_HEADER, GET_STATE, SET_PIN.
-  expect(card.log).toHaveLength(1 + 1 + 16 + 8);
+  // GET_STATE, ATTEST_INIT, SET_CERT, SET_REGISTRY_KEY, SET_HEADER, GET_STATE,
+  // GET_PUB 0, GET_CERT, GET_NONCE, the sealed SET_PIN.
+  expect(card.log).toHaveLength(1 + 1 + 16 + 11);
 });
 
 test('an 8-slot card that was partly keyed keeps its keys and gets the rest', async () => {
@@ -300,7 +343,7 @@ test('a re-key of a 32-slot card covers the install tap’s slots, 0-7', async (
 test('finishVerified reads back slots 0-7 of a finished 32-slot card, generating none', async () => {
   const card = new FakeGpCard({appletSlots: 32}).withFinishedApplet('2468');
   const keys = card.applet!.slots.slice(0, 8).map(s => s!);
-  const r = await finishVerified(card.transceive, '2468');
+  const r = await finishVerified(card.transceive, '2468', TEST_CERT_KEY);
   expect(r).toEqual(expect.objectContaining({ok: true, slotCount: 32, generated: []}));
   expect(r.ok && r.keys).toEqual(keys);
   expect(card.applet!.slots.slice(8).every(s => s === null)).toBe(true);
@@ -314,7 +357,8 @@ describe('applet 4.0 set-up: the anchor before SET_PIN, in one selection', () =>
     const r = await finishCard(card.tx, '482916', undefined, {offline});
     expect(r.ok).toBe(true);
     const after = ins(card.log).slice(1 + 1 + 16);
-    expect(after).toEqual([0x18, 0x16, 0x30, 0x31, 0x34, 0x19, 0x16, 0x41]);
+    // ... then the checks before the seal (GET_PUB 0, GET_CERT, GET_NONCE) and the sealed SET_PIN.
+    expect(after).toEqual([0x18, 0x16, 0x30, 0x31, 0x34, 0x19, 0x16, 0x11, 0x32, 0x44, 0x41]);
     // One selection: the only SELECT is the first APDU.
     expect(ins(card.log).filter(i => i === 'SELECT')).toHaveLength(1);
     const header = card.log.find(a => a[1] === 0x19)!;
@@ -372,7 +416,7 @@ describe('applet 4.0 set-up: the anchor before SET_PIN, in one selection', () =>
       const r = await finishCard(card.tx, '482916', undefined, {offline});
       expect(r).toMatchObject({ok: false, step: 'select', reason: OLD_APPLET, oldApplet: true});
       expect(card.log).toHaveLength(1);
-      const v = await finishVerified(applet({version, pinSet: true}).tx, '9999');
+      const v = await finishVerified(applet({version, pinSet: true}).tx, '9999', TEST_CERT_KEY);
       expect(v).toMatchObject({ok: false, step: 'select', reason: OLD_APPLET, oldApplet: true});
     }
     expect(OLD_APPLET).toBe('This card has an older applet. Reset it and set it up again.');
@@ -413,7 +457,7 @@ describe('applet 4.0: a wait served within the tap', () => {
   test('finishVerified serves the wait the card owes, with the seconds left, and reads the keys', async () => {
     const card = owing(2, 2);
     const waits: number[] = [];
-    const r = await finishVerified(card.transceive, PIN4, undefined, s => waits.push(s));
+    const r = await finishVerified(card.transceive, PIN4, TEST_CERT_KEY, undefined, s => waits.push(s));
     expect(r).toEqual(expect.objectContaining({ok: true}));
     expect(waits).toEqual([1, 1, 0]);
     expect(card.applet!.owed).toBe(0);
@@ -422,19 +466,57 @@ describe('applet 4.0: a wait served within the tap', () => {
   test('verifyPinHeld returns a wrong try as the card answers it, after the wait', async () => {
     const card = owing(1, 1);
     await card.transceive(select4());
-    const r = await verifyPinHeld(card.transceive, '1111', 1);
+    const trusted = await TrustedCard.check(a => exchange(card.transceive, a), TEST_CERT_KEY);
+    expect(trusted.ok).toBe(true);
+    const r = await verifyPinHeld(card.transceive, trusted.ok ? trusted.trust : (null as never), '1111', 1);
     expect(r.sw).toBe(0x63c2);
     expect(card.applet!.owed).toBe(2);
   });
 
   test('verifyPinHeld stops when the card asks past the count it gave', async () => {
     let n = 0;
-    const always = async () => {
+    const card = owing(0, 0);
+    await card.transceive(select4());
+    const always = async (apdu: number[]) => {
+      if (apdu[1] !== 0x40) {
+        return card.transceive(apdu);
+      }
       n += 1;
       return [0x6a, 0x98];
     };
-    expect((await verifyPinHeld(always, PIN4, 1)).sw).toBe(0x6a98);
+    const trusted = await TrustedCard.check(a => exchange(always, a), TEST_CERT_KEY);
+    expect((await verifyPinHeld(always, trusted.ok ? trusted.trust : (null as never), PIN4, 1)).sw).toBe(0x6a98);
     // the asking, then the one that would have tried the PIN
     expect(n).toBe(2);
+  });
+});
+
+describe('applet 4.0: the PIN is sealed only to a card that checks', () => {
+  test('finishVerified with no certificate key sends no VERIFY_PIN', async () => {
+    const card = new FakeGpCard().withFinishedApplet('2468');
+    const r = await finishVerified(card.transceive, '2468', null);
+    expect(r).toMatchObject({ok: false, step: 'verifyPin', reason: NEEDS_CERT_KEY});
+    expect(card.sealedSent).toEqual([]);
+  });
+
+  test('verifyPinHeld seals once and sends the same envelope through the wait', async () => {
+    const card = new FakeGpCard().withFinishedApplet('2468');
+    card.applet!.wrong = 2;
+    card.applet!.owed = 3;
+    const sent: number[][] = [];
+    const tx = async (apdu: number[]) => {
+      if (apdu[1] === 0x40) {
+        sent.push(apdu);
+      }
+      return card.transceive(apdu);
+    };
+    await tx(select4());
+    const trusted = await TrustedCard.check(a => exchange(tx, a), TEST_CERT_KEY);
+    const r = await verifyPinHeld(tx, trusted.ok ? trusted.trust : (null as never), '2468', 3);
+    expect(r.sw).toBe(0x9000);
+    // three askings and the one that writes the wait down and tries the PIN
+    expect(sent).toHaveLength(4);
+    expect(sent.every(a => a.join() === sent[0].join())).toBe(true);
+    expect(sent[0].slice(0, 5)).toEqual([0xb0, 0x40, 0x01, 0x00, 90]);
   });
 });

@@ -7,6 +7,7 @@ Rust side of the spike: a `Card` transport and federation tests that spend a not
 | `card/` (`fedimint-card-host-card`) | `Card` trait (`gen_key`, `get_pub`, `sign`, and applet 3.0's `set_note`, `get_slot`, `get_state`, `set_change`, `set_limit`, `set_header`, `attest_init`, `set_cert`, `get_cert`, `attest`; `applet_version`); `CardClient<T: Transport>`; backends `SoftCard` (in-process; `SoftCard::new()` is 2.1, `SoftCard::v3()` follows applet 3.0), `BridgeTransport` (HTTP, `ureq`), `PcscTransport` (feature `pcsc`); `v3` (3.0 answers, header work, the registry's certificate) |
 | `fed-tests/` (`fedimint-card-fed-tests`) | 4-guardian in-process federation (`fedimint-testing`), hand-built transactions, steps 3-6 as `cargo test` |
 | `pos-core/` (`fedimint-card-pos-core`) | The offline charge the till and the POS phones share (`docs/POS-OFFLINE.md`): attestation, note checks, the planner, the durable queue, the offline kit and a phone's store; no fedimint client, no async runtime. Feature `ffi`: the apps' UniFFI interface; `scripts/pos-core-mobile.sh android\|ios\|bindings\|check` builds it for the phones |
+| `old-card-pin/` (`fedimint-card-old-card-pin`) | The P1 00 PIN of cards older than 4.0, for tests only. No till, POS phone or command line sends a P1 00 PIN (a card older than 4.0 gets the old-card refusal first), and `tests/not_in_the_product.rs` fails if `sidecar` or `pos-core` lists this crate as a dependency or names it |
 
 ## Pin
 

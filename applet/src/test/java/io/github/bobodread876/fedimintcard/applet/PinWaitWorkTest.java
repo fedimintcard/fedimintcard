@@ -77,7 +77,8 @@ class PinWaitWorkTest {
         assertEquals(0, d.notThirtyTwo, "each round over 32 bytes");
         d.finals = 0;
         assertSw(0x9000, c.verifyPinRaw(DEFAULT_PIN), "the stretch ends, nothing more is owed, and the right PIN opens");
-        assertEquals(0, d.finals, "the stretch's end and the try do no rounds");
+        // The sealed try hashes the seal's two blocks (the tag's, then the keystream's), and nothing more.
+        assertEquals(2, d.finals, "the stretch's end does no rounds, and the try only the seal's two blocks");
     }
 
     @Test
