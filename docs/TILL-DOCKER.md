@@ -1,6 +1,6 @@
 # Run a Card 4.0 merchant till
 
-This image accepts **Fedimint Card 4.x cards only** and requires a **Card 4.0 registry**. Check your cards and registry version before upgrading a till that serves older cards. Use the Card 4.0 generation of the POS app for these cards.
+This image accepts **Fedimint Card 4.x cards only** and requires a **Card 4.0 registry**. Check your cards and registry version before upgrading a till that serves older cards. The till opens its existing wallet in place. It supports Bitcoin mint v1 and mint v2 federations. For a mint v2 federation, use a Card 4.0 registry with mint v2 support. Offline phone payments also require a POS app with mint v2 support.
 
 The till uses `https://registry.fedimintcard.org` when `OPS_URL` is unset. To use another Card 4.0 registry, add a line such as `OPS_URL=https://registry.example.org` to the `.env` file beside `compose.yaml`. Use your registry’s HTTPS origin. Run `docker compose up -d` to apply the setting before connecting the till to the registry.
 

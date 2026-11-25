@@ -4,7 +4,7 @@ Status: agreed 2026-11-05 (owner: "yes", amount rule "nearest card amount"), bui
 in `OPS-PLAN.md`.
 
 The holder pays a Lightning invoice from any wallet on their own phone; the till receives eCash
-through the federation's gateway and loads it onto the card with the holder load the Mac loader
+through the federation's Lightning or Lightning v2 gateway and loads it onto the card with the holder load the Mac loader
 uses (`holder.rs`, the registry's `/cards/:id/load` routes). No PIN: nothing leaves the card.
 
 ## Flow
@@ -129,5 +129,3 @@ the card was full. The till keeps it `paid`, and the POS offers it again.
 
 - A cash top-up from the till's own balance (`POST /v1/topup` with `cash: true`): later, with an
   operator PIN or similar so a phone cannot drain the till.
-- lnv2: the federation's lnv2 module (v1.0) is older than the client in fedimint v0.13 speaks; the
-  till uses the federation's `ln` module.

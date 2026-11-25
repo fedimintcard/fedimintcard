@@ -705,7 +705,9 @@
         if (document.hidden) closeSheet();
       });
       async function api(path, method = 'GET', data) {
-        const epoch = session,
+        const epoch = session;
+        let r;
+        try {
           r = await fetch('/admin/' + path, {
             method,
             cache: 'no-store',
@@ -714,6 +716,11 @@
             headers: { Authorization: 'Bearer ' + auth, ...(data ? { 'Content-Type': 'application/json' } : {}) },
             body: data ? JSON.stringify(data) : undefined,
           });
+        } catch {
+          const err = new Error('Lost contact with the till. Check the connection and the status of your request.');
+          err.code = 'unreachable';
+          throw err;
+        }
         if (epoch !== session) throw new Error('Session closed.');
         if (r.status === 401) {
           signout();
@@ -784,12 +791,29 @@
       const when = (n) => (n ? new Date(n).toLocaleString() : '');
       async function refresh() {
         clearTimeout(timer);
-        const st = await api('status');
+        let st;
+        try {
+          st = await api('status');
+        } catch (e) {
+          if (auth && !el('console').hidden) {
+            el('setup').hidden = el('live').hidden = true;
+            el('health').textContent = 'Reconnecting to till…';
+            timer = setTimeout(() => perform(el('refresh'), refresh), 3000);
+            if (e.code === 'unreachable') return;
+          }
+          throw e;
+        }
         el('login').hidden = true;
         el('console').hidden = el('exit').hidden = false;
-        el('setup').hidden = st.joined || st.starting;
+        el('setup').hidden = !!(st.joined || st.starting || st.setup_error);
         el('live').hidden = !st.joined;
-        el('health').textContent = st.starting
+        if (st.setup_error) {
+          el('health').textContent = 'Wallet unavailable';
+          notice(st.setup_error, true);
+          return;
+        }
+        el('health').textContent = st.retrying_mint ? 'Waiting for the federation’s Bitcoin mint. Retrying automatically…'
+          : st.joining ? 'Joining federation…' : st.starting
           ? 'Starting till…'
           : st.joined
             ? st.connected
@@ -797,7 +821,7 @@
               : 'Registry setup pending'
             : 'First setup';
         if (st.starting) {
-          timer = setTimeout(() => perform(el('refresh'), refresh), 1200);
+          timer = setTimeout(() => perform(el('refresh'), refresh), st.retrying_mint ? 5000 : 1200);
           return;
         }
         if (!st.joined) return;
@@ -949,7 +973,19 @@
         dialog('Join federation?', 'This federation will hold this till’s sales.', {
           label: 'Join federation',
           action: async () => {
-            await api('join', 'POST', d);
+            el('setup').hidden = true;
+            el('health').textContent = 'Joining federation…';
+            try {
+              await api('join', 'POST', d);
+            } catch (e) {
+              await refresh();
+              if (e.code === 'unreachable' && !el('setup').hidden) {
+                notice('The till is ready for a federation invite. Try joining again.', true);
+              } else if (e.code !== 'setup_changed' && e.code !== 'unreachable') {
+                throw e;
+              }
+              return;
+            }
             await refresh();
           },
         }),

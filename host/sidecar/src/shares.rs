@@ -1,4 +1,4 @@
-//! Blind signature shares for mint v1 outputs: fetch a threshold of verified shares from the
+//! Blind signature shares for mint outputs: fetch a threshold of verified shares from the
 //! guardians, aggregate, unblind, and check the finished note against the federation key.
 
 use std::collections::BTreeMap;
@@ -13,9 +13,10 @@ use fedimint_core::{Amount, NumPeersExt, OutPoint, PeerId, TransactionId};
 use fedimint_mint_client::output::verify_blind_share;
 // Deprecated upstream in favour of the batch endpoint, but the single-output one works against
 // every federation version, which matters for an unknown demo federation.
+use crate::wallet::MintVersion;
 #[allow(deprecated)]
 use fedimint_core::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
-use fedimint_mint_common::{Nonce, Note};
+use fedimint_mint_common::Nonce;
 use tbs::{BlindedMessage, BlindedSignature, BlindedSignatureShare, BlindingKey};
 
 use crate::wallet::Wallet;
@@ -36,6 +37,40 @@ pub struct OutSpec {
 
 /// Fetch a threshold of valid shares for one output and aggregate them into a blind signature.
 pub async fn fetch_blind_signature(w: &Wallet, txid: TransactionId, spec: OutSpec, timeout: Duration) -> Result<BlindedSignature> {
+    if w.mint_version == MintVersion::V2 {
+        let range = fedimint_core::OutPointRange::new(
+            txid,
+            fedimint_core::IdxRange::from(spec.out_idx..spec.out_idx.checked_add(1).context("output index exceeds range")?),
+        );
+        let api = w.client.api().with_module(w.mint_id);
+        let peer_pks = w.mint_cfg.peer_tbs_pks.clone();
+        let shares: BTreeMap<PeerId, BlindedSignatureShare> = tokio::time::timeout(
+            timeout,
+            api.request_with_strategy_retry(
+                FilterMapThreshold::new(
+                    move |peer, shares: Vec<BlindedSignatureShare>| {
+                        ready(match shares.as_slice() {
+                            [share]
+                                if peer_pks
+                                    .get(&peer)
+                                    .and_then(|tiers| tiers.get(spec.amount))
+                                    .is_some_and(|pk| tbs::verify_signature_share(spec.blinded, *share, *pk)) =>
+                            {
+                                Ok(*share)
+                            }
+                            _ => Err(ServerError::InvalidResponse("invalid mint signature share".into())),
+                        })
+                    },
+                    api.all_peers().to_num_peers(),
+                ),
+                fedimint_mintv2_common::endpoint_constants::SIGNATURE_SHARES_ENDPOINT.to_owned(),
+                ApiRequestErased::new(range),
+            ),
+        )
+        .await
+        .context("timed out waiting for mint v2 signature shares")?;
+        return Ok(tbs::aggregate_signature_shares(&shares.into_iter().map(|(p, s)| (p.to_usize() as u64, s)).collect()));
+    }
     // `await_output_outcome` is a federation-wide endpoint, not a mint module one.
     let api = w.client.api();
     let decoder = w.client.decoders().get_expect(w.mint_id).clone();
@@ -77,7 +112,7 @@ pub fn finish_note(
         bail!("aggregated blind signature does not verify");
     }
     let signature = tbs::unblind_signature(blinding_key, sig);
-    if !(Note { nonce, signature }).verify(pk) {
+    if !w.mint_version.verify(nonce, signature, pk) {
         bail!("unblinded note does not verify");
     }
     Ok(signature)
@@ -94,7 +129,7 @@ pub async fn note_signature(
     key: BlindingKey,
     timeout: Duration,
 ) -> Result<tbs::Signature> {
-    let blinded = blind(nonce, key);
+    let blinded = w.mint_version.blind(nonce, key);
     let sig = fetch_blind_signature(w, outpoint.txid, OutSpec { out_idx: outpoint.out_idx, amount, blinded }, timeout).await?;
     finish_note(w, amount, nonce, key, blinded, sig)
 }

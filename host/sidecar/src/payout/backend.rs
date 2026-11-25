@@ -31,7 +31,7 @@ use super::funds::{self, Snapshot};
 use crate::pay::Pays;
 use crate::till::TillHandle;
 use crate::topup::Topups;
-use crate::wallet::{Wallet, WalletPay};
+use crate::wallet::{MintVersion, Wallet, WalletPay, encode_v2_ecash};
 
 /// The key of the tag in a payout export's operation meta.
 pub const TAG_KEY: &str = "fedimintcard_payout";
@@ -202,13 +202,17 @@ fn parse_op(text: &str) -> Result<OperationId> {
 /// Spend exactly `amount_msat` as eCash of this federation (with its invite), the spend tagged
 /// `tag` in the wallet's operation log. The notes are never logged.
 pub async fn export_tagged(w: &Wallet, amount_msat: u64, tag: &str) -> Result<(String, u64)> {
-    let mint = w.mint()?;
     let amount = Amount::from_msats(amount_msat);
     ensure!(
-        w.mint_cfg.fee_consensus.round_up(amount) == amount,
-        "{amount_msat} msat is not a multiple of {} msat, the federation's smallest economical note",
+        amount_msat > 0 && w.mint_cfg.fee_consensus.checked_round_up(amount) == Some(amount),
+        "{amount_msat} msat is not a positive multiple of {} msat, the federation's smallest economical note",
         w.min_denom()
     );
+    if w.mint_version == MintVersion::V2 {
+        let (_, notes) = w.mint_v2()?.send(amount, json!({ TAG_KEY: tag }), true).await?;
+        return Ok((encode_v2_ecash(&notes), notes.amount().msats));
+    }
+    let mint = w.mint()?;
     let notes = mint.send_oob_notes(amount, json!({ TAG_KEY: tag })).await?;
     // Spent either way: the caller records what the wallet handed out.
     let face = notes.total_amount().msats;
@@ -229,6 +233,24 @@ pub async fn find_tagged(w: &Wallet, tags: &[String]) -> Result<HashMap<String, 
     loop {
         let page = log.paginate_operations_rev(LOG_PAGE, last).await;
         for (key, entry) in &page {
+            if entry.operation_module_kind() == fedimint_mintv2_common::KIND.as_str() {
+                use fedimint_mintv2_client::MintOperationMeta as V2Meta;
+                // A Reissue makes change inside the wallet. Only Send debits the exported notes.
+                let meta = entry.try_meta::<V2Meta>()?;
+                let (custom, operation, tag_key) = match meta {
+                    V2Meta::Send { ecash, custom_meta } => (custom_meta, Tagged::Export { notes: ecash }, TAG_KEY),
+                    V2Meta::Receive { custom_meta, .. } => {
+                        (custom_meta, Tagged::Reclaim { operation_id: hex::encode(key.operation_id.0) }, RECLAIM_KEY)
+                    }
+                    V2Meta::Reissue { .. } => continue,
+                };
+                if let Some(tag) = custom.get(tag_key).and_then(Value::as_str)
+                    && tags.iter().any(|requested| requested == tag)
+                {
+                    found.insert(tag.to_owned(), operation);
+                }
+                continue;
+            }
             if entry.operation_module_kind() != fedimint_mint_common::KIND.as_str() {
                 continue;
             }
@@ -257,6 +279,14 @@ pub async fn find_tagged(w: &Wallet, tags: &[String]) -> Result<HashMap<String, 
 
 /// Start reissuing exported notes back into the wallet, the reissue tagged `tag`.
 pub async fn reclaim_start(w: &Wallet, notes: &str, tag: &str) -> Result<ReclaimStart> {
+    if w.mint_version == MintVersion::V2 {
+        let ecash = w.decode_v2_ecash(notes)?;
+        return match w.mint_v2()?.receive(ecash, json!({ RECLAIM_KEY: tag })).await {
+            Ok(op) => Ok(ReclaimStart::Started(hex::encode(op.0))),
+            Err(fedimint_mintv2_client::ReceiveECashError::AlreadyReceived) => Ok(ReclaimStart::AlreadyReissued),
+            Err(e) => Err(e.into()),
+        };
+    }
     let oob = OOBNotes::from_str(notes).map_err(|e| anyhow!("not an eCash string: {e}"))?;
     let mint = w.mint()?;
     match mint.reissue_external_notes(oob, json!({ RECLAIM_KEY: tag })).await {
@@ -269,6 +299,14 @@ pub async fn reclaim_start(w: &Wallet, notes: &str, tag: &str) -> Result<Reclaim
 /// The reissue `operation_id`'s state, from the client's own state machine.
 pub async fn reclaim_status(w: &Wallet, operation_id: &str, wait: Duration) -> Result<ReclaimState> {
     let op = parse_op(operation_id)?;
+    if w.mint_version == MintVersion::V2 {
+        return Ok(match tokio::time::timeout(wait, w.v2_received(op)).await {
+            Ok(Ok(true)) => ReclaimState::Done,
+            Ok(Ok(false)) => ReclaimState::Rejected("mint rejected the notes".into()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => ReclaimState::Pending,
+        });
+    }
     let mint = w.mint()?;
     let mut stream = mint.subscribe_reissue_external_notes(op).await?.into_stream();
     let follow = async {

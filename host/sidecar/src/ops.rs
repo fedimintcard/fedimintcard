@@ -169,6 +169,10 @@ impl std::error::Error for OpsError {}
 /// The card's state as `GET /cards/:short_id/state` answers it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteState {
+    #[serde(default)]
+    pub federation_id: Option<String>,
+    #[serde(default)]
+    pub mint_version: crate::wallet::MintVersion,
     pub version: u64,
     /// Keyed slots only; see `unkeyed_slots`.
     pub slots: Vec<RemoteSlot>,
@@ -186,6 +190,17 @@ pub struct RemoteState {
     /// them.
     #[serde(default)]
     pub stranded: Vec<RemoteStranded>,
+}
+
+impl RemoteState {
+    fn belongs_to(&self, federation: &str, mint: crate::wallet::MintVersion) -> bool {
+        self.mint_version == mint
+            && match &self.federation_id {
+                Some(id) => id == federation,
+                // Old 4.0 registries answered v1 card state without its federation id.
+                None => mint == crate::wallet::MintVersion::V1,
+            }
+    }
 }
 
 /// A slot the registry holds as stranded: a till reported it SPENT, or owed CHANGE, for `txid`,
@@ -308,6 +323,7 @@ pub struct RemoteTx {
 /// A registry client for one till token. Cheap to clone.
 #[derive(Clone)]
 pub struct OpsClient {
+    registered_v2: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     http: reqwest::Client,
     url: String,
     token: String,
@@ -316,7 +332,7 @@ pub struct OpsClient {
 impl OpsClient {
     pub fn new(cfg: &OpsConfig) -> Result<Self> {
         let http = reqwest::Client::builder().timeout(OPS_TIMEOUT).build().context("building the ops HTTP client")?;
-        Ok(Self { http, url: cfg.url.trim_end_matches('/').to_owned(), token: cfg.token.clone() })
+        Ok(Self { registered_v2: Default::default(), http, url: cfg.url.trim_end_matches('/').to_owned(), token: cfg.token.clone() })
     }
 
     /// The registry's URL, without a trailing slash.
@@ -437,7 +453,24 @@ impl OpsClient {
         if let Some(name) = report.name.as_deref().filter(|n| !n.trim().is_empty()) {
             body["name"] = json!(name);
         }
-        self.call(reqwest::Method::POST, "/federations", Some(&body)).await.map(|_| ())
+        let path = match report.mint_version {
+            crate::wallet::MintVersion::V1 => "/federations",
+            crate::wallet::MintVersion::V2 => {
+                body["mint_version"] = json!(report.mint_version);
+                "/federations/mintv2"
+            }
+        };
+        let answer = self.call(reqwest::Method::POST, path, Some(&body)).await?;
+        if report.mint_version == crate::wallet::MintVersion::V2 {
+            if answer["ok"].as_bool() != Some(true)
+                || answer["mint_version"].as_str() != Some("v2")
+                || answer["federation_id"].as_str() != Some(&report.federation_id)
+            {
+                return Err(OpsError::Refused(422, "the registry did not confirm this federation’s mint v2 keys".into()));
+            }
+            *self.registered_v2.lock().unwrap() = Some(report.federation_id.clone());
+        }
+        Ok(())
     }
 
     /// `POST /cards/:id/slot-keys` (till): the first keys of never-keyed slots, all or nothing.
@@ -480,6 +513,8 @@ pub enum OfflineAnswer {
 /// `GET /cards/:id/slots` as the registry answers it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FreeSlots {
+    #[serde(default)]
+    pub mint_version: crate::wallet::MintVersion,
     pub version: u64,
     pub federation_id: String,
     /// Keyed slots whose key never carried a note.
@@ -559,6 +594,7 @@ pub async fn key_slots(card: &mut dyn Card, client: &OpsClient, short_id: &str, 
 /// signature against before it is live (OPS-PLAN O4).
 #[derive(Debug, Clone)]
 pub struct FederationReport {
+    pub mint_version: crate::wallet::MintVersion,
     pub federation_id: String,
     pub name: Option<String>,
     /// Tier in msat (decimal) to its `tbs::AggregatePublicKey`, 96 bytes compressed G2, hex.
@@ -569,9 +605,9 @@ impl FederationReport {
     /// Read from the wallet's copy of the federation's client config.
     pub async fn of(wallet: &crate::wallet::Wallet) -> Self {
         use fedimint_core::encoding::Encodable as _;
-        let name = wallet.client.config().await.global.meta.get("federation_name").cloned();
+        let name = wallet.federation_name().await;
         let tbs_pks = wallet.mint_cfg.tbs_pks.iter().map(|(amount, pk)| (amount.msats.to_string(), pk.consensus_encode_to_hex())).collect();
-        Self { federation_id: wallet.federation_id().to_string(), name, tbs_pks }
+        Self { mint_version: wallet.mint_version, federation_id: wallet.federation_id().to_string(), name, tbs_pks }
     }
 }
 
@@ -839,8 +875,21 @@ impl Ops {
         }
     }
 
+    pub(crate) async fn confirm_mint(&self, wallet: &crate::wallet::Wallet) -> Result<()> {
+        if wallet.mint_version == crate::wallet::MintVersion::V2
+            && self.client.registered_v2.lock().unwrap().as_ref() != Some(&wallet.federation_id().to_string())
+        {
+            self.client
+                .federation(&FederationReport::of(wallet).await)
+                .await
+                .context("the registry must accept this federation’s mint v2 keys before a card can be used")?;
+        }
+        Ok(())
+    }
+
     /// [`attach`](Self::attach) for a card named by its short id, without reading the card.
     pub async fn attach_id(&self, cw: &mut CardWallet, short_id: &str) -> Result<StateStore> {
+        self.confirm_mint(&cw.wallet).await?;
         let card = StateStore::open(self.card_path(short_id))?;
         let base = std::mem::replace(&mut cw.store, card);
         cw.ops = Some(OpsLink {
@@ -918,6 +967,9 @@ impl CardWallet {
     async fn ops_fetch(&mut self) -> Result<RemoteState> {
         let link = self.ops.as_mut().context("no ops link")?;
         let remote = link.client.state(&link.short_id).await?;
+        if !remote.belongs_to(&self.wallet.federation_id().to_string(), self.wallet.mint_version) {
+            return Err(OpsError::Refused(409, "the card belongs to a different federation or mint".into()).into());
+        }
         link.version = remote.version;
         link.remote_slots = remote.slots.iter().map(|s| (s.slot, s.pubkey.clone())).collect();
         link.unkeyed = remote.unkeyed_slots.clone();
@@ -1242,6 +1294,8 @@ impl CardWallet {
     /// ops holds. Fails if ops cannot be reached: a stale copy is never charged against.
     pub async fn ops_load(&mut self) -> Result<()> {
         let mut remote = self.ops_fetch().await?;
+        // Publish a committed issue before replacing the local note list from the registry.
+        self.finish_issue_submission().await?;
         if !self.store.state.ops_outbox.is_empty() {
             self.ops_push().await?;
             remote = self.ops_fetch().await?;
@@ -1857,6 +1911,8 @@ mod tests {
 
     fn remote(notes: Vec<RemoteNote>, open: Vec<RemoteTx>) -> RemoteState {
         RemoteState {
+            federation_id: None,
+            mint_version: Default::default(),
             version: 3,
             slots: (0..2).map(|s| RemoteSlot { slot: s, pubkey: format!("{s:02x}").repeat(32) }).collect(),
             unkeyed_slots: vec![],
@@ -1865,6 +1921,21 @@ mod tests {
             releases: vec![],
             stranded: vec![],
         }
+    }
+
+    #[test]
+    fn card_state_is_bound_to_the_federation_and_mint() {
+        use crate::wallet::MintVersion::{V1, V2};
+        let mut state = remote(vec![], vec![]);
+        assert!(state.belongs_to("ours", V1));
+        assert!(!state.belongs_to("ours", V2));
+        state.mint_version = V2;
+        assert!(!state.belongs_to("ours", V2));
+        state.federation_id = Some("theirs".into());
+        assert!(!state.belongs_to("ours", V2));
+        state.federation_id = Some("ours".into());
+        assert!(state.belongs_to("ours", V2));
+        assert!(!state.belongs_to("ours", V1));
     }
 
     #[test]

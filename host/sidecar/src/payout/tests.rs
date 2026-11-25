@@ -863,12 +863,12 @@ async fn a_lightning_payout_holds_back_the_provable_fee_bound_on_mixed_fee_sched
         (Linear { base_msat: 100, ppm: 1_000 }, v2),
     ] {
         let fx = Fx::new(500_000);
-        *fx.wallet.schedules.lock().unwrap() = Schedules { mint, ln: Some(ln), ln_problem: None };
+        *fx.wallet.schedules.lock().unwrap() = Schedules { mint, min_change_msat: 1, ln: Some(ln), ln_problem: None };
         fx.confirmed(Mode::Both).await;
         let rid = format!("{mint:?}{ln:?}");
         let rec = fx.engine().lightning(fx.manual(&rid), Some(25_000), WAIT).await.unwrap();
         assert_eq!(rec.state, State::Paid, "{rid}");
-        let s = Schedules { mint, ln: Some(ln), ln_problem: None };
+        let s = Schedules { mint, min_change_msat: 1, ln: Some(ln), ln_problem: None };
         // The bound at the balance the final snapshot read (nothing was spent before it).
         let want = super::fees::ln_send_fee_bound_over(&s, 500_000_000, 25_000_000, 25_100_000).unwrap();
         assert_eq!(rec.fee_allowance_msat, want, "{rid}");
@@ -887,6 +887,7 @@ async fn a_lightning_schedule_that_cannot_be_bounded_refuses_lightning_and_leave
     let fx = Fx::new(200_000);
     fx.confirmed(Mode::Both).await;
     *fx.wallet.schedules.lock().unwrap() = Schedules {
+        min_change_msat: 1,
         mint: Linear { base_msat: 100, ppm: 0 },
         ln: None,
         ln_problem: Some("the lnv2 module's fees cannot be bounded".into()),

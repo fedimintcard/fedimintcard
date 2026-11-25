@@ -325,6 +325,15 @@ pub async fn offline_kit(State(h): State<TillHandle>, Query(q): Query<KitQuery>)
     let Some(off) = h.offline_now() else {
         return Reply::fail(503, "offline_not_ready", "this till takes no offline charges").into_response();
     };
+    if h.wallet().mint_version == crate::wallet::MintVersion::V2 {
+        let ops = h.conn().lock().unwrap().ops.clone();
+        let Some(ops) = ops else {
+            return Reply::fail(503, "offline_not_ready", "the registry must confirm this federation’s mint v2 keys first").into_response();
+        };
+        if let Err(e) = ops.confirm_mint(h.wallet()).await {
+            return Reply::fail(503, "offline_not_ready", format!("{e:#}")).into_response();
+        }
+    }
     let keys = TillKeys::of(h.wallet());
     let header = h.header();
     let r = tokio::task::spawn_blocking(move || {

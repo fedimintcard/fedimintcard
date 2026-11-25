@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use fedimint_card_pos_core::charge::{Env, Pin, TillOuts, mint_decoders, resume_signing};
+use fedimint_card_pos_core::charge::{Env, Pin, TillOuts, resume_signing};
 use serde_json::{Value, json};
 
 use crate::glue::{CardWallet, on_card};
@@ -165,8 +165,9 @@ fn now_ms() -> u64 {
 /// card has never seen carry a note. On success the signed transaction is in the queue, its notes
 /// in the spent list; the caller records the sale and answers.
 pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, client_ref: Option<&str>) -> Result<Taken> {
+    ops.confirm_mint(&cw.wallet).await?;
     let cert_key = crate::claim::read_cert_key(&off.dir)?;
-    let decoders = mint_decoders(cw.wallet.mint_id);
+    let decoders = cw.wallet.mint_version.decoders(cw.wallet.mint_id);
     // A KEYED slot whose key the till's copy of the card knows to have carried a note is not a
     // slot for change: a load not yet written to the card, or a key whose note died (a rejected
     // online charge's change slot), which the registry refuses as change until it is renewed.
@@ -179,6 +180,7 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
         None => Pin::OpenWith(fedimint_card_host_card::pin_from_env()),
     };
     let env = Env {
+        mint_version: cw.wallet.mint_version,
         mint_id: cw.wallet.mint_id,
         tbs_pks: &cw.wallet.mint_cfg.tbs_pks,
         fee: &cw.wallet.mint_cfg.fee_consensus,
@@ -251,7 +253,7 @@ pub fn settle_left_signing(cw: &mut CardWallet, off: &Offline) -> LeftSigning {
         out.error = Some(e);
         return out;
     }
-    let decoders = mint_decoders(cw.wallet.mint_id);
+    let decoders = cw.wallet.mint_version.decoders(cw.wallet.mint_id);
     let card = cw.card.as_mut();
     if let Err(e) = on_card(|| resume_signing(card, &off.queue, &decoders, now_ms(), &short_id)) {
         out.error = Some(e);

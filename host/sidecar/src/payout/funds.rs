@@ -325,6 +325,7 @@ pub(crate) mod tests {
     #[test]
     fn every_claim_carries_its_fee_bound_and_an_unbounded_schedule_fails_closed() {
         let s = Schedules {
+            min_change_msat: 1,
             mint: Linear { base_msat: 100, ppm: 0 },
             ln: Some(LnSchedule::V1 { contract_input_msat: 0, contract_output_msat: 0 }),
             ln_problem: None,

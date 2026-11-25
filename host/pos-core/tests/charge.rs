@@ -106,7 +106,7 @@ fn take_counted(s: &Store, card: &SoftTransport, kit: &str, price: u64, cref: &s
 /// The till's view of a charge: the signed bytes decode, each input's signature verifies over
 /// the txid under its note's key, and each output is a kit pool entry or a change opening.
 fn check_signed(c: &fedimint_card_pos_core::queue::OfflineCharge, kit: &fedimint_card_pos_core::kit::Kit) {
-    let decoders = fedimint_card_pos_core::charge::mint_decoders(kit.mint_instance_id);
+    let decoders = kit.mint_version.decoders(kit.mint_instance_id);
     let tx = Transaction::consensus_decode_hex(c.signed_hex.as_deref().unwrap(), &decoders).unwrap();
     assert_eq!(tx.tx_hash().to_string(), c.txid);
     let TransactionSignature::NaiveMultisig(sigs) = &tx.signatures else { panic!("multisig") };
@@ -158,6 +158,51 @@ fn a_card_pays_offline_from_a_kit() {
         let q: Value = serde_json::from_slice(&std::fs::read(s.dir().join(QUEUE_FILE)).unwrap()).unwrap();
         assert_eq!(q["charges"][0]["state"], "queued");
         assert_eq!(q["charges"][0]["pool"].as_array().unwrap().len(), c.pool.len());
+    }
+}
+
+#[test]
+fn a_mint_v2_offline_kit_spends_a_registry_signed_card_note() {
+    use fedimint_card_pos_core::mint::MintVersion;
+    use fedimint_core::secp256k1::{Parity, PublicKey};
+
+    let fx = Fx::new(true);
+    let (_dir, s) = store();
+    let card = fx.card(32, &[]);
+    let amount = 1 << 16;
+    let sk = tbs::SecretKeyShare(tbs::BlindingKey::random().0);
+    let pk = tbs::AggregatePublicKey(tbs::derive_pk_share(&sk).0);
+    {
+        let mut c = card.0.lock().unwrap();
+        let key = c.get_pub(0).unwrap();
+        let msg = fedimint_mintv2_common::nonce_message(PublicKey::from_x_only_public_key(key, Parity::Even));
+        let bk = tbs::BlindingKey::random();
+        let share = tbs::sign_message(tbs::blind_message(msg, bk), sk);
+        let signature: [u8; 48] = tbs::unblind_signature(bk, tbs::BlindedSignature(share.0)).consensus_encode_to_vec().try_into().unwrap();
+        let cert = fedimint_card_host_card::v3::sign_note(&fx.registry, &key.serialize(), amount, &signature);
+        c.set_note(0, amount, &signature, &cert).unwrap();
+    }
+    let mut kit = fx.kit(s.phone_id(), 10, now_ms(), DAY_MS);
+    kit.tbs_pks.insert(amount.to_string(), pk.consensus_encode_to_hex());
+    // A v1 verifier sees a different note even under the same tier key.
+    assert!(take(&s, &card, &serde_json::to_string(&kit).unwrap(), 20_000, "wrong-mint").is_err());
+    assert!(spent_hashes(&card).is_empty());
+    kit.version = 2;
+    kit.mint_version = MintVersion::V2;
+    kit.fee_consensus = (Amount::from_msats(10), 0_u64).consensus_encode_to_hex();
+    assert_eq!(kit.decode(s.phone_id()).unwrap().fee.fee(Amount::from_msats(amount)).msats, 10);
+    let taken = take(&s, &card, &serde_json::to_string(&kit).unwrap(), 20_000, "v2-offline").unwrap();
+    check_signed(&taken.charge, &kit);
+    let tx =
+        Transaction::consensus_decode_hex(taken.charge.signed_hex.as_deref().unwrap(), &kit.mint_version.decoders(kit.mint_instance_id))
+            .unwrap();
+    let (value, nonce, signature) = MintVersion::V2.read_input(kit.mint_instance_id, &tx.inputs[0]).unwrap();
+    assert_eq!(value.msats, amount);
+    assert!(MintVersion::V2.verify(nonce, signature, pk));
+    assert!(!taken.charge.change.is_empty());
+    for output in tx.outputs {
+        let (amount, _) = MintVersion::V2.read_output(kit.mint_instance_id, &output).unwrap();
+        assert!(amount.msats > 10, "all issued notes must clear the actual mint's per-note fee");
     }
 }
 
@@ -276,6 +321,7 @@ fn the_cards_clock_rechecks_the_kits_expiry() {
     let keys = kit.decode(&phone).unwrap();
     let header: [u8; 80] = hex::decode(H900200).unwrap().try_into().unwrap();
     let env = |expires_at_ms: u64| Env {
+        mint_version: Default::default(),
         mint_id: kit.mint_instance_id,
         tbs_pks: &keys.tbs_pks,
         fee: &keys.fee,
@@ -994,6 +1040,7 @@ fn a_charge_left_signing_is_resumed_with_no_env_and_no_second_charge() {
     let kit = fx.kit(&phone, 8, now, DAY_MS);
     let keys = kit.decode(&phone).unwrap();
     let env = Env {
+        mint_version: Default::default(),
         mint_id: kit.mint_instance_id,
         tbs_pks: &keys.tbs_pks,
         fee: &keys.fee,

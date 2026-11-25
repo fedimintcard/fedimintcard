@@ -21,3 +21,5 @@ pub mod wallet;
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old paths.
 pub use fedimint_card_pos_core::plan;
+
+mod v2_history;

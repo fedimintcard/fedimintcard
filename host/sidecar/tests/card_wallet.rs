@@ -116,11 +116,15 @@ fn soft_v4() -> anyhow::Result<Box<dyn Card>> {
 
 /// [`fx`] on a card of the caller's choosing, such as a soft 2.0 card with eight slots.
 async fn fx_card(fees: bool, funds: Amount, card: Box<dyn Card>) -> anyhow::Result<Fx> {
+    fx_card_on(Fixtures::new_primary(MintClientInit, MintInit), fees, funds, card).await
+}
+
+async fn fx_card_on(fixtures: Fixtures, fees: bool, funds: Amount, card: Box<dyn Card>) -> anyhow::Result<Fx> {
     assert!(
         std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
         "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend"
     );
-    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fixtures = fixtures.with_module(DummyClientInit, DummyInit);
     let mut builder = fixtures.new_fed_builder(0);
     if !fees {
         builder = builder.disable_mint_fees();
@@ -256,6 +260,71 @@ async fn spend_with_card_signature_is_exact_fees_on() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_with_card_signature_is_exact_fees_off() -> anyhow::Result<()> {
     spend_exact(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_card_load_purchase_and_change_can_be_redeemed_at_the_same_federation() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(fedimint_mintv2_client::MintClientInit, fedimint_mintv2_server::MintInit);
+    let mut f = fx_card_on(fixtures, false, Amount::from_sats(10_000), soft_v4()?).await?;
+    let amount = 1 << 19;
+    let initial_balance = f.cw.wallet.balance_msat().await?;
+    topup(&mut f.cw, &[amount]).await?;
+    assert_eq!(f.cw.balance().await?.live_msat, amount);
+    let loaded_balance = f.cw.wallet.balance_msat().await?;
+    assert_eq!(loaded_balance + amount, initial_balance);
+
+    let first = f.cw.spend(1 << 17).await?;
+    assert_eq!(first.till_msat, 1 << 17);
+    assert_eq!(first.received.msats, first.till_msat);
+    registry_signs(&mut f.cw)?;
+    let change = f.cw.balance().await?.live_msat;
+    assert_eq!(change, amount - first.till_msat);
+
+    let second = f.cw.spend(change).await?;
+    assert_eq!(second.received.msats, change);
+    assert_eq!(f.cw.balance().await?.live_msat, 0);
+    assert_eq!(f.cw.wallet.balance_msat().await?, initial_balance);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_card_purchase_and_cashout_at_ten_msat_settle_into_bitcoin_wallets() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(fedimint_mintv2_client::MintClientInit, fedimint_card_fed_tests::ten_msat_mint::TenMsatMint);
+    let card = if std::env::var("CARD_BACKEND").as_deref() == Ok("bridge") { persistent_card()? } else { soft_v4()? };
+    let mut f = fx_card_on(fixtures, true, Amount::from_sats(10_000), card).await?;
+    let loaded = 1 << 20;
+    topup(&mut f.cw, &[loaded]).await?;
+    anyhow::ensure!(f.cw.wallet.fee(512) == 10);
+    // Topup has delivered the card output; its own wallet change may still be in flight.
+    let ops = f.cw.wallet.client.operation_log().paginate_operations_rev(10, None).await;
+    let (key, _) = ops.iter().find(|(_, entry)| entry.operation_module_kind() == "card-topup").expect("recorded card load");
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while f.cw.wallet.client.has_active_states(key.operation_id).await {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?;
+    let balance = f.cw.wallet.balance_msat().await?;
+    let sale = f.cw.spend(100_000).await?;
+    anyhow::ensure!(!sale.collection_pending && sale.received.msats == sale.till_msat);
+    anyhow::ensure!(sale.till_msat >= 100_000 && sale.fees_msat > 0);
+    let credited = f.cw.wallet.balance_msat().await?.checked_sub(balance).expect("sale credited the till wallet");
+    anyhow::ensure!(
+        credited > 0 && credited <= sale.till_msat,
+        "merchant balance {balance}, net credit {credited}, gross {}",
+        sale.till_msat
+    );
+    registry_signs(&mut f.cw)?;
+    let change = f.cw.balance().await?.live_msat;
+    anyhow::ensure!(loaded == sale.till_msat + change + sale.fees_msat);
+    let (slot, _) = sale.change.iter().max_by_key(|(_, a)| *a).expect("sale returned change");
+    let attempt = f.cw.cashout(*slot).await?;
+    anyhow::ensure!(!attempt.collection_pending && attempt.exported_msat > 0 && attempt.exported_msat <= attempt.gained_msat);
+    let recipient = Wallet::from_client(f.fed.new_client().await).await?;
+    let imported = recipient.import(attempt.ecash.as_deref().expect("cashout exported v2 eCash")).await?;
+    anyhow::ensure!(imported.face.msats == attempt.exported_msat);
+    anyhow::ensure!(recipient.balance_msat().await? + imported.fee_msat == imported.face.msats);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -858,5 +927,40 @@ async fn a_spent_slot_is_renewed_only_once_the_federation_reports_its_note_spent
     assert_eq!(r.inputs, vec![(slot, 1 << 20)]);
     assert_ne!(f.cw.card.get_pub(slot)?, key, "renewed once the federation reports the note spent");
     drop(f.fed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_issue_interrupted_on_either_side_of_wallet_commit_resolves_once() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(fedimint_mintv2_client::MintClientInit, fedimint_mintv2_server::MintInit);
+    let mut f = fx_card_on(fixtures, false, Amount::from_sats(10_000), soft_v4()?).await?;
+    let start = f.cw.wallet.balance_msat().await?;
+    let amount = 1 << 17;
+    for point in [CrashPoint::IssueBeforeCommit, CrashPoint::IssueAfterCommit] {
+        f.cw.crash_point = Some(point);
+        assert!(f.cw.topup_ref(&[amount], Some("same-order")).await.is_err());
+        let operation = f.cw.store.state.issue_submission.as_ref().expect("journaled load").operation;
+        // Reload the durable card state just as the service does on its next start.
+        f.cw.store = StateStore::open(f._dir.path().join("card_state.json"))?;
+        f.cw.crash_point = None;
+        f.cw.balance().await?;
+        assert!(f.cw.store.state.issue_submission.is_none());
+        if point == CrashPoint::IssueBeforeCommit {
+            assert!(f.cw.store.state.issues.is_empty());
+            assert!(f.cw.store.state.notes.is_empty());
+            assert_eq!(f.cw.wallet.balance_msat().await?, start);
+        } else {
+            assert_eq!(f.cw.store.state.issues.len(), 1);
+            assert_eq!(f.cw.store.state.notes.len(), 1);
+            let note = &f.cw.store.state.notes[0];
+            assert!(note.signature.is_some());
+            assert_eq!(note.txid.as_deref(), Some(f.cw.store.state.issues[0].txid.as_str()));
+            let recorded = f.cw.wallet.client.operation_log().get_operation(operation).await.expect("committed load operation");
+            assert_eq!(recorded.try_meta::<fedimint_core::TransactionId>()?.to_string(), f.cw.store.state.issues[0].txid);
+            // Collecting the card signature can finish before mint v2 credits this operation's wallet change.
+            tokio::time::timeout(Duration::from_secs(45), f.cw.wallet.client.await_no_active_states(operation)).await?;
+            assert_eq!(f.cw.wallet.balance_msat().await?, start - amount);
+        }
+    }
     Ok(())
 }

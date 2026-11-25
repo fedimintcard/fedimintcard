@@ -17,6 +17,7 @@ pub mod charge;
 pub mod ffi;
 pub mod files;
 pub mod kit;
+pub mod mint;
 pub mod plan;
 pub mod queue;
 pub mod refusal;

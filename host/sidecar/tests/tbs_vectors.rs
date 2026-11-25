@@ -55,6 +55,12 @@ fn vectors() -> Value {
             let note = Note { nonce: n, signature };
             assert!(note.verify(pk), "the federation's own check passes");
             assert!(!note.verify(other), "and fails under the other tier's key");
+            let v2_message = fedimint_mintv2_common::nonce_message(n.0);
+            let v2_blinded = tbs::blind_message(v2_message, key);
+            let v2_signature = tbs::unblind_signature(key, BlindedSignature(tbs::sign_message(v2_blinded, *sk).0));
+            assert!(tbs::verify(v2_message, v2_signature, pk));
+            assert!(!tbs::verify(v2_message, signature, pk));
+            assert!(!tbs::verify(n.to_message(), v2_signature, pk));
             notes.push(json!({
                 "amount_msat": amount,
                 "nonce": hex::encode(n.0.serialize()),
@@ -62,11 +68,13 @@ fn vectors() -> Value {
                 "pk": hexof(&pk),
                 "other_tier_pk": hexof(&other),
                 "message": hexof(&n.to_message()),
+                "v2_message": hexof(&v2_message),
+                "v2_signature": hexof(&v2_signature),
             }));
         }
     }
     json!({
-        "source": "host/sidecar/tests/tbs_vectors.rs (fedimint v0.13.0 tbs, mint-common Note::verify)",
+        "source": "host/sidecar/tests/tbs_vectors.rs (Fedimint tbs, mint v1 and v2 note signatures)",
         "messages": messages,
         "notes": notes,
     })

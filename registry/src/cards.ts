@@ -28,7 +28,7 @@ import {
 } from './http';
 import {isChip, linkChip} from './managerKeys';
 import {adoptPendingAttestation, type CheckedNote} from './offline';
-import {checkNotes, putMintKeys} from './mint';
+import {cardFederation, checkNotes, putMintKeys} from './mint';
 
 /**
  * The slot counts a card can have: 8 for every applet before 2.1, 32 from
@@ -656,8 +656,11 @@ export function cardState(sql: Sql, shortId: string, now: number) {
     };
   });
   const count = slotCount(sql, shortId);
+  const fed = cardFederation(sql, shortId);
   return {
     short_id: shortId,
+    federation_id: fed?.federation_id,
+    ...(fed?.mint_version ? {mint_version: fed.mint_version} : {}),
     version: versionOf(sql, shortId),
     slot_count: count,
     slots,
@@ -1121,6 +1124,7 @@ export function putFederationName(
   operatorId: number,
   r: Record<string, unknown>,
   now: number,
+  version: import('./tbs').MintVersion = 'v1',
 ): void {
   if (!isHex(r.federation_id, 32)) {
     throw new BadRequest('federation_id must be the decoded federation id, 32 bytes hex');
@@ -1143,7 +1147,7 @@ export function putFederationName(
     );
   }
   if (r.tbs_pks !== undefined) {
-    putMintKeys(sql, operatorId, r.federation_id, r.tbs_pks, now);
+    putMintKeys(sql, operatorId, r.federation_id, r.tbs_pks, now, version);
   }
 }
 

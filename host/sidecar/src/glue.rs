@@ -18,12 +18,13 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::wallet::MintVersion;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::{
     Card, MIN_SLOTS, SLOTS, SW_CONDITIONS_NOT_SATISFIED, SW_NO_SPACE, SlotState, StatusWord, past_last_slot, status_word,
 };
 use fedimint_client::transaction::{ClientOutput, ClientOutputBundle, TransactionBuilder};
-use fedimint_core::core::{IntoDynInstance, OperationId};
+use fedimint_core::core::{IntoDynInstance as _, OperationId};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
 use fedimint_core::module::registry::ModuleRegistry;
@@ -34,12 +35,12 @@ use fedimint_core::transaction::{Transaction, TransactionError, TransactionSigna
 use fedimint_core::{Amount, OutPoint, TieredMulti, TransactionId};
 use fedimint_mint_client::api::MintFederationApi as _;
 use fedimint_mint_client::{OOBNotes, SpendableNote};
-use fedimint_mint_common::{BlindNonce, MintInput, MintOutput, Nonce, Note};
+use fedimint_mint_common::{BlindNonce, MintOutput, Nonce};
 use tbs::BlindingKey;
 
 use crate::ops::{OpsError, OpsLink};
 use crate::plan::{self, Plan};
-use crate::shares::{self, FETCH_TIMEOUT, OutSpec, blind};
+use crate::shares::{self, FETCH_TIMEOUT, OutSpec};
 use crate::state::{
     CardState, HostKind, HostPending, IssueRec, LoadNote, NoteRec, NoteStatus, OpsWrite, PendingOverwrite, PendingTx, StateStore, Tombstone,
 };
@@ -143,15 +144,28 @@ fn dec<T: Decodable>(s: &str) -> Result<T> {
 /// Mint outputs for card notes, `(msat, blinded nonce)` each, with no state machine: the caller
 /// holds the blinding keys and collects the signatures itself. The stock client puts explicit
 /// outputs first, so output i of the transaction is note i.
-pub fn card_outputs(wallet: &Wallet, outs: impl Iterator<Item = (u64, tbs::BlindedMessage)>) -> ClientOutputBundle {
-    ClientOutputBundle::new_no_sm(
-        outs.map(|(amount, blinded)| ClientOutput {
-            output: MintOutput::new_v0(Amount::from_msats(amount), BlindNonce(blinded)),
-            amounts: Amounts::new_bitcoin(Amount::from_msats(amount)),
-        })
-        .collect(),
-    )
-    .into_dyn(wallet.mint_id)
+pub fn card_outputs(wallet: &Wallet, outs: impl Iterator<Item = (u64, tbs::BlindedMessage)>) -> Result<ClientOutputBundle> {
+    use fedimint_card_pos_core::mint::{MintVersion, denomination};
+    Ok(match wallet.mint_version {
+        MintVersion::V1 => ClientOutputBundle::new_no_sm(
+            outs.map(|(amount, blinded)| ClientOutput {
+                output: MintOutput::new_v0(Amount::from_msats(amount), BlindNonce(blinded)),
+                amounts: Amounts::new_bitcoin(Amount::from_msats(amount)),
+            })
+            .collect(),
+        )
+        .into_dyn(wallet.mint_id),
+        MintVersion::V2 => ClientOutputBundle::new_no_sm(
+            outs.map(|(amount, blinded)| {
+                Ok(ClientOutput {
+                    output: fedimint_mintv2_common::MintOutput::new_v0(denomination(amount)?, blinded, rand::thread_rng().r#gen()),
+                    amounts: Amounts::new_bitcoin(Amount::from_msats(amount)),
+                })
+            })
+            .collect::<Result<_>>()?,
+        )
+        .into_dyn(wallet.mint_id),
+    })
 }
 
 fn nonce_hex(n: Nonce) -> String {
@@ -259,6 +273,10 @@ pub struct CashoutReport {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
+    /// A card load was journaled but its wallet operation has not been committed.
+    IssueBeforeCommit,
+    /// The wallet committed the card load but its txid is not yet in the card store.
+    IssueAfterCommit,
     /// After signing, before the transaction is marked submitted. On ops: after ops has the
     /// signed bytes (so the charge counts as submitted), before it is sent.
     BeforeSubmit,
@@ -271,6 +289,7 @@ pub enum CrashPoint {
 }
 
 pub struct CardWallet {
+    v2_history: crate::v2_history::SpentHistory,
     pub wallet: Wallet,
     pub store: StateStore,
     pub card: Box<dyn Card>,
@@ -322,6 +341,7 @@ impl std::error::Error for NoCertKey {}
 impl CardWallet {
     pub fn new(wallet: Wallet, store: StateStore, card: Box<dyn Card>) -> Self {
         Self {
+            v2_history: crate::v2_history::SpentHistory::new(wallet.client.db(), wallet.mint_id),
             wallet,
             store,
             card,
@@ -618,10 +638,14 @@ impl CardWallet {
 
     pub async fn is_spent(&self, nonce: Nonce) -> Result<bool> {
         let api = self.wallet.client.api().with_module(self.wallet.mint_id);
-        tokio::time::timeout(Duration::from_secs(10), api.check_note_spent(nonce))
-            .await
-            .context("asking the federation whether a note is spent timed out")?
-            .map_err(Into::into)
+        tokio::time::timeout(Duration::from_secs(10), async {
+            match self.wallet.mint_version {
+                MintVersion::V1 => Ok(api.check_note_spent(nonce).await?),
+                MintVersion::V2 => self.v2_history.is_spent(api, nonce.0).await,
+            }
+        })
+        .await
+        .context("asking the federation whether a note is spent timed out")?
     }
 
     async fn submit(&self, tx: Transaction) -> Result<Result<TransactionId, TransactionError>> {
@@ -652,6 +676,7 @@ impl CardWallet {
     /// A card older than 4.0 is refused (409 `old_card`) before anything is read from it or
     /// recorded: a 4.x till's sale refuses such a card, so value put on it could not be spent here.
     pub async fn topup_ref(&mut self, amounts: &[u64], client_ref: Option<&str>) -> Result<Vec<(u8, u64)>> {
+        self.finish_issue_submission().await?;
         self.require_current_card()?;
         self.recover_overwrites()?;
         let notes: Vec<u64> = amounts.iter().flat_map(|a| plan::binary(*a)).collect();
@@ -688,7 +713,7 @@ impl CardWallet {
             let pk = xonly(self.store.state.slot_pubkey(slot).expect("free implies cached"))?;
             let nonce = nonce_for(pk);
             let key = BlindingKey::random();
-            let blinded = blind(nonce, key);
+            let blinded = self.wallet.mint_version.blind(nonce, key);
             outs.push(Out { slot, amount: *amount, nonce, key, blinded });
         }
         // Persist before the federation hears of it. The stock client puts explicit outputs
@@ -718,55 +743,37 @@ impl CardWallet {
                 ts_unix_ms: now_ms(),
             });
         }
+        let op = OperationId::new_random();
+        let notes_for_registry = outs
+            .iter()
+            .enumerate()
+            .map(|(i, o)| LoadNote {
+                slot: o.slot,
+                amount_msat: o.amount,
+                nonce: nonce_hex(o.nonce),
+                blinding_key: enc(&o.key),
+                out_idx: i as u64,
+            })
+            .collect();
+        self.store.state.issue_submission =
+            Some(crate::state::IssueSubmission { operation: op, client_ref: client_ref.map(str::to_owned), notes: notes_for_registry });
         self.store.save()?;
 
-        let bundle = card_outputs(&self.wallet, outs.iter().map(|o| (o.amount, o.blinded)));
-        let client = &self.wallet.client;
-        let op = OperationId::new_random();
-        let range =
-            match client.finalize_and_submit_transaction(op, "card-topup", |_| (), TransactionBuilder::new().with_outputs(bundle)).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Nothing was sent: forget the pending records and any ref pointing at them.
-                    let nonces: Vec<String> = outs.iter().map(|o| nonce_hex(o.nonce)).collect();
-                    self.store.state.notes.retain(|n| !(nonces.contains(&n.nonce) && n.status == NoteStatus::Pending));
-                    if let Some(cref) = client_ref {
-                        self.store.state.issues.retain(|r| r.client_ref != cref);
-                    }
-                    self.store.save()?;
-                    return Err(anyhow!(e)).context("building the topup transaction");
-                }
-            };
-        let txid = range.txid();
-        for n in self.store.state.notes.iter_mut().filter(|n| n.status == NoteStatus::Pending && n.txid.is_none()) {
-            if outs.iter().any(|o| nonce_hex(o.nonce) == n.nonce) {
-                n.txid = Some(txid.to_string());
-            }
+        if self.crash_point == Some(CrashPoint::IssueBeforeCommit) {
+            bail!("simulated interruption before card load submission");
         }
-        if let Some(cref) = client_ref
-            && let Some(r) = self.store.state.issues.iter_mut().find(|r| r.client_ref == cref)
-        {
-            r.txid = txid.to_string();
+        let bundle = card_outputs(&self.wallet, outs.iter().map(|o| (o.amount, o.blinded)))?;
+        let result = self
+            .wallet
+            .client
+            .finalize_and_submit_transaction(op, "card-topup", |range| range.txid(), TransactionBuilder::new().with_outputs(bundle))
+            .await;
+        if self.crash_point == Some(CrashPoint::IssueAfterCommit) {
+            bail!("simulated interruption after card load submission");
         }
-        // On ops the notes are recorded once they are live (the stock client builds and sends in
-        // one call, so there are no unsigned bytes to post first). The blinding keys are kept in
-        // the queued write because the registry records each note with its key.
-        self.ops_enqueue(OpsWrite::Load {
-            txid: txid.to_string(),
-            client_ref: client_ref.map_or_else(|| txid.to_string(), str::to_owned),
-            notes: outs
-                .iter()
-                .enumerate()
-                .map(|(i, o)| LoadNote {
-                    slot: o.slot,
-                    amount_msat: o.amount,
-                    nonce: nonce_hex(o.nonce),
-                    blinding_key: enc(&o.key),
-                    out_idx: i as u64,
-                })
-                .collect(),
-        });
-        self.store.save()?;
+        // Both the txid and operation exist in RocksDB together or neither does.
+        self.finish_issue_submission().await?;
+        let txid = result.map_err(|e| anyhow!(e)).context("building the topup transaction")?.txid();
 
         let client = &self.wallet.client;
         let accepted = tokio::time::timeout(SUBMIT_TIMEOUT, client.transaction_updates(op).await.await_tx_accepted(txid))
@@ -788,6 +795,34 @@ impl CardWallet {
         self.ops_sync().await;
         self.sync_card_notes();
         Ok(outs.iter().map(|o| (o.slot, o.amount)).collect())
+    }
+
+    /// Reconcile the operation written atomically with a stock-client submission. Called with the card store exclusively held.
+    pub(crate) async fn finish_issue_submission(&mut self) -> Result<()> {
+        let Some(pending) = self.store.state.issue_submission.clone() else { return Ok(()) };
+        let operation = self.wallet.client.operation_log().get_operation(pending.operation).await;
+        let matches = |n: &NoteRec| pending.notes.iter().any(|o| o.nonce == n.nonce);
+        if let Some(operation) = operation {
+            ensure!(operation.operation_module_kind() == "card-topup", "unexpected wallet operation for pending card topup");
+            let txid = operation.try_meta::<TransactionId>().context("reading the committed card topup transaction")?.to_string();
+            for n in self.store.state.notes.iter_mut().filter(|n| matches(n)) {
+                n.txid = Some(txid.clone());
+            }
+            if let Some(cref) = &pending.client_ref
+                && let Some(r) = self.store.state.issues.iter_mut().find(|r| r.client_ref == *cref)
+            {
+                r.txid = txid.clone();
+            }
+            self.ops_enqueue(OpsWrite::Load { client_ref: pending.client_ref.unwrap_or_else(|| txid.clone()), txid, notes: pending.notes });
+        } else {
+            // The stock client did not commit this operation; nothing can broadcast it.
+            self.store.state.notes.retain(|n| !(matches(n) && n.status == NoteStatus::Pending && n.txid.is_none()));
+            if let Some(cref) = &pending.client_ref {
+                self.store.state.issues.retain(|r| r.client_ref != *cref || !r.txid.is_empty());
+            }
+        }
+        self.store.state.issue_submission = None;
+        self.store.save()
     }
 
     /// Fetch the signature for a pending card note at a known outpoint and make it live.
@@ -819,6 +854,9 @@ impl CardWallet {
     /// where the blind nonce was used. Fails until consensus has processed the transaction, and
     /// older federations do not have the endpoint at all.
     async fn outpoint_by_blind_nonce(&self, blinded: tbs::BlindedMessage) -> Option<OutPoint> {
+        if self.wallet.mint_version == MintVersion::V2 {
+            return None;
+        }
         let api = self.wallet.client.api().with_module(self.wallet.mint_id);
         let ops = api.fetch_blind_nonce_outpoints(vec![BlindNonce(blinded)]).await.ok()?;
         ops.into_iter().next()
@@ -895,7 +933,7 @@ impl CardWallet {
         for n in pending {
             let (Some(bk), Ok(nonce)) = (n.blinding_key.as_deref(), nonce_from_hex(&n.nonce)) else { continue };
             let key: BlindingKey = dec(bk)?;
-            let Some(op) = self.outpoint_of(n.txid.as_deref(), n.out_idx, blind(nonce, key)).await else {
+            let Some(op) = self.outpoint_of(n.txid.as_deref(), n.out_idx, self.wallet.mint_version.blind(nonce, key)).await else {
                 all = false;
                 continue;
             };
@@ -911,12 +949,13 @@ impl CardWallet {
         let items: Vec<HostPending> = self.store.state.host_pending.iter().filter(|h| h.group == txid).cloned().collect();
         if !items.is_empty() {
             let mut notes = TieredMulti::<SpendableNote>::default();
+            let mut notes_v2 = Vec::new();
             let mut complete = true;
             for h in &items {
                 let kp = Keypair::from_secret_key(SECP256K1, &SecretKey::from_str(&h.secret_key).context("bad stored secret key")?);
                 let key: BlindingKey = dec(&h.blinding_key)?;
                 let nonce = Nonce(kp.public_key());
-                let blinded = blind(nonce, key);
+                let blinded = self.wallet.mint_version.blind(nonce, key);
                 let amount = Amount::from_msats(h.amount_msat);
                 let Some(op) = self.outpoint_of(Some(txid), h.out_idx, blinded).await else {
                     complete = false;
@@ -930,7 +969,14 @@ impl CardWallet {
                 }
                 .await;
                 match got {
-                    Ok(signature) => notes.push(amount, SpendableNote { signature, spend_key: kp }),
+                    Ok(signature) => match self.wallet.mint_version {
+                        MintVersion::V1 => notes.push(amount, SpendableNote { signature, spend_key: kp }),
+                        MintVersion::V2 => notes_v2.push(fedimint_mintv2_client::SpendableNote {
+                            denomination: fedimint_card_pos_core::mint::denomination(amount.msats)?,
+                            keypair: kp,
+                            signature,
+                        }),
+                    },
                     Err(e) => {
                         rec.errors.push(format!("{txid}: host note {}: {e:#}", h.amount_msat));
                         complete = false;
@@ -939,17 +985,23 @@ impl CardWallet {
                 }
             }
             if complete {
-                let oob = OOBNotes::new(self.wallet.federation_id().to_prefix(), notes);
+                let oob = match self.wallet.mint_version {
+                    MintVersion::V1 => OOBNotes::new(self.wallet.federation_id().to_prefix(), notes).to_string(),
+                    MintVersion::V2 => fedimint_core::base32::encode_prefixed(
+                        fedimint_core::base32::FEDIMINT_PREFIX,
+                        &fedimint_mintv2_client::ECash::new(self.wallet.federation_id(), notes_v2),
+                    ),
+                };
                 match items[0].kind {
                     HostKind::Cashout => {
                         // Legacy record: the string must reach cashouts.log before the secret
                         // keys are forgotten.
-                        let text = oob.to_string();
+                        let text = oob;
                         self.store.append_cashout_log(&text)?;
                         self.recovered_cashouts.push(text.clone());
                         rec.cashouts.push(text);
                     }
-                    HostKind::Till => match self.wallet.import_notes(oob).await {
+                    HostKind::Till => match self.wallet.import(&oob).await {
                         Ok(imp) => {
                             if !imp.already {
                                 rec.till_received += imp.face.msats;
@@ -975,6 +1027,7 @@ impl CardWallet {
     /// Complete whatever interrupted commands left. Errors are collected per transaction, never
     /// propagated: one stuck group must not block the others.
     pub async fn resolve_pending(&mut self, timeout: Duration) -> Result<Recovered> {
+        self.finish_issue_submission().await?;
         let mut rec = Recovered::default();
         let ptxs = self.store.state.pending_txs.clone();
         for ptx in ptxs {
@@ -1007,7 +1060,7 @@ impl CardWallet {
         for n in blind_only {
             let (Some(bk), Ok(nonce)) = (n.blinding_key.as_deref(), nonce_from_hex(&n.nonce)) else { continue };
             let Ok(key) = dec::<BlindingKey>(bk) else { continue };
-            if let Some(op) = self.outpoint_by_blind_nonce(blind(nonce, key)).await {
+            if let Some(op) = self.outpoint_by_blind_nonce(self.wallet.mint_version.blind(nonce, key)).await {
                 match self.finalize_card_note(&n.nonce, op, timeout).await {
                     Ok(()) => rec.notes_live += 1,
                     Err(e) => rec.errors.push(format!("slot {}: {e:#}", n.slot)),
@@ -1302,15 +1355,12 @@ impl CardWallet {
         for n in inputs {
             let nonce = nonce_from_hex(&n.nonce)?;
             let signature = dec(n.signature.as_deref().context("live note without signature")?)?;
-            tx_inputs.push(MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce, signature }).into_dyn(mint_id));
+            tx_inputs.push(self.wallet.mint_version.input(mint_id, n.amount_msat, nonce, signature)?);
             keys.push((n.slot, XOnlyPublicKey::from(nonce.0)));
         }
         let mut tx = Transaction {
             inputs: tx_inputs,
-            outputs: outs
-                .iter()
-                .map(|o| MintOutput::new_v0(Amount::from_msats(o.amount), BlindNonce(o.blinded)).into_dyn(mint_id))
-                .collect(),
+            outputs: outs.iter().map(|o| self.wallet.mint_version.output(mint_id, o.amount, o.blinded)).collect::<Result<_>>()?,
             nonce: rand::thread_rng().r#gen(),
             signatures: TransactionSignature::NaiveMultisig(vec![]),
         };
@@ -1495,11 +1545,19 @@ impl CardWallet {
                     OwnerKind::Card(slot) => {
                         let pk = xonly(self.store.state.slot_pubkey(slot).context("slot without cached key")?)?;
                         let nonce = nonce_for(pk);
-                        PlannedOut { amount: *a, blinded: blind(nonce, key), owner: Owner::Card { slot, nonce, key } }
+                        PlannedOut {
+                            amount: *a,
+                            blinded: self.wallet.mint_version.blind(nonce, key),
+                            owner: Owner::Card { slot, nonce, key },
+                        }
                     }
                     OwnerKind::Host(kind) => {
                         let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
-                        PlannedOut { amount: *a, blinded: blind(Nonce(kp.public_key()), key), owner: Owner::Host { kp, key, kind } }
+                        PlannedOut {
+                            amount: *a,
+                            blinded: self.wallet.mint_version.blind(Nonce(kp.public_key()), key),
+                            owner: Owner::Host { kp, key, kind },
+                        }
                     }
                 })
             })
@@ -1587,7 +1645,7 @@ impl CardWallet {
         // spend it.
         self.ops_sync().await;
         let fee = self.fee_fn();
-        let min_denom = self.wallet.min_denom();
+        let min_denom = self.wallet.mint_cfg.fee_consensus.output_floors();
 
         // Room for change is the free keyed slots plus, on ops, the never-keyed slots this tap can
         // key (split keying): the plan is made over both, and only the slots the change needs (and
@@ -1728,7 +1786,7 @@ impl CardWallet {
         };
         ensure!(!self.is_spent(nonce_from_hex(&note.nonce)?).await?, "the federation reports this note already spent; run `card balance`");
         let fee = self.fee_fn();
-        let (amounts, dust) = plan::cashout(note.amount_msat, &fee, self.wallet.min_denom())
+        let (amounts, dust) = plan::cashout(note.amount_msat, &fee, self.wallet.mint_cfg.fee_consensus.output_floors())
             .with_context(|| format!("a {} msat note cannot pay its own fee", note.amount_msat))?;
         self.require_tiers(&amounts)?;
         let outs = self.build_outs(&amounts, |_| Ok(OwnerKind::Host(HostKind::Till)))?;
@@ -1787,8 +1845,8 @@ impl CardWallet {
         if amount == 0 {
             return Ok(None);
         }
-        let (notes, face) = self.wallet.export(amount, false, true).await?;
-        Ok(Some((notes.to_string(), face.msats)))
+        let (notes, face) = self.wallet.export_ecash(amount, false, true).await?;
+        Ok(Some((notes, face.msats)))
     }
 }
 

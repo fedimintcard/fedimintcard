@@ -683,7 +683,7 @@ pub async fn new_with_conn(
     let sales = Arc::new(Mutex::new(sales));
     let inflight = Arc::new(Mutex::new(None));
     let pending_refs = Arc::new(Mutex::new(refs_now(&cw, ops.as_ref())));
-    let federation_name = cw.wallet.client.config().await.global.meta.get("federation_name").cloned();
+    let federation_name = cw.wallet.federation_name().await;
     let offline: SharedOffline = Arc::new(Mutex::new(None));
     let handle = TillHandle {
         tx,
@@ -1001,7 +1001,7 @@ async fn holder_room(
     }
     // The issue's own transaction: its card outputs are mint outputs, so its fees are bounded as
     // any mint transaction from this balance (`crate::payout::fees`).
-    let fee = crate::payout::fees::mint_fee_bound(&snap.schedules.mint, snap.balance_msat, 0);
+    let fee = crate::payout::fees::mint_fee_bound(&snap.schedules, snap.balance_msat, 0);
     Ok(Some(snap.balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(fee)))
 }
 
@@ -1011,6 +1011,9 @@ async fn issue_job(
     client_ref: Option<String>,
     room: std::result::Result<Option<u64>, String>,
 ) -> Reply {
+    if let Err(e) = cw.finish_issue_submission().await {
+        return error_reply(&e);
+    }
     if let Some(cref) = client_ref.as_deref()
         && let Some(rec) = cw.store.state.issues.iter().find(|r| r.client_ref == cref).cloned()
     {
@@ -2051,7 +2054,7 @@ struct TopupReq {
 }
 
 fn topups_unavailable() -> Reply {
-    Reply::fail(503, "lightning_unavailable", "this till takes no Lightning top-ups (the federation's ln module is not available)")
+    Reply::fail(503, "lightning_unavailable", "this federation has no Lightning module available for top-ups")
 }
 
 /// The registry's URL, or the refusal: a top-up is a holder load, recorded in ops.
@@ -2132,6 +2135,9 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         // Unkeyed slots (split keying) below 24 count as room: the load's tap keys them
         // (`holder.rs`). `free_slots` lists no slot from 24 up.
         let free = match ops.client.free_slots(id).await {
+            Ok(f) if f.federation_id != h.wallet.federation_id().to_string() || f.mint_version != h.wallet.mint_version => {
+                return Reply::fail(409, "wrong_federation", "the card belongs to a different federation or mint");
+            }
             Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
             Err(e) => return Reply::fail(503, "ops_unreachable", format!("the card's free slots: {e}")),
         };
@@ -2440,16 +2446,11 @@ pub(crate) async fn serve_managed(
             }
         })
     };
-    // Top-ups by Lightning, when the federation's ln module is there (docs/TOPUP.md).
-    let handle = match wallet.lightning() {
-        Ok(_) => {
-            let store = crate::topup::TopupStore::open(crate::topup::TopupStore::path_in(&dir))?;
-            handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet: wallet.clone() })))
-        }
-        Err(e) => {
-            eprintln!("no Lightning top-ups: {e:#}");
-            handle
-        }
+    let handle = if wallet.lightning().is_ok() || wallet.lightning_v2().is_ok() {
+        let store = crate::topup::TopupStore::open(crate::topup::TopupStore::path_in(&dir))?;
+        handle.with_topups(Topups::new(store, Arc::new(crate::topup::WalletLightning { wallet: wallet.clone() })))
+    } else {
+        handle
     };
     // Invoices paid with a card, when the wallet can pay invoices. The records are resolved even
     // with paying turned off, so a pay a restart left open is still settled.

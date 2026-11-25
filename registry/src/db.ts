@@ -290,6 +290,9 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE notes ADD COLUMN reg_sig TEXT;
   `,
+  // Existing federation keys use the v1 note signature scheme.
+  `ALTER TABLE federation_keys ADD COLUMN mint_version TEXT NOT NULL DEFAULT 'v1'
+    CHECK (mint_version IN ('v1', 'v2'));`,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

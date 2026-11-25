@@ -22,30 +22,29 @@
 use std::str::FromStr as _;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::mint::MintFee;
+use crate::mint::MintVersion;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, SW_OVER_LIMIT, header_time};
 use fedimint_card_host_card::{
     Card, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, TrustedCard, UnsupportedApplet, UntrustedCard, is_change_slot,
     open_pin_session_held, status_word, trust_card, verify_pin_held,
 };
-use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId};
+use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::module::CommonModuleInit as _;
 use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::rand::{self, Rng};
 use fedimint_core::secp256k1::{Keypair, Message, PublicKey, SECP256K1, XOnlyPublicKey};
 use fedimint_core::transaction::{Transaction, TransactionSignature};
 use fedimint_core::{Amount, Tiered, TransactionId};
-use fedimint_mint_common::config::FeeConsensus;
-use fedimint_mint_common::{BlindNonce, MintCommonInit, MintInput, MintOutput, Note};
 use tbs::{AggregatePublicKey, BlindedMessage, BlindingKey};
 
 use crate::files::{HostKind, HostPending, LoadNote};
 use crate::plan::{self, ALL_TIERS, MAX_CARD_NOTES, PlanError, Tiers};
 use crate::queue::{ChargeState, OfflineCharge, OfflineConfig, OfflineError, OfflineInput, PoolRef, Queue, Stats};
 use crate::refusal::{PinWait, wait_seconds};
-use crate::{blind, nonce_for, short_id_of};
+use crate::{nonce_for, short_id_of};
 
 /// Largest price accepted (2^40 msat, about 11 BTC), as the till API.
 pub const MAX_PRICE_MSAT: u64 = 1 << 40;
@@ -90,10 +89,11 @@ pub type KeyedFilter<'a> = &'a dyn Fn(&str, &[u8]) -> Result<Vec<u8>>;
 
 /// What an offline charge works with besides the card and the queue.
 pub struct Env<'a> {
+    pub mint_version: MintVersion,
     pub mint_id: ModuleInstanceId,
     /// The federation's key per note tier.
     pub tbs_pks: &'a Tiered<AggregatePublicKey>,
-    pub fee: &'a FeeConsensus,
+    pub fee: &'a MintFee,
     /// The federation takes a surplus (core consensus 2.1 or later): the charge keeps a fee margin.
     pub surplus_allowed: bool,
     /// Decodes a queued transaction: [`mint_decoders`].
@@ -120,7 +120,7 @@ pub struct Env<'a> {
 
 /// A decoder registry with only the mint module, at `mint_id`: all an offline charge holds.
 pub fn mint_decoders(mint_id: ModuleInstanceId) -> ModuleDecoderRegistry {
-    ModuleRegistry::from_iter([(mint_id, fedimint_mint_common::KIND, MintCommonInit::decoder())])
+    MintVersion::V1.decoders(mint_id)
 }
 
 /// What a charge answers: the queued charge, and whether it was taken before (a repeat of the
@@ -416,7 +416,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
                     invalid += 1;
                     continue;
                 };
-                let good = sig_of(&n.sig48).is_ok_and(|signature| Note { nonce: nonce_for(key), signature }.verify(*pk));
+                let good = sig_of(&n.sig48).is_ok_and(|signature| env.mint_version.verify(nonce_for(key), signature, *pk));
                 if !good {
                     tracing::warn!("slot {slot}: the note's federation signature does not verify; skipped");
                     invalid += 1;
@@ -441,7 +441,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
     let fee_cfg = env.fee.clone();
     let fee = move |a: u64| fee_cfg.fee(Amount::from_msats(a)).msats;
     let amounts: Vec<u64> = notes.iter().map(|n| n.amount_msat).collect();
-    let min_denom = env.fee.min_economical_denomination().msats;
+    let min_denom = env.fee.output_floors();
     let (pool, tiers) = usable_pool(&lock(queue), &env.till_outs);
     let planned = if env.surplus_allowed {
         plan::solve_with_margin_in(&amounts, price, keyed.len(), &fee, min_denom, env.cfg.fee_headroom, tiers)
@@ -477,7 +477,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
             for a in &plan.till {
                 let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
                 let key = BlindingKey::random();
-                outs.push((*a, blind(fedimint_mint_common::Nonce(kp.public_key()), key)));
+                outs.push((*a, env.mint_version.blind(fedimint_mint_common::Nonce(kp.public_key()), key)));
                 host.push((*a, kp, key));
             }
         }
@@ -498,18 +498,15 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         let nonce = nonce_for(key);
         let bk = BlindingKey::random();
         change.push((*slot, *a, nonce, bk));
-        outs.push((*a, blind(nonce, bk)));
+        outs.push((*a, env.mint_version.blind(nonce, bk)));
     }
     ensure!(change.len() == plan.change.len(), "the planner used more slots than are keyed");
     let mut tx = Transaction {
         inputs: inputs
             .iter()
-            .map(|n| -> Result<_> {
-                Ok(MintInput::new_v0(Amount::from_msats(n.amount_msat), Note { nonce: nonce_for(n.key), signature: sig_of(&n.sig48)? })
-                    .into_dyn(env.mint_id))
-            })
+            .map(|n| -> Result<_> { env.mint_version.input(env.mint_id, n.amount_msat, nonce_for(n.key), sig_of(&n.sig48)?) })
             .collect::<Result<_>>()?,
-        outputs: outs.iter().map(|(a, b)| MintOutput::new_v0(Amount::from_msats(*a), BlindNonce(*b)).into_dyn(env.mint_id)).collect(),
+        outputs: outs.iter().map(|(a, b)| env.mint_version.output(env.mint_id, *a, *b)).collect::<Result<_>>()?,
         nonce: rand::thread_rng().r#gen(),
         signatures: TransactionSignature::NaiveMultisig(vec![]),
     };
@@ -619,7 +616,7 @@ fn no_plan(
     price: u64,
     free: usize,
     fee: plan::FeeFn,
-    min_denom: u64,
+    min_denom: plan::OutputFloors,
     tiers: Tiers,
     invalid: usize,
 ) -> anyhow::Error {

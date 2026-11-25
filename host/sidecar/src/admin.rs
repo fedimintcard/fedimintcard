@@ -27,12 +27,22 @@ struct JoinRequest {
     answer: oneshot::Sender<Reply>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupPhase {
+    Opening,
+    NeedsInvite,
+    Joining,
+    RetryingMint,
+    UnsupportedMint,
+}
+
 struct Control {
     dir: PathBuf,
     registry: String,
     pos_url: Option<String>,
     live: RwLock<Weak<TillHandle>>,
     joins: mpsc::Sender<JoinRequest>,
+    setup: watch::Sender<SetupPhase>,
     stop: watch::Sender<bool>,
     claim_lock: Mutex<()>,
     payout_lock: Mutex<()>,
@@ -49,6 +59,7 @@ impl AdminState {
             pos_url,
             live: RwLock::new(Weak::new()),
             joins,
+            setup: watch::channel(SetupPhase::Opening).0,
             stop: watch::channel(false).0,
             claim_lock: Mutex::new(()),
             payout_lock: Mutex::new(()),
@@ -166,7 +177,16 @@ async fn status(State(s): State<AdminState>) -> Reply {
             reply.body["joined"] = json!(true);
             reply
         }
-        Err(_) => Reply::ok(json!({"joined": false, "starting": s.0.joins.is_closed()})),
+        Err(_) => {
+            let phase = *s.0.setup.borrow();
+            Reply::ok(json!({
+                "joined": false,
+                "starting": matches!(phase, SetupPhase::Opening | SetupPhase::Joining | SetupPhase::RetryingMint),
+                "retrying_mint": phase == SetupPhase::RetryingMint,
+                "joining": phase == SetupPhase::Joining,
+                "setup_error": (phase == SetupPhase::UnsupportedMint).then(|| crate::wallet::UnsupportedMint.to_string()),
+            }))
+        }
     };
     reply.body["pos_url"] = json!(s.0.pos_url);
     reply
@@ -203,12 +223,21 @@ struct Invite {
 }
 
 async fn join(State(s): State<AdminState>, Json(req): Json<Invite>) -> Reply {
+    if !s.0.setup.send_if_modified(|phase| {
+        if *phase != SetupPhase::NeedsInvite {
+            return false;
+        }
+        *phase = SetupPhase::Joining;
+        true
+    }) {
+        return Reply::fail(409, "setup_changed", "Federation setup has changed. Refresh to see its status.");
+    }
     let (answer, reply) = oneshot::channel();
     let request = JoinRequest { invite: req.invite.trim().to_owned(), answer };
     if s.0.joins.try_send(request).is_err() {
-        return Reply::fail(409, "join_unavailable", "The till is already joining or joined.");
+        return Reply::fail(503, "setup_unavailable", "Federation setup is unavailable.");
     }
-    reply.await.unwrap_or_else(|_| Reply::fail(409, "join_unavailable", "The till is already joining or joined."))
+    reply.await.unwrap_or_else(|_| Reply::fail(503, "setup_unavailable", "The till stopped during federation setup."))
 }
 
 #[derive(Deserialize)]
@@ -270,6 +299,26 @@ pub(crate) fn qr_svg(text: &str) -> Result<String, Reply> {
     Ok(svg)
 }
 
+async fn open_saved_wallet(state: &AdminState) -> Result<Option<Wallet>> {
+    loop {
+        let result = tokio::select! {
+            result = Wallet::open(state.dir()) => result,
+            _ = state.stopping() => return Ok(None),
+        };
+        match result {
+            Err(e) if e.is::<crate::wallet::MintUnavailable>() => {
+                state.0.setup.send_replace(SetupPhase::RetryingMint);
+                tracing::warn!("Waiting for the saved wallet’s Bitcoin mint API. Retrying in 30 seconds.");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = state.stopping() => return Ok(None),
+                }
+            }
+            result => return result.map(Some),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     dir: PathBuf,
@@ -310,9 +359,10 @@ pub async fn serve(
     };
     let pos = async {
         let wallet = if Wallet::joined(&dir).await? {
-            Wallet::open(&dir).await?
+            None
         } else {
             loop {
+                state.0.setup.send_replace(SetupPhase::NeedsInvite);
                 let request = tokio::select! {
                     req = rx.recv() => req.context("admin listener closed")?,
                     _ = state.stopping() => return Ok(()),
@@ -324,15 +374,19 @@ pub async fn serve(
                 };
                 match joined {
                     Ok(w) => {
+                        state.0.setup.send_replace(SetupPhase::Opening);
                         rx.close();
                         let _ = request.answer.send(Reply::ok(json!({"joined":true})));
-                        break w;
+                        break Some(w);
                     }
                     Err(_) if Wallet::joined(&dir).await? => {
-                        let w = Wallet::open(&dir).await?;
+                        state.0.setup.send_replace(SetupPhase::Opening);
                         rx.close();
-                        let _ = request.answer.send(Reply::ok(json!({"joined":true})));
-                        break w;
+                        let _ = request.answer.send(Reply::ok(json!({"starting":true})));
+                        break None;
+                    }
+                    Err(e) if e.is::<crate::wallet::UnsupportedMint>() => {
+                        let _ = request.answer.send(Reply::fail(422, "unsupported_mint", crate::wallet::UnsupportedMint.to_string()));
                     }
                     Err(_) => {
                         let _ = request.answer.send(Reply::fail(400, "join_failed", "Check the federation invite and its connectivity."));
@@ -341,13 +395,32 @@ pub async fn serve(
             }
         };
         drop(rx);
+        let wallet = match wallet {
+            Some(w) => w,
+            None => {
+                let Some(w) = open_saved_wallet(&state).await? else { return Ok(()) };
+                state.0.setup.send_replace(SetupPhase::Opening);
+                w
+            }
+        };
         let store = StateStore::open(state_path(&dir))?;
         let cw = CardWallet::new(wallet, store, Box::new(crate::till::NoCard));
         crate::till::serve_managed(cw, pos_listen, relay, Some(registry), ops_token, true, opts, Some(state.clone())).await
     };
     // The sweep loop is scoped to this service and shares the same authenticated admin state.
     let services = async {
-        tokio::try_join!(admin, pos)?;
+        let serve_pos = async {
+            match pos.await {
+                Err(e) if e.is::<crate::wallet::UnsupportedMint>() => {
+                    state.0.setup.send_replace(SetupPhase::UnsupportedMint);
+                    tracing::warn!("The saved wallet uses a mint this till cannot open.");
+                    state.stopping().await;
+                    Ok(())
+                }
+                result => result,
+            }
+        };
+        tokio::try_join!(admin, serve_pos)?;
         Ok(())
     };
     tokio::pin!(services);
@@ -377,6 +450,42 @@ mod tests {
         assert!(pairing_origin(None, None, listener)?.is_none());
         assert!(pairing_origin(None, Some("127.0.0.1:16411"), listener)?.is_none());
         assert!(pairing_origin(Some("https://u:pw@pos.example/"), None, listener).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_is_single_flight_and_status_survives_a_closed_browser() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AdminState::new(dir.path().to_owned(), "http://127.0.0.1".into(), None, tx);
+        let submit = |s: AdminState| join(State(s), Json(Invite { invite: " test-invite ".into() }));
+
+        assert_eq!(status(State(state.clone())).await.body["starting"], true);
+        assert_eq!(submit(state.clone()).await.status, 409);
+        state.0.setup.send_replace(SetupPhase::NeedsInvite);
+        let browser = tokio::spawn(submit(state.clone()));
+        let request = rx.recv().await.expect("join worker received the request");
+        assert_eq!(request.invite, "test-invite");
+        browser.abort();
+        let _ = browser.await;
+        assert_eq!(status(State(state.clone())).await.body["joining"], true);
+        assert_eq!(submit(state.clone()).await.status, 409);
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(request.answer.send(Reply::ok(json!({}))).is_err());
+
+        state.0.setup.send_replace(SetupPhase::RetryingMint);
+        let retry = status(State(state.clone())).await;
+        assert_eq!(retry.body["retrying_mint"], true);
+        assert_eq!(retry.body["starting"], true);
+        assert!(retry.body["setup_error"].is_null());
+        assert_eq!(submit(state.clone()).await.status, 409);
+        state.0.setup.send_replace(SetupPhase::UnsupportedMint);
+        let status = status(State(state.clone())).await;
+        assert_eq!(status.status, 200);
+        assert!(status.body["setup_error"].as_str().is_some());
+        assert_eq!(status.body["starting"], false);
+        assert_eq!(submit(state.clone()).await.status, 409);
+        assert_eq!(state.till().await.err().expect("no POS wallet").status, 503);
         Ok(())
     }
 

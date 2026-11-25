@@ -380,6 +380,8 @@ the money truth is the federation and `card_state.json`.
 
 `200 {"ok":true,"kit":{"version":1,"kit_id":"<32 hex>","phone_id":"<32 hex>","federation_id":"<hex>","mint_instance_id":N,"tbs_pks":{"<msat>":"<hex>",…},"fee_consensus":"<hex>","fee_headroom":{"base_msat":N,"ppm":N},"surplus_allowed":bool,"cert_key":"<130 hex>","cap_msat":N,"cap_count":N,"issued_at_ms":T,"expires_at_ms":T,"block_header":"<160 hex>"|absent,"pool":[{"amount_msat":N,"blinded":["<96 hex>",…]},…]}}`
 
+A Bitcoin mint v1 federation uses version 1 of the kit. A Bitcoin mint v2 federation uses version 2 with `mint_version: "v2"` and requires a POS app that understands this version.
+
 The kit carries the federation's note keys per tier and its mint fees, the till's fee headroom,
 the registry's certificate key, the phone's caps (the till's `--offline-cap-*`), its validity
 (`--offline-kit-ttl-hours`), the newest block header, and a pool of the till's outputs: per tier
@@ -455,9 +457,9 @@ charge's change). Room for a top-up is `free_slots.length + unkeyed_slots.length
 ## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load, GET /v1/topups/waiting
 
 Top-up by Lightning (`docs/TOPUP.md`): the till makes an invoice through the federation's gateway
-(its `ln` module) and loads what it received onto the card as a holder load, recorded in ops.
+(its `ln` or `lnv2` module) and loads what it received onto the card as a holder load, recorded in ops.
 On ops only (`503 ops_not_connected` otherwise); `503 lightning_unavailable` when the federation's
-`ln` module is not usable.
+Lightning module is unavailable.
 
 `POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>","short_id":"<8 hex, optional>"}`
 rounds `N` to the nearest card amount (at most 3 notes) and answers the top-up. With `short_id`
@@ -507,7 +509,7 @@ from its own wallet with what it took. Off by default: `till serve --pay-enabled
 | `--pay-daily-cap-msat` | `TILL_PAY_DAILY_CAP_MSAT` | 1,000,000,000 | most the till charges for pays in any 24 hours (pays not charged, failed or refunded do not count) |
 | `--pay-min-expiry-secs` | `TILL_PAY_MIN_EXPIRY_SECS` | 120 | least time an invoice must have left |
 
-The routes answer `503 lightning_unavailable` when the till's federation has no `ln` module the
+The routes answer `503 lightning_unavailable` when the till's federation has no Lightning module the
 wallet can pay with; `POST /v1/pay` answers it too when no gateway can pay the invoice now.
 
 ### POST /v1/pay

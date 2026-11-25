@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["card", "fed-tests", "old-card-pin", "pos-core", "sidecar"]
+members = ["card", "fed-tests", "old-card-pin", "pos-core", "sidecar", "vendor/fedimint-mintv2-common"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,10 @@ fedimint-testing = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.
 fedimint-mintv2-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
 fedimint-mintv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
 fedimint-mintv2-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
+fedimint-meta-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
+fedimint-meta-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
+fedimint-walletv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
+fedimint-walletv2-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
 fedimint-dummy-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
 fedimint-dummy-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
 fedimint-dummy-server = { git = "https://github.com/fedimint/fedimint", tag = "v0.13.0" }
@@ -34,6 +38,10 @@ tbs = { package = "fedimint-tbs", git = "https://github.com/fedimint/fedimint", 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 anyhow = "1"
 tracing = "0.1"
+
+# Keep every mintv2 consumer on the same wire-compatible implementation.
+[patch."https://github.com/fedimint/fedimint"]
+fedimint-mintv2-common = { path = "vendor/fedimint-mintv2-common" }
 
 # Fedimint's [profile.dev.package] overrides do not propagate to git dependencies.
 [profile.dev]

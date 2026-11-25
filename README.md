@@ -15,7 +15,7 @@ This is experimental software. Put on a card only what you can afford to lose.
 
 ## Card 4.0 merchant till
 
-The merchant till accepts Card 4.x and requires a Card 4.0 registry. Merchants with older cards still need a compatible till to spend or withdraw their balance. Use the web page to set up a till, pair a POS phone, review sales and withdraw proceeds.
+The merchant till accepts Card 4.x and works with Bitcoin mint v1 and mint v2 federations. It requires a Card 4.0 registry with support for the selected mint. Merchants with older cards still need a compatible till to spend or withdraw their balance. Use the web page to set up a till, pair a POS phone, review sales and withdraw proceeds.
 
 [Docker installation and backup](docs/TILL-DOCKER.md) · [Merchant overview](docs/images/till/overview.png) · [Payouts](docs/images/till/payouts.png)
 

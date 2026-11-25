@@ -17,12 +17,13 @@ use std::str::FromStr as _;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use fedimint_card_pos_core::charge::mint_decoders;
 use fedimint_card_pos_core::files::{HostKind, HostPending, write_private_json};
-use fedimint_card_pos_core::kit::{KIT_MAX_BYTES, KIT_VERSION, Kit, PoolTier};
+use fedimint_card_pos_core::kit::{KIT_MAX_BYTES, Kit, PoolTier};
+use fedimint_card_pos_core::mint::MintFee;
+use fedimint_card_pos_core::mint::MintVersion;
+use fedimint_card_pos_core::nonce_for;
 use fedimint_card_pos_core::plan;
 use fedimint_card_pos_core::queue::{ChargeState, OfflineCharge, OfflineConfig, OfflineError, Queue};
-use fedimint_card_pos_core::{blind, nonce_for};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
@@ -30,8 +31,7 @@ use fedimint_core::secp256k1::hashes::Hash as _;
 use fedimint_core::secp256k1::{Keypair, Message, PublicKey, SECP256K1, XOnlyPublicKey};
 use fedimint_core::transaction::{Transaction, TransactionSignature};
 use fedimint_core::{Amount, Tiered};
-use fedimint_mint_common::config::FeeConsensus;
-use fedimint_mint_common::{MintInput, MintOutput, Nonce};
+use fedimint_mint_common::Nonce;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tbs::{AggregatePublicKey, BlindingKey};
@@ -197,10 +197,11 @@ pub fn reconcile(queue: &Queue, pool: &mut PoolLedger) -> Result<usize> {
 /// What a kit and an ingest need of the till's federation.
 #[derive(Clone)]
 pub struct TillKeys {
+    pub mint_version: MintVersion,
     pub federation_id: String,
     pub mint_id: ModuleInstanceId,
     pub tbs_pks: Tiered<AggregatePublicKey>,
-    pub fee: FeeConsensus,
+    pub fee: MintFee,
     pub surplus_allowed: bool,
 }
 
@@ -208,6 +209,7 @@ impl TillKeys {
     pub fn of(w: &crate::wallet::Wallet) -> Self {
         Self {
             federation_id: w.federation_id().to_string(),
+            mint_version: w.mint_version,
             mint_id: w.mint_id,
             tbs_pks: w.mint_cfg.tbs_pks.clone(),
             fee: w.mint_cfg.fee_consensus.clone(),
@@ -223,7 +225,8 @@ impl TillKeys {
     /// (`plan::lowest_till_note`) to the largest at or below the phone's value cap.
     pub fn pool_tiers(&self, cap_msat: u64) -> Vec<u64> {
         let fee = |a: u64| self.fee_msat(a);
-        let lowest = plan::lowest_till_note(&fee, self.fee.min_economical_denomination().msats);
+        let floors = self.fee.output_floors();
+        let lowest = plan::lowest_till_note(&fee, floors.preferred).max(floors.minimum);
         self.tbs_pks.iter().map(|(a, _)| a.msats).filter(|t| t.is_power_of_two() && *t >= lowest && *t <= cap_msat).collect()
     }
 }
@@ -300,13 +303,17 @@ fn kit_of(pool: &PoolLedger, rec: &KitRec, keys: &TillKeys, cfg: &OfflineConfig,
     }
     tiers.sort_by_key(|t| t.amount_msat);
     Kit {
-        version: KIT_VERSION,
+        version: match keys.mint_version {
+            MintVersion::V1 => 1,
+            MintVersion::V2 => 2,
+        },
+        mint_version: keys.mint_version,
         kit_id: rec.kit_id.clone(),
         phone_id: rec.phone_id.clone(),
         federation_id: keys.federation_id.clone(),
         mint_instance_id: keys.mint_id,
         tbs_pks: keys.tbs_pks.iter().map(|(a, pk)| (a.msats.to_string(), pk.consensus_encode_to_hex())).collect(),
-        fee_consensus: keys.fee.consensus_encode_to_hex(),
+        fee_consensus: keys.fee.consensus_hex(),
         fee_headroom: cfg.fee_headroom,
         surplus_allowed: keys.surplus_allowed,
         cert_key: cert_key.to_owned(),
@@ -401,7 +408,7 @@ fn top_up(pool: &PoolLedger, rec: &KitRec, kit: &KitParts) -> Result<Vec<PoolRec
             let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
             let bk = BlindingKey::random();
             entries.push(PoolRec {
-                blinded: blind(Nonce(kp.public_key()), bk).consensus_encode_to_hex(),
+                blinded: kit.keys.mint_version.blind(Nonce(kp.public_key()), bk).consensus_encode_to_hex(),
                 amount_msat: *t,
                 kit_id: rec.kit_id.clone(),
                 state: EntryState::Issued { secret_key: hex::encode(kp.secret_bytes()), blinding_key: bk.consensus_encode_to_hex() },
@@ -484,7 +491,7 @@ pub fn ingest(
     charges: Vec<Value>,
     now: u64,
 ) -> Vec<Ingested> {
-    let decoders = mint_decoders(keys.mint_id);
+    let decoders = keys.mint_version.decoders(keys.mint_id);
     // The bytes of each, checked with no lock held.
     let checked: Vec<Result<(OfflineCharge, Checked), Ingested>> = charges
         .into_iter()
@@ -714,32 +721,28 @@ fn check(c: &OfflineCharge, keys: &TillKeys, decoders: &ModuleDecoderRegistry) -
     let mut in_sum = 0u64;
     let mut fees = 0u64;
     for ((input, sig), declared) in tx.inputs.iter().zip(sigs).zip(&c.inputs) {
-        let note = input
-            .as_any()
-            .downcast_ref::<MintInput>()
-            .filter(|_| input.module_instance_id() == keys.mint_id)
-            .and_then(MintInput::maybe_v0_ref)
+        let (amount, nonce, signature) = keys
+            .mint_version
+            .read_input(keys.mint_id, input)
             .ok_or_else(|| bad("an input that is not a note of this till's mint".into()))?;
-        let nonce_hex = hex::encode(note.note.nonce.0.serialize());
-        if note.amount.msats != declared.amount_msat
-            || nonce_hex != declared.nonce
-            || note.note.signature.consensus_encode_to_hex() != declared.signature
+        let nonce_hex = hex::encode(nonce.0.serialize());
+        if amount.msats != declared.amount_msat || nonce_hex != declared.nonce || signature.consensus_encode_to_hex() != declared.signature
         {
             return Err(bad(format!("input {nonce_hex} is not what the charge declares")));
         }
         let pk = keys
             .tbs_pks
-            .tier(&note.amount)
-            .map_err(|_| ("bad_note", format!("{} msat is not a denomination of this federation", note.amount.msats)))?;
-        if !note.note.verify(*pk) {
+            .tier(&amount)
+            .map_err(|_| ("bad_note", format!("{} msat is not a denomination of this federation", amount.msats)))?;
+        if !keys.mint_version.verify(nonce, signature, *pk) {
             return Err(("bad_note", format!("note {nonce_hex}'s federation signature does not verify")));
         }
-        let key = XOnlyPublicKey::from(note.note.nonce.0);
+        let key = XOnlyPublicKey::from(nonce.0);
         if SECP256K1.verify_schnorr(sig, &msg, &key).is_err() {
             return Err(("bad_signature", format!("the card's signature for note {nonce_hex} does not verify")));
         }
-        in_sum += note.amount.msats;
-        fees += keys.fee_msat(note.amount.msats);
+        in_sum += amount.msats;
+        fees += keys.fee_msat(amount.msats);
     }
     if c.pool.is_empty() || tx.outputs.len() != c.change.len() + c.pool.len() {
         return Err(bad(format!("{} outputs, {} change and {} pool declared", tx.outputs.len(), c.change.len(), c.pool.len())));
@@ -747,21 +750,22 @@ fn check(c: &OfflineCharge, keys: &TillKeys, decoders: &ModuleDecoderRegistry) -
     let mut out_sum = 0u64;
     let mut till_msat = 0u64;
     for (i, output) in tx.outputs.iter().enumerate() {
-        let out = output
-            .as_any()
-            .downcast_ref::<MintOutput>()
-            .filter(|_| output.module_instance_id() == keys.mint_id)
-            .and_then(MintOutput::maybe_v0_ref)
+        let (amount, blinded) = keys
+            .mint_version
+            .read_output(keys.mint_id, output)
             .ok_or_else(|| bad(format!("output {i} is not a note of this till's mint")))?;
         let i = i as u64;
-        let amount = out.amount.msats;
+        let amount = amount.msats;
+        if amount < keys.fee.output_floors().minimum {
+            return Err(bad(format!("output {i} is too small for this mint to redeem")));
+        }
         let ok = if let Some(ch) = c.change.iter().find(|ch| ch.out_idx == i) {
             let nonce = PublicKey::from_str(&ch.nonce).map(Nonce).map_err(|_| bad(format!("change {i}'s nonce")))?;
             let bk = BlindingKey::consensus_decode_hex(&ch.blinding_key, &reg).map_err(|_| bad(format!("change {i}'s blinding key")))?;
-            ch.amount_msat == amount && blind(nonce, bk) == out.blind_nonce.0 && nonce_for(XOnlyPublicKey::from(nonce.0)) == nonce
+            ch.amount_msat == amount && keys.mint_version.blind(nonce, bk) == blinded && nonce_for(XOnlyPublicKey::from(nonce.0)) == nonce
         } else if let Some(p) = c.pool.iter().find(|p| p.out_idx == i) {
             till_msat += amount;
-            p.amount_msat == amount && p.blinded == out.blind_nonce.0.consensus_encode_to_hex()
+            p.amount_msat == amount && p.blinded == blinded.consensus_encode_to_hex()
         } else {
             false
         };
