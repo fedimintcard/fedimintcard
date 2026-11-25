@@ -126,6 +126,8 @@ enum ChargeErrorCode: String, CaseIterable {
     case cardLimit = "card_limit"
     case unknown = ""
 
+    var isFederationCheck: Bool { self == .wrongFederation || self == .offlineNoteInvalid }
+
     static func fromWire(_ s: String?, detail: String? = nil) -> ChargeErrorCode {
         // The Card 4.0 till :11 wraps this refusal in its registry error.
         if s == "ops_refused", detail == "ops refused (409): the card belongs to a different federation or mint" {

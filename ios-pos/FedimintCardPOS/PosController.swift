@@ -229,8 +229,8 @@ final class PosController: ObservableObject {
                     await self?.renewKit(till)
                 } // wipes pin
                 if self.localTransport === card { self.localTransport = nil }
-                self.finishCharge(r)
                 self.phone = self.offline.snapshot
+                self.finishCharge(r, held: self.phone.localOnlyRefs.contains(ref))
                 self.send(.chargeDone(chargeId: cid, result: r))
             }
         case .createTopUp(let cid, let msat, let ref, let card):
@@ -275,12 +275,13 @@ final class PosController: ObservableObject {
     }
 
     /// The NFC sheet's last word on a charge, the till's or the phone's ("Paid offline · N sats").
-    private func finishCharge(_ r: ChargeResult) {
+    private func finishCharge(_ r: ChargeResult, held: Bool = false) {
         switch r {
         case .success(let rc): endCardJob(message: receiptHeadline(rc), ok: true)
         case .declined(let code, _, _, _, _, _) where code == .wrongPin: endCardJob(message: "Wrong PIN", ok: false)
-        case .declined(let code, _, _, _, _, _) where code == .wrongFederation || code == .offlineNoteInvalid:
-            endCardJob(message: errorCopy(ErrorKind.from(code), "").0, ok: false)
+        case .declined(let code, _, _, _, _, _) where code.isFederationCheck:
+            let kind: ErrorKind = held ? .heldOnPhone : .from(code)
+            endCardJob(message: errorCopy(kind, "").0, ok: false)
         default: endCardJob(message: "Payment didn't go through", ok: false)
         }
     }

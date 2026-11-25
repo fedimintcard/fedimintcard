@@ -143,6 +143,34 @@ final class PosControllerOfflineTests: XCTestCase {
         }
     }
 
+    func testUnavailableSigningRecordsKeepTheLocalChargeOnItsCard() async {
+        for code in ["offline_note_invalid", "wrong_federation"] {
+            let r = ControllerRig()
+            await r.open()
+            await r.poll()
+            r.pos.key(5)
+            r.pos.send(.chargePressed)
+            guard case .enteringPin(_, let ref, _, _, _) = r.pos.state else { return XCTFail() }
+            r.core.signing = [ref]
+            await r.phone.refresh()
+            r.typePin() // This tap goes to the phone core.
+            r.core.signing = []
+            await r.phone.refresh()
+            XCTAssertFalse(r.phone.snapshot.localOnlyRefs.contains(ref))
+            r.core.signingThrows = true
+            r.core.outcomes = [.refused(code: code, detail: "unchecked", suggestedMsat: nil, wrongTries: nil, waitS: nil)]
+            r.reader.onCard?(MockCard())
+            await r.until("the held result") { if case .error = r.pos.state { return true }; return false }
+            guard case .error(let info) = r.pos.state else { return XCTFail() }
+            XCTAssertEqual(info.kind, .heldOnPhone)
+            XCTAssertEqual(info.unresolvedRef, ref)
+            XCTAssertTrue(r.pos.phone.localOnlyRefs.contains(ref))
+            XCTAssertEqual(r.reader.log, ["begin", "error: Payment not finished"])
+            XCTAssertFalse(r.till.paths.contains("/v1/charge"))
+            r.pos.stop()
+        }
+    }
+
     func testFederationMismatchReachesTheNFCSheetAndTheBalanceScreen() async {
         let r = ControllerRig()
         await r.open()

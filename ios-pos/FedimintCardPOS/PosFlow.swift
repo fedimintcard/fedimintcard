@@ -587,7 +587,7 @@ final class PosFlow {
                 // A PIN wait moved nothing: tap again. A held sale stays held, and a refused
                 // signature on it shows the held sale: part of it may already be signed.
                 var kind = Self.kind(code, local: local)
-                if held && kind == .signCheckFailed { kind = .heldOnPhone }
+                if held && (kind == .signCheckFailed || code.isFederationCheck) { kind = .heldOnPhone }
                 state = errorFrom(price: price, ref: ref, prevUnresolved: unresolved, kind: kind, detail: detail, suggestedMsat: suggested, held: held, waitS: wait)
             case .failed(let te):
                 var detail = ""
