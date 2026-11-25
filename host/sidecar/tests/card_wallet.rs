@@ -939,7 +939,7 @@ async fn v2_issue_interrupted_on_either_side_of_wallet_commit_resolves_once() ->
     for point in [CrashPoint::IssueBeforeCommit, CrashPoint::IssueAfterCommit] {
         f.cw.crash_point = Some(point);
         assert!(f.cw.topup_ref(&[amount], Some("same-order")).await.is_err());
-        assert!(f.cw.store.state.issue_submission.is_some());
+        let operation = f.cw.store.state.issue_submission.as_ref().expect("journaled load").operation;
         // Reload the durable card state just as the service does on its next start.
         f.cw.store = StateStore::open(f._dir.path().join("card_state.json"))?;
         f.cw.crash_point = None;
@@ -955,6 +955,10 @@ async fn v2_issue_interrupted_on_either_side_of_wallet_commit_resolves_once() ->
             let note = &f.cw.store.state.notes[0];
             assert!(note.signature.is_some());
             assert_eq!(note.txid.as_deref(), Some(f.cw.store.state.issues[0].txid.as_str()));
+            let recorded = f.cw.wallet.client.operation_log().get_operation(operation).await.expect("committed load operation");
+            assert_eq!(recorded.try_meta::<fedimint_core::TransactionId>()?.to_string(), f.cw.store.state.issues[0].txid);
+            // Collecting the card signature can finish before mint v2 credits this operation's wallet change.
+            tokio::time::timeout(Duration::from_secs(45), f.cw.wallet.client.await_no_active_states(operation)).await?;
             assert_eq!(f.cw.wallet.balance_msat().await?, start - amount);
         }
     }
