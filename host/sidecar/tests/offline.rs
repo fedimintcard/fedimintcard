@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use fedimint_card_host_card::{BridgeError, Card, Certificate, SlotState, SoftCard, open_pin_session};
+use fedimint_card_host_card::{BridgeError, CHANGE_SLOTS_FROM, Card, Certificate, SlotState, SoftCard};
 use fedimint_card_pos_core::kit::Kit;
 use fedimint_card_pos_core::store::Store;
 use fedimint_card_sidecar::glue::CardWallet;
@@ -128,7 +128,15 @@ struct FakeOps {
     cert: p256::ecdsa::SigningKey,
     cards: Mutex<HashMap<String, FakeCard>>,
     down: AtomicBool,
+    /// Answer `GET /registry/cert-key` with no key, as a registry without `CERT_SIGNING_KEY`.
+    no_cert: AtomicBool,
+    /// `GET /registry/cert-key` alone answers 502 (the rest of the registry answers).
+    cert_down: AtomicBool,
+    /// Every `GET /registry/cert-key` asked, the probe's included.
+    cert_fetches: AtomicUsize,
     outcomes: Mutex<Vec<Value>>,
+    /// Every `POST /load/outcome` body (the holder's load route), in order.
+    load_outcomes: Mutex<Vec<Value>>,
     reports: Mutex<Vec<Value>>,
     /// Every `POST /slot-keys` body, in order.
     key_posts: Mutex<Vec<Value>>,
@@ -138,6 +146,16 @@ struct FakeOps {
     stranded_posts: Mutex<Vec<Value>>,
     /// A registry before v13: no `stranded` in the state, and `POST /stranded` answers 404.
     before_strandings: AtomicBool,
+    /// The registry signs no note (its key is off): outcomes stand with `notes: []`.
+    no_note_key: AtomicBool,
+    /// The holder's load route answers 429 (the card's hourly load budget is spent).
+    load_budget_spent: AtomicBool,
+    /// Every `ALERT` line the registry would log, in order.
+    alerts: Mutex<Vec<String>>,
+    /// `/offline-charges` refuses every report: `change_used` as `registry/src/offline.ts` answers
+    /// a change nonce that already carries a note (409 `double_spend`, the change slots released,
+    /// the inputs live), any other value as a 422 with that reason.
+    refuse_reports: Mutex<Option<&'static str>>,
 }
 
 type S = State<Arc<FakeOps>>;
@@ -156,12 +174,20 @@ impl FakeOps {
             cert: p256::ecdsa::SigningKey::random(&mut rand::thread_rng()),
             cards: Mutex::new(HashMap::new()),
             down: AtomicBool::new(false),
+            no_cert: AtomicBool::new(false),
+            cert_down: AtomicBool::new(false),
+            cert_fetches: AtomicUsize::new(0),
             outcomes: Mutex::new(vec![]),
+            load_outcomes: Mutex::new(vec![]),
             reports: Mutex::new(vec![]),
             key_posts: Mutex::new(vec![]),
             renewals: Mutex::new(vec![]),
             stranded_posts: Mutex::new(vec![]),
             before_strandings: AtomicBool::new(false),
+            no_note_key: AtomicBool::new(false),
+            load_budget_spent: AtomicBool::new(false),
+            alerts: Mutex::new(vec![]),
+            refuse_reports: Mutex::new(None),
         })
     }
 
@@ -206,8 +232,15 @@ impl FakeOps {
 }
 
 async fn cert_key(State(r): S) -> Response {
+    r.cert_fetches.fetch_add(1, Ordering::SeqCst);
     if let Some(d) = r.down() {
         return d;
+    }
+    if r.cert_down.load(Ordering::SeqCst) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    if r.no_cert.load(Ordering::SeqCst) {
+        return ok(json!({"ok": true, "key": null}));
     }
     ok(json!({"ok": true, "key": hex::encode(r.cert_pub())}))
 }
@@ -275,6 +308,28 @@ async fn slot_keys(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) ->
     ok(json!({"ok": true, "version": c.version, "added": added, "replayed": added.is_empty(), "unkeyed_slots": unkeyed_of(c)}))
 }
 
+/// As the registry signs a note when it turns live (DESIGN § 6): each live note of `nonces`
+/// whose nonce is its slot's current key, once. Answers them as an outcome's answer lists them.
+fn sign_live(cert: &p256::ecdsa::SigningKey, c: &mut FakeCard, nonces: &[Value]) -> Vec<Value> {
+    let mut out = vec![];
+    for n in c.notes.iter_mut().filter(|n| nonces.contains(&n["nonce"]) && n["status"] == "live") {
+        let slot = n["slot"].as_u64().unwrap() as u8;
+        let nonce = n["nonce"].as_str().unwrap().to_owned();
+        let Some((_, key)) = c.slots.iter().find(|(s, _)| *s == slot) else { continue };
+        if nonce.get(2..) != Some(key.as_str()) {
+            continue;
+        }
+        if n["reg_sig"].is_null() {
+            let x: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+            let sig48 = fedimint_card_sidecar::glue::sig48_of(n["signature"].as_str().unwrap()).unwrap();
+            let amount = n["amount_msat"].as_u64().unwrap();
+            n["reg_sig"] = json!(hex::encode(fedimint_card_host_card::v3::sign_note(cert, &x, amount, &sig48)));
+        }
+        out.push(json!({"slot": slot, "nonce": nonce, "reg_sig": n["reg_sig"]}));
+    }
+    out
+}
+
 fn add_change(c: &mut FakeCard, txid: &Value, change: &[Value]) {
     for ch in change {
         c.notes.push(json!({
@@ -302,6 +357,19 @@ async fn intent(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> Re
         }
     }
     let change = b["change"].as_array().unwrap().clone();
+    // As `recordIntent`: change into slots 24 to 31, or under one of their keys, is refused for a
+    // charge; a top-up's is recorded, with the alert.
+    let change_keys: Vec<&String> = c.slots.iter().filter(|(s, _)| *s >= CHANGE_SLOTS_FROM).map(|(_, k)| k).collect();
+    let in_change_slot = |ch: &Value| {
+        ch["slot"].as_u64().is_some_and(|s| s >= CHANGE_SLOTS_FROM as u64)
+            || ch["nonce"].as_str().is_some_and(|n| n.len() == 66 && n.starts_with("02") && change_keys.iter().any(|k| n[2..] == **k))
+    };
+    if change.iter().any(in_change_slot) {
+        if !b["inputs"].as_array().unwrap().is_empty() {
+            return fail(409, "change into a change slot");
+        }
+        r.alerts.lock().unwrap().push(format!("load_in_change_slot {id}"));
+    }
     // Registry v13: a CHANGE slot held as stranded takes no other change.
     for ch in &change {
         if c.strandings.iter().any(|s| s["slot"] == ch["slot"] && s["kind"] == "change" && strand_open(c, s)) {
@@ -321,9 +389,40 @@ async fn submitted(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) ->
     let mut g = r.cards.lock().unwrap();
     let c = g.get_mut(&id).unwrap();
     let Some(t) = c.txs.iter_mut().find(|t| t["txid"] == b["txid"]) else { return fail(404, "no such charge") };
+    // As `cards.ts recordSubmitted`: a rejected charge is not accepted for sending, whatever bytes
+    // are posted; the same bytes again replay while the charge is open or accepted.
+    if t["status"] == "rejected" {
+        return fail(409, "the charge is recorded rejected; do not send it");
+    }
+    if !t["signed_hex"].is_null() {
+        if t["signed_hex"] == b["tx_hex"] {
+            return ok(json!({"ok": true, "version": c.version, "replayed": true}));
+        }
+        return fail(409, "the charge already has other signed bytes");
+    }
+    if t["status"] != "open" {
+        return fail(409, "the charge is already resolved; do not send it");
+    }
     t["signed_hex"] = b["tx_hex"].clone();
     c.version += 1;
     ok(json!({"ok": true, "version": c.version}))
+}
+
+/// The holder's load route as a repeat reaches it: the notes of that load the registry has
+/// signed (signing any still unsigned).
+async fn load_outcome(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> Response {
+    if let Some(d) = r.down() {
+        return d;
+    }
+    r.load_outcomes.lock().unwrap().push(b.clone());
+    if r.load_budget_spent.load(Ordering::SeqCst) {
+        return fail(429, "the card's load budget is spent");
+    }
+    let mut g = r.cards.lock().unwrap();
+    let c = g.get_mut(&id).unwrap();
+    let nonces: Vec<Value> = b["notes"].as_array().unwrap().iter().map(|n| n["nonce"].clone()).collect();
+    let notes = if r.no_note_key.load(Ordering::SeqCst) { vec![] } else { sign_live(&r.cert, c, &nonces) };
+    ok(json!({"ok": true, "version": c.version, "notes": notes}))
 }
 
 async fn outcome(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> Response {
@@ -333,8 +432,22 @@ async fn outcome(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> R
     let mut g = r.cards.lock().unwrap();
     let c = g.get_mut(&id).unwrap();
     let Some(t) = c.txs.iter_mut().find(|t| t["txid"] == b["txid"]) else { return fail(404, "no such charge") };
+    let change_nonces: Vec<Value> = t["change"].as_array().unwrap().iter().map(|ch| ch["nonce"].clone()).collect();
     if t["status"] != "open" {
-        return ok(json!({"ok": true, "version": c.version}));
+        // A repeat: the registry replays the outcome it recorded when the same `accepted` comes
+        // with some of its change, each `{nonce, signature}` among the recorded ones
+        // (`cards.ts repeatMatches`), else 409.
+        let pairs = |v: &Value| -> Vec<(Value, Value)> {
+            v["change"].as_array().map(|a| a.iter().map(|c| (c["nonce"].clone(), c["signature"].clone())).collect()).unwrap_or_default()
+        };
+        let recorded = r.outcomes.lock().unwrap().iter().find(|o| o["txid"] == b["txid"]).cloned();
+        if recorded.is_some_and(|o| o["accepted"] != b["accepted"] || !pairs(&b).iter().all(|p| pairs(&o).contains(p))) {
+            return fail(409, "the transaction is resolved with another outcome");
+        }
+        // The notes it sent the registry has signed (signing any still unsigned).
+        let sent: Vec<Value> = pairs(&b).into_iter().map(|(n, _)| n).filter(|n| change_nonces.contains(n)).collect();
+        let notes = if r.no_note_key.load(Ordering::SeqCst) { vec![] } else { sign_live(&r.cert, c, &sent) };
+        return ok(json!({"ok": true, "version": c.version, "notes": notes}));
     }
     let accepted = b["accepted"] == true;
     t["status"] = json!(if accepted { "accepted" } else { "rejected" });
@@ -369,9 +482,10 @@ async fn outcome(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) -> R
             add_releases(&r.cert, c, &b["txid"], &slots);
         }
     }
+    let notes = if accepted && !r.no_note_key.load(Ordering::SeqCst) { sign_live(&r.cert, c, &change_nonces) } else { vec![] };
     c.version += 1;
     r.outcomes.lock().unwrap().push(b.clone());
-    ok(json!({"ok": true, "version": c.version}))
+    ok(json!({"ok": true, "version": c.version, "notes": notes}))
 }
 
 async fn renew(State(r): S, Path((id, slot)): Path<(String, u8)>, Json(b): Json<Value>) -> Response {
@@ -402,6 +516,18 @@ async fn offline_charges(State(r): S, Path(id): Path<String>, Json(b): Json<Valu
     let c = g.get_mut(&id).unwrap();
     assert!(b["signed_hex"].as_str().is_some_and(|s| !s.is_empty()) && b["signed_at"].as_u64().is_some_and(|t| t > 0), "{b}");
     assert!(b["tx_hex"].as_str().is_some_and(|s| !s.is_empty()), "{b}");
+    if let Some(why) = *r.refuse_reports.lock().unwrap() {
+        if why != "change_used" {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"ok": false, "reason": why}))).into_response();
+        }
+        let change = b["change"].as_array().unwrap();
+        if !c.releases.iter().any(|x| x["txid"] == b["txid"]) {
+            let slots: Vec<u8> = change.iter().map(|ch| ch["slot"].as_u64().unwrap() as u8).collect();
+            add_releases(&r.cert, c, &b["txid"], &slots);
+        }
+        let conflicts: Vec<Value> = change.iter().map(|ch| json!({"nonce": ch["nonce"], "status": "change_used", "txid": null})).collect();
+        return (StatusCode::CONFLICT, Json(json!({"ok": false, "reason": "double_spend", "conflicts": conflicts}))).into_response();
+    }
     if c.txs.iter().any(|t| t["txid"] == b["txid"]) {
         return ok(json!({"ok": true, "version": c.version}));
     }
@@ -546,6 +672,7 @@ async fn serve(r: Arc<FakeOps>) -> String {
         .route("/cards/{id}/intent", post(intent))
         .route("/cards/{id}/submitted", post(submitted))
         .route("/cards/{id}/outcome", post(outcome))
+        .route("/cards/{id}/load/outcome", post(load_outcome))
         .route("/cards/{id}/slots/{slot}", put(renew))
         .route("/cards/{id}/slot-keys", post(slot_keys))
         .route("/cards/{id}/offline-charges", post(offline_charges))
@@ -589,19 +716,33 @@ fn provision(reg: &FakeOps, card: &Rc<RefCell<SoftCard>>) -> String {
 
 /// [`provision`] with only slots `0..n` keyed and registered.
 fn provision_slots(reg: &FakeOps, card: &Rc<RefCell<SoftCard>>, n: u8) -> String {
+    provision_keys(reg, card, &(0..n).collect::<Vec<u8>>())
+}
+
+/// [`provision`] with only `slots` (slot 0 first) keyed and registered.
+fn provision_keys(reg: &FakeOps, card: &Rc<RefCell<SoftCard>>, slots: &[u8]) -> String {
+    assert_eq!(slots.first(), Some(&0), "slot 0's key names the card");
     let mut c = card.borrow_mut();
-    let keys: Vec<XOnlyPublicKey> = (0..n).map(|s| c.gen_key(s).unwrap()).collect();
+    let keys: Vec<XOnlyPublicKey> = slots.iter().map(|s| c.gen_key(*s).unwrap()).collect();
     if c.version().sign_once() {
         let w = c.attest_init().unwrap();
         let cert = Certificate::sign(&reg.cert, &keys[0].serialize(), &w).unwrap();
         c.set_cert(&cert.to_bytes()).unwrap();
         c.set_registry_key(&reg.cert_pub().try_into().unwrap()).unwrap();
+        // A 4.0 card takes its PIN only in the selection that anchored its clock.
+        fedimint_card_host_card::softkit::ready_for_pin(&mut *c).unwrap();
     }
-    open_pin_session(&mut *c).unwrap();
+    if c.version().sign_once() {
+        fedimint_card_host_card::softkit::open_test_session_under(&mut *c, &reg.cert_pub()).unwrap();
+    } else {
+        // A card older than 4.0 carries its PIN as such a card does; no till sends it one.
+        fedimint_card_old_card_pin::open_pin_session(&mut *c).unwrap();
+        c.forget_received();
+    }
     let id = short_id_of(&keys[0]);
     reg.cards.lock().unwrap().insert(
         id.clone(),
-        FakeCard { version: 1, slots: keys.iter().enumerate().map(|(i, k)| (i as u8, k.to_string())).collect(), ..Default::default() },
+        FakeCard { version: 1, slots: slots.iter().zip(&keys).map(|(s, k)| (*s, k.to_string())).collect(), ..Default::default() },
     );
     id
 }
@@ -645,6 +786,18 @@ struct Till {
     reg: Arc<FakeOps>,
     dir: tempfile::TempDir,
     _fed: FederationTest,
+    _no_alerts: NoAlerts,
+}
+
+/// Every test: the till never tops up into slots 24 to 31 (the registry would raise its alert).
+struct NoAlerts(Arc<FakeOps>);
+
+impl Drop for NoAlerts {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert_eq!(*self.0.alerts.lock().unwrap(), Vec::<String>::new(), "a top-up into a change slot");
+        }
+    }
 }
 
 impl Till {
@@ -664,7 +817,7 @@ impl Till {
         let off = Offline::open(dir.path(), cfg)?;
         let cw = CardWallet::new(wallet, StateStore::open(dir.path().join("card_state.json"))?, Box::new(till::NoCard));
         let sales = Arc::new(Mutex::new(SalesStore::open(dir.path().join("sales.json"))?));
-        let mut t = Self { cw, ops, off, sales, reg, dir, _fed: fed };
+        let mut t = Self { cw, ops, off, sales, _no_alerts: NoAlerts(reg.clone()), reg, dir, _fed: fed };
         // Online at start: the probe keeps the registry's certificate key.
         let (r, f) = t.off.reach.probe(Some(&t.ops), &t.cw.wallet, t.dir.path()).await;
         assert_eq!((r, f), (Some(true), true));
@@ -723,7 +876,7 @@ impl Till {
 }
 
 fn v3_card() -> Rc<RefCell<SoftCard>> {
-    Rc::new(RefCell::new(SoftCard::v3()))
+    Rc::new(RefCell::new(SoftCard::v4()))
 }
 
 fn slot_states(card: &Rc<RefCell<SoftCard>>, slots: &[u64]) -> Vec<SlotState> {
@@ -761,6 +914,239 @@ async fn a_3_0_card_pays_online_and_holds_its_change() -> anyhow::Result<()> {
     }
     let open = t.reg.cards.lock().unwrap()[&id].txs.iter().filter(|x| x["status"] == "open").count();
     assert_eq!(open, 0, "the outcome reached the registry");
+    Ok(())
+}
+
+/// Forget the certificate key the till keeps, as a till set up before it had one.
+fn forget_cert_key(dir: &std::path::Path) {
+    let p = dir.join("till-ops.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("cert_key");
+    std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(dir).unwrap(), None);
+}
+
+/// A till that keeps no certificate key asks the registry for it when a card is tapped, keeps it,
+/// and seals the 4.0 card's PIN to the card checked under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_without_the_certificate_key_fetches_and_keeps_it_at_the_tap() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    forget_cert_key(t.dir.path());
+    t.tap(&card);
+    t.cw.pin = Some(b"1234".to_vec());
+    let base = t.ops.attach(&mut t.cw).await?;
+    let want = Some(hex::encode(t.reg.cert_pub()));
+    assert_eq!(t.cw.ops.as_ref().unwrap().cert_key, want, "the tap has the registry's key");
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?, want, "and the till keeps it");
+    t.cw.verify_pin_session()?;
+    Ops::finish(&mut t.cw, base).await;
+    t.cw.pin = None;
+    Ok(())
+}
+
+/// A till that keeps no certificate key and cannot get one sends a 4.0 card no PIN: nothing is
+/// asked of the card's PIN (no nonce, no try), and the merchant is told to retry once the till
+/// has reached the registry (`offline_not_ready`). Once the registry has a key, the next tap
+/// fetches it and the PIN goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_that_cannot_get_the_certificate_key_sends_no_pin() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    forget_cert_key(t.dir.path());
+    t.reg.no_cert.store(true, Ordering::SeqCst);
+    let tries = card.borrow_mut().get_state()?.wrong_tries;
+    t.tap(&card);
+    t.cw.pin = Some(b"1234".to_vec());
+    let base = t.ops.attach(&mut t.cw).await?;
+    assert_eq!(t.cw.ops.as_ref().unwrap().cert_key, None);
+    let e = t.cw.verify_pin_session().unwrap_err();
+    let class = fedimint_card_sidecar::till::classify(&e);
+    assert_eq!((class.status, class.code), (503, "offline_not_ready"), "{e:#}");
+    assert!(format!("{e:#}").contains("no PIN was sent"), "{e:#}");
+    assert!(!card.borrow().nonce_live(), "no GET_NONCE was asked");
+    assert_eq!(card.borrow_mut().get_state()?.wrong_tries, tries, "no try was spent");
+    Ops::finish(&mut t.cw, base).await;
+    t.cw.pin = None;
+    // What the merchant's app is told: the API answer for this refusal.
+    let reply = fedimint_card_sidecar::till::error_reply(&e);
+    assert_eq!((reply.status, reply.body["error"].as_str()), (503, Some("offline_not_ready")), "{}", reply.body);
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?, None, "nothing kept");
+
+    t.reg.no_cert.store(false, Ordering::SeqCst);
+    t.attach_tap(&card).await?;
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?, Some(hex::encode(t.reg.cert_pub())));
+    Ok(())
+}
+
+/// A note the registry has not signed stays off the card and out of every plan; the till asks for
+/// its signature again at each tap, and once the registry gives it, that tap writes it and the
+/// charge spends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_note_the_registry_has_not_signed_waits_for_a_later_tap() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.reg.no_note_key.store(true, Ordering::SeqCst);
+    t.load(&card, &[1 << 16]).await?;
+    assert_eq!(card.borrow().slot_state(0).unwrap(), SlotState::Keyed, "no signature, so no SET_NOTE");
+    let (status, body) = t.charge(&card, 20_000, "w1").await;
+    assert_ne!(status, 200, "a note that cannot reach the card pays nothing: {body}");
+    assert_eq!(body["error"], "insufficient", "the plan leaves the waiting note out: {body}");
+    assert_eq!(card.borrow().slot_state(0).unwrap(), SlotState::Keyed, "nothing signed");
+    assert!(t.reg.cards.lock().unwrap()[&id].txs.iter().all(|x| x["inputs"].as_array().is_none_or(|a| a.is_empty())), "no charge recorded");
+
+    // The registry's key is back: the next tap repeats the load's outcome, the answer signs the
+    // note, the tap writes it, and it pays.
+    t.reg.no_note_key.store(false, Ordering::SeqCst);
+    let (status, body) = t.charge(&card, 20_000, "w2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(slots_of(&body, "inputs"), vec![0]);
+    Ok(())
+}
+
+/// A stranger with the card in hand but not the PIN can only GEN_KEY its EMPTY slots. A till on
+/// ops adopts those keys the next time it needs the slots (they are the card's own keys): the
+/// top-up registers them, lands its notes in them, and nothing is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_keying_the_free_slots_without_the_pin_costs_a_top_up_nothing() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision_split(&t.reg, &card, 1);
+    let n = card.borrow().slot_len();
+    // The stranger: a fresh selection, no PIN, and every EMPTY slot keyed.
+    {
+        let mut c = card.borrow_mut();
+        c.apdu(&fedimint_card_host_card::SELECT_APDU)?;
+        for slot in 1..n {
+            assert_eq!(c.slot_state(slot), Some(SlotState::Empty));
+            c.gen_key(slot)?;
+        }
+    }
+    let stranger: Vec<XOnlyPublicKey> = (1..n).map(|s| card.borrow_mut().get_pub(s).unwrap()).collect();
+
+    t.load(&card, &[1 << 16, 1 << 14, 1 << 12]).await?;
+    let noted: Vec<u8> = (0..n).filter(|s| card.borrow().slot_state(*s).unwrap() == SlotState::Note).collect();
+    assert_eq!(noted.len(), 3, "every note is on the card: {noted:?}");
+    assert!(noted.iter().any(|s| *s >= 1), "a stranger-keyed slot holds a note: {noted:?}");
+    {
+        let regs = t.reg.cards.lock().unwrap();
+        let slots = &regs[&id].slots;
+        for s in noted.iter().filter(|s| **s >= 1) {
+            let key = slots.iter().find(|(k, _)| k == s).map(|(_, v)| v.clone());
+            assert_eq!(key, Some(stranger[*s as usize - 1].to_string()), "slot {s}: the registry holds the key the card holds");
+        }
+        // The registry holds a note on each of those slots' keys, and together they are the top-up.
+        let on_keys: u64 =
+            noted.iter().map(|s| note_on_key(&regs[&id], *s).expect("a note on the slot's key")["amount_msat"].as_u64().unwrap()).sum();
+        assert_eq!(on_keys, (1 << 16) + (1 << 14) + (1 << 12), "nothing lost");
+    }
+    // The notes pay.
+    let (status, body) = t.charge(&card, 20_000, "s1").await;
+    assert_eq!(status, 200, "{body}");
+    Ok(())
+}
+
+/// A load the registry does not know as a transaction (a holder's) is asked at the load route,
+/// which spends the card's hourly load budget: only after `/outcome` answers 404, and at most
+/// once an hour for the card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holders_load_is_asked_for_its_signatures_at_the_load_route_at_most_once_an_hour() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.reg.no_note_key.store(true, Ordering::SeqCst);
+    t.load(&card, &[1 << 16]).await?;
+    t.reg.cards.lock().unwrap().get_mut(&id).unwrap().txs.retain(|x| x["inputs"].as_array().is_some_and(|a| !a.is_empty()));
+    let (status, body) = t.charge(&card, 20_000, "w1").await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(t.reg.load_outcomes.lock().unwrap().len(), 1, "asked at the load route after the 404");
+    t.reg.no_note_key.store(false, Ordering::SeqCst);
+    let (status, body) = t.charge(&card, 20_000, "w2").await;
+    assert_ne!(status, 200, "not asked again within the hour: {body}");
+    assert_eq!(t.reg.load_outcomes.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+/// A repeat the registry refuses (409: it recorded another outcome) is not taken to the load
+/// route; the note waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_refused_with_409_never_goes_to_the_load_route() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.reg.no_note_key.store(true, Ordering::SeqCst);
+    t.load(&card, &[1 << 16]).await?;
+    for o in t.reg.outcomes.lock().unwrap().iter_mut() {
+        o["change"] = json!([{"nonce": "00", "signature": "00"}]);
+    }
+    t.reg.no_note_key.store(false, Ordering::SeqCst);
+    let (status, body) = t.charge(&card, 20_000, "w1").await;
+    assert_ne!(status, 200, "the note still waits: {body}");
+    assert!(t.reg.load_outcomes.lock().unwrap().is_empty(), "no load route after a 409");
+    assert_eq!(card.borrow().slot_state(0).unwrap(), SlotState::Keyed);
+    Ok(())
+}
+
+/// A `429` from the holder's load route (anyone with the card's short id can spend its hourly
+/// budget) ends the tap's asking like an unreachable registry: it is no miss, so it never pushes
+/// the load's back-off out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_route_429_is_no_miss_for_the_back_off() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.reg.no_note_key.store(true, Ordering::SeqCst);
+    t.load(&card, &[1 << 16]).await?;
+    t.reg.cards.lock().unwrap().get_mut(&id).unwrap().txs.retain(|x| x["inputs"].as_array().is_some_and(|a| !a.is_empty()));
+    t.reg.load_budget_spent.store(true, Ordering::SeqCst);
+    let (status, body) = t.charge(&card, 20_000, "w1").await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(t.reg.load_outcomes.lock().unwrap().len(), 1, "asked at the load route");
+    let asks = StateStore::open(t.ops.card_path(&id))?.state.sig_asks;
+    assert!(!asks.is_empty() && asks.values().all(|a| a.misses == 0 && a.load), "{asks:?}");
+    Ok(())
+}
+
+/// The change of an offline charge that the registry could not sign at its outcome waits, and a
+/// later tap gets its signature. The registry files the charge's inputs under the same txid, so
+/// the repeat must send only the notes still waiting, never every note with the txid.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offline_charges_change_left_unsigned_is_signed_at_a_later_tap() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 14]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 50_000, "b").await;
+    assert_eq!((status, &body["offline"]), (200, &json!(true)), "{body}");
+    let change = slots_of(&body, "change");
+    assert!(!change.is_empty(), "{body}");
+    t.set_down(false);
+    t.reg.no_note_key.store(true, Ordering::SeqCst);
+    let sent = t.send().await;
+    assert_eq!(sent["settled"].as_array().unwrap().len(), 1, "{sent}");
+    t.tap(&card);
+    let r = card_balance_job(&mut t.cw, Some(&t.ops), &t.sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "unsigned change stays off the card");
+
+    // The key is back: the next tap's repeat sends the waiting change, and the tap writes it.
+    t.reg.no_note_key.store(false, Ordering::SeqCst);
+    t.tap(&card);
+    let r = card_balance_job(&mut t.cw, Some(&t.ops), &t.sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Note), "{:?}", slot_states(&card, &change));
+    let file = StateStore::open(t.ops.card_path(&id))?.state;
+    let waiting: Vec<u8> = file
+        .notes
+        .iter()
+        .filter(|n| n.status == NoteStatus::Live && n.signature.is_some() && n.reg_sig.is_none())
+        .map(|n| n.slot)
+        .collect();
+    assert!(waiting.is_empty(), "nothing waits: {waiting:?}");
     Ok(())
 }
 
@@ -861,7 +1247,9 @@ async fn a_clone_with_an_uncertified_attestation_key_is_refused() -> anyhow::Res
     provision(&t.reg, &card);
     t.load(&card, &[1 << 16]).await?;
     let clone = Rc::new(RefCell::new(card.borrow().extract_clone()));
-    clone.borrow_mut().verify_pin(b"1234")?;
+    // A copy of the card's slots has no certified PIN key (the PIN key never leaves the card), so
+    // no PIN session opens on it: the sealed VERIFY has no checked key to be sealed to.
+    assert!(fedimint_card_host_card::softkit::open_test_session_under(&mut *clone.borrow_mut(), &t.reg.cert_pub()).is_err());
     t.set_down(true);
     let (status, body) = t.charge(&clone, 20_000, "d").await;
     assert_eq!((status, body["error"].as_str()), (403, Some("card_not_genuine")), "{body}");
@@ -883,11 +1271,25 @@ async fn the_tills_caps_and_a_2_1_card_are_refused() -> anyhow::Result<()> {
     t.load(&card, &[1 << 16, 1 << 15]).await?;
     let old = Rc::new(RefCell::new(SoftCard::new()));
     provision(&t.reg, &old);
-    t.load(&old, &[1 << 16]).await?;
+    // A top-up is refused like a sale: nothing goes on the card, and no PIN command reaches it.
+    let e = t.load(&old, &[1 << 16]).await.expect_err("a 2.1 card takes no top-up");
+    assert!(fedimint_card_host_card::is_old_card(&e), "{e:#}");
+    assert!(t.cw.store.state.notes.is_empty(), "the refused top-up recorded no note");
+    assert!(!old.borrow().heard_a_pin_command(), "the top-up: the card received {:02x?}", old.borrow().received_ins());
     t.set_down(true);
 
     let (status, body) = t.charge(&old, 10_000, "f").await;
-    assert_eq!((status, body["error"].as_str()), (409, Some("offline_unsupported_card")), "{body}");
+    // Applet 4.0's hosts take no older card at all: the old-card message, nothing signed, and no
+    // PIN command, sealed or not, reaches the card.
+    assert_eq!((status, body["error"].as_str()), (409, Some("old_card")), "{body}");
+    assert_eq!(body["detail"].as_str(), Some(fedimint_card_host_card::OLD_CARD_MESSAGE), "{body}");
+    assert_eq!(spent_slots(&old), 0);
+    assert!(!old.borrow().heard_a_pin_command(), "the card received {:02x?}", old.borrow().received_ins());
+    t.set_down(false);
+    let (status, body) = t.charge(&old, 10_000, "f-online").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("old_card")), "online: {body}");
+    assert!(!old.borrow().heard_a_pin_command(), "online: the card received {:02x?}", old.borrow().received_ins());
+    t.set_down(true);
 
     let (status, body) = t.charge(&card, 70_000, "e-big").await;
     assert_eq!((status, body["error"].as_str()), (503, Some("offline_cap_reached")), "over the msat cap: {body}");
@@ -1090,7 +1492,6 @@ async fn an_online_retap_of_a_sale_left_signing_offline_finishes_it() -> anyhow:
     provision(&t.reg, &old);
     t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
     t.load(&other, &[1 << 16, 1 << 16]).await?;
-    t.load(&old, &[1 << 16, 1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
     assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
@@ -1098,11 +1499,13 @@ async fn an_online_retap_of_a_sale_left_signing_offline_finishes_it() -> anyhow:
     assert_eq!((first.len(), first[0].state), (1, ChargeState::Signing));
 
     t.set_down(false);
-    for (which, c) in [("another 3.0 card", &other), ("a 2.1 card", &old)] {
+    // Another card waits for the first; a card older than 4.0 is refused outright.
+    for (which, c, want) in [("another 4.0 card", &other, (202, "undecided")), ("a 2.1 card", &old, (409, "old_card"))] {
         let (status, body) = t.charge(c, 90_000, "pulled").await;
-        assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{which}: {body}");
+        assert_eq!((status, body["error"].as_str()), (want.0, Some(want.1)), "{which}: {body}");
         assert_eq!(spent_slots(c), 0, "{which}: nothing signed");
     }
+    assert!(!old.borrow().heard_a_pin_command(), "a 2.1 card hears no PIN command: {:02x?}", old.borrow().received_ins());
     assert!(t.sales.lock().unwrap().find_ref("pulled").is_none(), "no sale");
     assert_eq!(t.off.queue.lock().unwrap().file.charges, first, "the offline charge still waits for its card");
 
@@ -1742,14 +2145,15 @@ async fn the_tills_header_moves_the_cards_clock_and_an_outage_moves_nothing() ->
 async fn a_double_spend_releases_the_change_slots_at_the_next_online_tap() -> anyhow::Result<()> {
     let mut t = Till::new(OfflineConfig::default()).await?;
     let card = v3_card();
-    // Few keyed slots, so the released ones are needed again.
-    let id = provision_slots(&t.reg, &card, 8);
+    // Few keyed slots: 0 to 7 for loads, the change slots 24 to 31.
+    let id = provision_keys(&t.reg, &card, &[0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31]);
     t.load(&card, &[1 << 16]).await?;
     t.set_down(true);
     let (status, body) = t.charge(&card, 20_000, "r1").await;
     assert_eq!(status, 200, "{body}");
     let change = slots_of(&body, "change");
     assert!(!change.is_empty() && slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "{body}");
+    assert!(change.iter().all(|s| *s >= 24), "{body}");
     let nonce = t.off.queue.lock().unwrap().file.charges[0].inputs[0].nonce.clone();
     t.reg.set_note_status(&id, &nonce, "spent");
     t.set_down(false);
@@ -1760,25 +2164,21 @@ async fn a_double_spend_releases_the_change_slots_at_the_next_online_tap() -> an
     let listed: Vec<u64> = t.reg.cards.lock().unwrap()[&id].releases.iter().map(|r| r["slot"].as_u64().unwrap()).collect();
     assert_eq!(listed, change, "a release per change slot, none for the input");
 
-    // The next online tap: CHANGE -> KEYED, and the slots take notes again.
+    // The next online tap: CHANGE -> KEYED. The load goes below 24, never into them.
     t.load(&card, &[1 << 15]).await?;
-    assert!(
-        slot_states(&card, &change).iter().all(|s| matches!(s, SlotState::Keyed | SlotState::Note)),
-        "{:?}",
-        slot_states(&card, &change)
-    );
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Keyed), "{:?}", slot_states(&card, &change));
     let input = slots_of(&body, "inputs")[0];
     assert_eq!(card.borrow().slot_state(input as u8), Some(SlotState::Spent), "the input was spent elsewhere: not released");
-    // Free slots are taken lowest first, and the released ones are the lowest.
-    let loaded: Vec<u64> = change.iter().copied().filter(|s| card.borrow().slot_state(*s as u8) == Some(SlotState::Note)).collect();
-    assert_eq!(loaded.len(), 1, "the load went to a released slot: {:?}", slot_states(&card, &change));
-    // A charge with change, into released slots again.
+    assert!((24..32).all(|s| card.borrow().slot_state(s) != Some(SlotState::Note)), "no load in a change slot");
+    // An offline charge with change, into the released slots again: change slots are taken
+    // lowest first, and the released ones are the lowest.
+    t.set_down(true);
     let (status, body) = t.charge(&card, 10_000, "r2").await;
     assert_eq!(status, 200, "{body}");
-    assert!(body.get("offline").is_none(), "{body}");
+    assert_eq!(body["offline"], true, "{body}");
     let change2 = slots_of(&body, "change");
-    assert!(!change2.is_empty() && change2.iter().all(|s| change.contains(s)), "change into the released slots: {body}");
-    assert!(slot_states(&card, &change2).iter().all(|s| *s == SlotState::Note), "{:?}", slot_states(&card, &change2));
+    assert!(!change2.is_empty() && change2.contains(&change[0]), "change into the released slots: {body}");
+    assert!(slot_states(&card, &change2).iter().all(|s| *s == SlotState::Change), "{:?}", slot_states(&card, &change2));
     Ok(())
 }
 
@@ -1832,17 +2232,252 @@ async fn a_charge_the_federation_rejects_releases_its_note_and_change_and_the_no
     assert_eq!(listed, want);
     assert_eq!(slot_states(&card, &inputs), vec![SlotState::Spent]);
 
-    // The next online tap releases: the input is a note again, the change slots are keyed.
+    // The next online tap releases the input: a note again. The change slots carry the rejected
+    // sale's dead notes, so they stay CHANGE until a tap has checked the PIN.
+    assert!(change.iter().all(|s| *s >= 24), "{body}");
+    let old_keys: Vec<String> = change.iter().map(|s| card.borrow_mut().get_pub(*s as u8).unwrap().to_string()).collect();
     t.tap(&card);
     let r = card_balance_job(&mut t.cw, Some(&t.ops), &t.sales).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
     assert_eq!(slot_states(&card, &inputs), vec![SlotState::Note]);
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "{:?}", slot_states(&card, &change));
+    // A wrong PIN releases nothing.
+    t.tap(&card);
+    t.cw.pin = Some(b"9999".to_vec());
+    let r = t.ops.attach(&mut t.cw).await;
+    t.cw.pin = None;
+    assert!(r.is_err(), "the wrong PIN ends the tap");
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "{:?}", slot_states(&card, &change));
+    // The right PIN: each change slot released and re-keyed in one step, with the spare reserve
+    // off (it keys nothing): the unit is outside its budget. The registry hears the new keys.
+    t.cw.spares = fedimint_card_sidecar::ops::SpareConfig { target: 12, max_per_tap: 0 };
+    t.attach_tap(&card).await?;
+    t.cw.spares = Default::default();
     assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Keyed), "{:?}", slot_states(&card, &change));
+    for (s, old) in change.iter().zip(&old_keys) {
+        let new = card.borrow_mut().get_pub(*s as u8)?.to_string();
+        assert_ne!(&new, old, "slot {s} re-keyed");
+        let reg = t.reg.cards.lock().unwrap()[&id].slots.iter().find(|(x, _)| u64::from(*x) == *s).map(|(_, k)| k.clone());
+        assert_eq!(reg.as_deref(), Some(new.as_str()), "the registry has slot {s}'s new key");
+    }
     // And that note pays an online charge.
     let (status, body) = t.charge(&card, 20_000, "f2").await;
     assert_eq!(status, 200, "{body}");
     assert!(body.get("offline").is_none(), "{body}");
     assert_eq!(slots_of(&body, "inputs"), inputs);
+    Ok(())
+}
+
+/// A tap cut between a dead change slot's RELEASE and its re-key leaves the slot KEYED on the key
+/// that carried the dead note. A tap without the PIN leaves it so; the next tap with the PIN
+/// re-keys it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_slot_released_but_not_rekeyed_is_rekeyed_at_the_next_pin_tap() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 20_000, "t1").await;
+    assert_eq!(status, 200, "{body}");
+    let change = slots_of(&body, "change");
+    assert!(!change.is_empty() && change.iter().all(|s| *s >= 24), "{body}");
+    {
+        let signed = t.off.queue.lock().unwrap().file.charges[0].signed_hex.clone().unwrap();
+        let spoiled = spoil_signatures(&t, &signed);
+        let mut q = t.off.queue.lock().unwrap();
+        q.file.charges[0].signed_hex = Some(spoiled);
+        q.save()?;
+    }
+    t.set_down(false);
+    let sent = t.send().await;
+    assert_eq!(sent["rejected"].as_array().unwrap().len(), 1, "{sent}");
+
+    // The cut: RELEASE took, the re-key did not.
+    let slot = change[0] as u8;
+    let old = card.borrow_mut().get_pub(slot)?;
+    let (txid, sig) = {
+        let g = t.reg.cards.lock().unwrap();
+        let r = g[&id].releases.iter().find(|r| r["slot"] == u64::from(slot)).unwrap().clone();
+        let txid: [u8; 32] = hex::decode(r["txid"].as_str().unwrap())?.try_into().unwrap();
+        (txid, hex::decode(r["sig"].as_str().unwrap())?)
+    };
+    card.borrow_mut().release(slot, &txid, &sig)?;
+    assert_eq!(card.borrow().slot_state(slot), Some(SlotState::Keyed));
+
+    // No PIN: left as it is.
+    t.tap(&card);
+    let r = card_balance_job(&mut t.cw, Some(&t.ops), &t.sales).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(card.borrow().slot_state(slot), Some(SlotState::Keyed));
+    assert_eq!(card.borrow_mut().get_pub(slot)?, old, "no PIN: not re-keyed");
+
+    // The PIN: re-keyed, the reserve off.
+    t.cw.spares = fedimint_card_sidecar::ops::SpareConfig { target: 12, max_per_tap: 0 };
+    t.attach_tap(&card).await?;
+    t.cw.spares = Default::default();
+    assert_eq!(card.borrow().slot_state(slot), Some(SlotState::Keyed));
+    let new = card.borrow_mut().get_pub(slot)?;
+    assert_ne!(new, old, "re-keyed");
+    let reg = t.reg.cards.lock().unwrap()[&id].slots.iter().find(|(x, _)| *x == slot).map(|(_, k)| k.clone());
+    assert_eq!(reg, Some(new.to_string()), "the registry has the new key");
+    Ok(())
+}
+
+// ------------------------------------------------------------------ a sale settled at a tap
+
+impl Till {
+    /// The sender's first half only: queued charges reported to the registry and written into
+    /// their cards' files, none sent to the federation.
+    async fn report_only(&mut self) -> fedimint_card_sidecar::offline::Sent {
+        self.off.reach.reset();
+        let mut sent = fedimint_card_sidecar::offline::Sent::default();
+        fedimint_card_sidecar::offline::report(&self.off, &self.ops, None, &mut sent).await;
+        sent
+    }
+}
+
+/// An offline sale of 20,000 msat from a card loaded with one note, reported but not sent: the
+/// card's next online tap is the one that sends it. Answers the sale's body and its change slots.
+async fn reported_not_sent(t: &mut Till, card: &Rc<RefCell<SoftCard>>, cref: &str) -> anyhow::Result<(Value, Vec<u64>)> {
+    provision(&t.reg, card);
+    t.load(card, &[1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge(card, 20_000, cref).await;
+    assert_eq!((status, body["offline"].clone()), (200, json!(true)), "{body}");
+    let change = slots_of(&body, "change");
+    assert!(!change.is_empty() && slot_states(card, &change).iter().all(|s| *s == SlotState::Change), "{body}");
+    t.set_down(false);
+    let sent = t.report_only().await;
+    assert_eq!(sent.reported.len(), 1, "{sent:?}");
+    Ok((body, change))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_balance_tap_that_settles_an_offline_sale_writes_its_change() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let (body, change) = reported_not_sent(&mut t, &card, "s2a").await?;
+    t.balance(&card).await;
+    let txid = body["txid"].as_str().unwrap();
+    assert!(t.reg.outcomes.lock().unwrap().iter().any(|o| o["txid"] == txid && o["accepted"] == true), "the outcome was posted");
+    assert!(slot_states(&card, &change).iter().all(|s| *s == SlotState::Note), "{:?}", slot_states(&card, &change));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_charge_after_an_offline_sale_spends_its_change() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let (_, change) = reported_not_sent(&mut t, &card, "s2b").await?;
+    // The card holds no other note: only the change can pay.
+    let (status, body) = t.charge(&card, 2_000, "s2c").await;
+    assert_eq!(status, 200, "{body}");
+    let inputs = slots_of(&body, "inputs");
+    assert!(!inputs.is_empty() && inputs.iter().all(|s| change.contains(s)), "{body}");
+    Ok(())
+}
+
+/// The queue's entry for `txid`, as written to `offline_queue.json`.
+fn queue_entry(t: &Till, txid: &str) -> anyhow::Result<Value> {
+    let queue: Value = serde_json::from_slice(&std::fs::read(t.dir.path().join("offline_queue.json"))?)?;
+    Ok(queue["charges"].as_array().unwrap().iter().find(|c| c["txid"] == txid).cloned().expect("in the queue"))
+}
+
+/// Nothing of the sale `txid` went to the federation or into the card's file, and its queue entry
+/// is `entry`.
+async fn never_sent(t: &Till, id: &str, txid: &str, inputs: &[String], entry: &Value, at: &str) -> anyhow::Result<()> {
+    for n in inputs {
+        assert!(!t.cw.is_spent(fedimint_mint_common::Nonce(n.parse()?)).await?, "{at}: input {n} is spent at the federation");
+    }
+    let file = StateStore::open(t.ops.card_path(id))?.state;
+    assert!(!file.pending_txs.iter().any(|p| p.txid == txid), "{at}: the card's file holds the sale");
+    assert_eq!(&queue_entry(t, txid)?, entry, "{at}: the queue entry changed");
+    Ok(())
+}
+
+async fn refused_sale_never_sent(why: &'static str, by_phone: bool, one_note: bool) -> anyhow::Result<()> {
+    let at = format!("{why}, {}", if by_phone { "a phone's sale" } else { "the till's own sale" });
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let notes: &[u64] = if one_note { &[1 << 16] } else { &[1 << 16, 1 << 16] };
+    let (card, phone, kit) = phone_and_card(&mut t, notes).await?;
+    let txid = if by_phone {
+        let c = phone.take(&card, &kit, 20_000, "n1")?;
+        assert_eq!(statuses(&t.ingest(&phone.id(), phone.drained())), vec![("queued", None)], "{at}");
+        c.txid
+    } else {
+        t.set_down(true);
+        let (status, body) = t.charge(&card, 20_000, "n1").await;
+        assert_eq!((status, body["offline"].clone()), (200, json!(true)), "{at}: {body}");
+        t.set_down(false);
+        body["txid"].as_str().unwrap().to_owned()
+    };
+    let (id, inputs) = {
+        let q = t.off.queue.lock().unwrap();
+        let c = q.file.charges.iter().find(|c| c.txid == txid).expect("queued");
+        assert!(!c.change.is_empty(), "{at}: a sale with change");
+        (c.short_id.clone(), c.inputs.iter().map(|i| i.nonce.clone()).collect::<Vec<_>>())
+    };
+    *t.reg.refuse_reports.lock().unwrap() = Some(why);
+    let sent = t.send().await;
+    let (key, state) = if why == "change_used" { ("double_spent", ChargeState::DoubleSpent) } else { ("refused", ChargeState::Refused) };
+    assert_eq!(sent[key], json!([txid]), "{at}: {sent}");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges.iter().find(|c| c.txid == txid).map(|c| c.state), Some(state), "{at}");
+    let entry = queue_entry(&t, &txid)?;
+    never_sent(&t, &id, &txid, &inputs, &entry, &format!("{at}, after the send")).await?;
+    t.send().await;
+    never_sent(&t, &id, &txid, &inputs, &entry, &format!("{at}, after a second send")).await?;
+    t.balance(&card).await;
+    never_sent(&t, &id, &txid, &inputs, &entry, &format!("{at}, after a balance tap")).await?;
+    // The card signed the refused sale with its input: the till holds that note back and reports
+    // it, so the registry can give it back. A charge the card's other notes pay goes ahead; on a
+    // card whose only note it is, the charge is refused `notes_held`. Either way the sale stays
+    // unsent.
+    for i in 0..2 {
+        let (status, body) = t.charge(&card, 2_000, &format!("n2-{i}")).await;
+        if one_note {
+            assert_eq!((status, body["error"].as_str()), (402, Some("notes_held")), "{at}: {body}");
+            let detail = body["detail"].as_str().unwrap();
+            assert!(detail.contains("held") && detail.contains("other notes cannot pay"), "{at}: {detail}");
+        } else {
+            assert_eq!(status, 200, "{at}, charge {i}: {body}");
+        }
+        never_sent(&t, &id, &txid, &inputs, &entry, &format!("{at}, after charge tap {i}")).await?;
+    }
+    let b = t.balance(&card).await;
+    assert_eq!(b["stranded_msat"], json!(1 << 16), "{at}: {b}");
+    let held = on_hold(&b);
+    assert_eq!(held.len(), 1, "{at}: {b}");
+    assert!(t.stranded_posts() >= 1, "{at}: the held input is reported");
+    let row = t.stranded_post(0);
+    assert!(row.iter().any(|x| x["slot"] == json!(held[0]) && x["kind"] == "spent" && x["txid"] == json!(txid)), "{at}: {row:?}");
+    Ok(())
+}
+
+/// A card whose only note is the input of a sale the registry refused: the charge is refused as
+/// `notes_held`, saying what is held, and the sale stays unsent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_the_notes_held_for_a_refused_sale_would_pay_is_refused_as_held() -> anyhow::Result<()> {
+    for by_phone in [false, true] {
+        for why in ["change_used", "bad_signature"] {
+            refused_sale_never_sent(why, by_phone, true).await?;
+        }
+    }
+    Ok(())
+}
+
+/// A sale the registry refused, as `change_used` (which the registry now answers as a double
+/// spend, releasing its change slots) or for another
+/// reason, whether the till made it or a phone's sync brought it: its signed bytes never reach
+/// the federation, at the send, a second send, a balance tap or a charge tap of its card. Its
+/// input is held and reported, and the card's other note pays.
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_bytes_of_a_sale_the_registry_refused_are_never_sent_to_the_federation() -> anyhow::Result<()> {
+    for by_phone in [false, true] {
+        for why in ["change_used", "bad_signature"] {
+            refused_sale_never_sent(why, by_phone, false).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1883,13 +2518,17 @@ fn price_with_change(t: &Till, card: &Rc<RefCell<SoftCard>>, from_sats: u64) -> 
 }
 
 /// The F6 drill's card (OFFLINE-PLAN.md § 10): registered with keys 0-7 of 32, loaded with ten
-/// notes, which keys five more (the shortfall plus KEY_AHEAD): 10 notes and 3 spare slots.
+/// notes, which keys five more below 24 (the shortfall plus KEY_AHEAD): 10 notes and 3 spare
+/// slots below 24. With the spare reserve on, the load's tap also keys change slots 24 and 25.
 async fn drill_card(t: &mut Till) -> anyhow::Result<(Rc<RefCell<SoftCard>>, String)> {
     let card = v3_card();
     let id = provision_split(&t.reg, &card, 8);
     t.load(&card, &[(1 << 20) - (1 << 10)]).await?;
-    assert_eq!(keyed_on(&card), 13);
-    assert_eq!(fresh_on(t, &id, &card), 3);
+    let keyed_below = |c: &Rc<RefCell<SoftCard>>| (0..24).filter(|s| c.borrow().slot_state(*s) != Some(SlotState::Empty)).count();
+    assert_eq!(keyed_below(&card), 13);
+    let change: Vec<u8> = if t.cw.spares.target == 0 { vec![] } else { vec![24, 25] };
+    assert_eq!((24..32).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Keyed)).collect::<Vec<u8>>(), change);
+    assert_eq!(fresh_on(t, &id, &card), 3 + change.len());
     Ok((card, id))
 }
 
@@ -1919,8 +2558,8 @@ async fn without_spare_slots_an_offline_charge_needing_change_is_refused_with_a_
         taken += 1;
     }
     let (price, status, body) = refused.expect("the card runs out of slots for change");
-    // As in the drill: one offline charge with change, then none.
-    assert_eq!(taken, 1, "without the reserve the card runs out of slots for change after one");
+    // Without the reserve no change slot (24 to 31) is keyed, so no offline charge takes change.
+    assert_eq!(taken, 0, "without the reserve the card has no slot for change offline");
     assert_eq!((status, body["error"].as_str()), (409, Some("offline_no_change_room")), "{body}");
     let detail = body["detail"].as_str().unwrap();
     assert!(detail.contains("needs change") && detail.contains("offline"), "{detail}");
@@ -1946,15 +2585,15 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
     let mut t = Till::new(OfflineConfig::default()).await?;
     assert_eq!(t.cw.spares, SpareConfig { target: SPARE_TARGET, max_per_tap: MAX_KEY_PER_TAP });
     assert_eq!(SPARE_TARGET, 12);
-    // The drill's numbers (13 keyed after the load, 3 of them spare) are a target of 6; at the
-    // default of 12 the load's own tap already keys spares. The rule is the same.
-    const TARGET: usize = 6;
+    // The drill's card has 3 spare slots below 24 and change slots 24 and 25 after its load; a
+    // target of 11 keys the other six change slots, two a tap. The rule is the default's.
+    const TARGET: usize = 11;
     t.cw.spares = SpareConfig { target: TARGET, max_per_tap: MAX_KEY_PER_TAP };
     let (card, id) = drill_card(&mut t).await?;
 
-    // Taps with nothing else to do: +2, then +1 to the target, then nothing.
+    // Taps with nothing else to do: +2 three times to the target, then nothing.
     let mut keyed = vec![];
-    for _ in 0..3 {
+    for _ in 0..4 {
         let (before, posts) = (keyed_on(&card), t.reg.key_posts.lock().unwrap().len());
         t.attach_tap(&card).await?;
         let added = keyed_on(&card) - before;
@@ -1962,15 +2601,16 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
         assert_eq!(t.reg.key_posts.lock().unwrap().len(), posts + usize::from(added > 0), "one slot-keys post per tap that keyed");
         keyed.push(added);
     }
-    assert_eq!(keyed, vec![2, 1, 0]);
+    assert_eq!(keyed, vec![2, 2, 2, 0]);
     assert_eq!(fresh_on(&t, &id, &card), TARGET);
+    assert!((24..32).all(|s| card.borrow().slot_state(s) == Some(SlotState::Keyed)), "every change slot keyed first");
     {
         // The registry has the card's keys, and lists the rest as unkeyed.
         let g = t.reg.cards.lock().unwrap();
         for (slot, k) in &g[&id].slots {
             assert_eq!(*k, card.borrow_mut().get_pub(*slot)?.to_string(), "slot {slot}");
         }
-        assert_eq!(unkeyed_of(&g[&id]), (16..32).collect::<Vec<u8>>());
+        assert_eq!(unkeyed_of(&g[&id]), (13..24).collect::<Vec<u8>>());
     }
     assert!(t.reg.renewals.lock().unwrap().is_empty(), "nothing was spent yet");
 
@@ -2028,6 +2668,81 @@ async fn online_taps_keep_a_spare_reserve_that_offline_change_can_use() -> anyho
     if renewed.len() < spent.len() {
         assert_eq!(unkeyed_of(&t.reg.cards.lock().unwrap()[&id]), unkeyed_before, "no new slot while a SPENT one could be renewed");
     }
+    Ok(())
+}
+
+/// A card's first tap keys change slots 24 and 25 even when its reserve is already at the
+/// target, and later taps key no more for it; its loads stay below 24.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cards_first_tap_keys_change_slots_24_and_25_whatever_its_budget() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision_split(&t.reg, &card, 16);
+    // The reserve's budget keys nothing on this card.
+    const _: () = assert!(16 >= SPARE_TARGET);
+    t.attach_tap(&card).await?;
+    let keyed: Vec<u8> = (16..32).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Keyed)).collect();
+    assert_eq!(keyed, vec![24, 25]);
+    t.attach_tap(&card).await?;
+    assert_eq!(t.reg.key_posts.lock().unwrap().len(), 1, "two change slots keyed and free: nothing more to key");
+    t.load(&card, &[(1 << 17) - (1 << 10)]).await?;
+    let notes: Vec<u8> = (0..32).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Note)).collect();
+    assert_eq!(notes, (0..7).collect::<Vec<u8>>());
+    let g = t.reg.cards.lock().unwrap();
+    assert_eq!(unkeyed_of(&g[&id]), (16..24).chain(26..32).collect::<Vec<u8>>());
+    Ok(())
+}
+
+/// A split card that needs keys for a load gets them below 24; the change slots are the reserve's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_keys_slots_below_24_only() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    t.cw.spares = SpareConfig { target: 0, max_per_tap: 0 };
+    let card = v3_card();
+    provision_split(&t.reg, &card, 20);
+    // 20 notes fill slots 0 to 19; the next load's 4 need keys, and KEY_AHEAD asks for 3 more.
+    t.load(&card, &[(1 << 20) - (1 << 10)]).await?;
+    t.load(&card, &[(1 << 20) - (1 << 10)]).await?;
+    t.load(&card, &[(1 << 14) - (1 << 10)]).await?;
+    assert!((0..24).all(|s| card.borrow().slot_state(s) == Some(SlotState::Note)));
+    assert!((24..32).all(|s| card.borrow().slot_state(s) == Some(SlotState::Empty)), "no change slot keyed for a load");
+    Ok(())
+}
+
+/// On a fully keyed card the till tops up and takes online change below 24, and offline change
+/// from 24 up.
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_and_online_change_stay_below_24_and_offline_change_goes_from_24() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16]).await?;
+    let notes: Vec<u8> = (0..32).filter(|s| card.borrow().slot_state(*s) == Some(SlotState::Note)).collect();
+    assert_eq!(notes, vec![0, 1]);
+    let (status, body) = t.charge(&card, 20_000, "on").await;
+    assert_eq!(status, 200, "{body}");
+    let change = slots_of(&body, "change");
+    assert!(!change.is_empty() && change.iter().all(|s| *s < 24), "{body}");
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 20_000, "off").await;
+    assert_eq!((status, &body["offline"]), (200, &json!(true)), "{body}");
+    let change = slots_of(&body, "change");
+    assert!(!change.is_empty() && change.iter().all(|s| (24..32).contains(s)), "{body}");
+    Ok(())
+}
+
+/// The till's offline path keeps change in slots 24 to 31: a card keyed only below 24 takes no
+/// change offline, however many of those slots are KEYED and free.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_change_never_goes_into_a_free_keyed_slot_below_24() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision_slots(&t.reg, &card, 24);
+    t.load(&card, &[1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge(&card, 20_000, "low").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("offline_no_change_room")), "{body}");
+    assert!((1..24).all(|s| card.borrow().slot_state(s) == Some(SlotState::Keyed)), "nothing written");
     Ok(())
 }
 
@@ -2339,7 +3054,7 @@ async fn a_charge_the_till_abandoned_is_held_and_reported_like_a_lost_phones() -
     assert_eq!(slot_states(&card, &[signed, unsigned]), vec![SlotState::Spent, SlotState::Note]);
     assert!(!change.is_empty() && slot_states(&card, &change).iter().all(|s| *s == SlotState::Change), "{change:?}");
     // Elsewhere the input the card had not signed for it pays another sale.
-    card.borrow_mut().verify_pin(b"1234")?;
+    fedimint_card_host_card::softkit::open_test_session_under(&mut *card.borrow_mut(), &t.reg.cert_pub())?;
     card.borrow_mut().sign(unsigned as u8, &[9; 32])?;
     // The card's next offline tap here abandons the charge and takes its own sale.
     let (status, body) = t.charge(&card, 20_000, "next").await;
@@ -2572,7 +3287,7 @@ async fn past_the_taps_checks_slots_are_held_on_doubt_and_reported_at_the_next_t
     t.load(&card, &[(1 << 20) - (1 << 10)]).await?;
     let amounts: Vec<u64> = (0..10u8).map(|s| card.borrow_mut().get_slot(s).unwrap().amount_msat).collect();
     assert!(amounts.iter().all(|a| *a > 0));
-    card.borrow_mut().verify_pin(b"1234")?;
+    fedimint_card_host_card::softkit::open_test_session_under(&mut *card.borrow_mut(), &t.reg.cert_pub())?;
     for s in 1..=9u8 {
         card.borrow_mut().sign(s, &[s; 32])?;
     }
@@ -2954,6 +3669,98 @@ async fn repeat_after_a_charge_proven_never_sent(same_card: bool) -> anyhow::Res
     Ok(())
 }
 
+/// A charge the card signed whose signed bytes the registry never answered for (not sent), as a
+/// second till sees it: open in the registry with no signed bytes. The second till is this till
+/// with no local file for the card. It records the charge rejected and charges `price` from the
+/// card. Returns the till, the card, its id, the first charge, the first till's file for the card
+/// and the second till's answer.
+async fn second_till_after_a_dropped_charge(
+    price: u64,
+) -> anyhow::Result<(Till, Rc<RefCell<SoftCard>>, String, PendingTx, Vec<u8>, (u16, Value))> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16]).await?;
+    t.cw.crash_point = Some(CrashPoint::SubmittedUnreachable);
+    let (status, body) = t.charge(&card, 20_000, "a1").await;
+    t.cw.crash_point = None;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let first = t.pending(&id)[0].clone();
+    assert!(first.ops_unconfirmed && !first.submitted && first.tx_hex.is_some(), "{first:?}");
+    let signed = input_slots(&t, &id, &first);
+    assert!(!signed.is_empty(), "the first charge has inputs");
+    for s in &signed {
+        assert_eq!(card.borrow().slot_state(*s as u8), Some(SlotState::Spent), "slot {s} signed the first charge");
+    }
+    let first_file = std::fs::read(t.ops.card_path(&id))?;
+    std::fs::remove_file(t.ops.card_path(&id))?;
+    let answer = t.charge(&card, price, "b1").await;
+    Ok((t, card, id, first, first_file, answer))
+}
+
+/// The slots of `p`'s inputs, from the registry's notes.
+fn input_slots(t: &Till, id: &str, p: &PendingTx) -> Vec<u64> {
+    t.reg.cards.lock().unwrap()[id]
+        .notes
+        .iter()
+        .filter(|n| n["nonce"].as_str().is_some_and(|x| p.inputs.iter().any(|i| i == x)))
+        .map(|n| n["slot"].as_u64().unwrap())
+        .collect()
+}
+
+/// A second till pays around the slots the card signed for a charge it records rejected, and the
+/// registry lists the releases of those slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_till_pays_around_the_slots_a_card_signed_for_a_dropped_charge() -> anyhow::Result<()> {
+    let (t, _card, id, first, _, (status, body)) = second_till_after_a_dropped_charge(20_000).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["txid"], json!(first.txid), "{body}");
+    let signed = input_slots(&t, &id, &first);
+    let sale = t.sale("b1");
+    assert!(sale.inputs.iter().all(|i| !signed.contains(&u64::from(i.slot))), "signed {signed:?}, inputs {:?}", sale.inputs);
+    let released = t.reg.released(&id, &first.txid);
+    assert!(signed.iter().all(|s| released.contains(s)), "signed {signed:?}, released {released:?}");
+    assert_eq!(t.open_charges(&id), 0);
+    Ok(())
+}
+
+/// A second till that only the notes the card signed for the dropped charge could pay answers 402
+/// `notes_held`, and signs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_till_that_only_the_signed_notes_could_pay_answers_notes_held() -> anyhow::Result<()> {
+    let (t, card, id, first, _, (status, body)) = second_till_after_a_dropped_charge(70_000).await?;
+    assert_eq!((status, body["error"].as_str()), (402, Some("notes_held")), "{body}");
+    assert_eq!(spent_slots(&card), input_slots(&t, &id, &first).len(), "nothing more signed");
+    assert_eq!(t.sales_count(), 0);
+    Ok(())
+}
+
+/// The first till posts the bytes of a charge the second till recorded rejected, after its own
+/// post reached the registry late: the registry answers 409, the first till does not send them,
+/// and the card pays its next sale.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_till_does_not_send_a_charge_recorded_rejected_and_the_card_pays_again() -> anyhow::Result<()> {
+    let (mut t, card, id, first, first_file, (status, body)) = second_till_after_a_dropped_charge(20_000).await?;
+    assert_eq!(status, 200, "{body}");
+    // The first till's post of the signed bytes reaches the registry late.
+    {
+        let mut g = t.reg.cards.lock().unwrap();
+        let tx = g.get_mut(&id).unwrap().txs.iter_mut().find(|x| x["txid"] == json!(first.txid)).unwrap();
+        assert_eq!(tx["status"], "rejected");
+        tx["signed_hex"] = json!(first.tx_hex);
+    }
+    std::fs::write(t.ops.card_path(&id), &first_file)?;
+    let (status, body) = t.charge(&card, 20_000, "a2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["txid"], json!(first.txid), "{body}");
+    assert!(t.pending(&id).is_empty(), "{:?}", t.pending(&id));
+    let old: fedimint_core::TransactionId = first.txid.parse().map_err(|_| anyhow::anyhow!("txid"))?;
+    let sent = tokio::time::timeout(Duration::from_secs(3), t.cw.wallet.client.api().await_transaction(old)).await;
+    assert!(sent.is_err(), "the rejected charge never reached the federation");
+    assert_eq!(t.sales_count(), 2);
+    Ok(())
+}
+
 // ------------------------------------------------------------------ a charge a card left signing, at an online tap (ENG-873)
 
 /// How a card leaves the field mid-sale ([`PulledAt`]).
@@ -3070,7 +3877,7 @@ async fn an_online_sale_sets_aside_a_charge_the_card_can_never_finish_and_holds_
     let change: Vec<u64> = left.change.iter().map(|c| u64::from(c.slot)).collect();
     assert_eq!(slot_states(&card, &[signed, unsigned]), vec![SlotState::Spent, SlotState::Note]);
     // Elsewhere the input the card had not signed for it pays another transaction.
-    card.borrow_mut().verify_pin(TEST_PIN)?;
+    fedimint_card_host_card::softkit::open_test_session_under(&mut *card.borrow_mut(), &t.reg.cert_pub())?;
     card.borrow_mut().sign(unsigned as u8, &[9; 32])?;
 
     let (status, body) = t.charge(&card, 20_000, "next").await;
@@ -3165,7 +3972,7 @@ async fn a_wrong_pin_at_an_online_sale_settles_nothing_and_spends_one_try() -> a
     let r = charge_job_with(&mut t.cw, Some(&t.ops), Some(&t.off), 20_000, Some("next".into()), &t.sales).await;
     t.cw.pin = None;
     assert_eq!((r.status, r.body["error"].as_str()), (403, Some("wrong_pin")), "{}", r.body);
-    assert!(r.body["detail"].as_str().is_some_and(|d| d.contains("2 tries left")), "one try spent: {}", r.body);
+    assert!(r.body["detail"].as_str().is_some_and(|d| d.contains("1 wrong in a row")), "one try spent: {}", r.body);
     assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "left as it was");
     assert!(t.reg.reports.lock().unwrap().is_empty(), "nothing reported");
     assert_eq!(t.stranded_posts(), 0, "nothing held");
@@ -3205,27 +4012,216 @@ async fn the_settle_needs_the_pin_and_leaves_another_cards_charge_alone() -> any
     Ok(())
 }
 
-/// The holder mistypes the PIN at the settle until the card blocks: each wrong PIN ends its tap
-/// with one try spent (`wrong_pin`, `wrong_pin`, then `pin_blocked` at the third), and none of the
-/// taps reports, holds or signs anything. The charge stays `signing`: a blocked card cannot settle
-/// it, and the right PIN is refused as blocked too.
+/// The holder mistypes the PIN at the settle three times: each wrong PIN ends its tap with one
+/// try counted (`wrong_pin`, the count in a row rising, each next try's wait served first), and
+/// none of the taps reports, holds or signs anything. Applet 4.0 never blocks: the right PIN,
+/// after the wait its try owes, settles the charge and takes the sale.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pin_blocked_at_the_settle_ends_each_tap_and_leaves_the_charge() -> anyhow::Result<()> {
+async fn wrong_pins_at_the_settle_end_each_tap_and_the_right_one_after_its_wait_settles() -> anyhow::Result<()> {
     let mut t = Till::new(OfflineConfig::default()).await?;
     let (card, left) = left_signing_offline(&mut t, |c| PulledAt::new(c, 1)).await?;
-    let wrong: &[u8] = b"9999";
-    for (pin, want) in
-        [(wrong, (403, "wrong_pin")), (wrong, (403, "wrong_pin")), (wrong, (423, "pin_blocked")), (TEST_PIN, (423, "pin_blocked"))]
-    {
+    for n in 1..=3 {
         t.tap(&card);
-        t.cw.pin = Some(pin.to_vec());
+        t.cw.pin = Some(b"9999".to_vec());
         let r = charge_job_with(&mut t.cw, Some(&t.ops), Some(&t.off), 20_000, Some("next".into()), &t.sales).await;
         t.cw.pin = None;
-        assert_eq!((r.status, r.body["error"].as_str()), (want.0, Some(want.1)), "{}", r.body);
+        assert_eq!((r.status, r.body["error"].as_str()), (403, Some("wrong_pin")), "{}", r.body);
+        assert!(r.body["detail"].as_str().is_some_and(|d| d.contains(&format!("{n} wrong in a row"))), "{}", r.body);
     }
-    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left], "left as it was");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, vec![left.clone()], "left as it was");
     assert!(t.reg.reports.lock().unwrap().is_empty(), "nothing reported");
     assert_eq!(t.stranded_posts(), 0, "nothing held");
     assert_eq!(spent_slots(&card), 1, "nothing signed");
+    assert_eq!(card.borrow_mut().get_state()?.owed, 4, "the next try owes four askings");
+    let (status, body) = t.charge(&card, 20_000, "next").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(t.sale("pulled").txid, left.txid);
+    assert_eq!(card.borrow_mut().get_state()?.wrong_tries, 0);
+    Ok(())
+}
+
+// ------------------------------------------------------------------ no certificate key: no 500 when no PIN was sent
+
+/// A card that left a charge signing offline (taken away at its second SIGN), back online.
+async fn left_signing(t: &mut Till) -> anyhow::Result<(Rc<RefCell<SoftCard>>, Vec<OfflineCharge>)> {
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16, 1 << 16, 1 << 16]).await?;
+    t.set_down(true);
+    let (status, body) = t.charge_pulled(&card, 1, 90_000, "pulled").await;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let first = t.off.queue.lock().unwrap().file.charges.clone();
+    assert_eq!((first.len(), first[0].state), (1, ChargeState::Signing));
+    t.set_down(false);
+    Ok((card, first))
+}
+
+/// An online sale that first settles a charge the card left signing, at a till that keeps no
+/// certificate key and whose registry answers without one, is `offline_not_ready` (503): no PIN is
+/// sent, nothing is signed, the left charge still waits, no sale is recorded. With the key back, the same sale goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn settling_a_charge_left_signing_without_the_certificate_key_is_offline_not_ready() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, first) = left_signing(&mut t).await?;
+    forget_cert_key(t.dir.path());
+    t.cw.cert_key = None;
+    t.reg.no_cert.store(true, Ordering::SeqCst);
+    let tries = card.borrow_mut().get_state()?.wrong_tries;
+    let spent = spent_slots(&card);
+    let (status, body) = t.charge(&card, 10_000, "next sale").await;
+    assert_eq!((status, body["error"].as_str()), (503, Some("offline_not_ready")), "{body}");
+    assert!(!card.borrow().nonce_live(), "no GET_NONCE was asked");
+    assert_eq!(card.borrow_mut().get_state()?.wrong_tries, tries, "no try was spent");
+    assert_eq!(spent_slots(&card), spent, "nothing signed");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, first, "the left charge still waits for its card");
+    assert!(t.sales.lock().unwrap().find_ref("next sale").is_none(), "no sale");
+
+    t.reg.no_cert.store(false, Ordering::SeqCst);
+    t.off.reach.reset();
+    let (status, body) = t.charge(&card, 10_000, "next sale").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(t.off.queue.lock().unwrap().file.charges.iter().all(|c| c.state != ChargeState::Signing), "the left charge was settled");
+    Ok(())
+}
+
+/// The same with an uncertified clone of the card in the field (its slot 0 key, so the left
+/// charge is "its"): `card_not_genuine` (403), no PIN, nothing signed on the clone, the charge
+/// still waits for the genuine card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clone_tapped_for_a_charge_left_signing_is_not_genuine() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let (card, first) = left_signing(&mut t).await?;
+    let clone = Rc::new(RefCell::new(card.borrow().extract_clone()));
+    let spent = spent_slots(&clone);
+    let (status, body) = t.charge(&clone, 10_000, "a clone's sale").await;
+    assert_eq!((status, body["error"].as_str()), (403, Some("card_not_genuine")), "{body}");
+    assert_eq!(spent_slots(&clone), spent, "nothing signed on the clone");
+    assert_eq!(t.off.queue.lock().unwrap().file.charges, first, "the left charge still waits for its card");
+    assert!(t.sales.lock().unwrap().find_ref("a clone's sale").is_none(), "no sale");
+    Ok(())
+}
+
+/// The other PIN paths of an online sale (the spare reserve and the dead change slots at the
+/// attach, then the sign) answer the same: a clone `card_not_genuine` (403), no key
+/// `offline_not_ready` (503); neither a 500, nothing signed, no try spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_online_sale_that_sends_no_pin_is_never_a_500() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16]).await?;
+    let clone = Rc::new(RefCell::new(card.borrow().extract_clone()));
+    let (status, body) = t.charge(&clone, 20_000, "clone").await;
+    assert_eq!((status, body["error"].as_str()), (403, Some("card_not_genuine")), "{body}");
+    assert_eq!(spent_slots(&clone), 0, "nothing signed on the clone");
+
+    forget_cert_key(t.dir.path());
+    t.cw.cert_key = None;
+    t.reg.no_cert.store(true, Ordering::SeqCst);
+    t.off.reach.reset();
+    let tries = card.borrow_mut().get_state()?.wrong_tries;
+    let (status, body) = t.charge(&card, 20_000, "no key").await;
+    assert_eq!((status, body["error"].as_str()), (503, Some("offline_not_ready")), "{body}");
+    assert_eq!((spent_slots(&card), card.borrow_mut().get_state()?.wrong_tries), (0, tries));
+    Ok(())
+}
+
+// ------------------------------------------------------------------ a rotated certificate key
+
+fn another_cert_key() -> String {
+    hex::encode(FakeOps::new().cert_pub())
+}
+
+fn cert_fetches(t: &Till) -> usize {
+    t.reg.cert_fetches.load(Ordering::SeqCst)
+}
+
+/// A till that runs on after the registry rotated its certificate key: the first card certified
+/// under the new key fails under the kept one, so that tap asks the registry once, keeps the new
+/// key (the job and `till-ops.json`) and the card's PIN goes. A card that verifies costs no fetch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_certificate_key_is_picked_up_at_the_first_card_that_fails_under_the_old() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16]).await?;
+    let new = hex::encode(t.reg.cert_pub());
+    let stale = another_cert_key();
+    fedimint_card_sidecar::claim::write_cert_key(t.dir.path(), &stale)?;
+    t.cw.cert_key = Some(stale);
+    let n0 = cert_fetches(&t);
+    t.attach_tap(&card).await?;
+    assert_eq!(cert_fetches(&t) - n0, 1, "one fetch");
+    assert_eq!(t.cw.cert_key.as_deref(), Some(new.as_str()), "the job has the new key");
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?.as_deref(), Some(new.as_str()), "and the till keeps it");
+    t.attach_tap(&card).await?;
+    assert_eq!(cert_fetches(&t) - n0, 1, "a card that verifies costs no fetch");
+    let (status, body) = t.charge(&card, 20_000, "after the rotation").await;
+    assert_eq!(status, 200, "{body}");
+    Ok(())
+}
+
+/// A card certified by some other registry fails under the till's key at every tap: each tap asks
+/// the registry once (a charge's tap: its probe and that one), the key stays, and its PIN is never
+/// sent (`card_not_genuine`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_another_registry_certified_costs_one_fetch_a_tap_and_is_refused() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let other = FakeOps::new();
+    let card = v3_card();
+    let id = provision(&other, &card);
+    let rec = other.cards.lock().unwrap().remove(&id).unwrap();
+    t.reg.cards.lock().unwrap().insert(id, rec);
+    let kept = fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?;
+    let n0 = cert_fetches(&t);
+    for tap in 1..=3 {
+        t.attach_tap(&card).await?;
+        assert_eq!(cert_fetches(&t) - n0, tap, "one fetch a tap");
+    }
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?, kept, "the till's key stays");
+    t.off.reach.reset();
+    let n1 = cert_fetches(&t);
+    // It holds no note this till can see, so the sale is refused before any PIN.
+    let (status, body) = t.charge(&card, 20_000, "fake").await;
+    assert_eq!((status, body["error"].as_str()), (402, Some("insufficient")), "{body}");
+    assert_eq!(cert_fetches(&t) - n1, 2, "a charge's tap: the probe and one check");
+    t.tap(&card);
+    t.cw.pin = Some(TEST_PIN.to_vec());
+    let e = t.cw.verify_pin_session().unwrap_err();
+    assert_eq!(fedimint_card_sidecar::till::classify(&e).code, "card_not_genuine", "{e:#}");
+    t.cw.pin = None;
+    assert!(!card.borrow().nonce_live(), "no GET_NONCE was asked");
+    Ok(())
+}
+
+/// With the registry's key route not answering, the till keeps the key it has: a card certified
+/// under a newer key is refused this tap (403, no PIN) and picked up at a tap once it answers. A
+/// kept key that is not hex is no key (503), never a 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_registry_unreachable_the_till_keeps_its_old_key() -> anyhow::Result<()> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    provision(&t.reg, &card);
+    t.load(&card, &[1 << 16]).await?;
+    let stale = another_cert_key();
+    fedimint_card_sidecar::claim::write_cert_key(t.dir.path(), &stale)?;
+    t.cw.cert_key = Some(stale.clone());
+    t.reg.cert_down.store(true, Ordering::SeqCst);
+    t.attach_tap(&card).await?;
+    assert_eq!(t.cw.cert_key.as_deref(), Some(stale.as_str()), "the old key stays");
+    assert_eq!(fedimint_card_sidecar::claim::read_cert_key(t.dir.path())?.as_deref(), Some(stale.as_str()));
+    t.tap(&card);
+    t.cw.pin = Some(TEST_PIN.to_vec());
+    let e = t.cw.verify_pin_session().unwrap_err();
+    assert_eq!(fedimint_card_sidecar::till::classify(&e).code, "card_not_genuine", "{e:#}");
+    t.cw.cert_key = Some("not hex".into());
+    let e = t.cw.verify_pin_session().unwrap_err();
+    assert_eq!(fedimint_card_sidecar::till::error_reply(&e).status, 503, "{e:#}");
+    assert!(!card.borrow().nonce_live(), "no GET_NONCE was asked");
+    t.cw.pin = None;
+
+    t.reg.cert_down.store(false, Ordering::SeqCst);
+    t.attach_tap(&card).await?;
+    assert_eq!(t.cw.cert_key, Some(hex::encode(t.reg.cert_pub())), "picked up once the registry answers");
     Ok(())
 }

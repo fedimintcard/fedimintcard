@@ -192,6 +192,7 @@ pub async fn charge(cw: &mut CardWallet, off: &Offline, ops: &Ops, price: u64, c
         keyed_ok: Some(&keyed_ok),
         now_ms: now_ms(),
         expires_at_ms: None,
+        holding: None,
     };
     let card = cw.card.as_mut();
     on_card(|| fedimint_card_pos_core::charge::charge(card, &off.queue, &env, price, client_ref))
@@ -365,6 +366,7 @@ fn write_into_card_file(ops: &Ops, c: &OfflineCharge) -> Result<()> {
                 blinding_key: None,
                 txid: None,
                 out_idx: None,
+                reg_sig: None,
             });
         }
     }
@@ -379,6 +381,7 @@ fn write_into_card_file(ops: &Ops, c: &OfflineCharge) -> Result<()> {
                 blinding_key: Some(ch.blinding_key.clone()),
                 txid: Some(c.txid.clone()),
                 out_idx: Some(ch.out_idx),
+                reg_sig: None,
             });
         }
     }

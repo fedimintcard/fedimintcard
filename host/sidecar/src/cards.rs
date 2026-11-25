@@ -17,10 +17,10 @@
 //! `precheck` is deliberately read-only: it is the gate the app shows *before* it writes
 //! anything, so it must answer from what is on the card without touching `card_state.json`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::{
-    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED, SW_NO_PIN_SET, SW_PIN_BLOCKED,
-    SW_PIN_REQUIRED, SW_SLOT_OUT_OF_RANGE, status_word,
+    PIN_MAX, PIN_MIN, SLOTS, SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED, SW_NO_PIN_SET, SW_PIN_REQUIRED,
+    SW_SLOT_OUT_OF_RANGE, status_word,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -95,8 +95,9 @@ pub enum AppletState {
     Unknown,
     /// `6984`: written but no PIN yet — `keySetup` must set one.
     NotSet,
-    /// `6983`: three wrong PINs; it will never sign again.
-    Blocked,
+    /// A PIN is set and the card owes a wait of `owed` askings before its next try (applet 4.0,
+    /// GET_STATE): it takes the PIN once held that long. It never blocks.
+    Wait { owed: u16 },
     /// `6A94`: a PIN is set and this session has not given it.
     Set,
 }
@@ -106,7 +107,7 @@ impl AppletState {
         match self {
             AppletState::Unknown => "unknown",
             AppletState::NotSet => "not_set",
-            AppletState::Blocked => "blocked",
+            AppletState::Wait { .. } => "wait",
             AppletState::Set => "set",
         }
     }
@@ -127,6 +128,10 @@ impl Precheck {
             "safe_to_replace": self.kind == CardKind::Blank,
             "kind": self.kind.as_str(),
             "applet": self.applet.as_str(),
+            "pin_wait_s": match self.applet {
+                AppletState::Wait { owed } => Some(fedimint_card_pos_core::wait_seconds(owed)),
+                _ => None,
+            },
             "empty_slots": self.empty_slots,
             "foreign_slots": self.foreign_slots,
             "free_slots": self.free_slots,
@@ -175,10 +180,6 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
                     // No dispatcher for `B0` at all: a card with no applet, so every slot is empty.
                     Some(SW_CLA_NOT_SUPPORTED) | Some(SW_INS_NOT_SUPPORTED) => empty.push(slot),
                     // A slot answered a PIN word: the applet is live and this is its PIN state.
-                    Some(SW_PIN_BLOCKED) => {
-                        applet = AppletState::Blocked;
-                        empty.push(slot);
-                    }
                     Some(SW_PIN_REQUIRED) => {
                         applet = AppletState::Set;
                         empty.push(slot);
@@ -191,6 +192,16 @@ pub fn precheck(cw: &mut CardWallet) -> Result<Precheck> {
                 },
             }
         }
+    }
+
+    // Applet 4.0 says its PIN state in GET_STATE: set or not, and the wait its next try owes.
+    if applet_present && on_card(|| cw.card.applet_version()).is_ok_and(|v| v.is_current()) {
+        let st = on_card(|| cw.card.get_state())?;
+        applet = match (st.pin_set, st.owed) {
+            (false, _) => AppletState::NotSet,
+            (true, 0) => AppletState::Set,
+            (true, owed) => AppletState::Wait { owed },
+        };
     }
 
     let kind = if !foreign.is_empty() {
@@ -260,7 +271,6 @@ pub enum PinState {
     AlreadySet,
     SetNow,
     NotSet,
-    Blocked,
 }
 
 impl PinState {
@@ -269,7 +279,6 @@ impl PinState {
             PinState::AlreadySet => "set",
             PinState::SetNow => "set_now",
             PinState::NotSet => "not_set",
-            PinState::Blocked => "blocked",
         }
     }
 }
@@ -351,33 +360,47 @@ pub fn key_setup(cw: &mut CardWallet, pin: Option<&[u8]>) -> Result<KeySetupOutc
     Ok(KeySetupOutcome { keys, short_id: sid, pin: pin_state, pin_verified, generated })
 }
 
-/// `SET_PIN` then `VERIFY_PIN`. The applet answers `6985` when a PIN already exists, which is the
-/// idempotent case, and `6983` when it is out of tries, which is terminal.
+/// The till's PIN set-up (`keySetup` with a PIN): applet 4.x only, sealed ([`set_pin_v4`]). A card
+/// older than 4.0 gets the old-card refusal before any PIN goes out.
 fn set_pin(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>)> {
     if !(PIN_MIN..=PIN_MAX).contains(&pin.len()) {
         return Err(anyhow!("PIN must be {PIN_MIN} to {PIN_MAX} digits, not {}", pin.len()));
     }
-    let existing = match on_card(|| cw.card.set_pin(pin)) {
-        Ok(()) => PinState::SetNow,
-        Err(e) => match status_word(&e) {
-            // The applet answers 6985 when a PIN already exists: nothing to do, and the card is
-            // unchanged, which is what makes a re-run of keySetup safe.
-            Some(SW_CONDITIONS_NOT_SATISFIED) => PinState::AlreadySet,
-            Some(SW_PIN_BLOCKED) => return Ok((PinState::Blocked, Some(false))),
-            w => return Err(e.context(format!("SET_PIN answered {}", w.map(|w| format!("{w:04X}")).unwrap_or_default()))),
-        },
+    cw.require_current_card()?;
+    set_pin_v4(cw, pin)
+}
+
+/// Applet 4.0 (DESIGN § 4): a card with a PIN is only verified, its wait served. A card without
+/// one is anchored first, in this selection, at the till's newest header, and SET_PIN then gives
+/// this selection the PIN (no VERIFY after it). No header: the till needs the internet first.
+/// SET_PIN still needs the registry's key on the card and no value, which the Setup app sees to.
+fn set_pin_v4(cw: &mut CardWallet, pin: &[u8]) -> Result<(PinState, Option<bool>)> {
+    use fedimint_card_pos_core::charge::{Pin, open_pin};
+    // The sealed PIN goes only to a card checked under the registry's key (§ 9).
+    let trust = cw.trusted_card()?;
+    if on_card(|| cw.card.get_state())?.pin_set {
+        let card = cw.card.as_mut();
+        let verified = match on_card(|| open_pin(card, &trust, &Pin::Verify(pin.to_vec()), None)) {
+            Ok(()) => true,
+            // A wrong PIN, or a wait the card was taken from: reported, not raised.
+            Err(e) if status_word(&e).is_some() || e.downcast_ref::<fedimint_card_pos_core::PinWait>().is_some() => false,
+            Err(e) => return Err(e).context("VERIFY_PIN"),
+        };
+        return Ok((PinState::AlreadySet, Some(verified)));
+    }
+    let Some(h) = cw.headers.as_ref().and_then(|h| h.latest()) else {
+        bail!("setting this card's PIN needs the internet: its clock is first set from a recent block header, and the till has none yet");
     };
-    let verified = match on_card(|| cw.card.verify_pin(pin)) {
-        Ok(()) => true,
-        Err(e) => match status_word(&e) {
-            // A wrong PIN or a blocked card: the card exists and is programmed, but it cannot
-            // spend. Reported, not raised: the plan records `pinNotSet`.
-            Some(SW_PIN_BLOCKED) | Some(0x6300..=0x63FF) => false,
-            Some(_) => false,
-            None => return Err(e).context("VERIFY_PIN"),
-        },
-    };
-    Ok((existing, Some(verified)))
+    on_card(|| cw.card.set_header(&h)).context("SET_HEADER, the anchor before SET_PIN")?;
+    ensure!(on_card(|| cw.card.get_state())?.anchored, "the card did not anchor its clock at the till's header; no PIN was set");
+    let card = cw.card.as_mut();
+    on_card(|| fedimint_card_host_card::set_pin_sealed(card, &trust, pin)).map_err(|e| {
+        let w = status_word(&e).map(|w| format!("{w:04X}")).unwrap_or_default();
+        e.context(format!(
+            "SET_PIN answered {w} (6985: the card has no registry key, holds value, or has no live nonce; set it up with the Setup app)"
+        ))
+    })?;
+    Ok((PinState::SetNow, Some(true)))
 }
 
 // ------------------------------------------------------------------ issue

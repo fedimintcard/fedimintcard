@@ -17,14 +17,16 @@ import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
 
 /**
- * JavaCard Classic never collects: every {@code new} on a command path is a permanent EEPROM/Flash
- * leak that fills the card after a few hundred taps. So the applet allocates once, at install
- * time — in a constructor, {@code install()}, or (SchnorrHW only) {@code init()}, which the applet
- * constructor calls — and a command path may not allocate at all.
+ * JavaCard Classic never collects: every allocation on a command path is a permanent EEPROM/Flash
+ * leak that fills the card after a few hundred taps. So the applet allocates at install time — in
+ * a constructor, {@code install()}, or (SchnorrHW only) {@code init()}, which the applet
+ * constructor calls — and otherwise only once each, behind a null check: the signer's RSA objects
+ * and the PIN's work keys at the first SET_PIN, and a slot's key pair at that slot's first GEN_KEY.
  *
- * <p>This is a source scan, not a bytecode check: it reads the three main-source files by path
+ * <p>This is a source scan, not a bytecode check: it reads the main-source files by path
  * (relative to the applet module), strips comments and string/char literals, tracks method bodies
- * by brace depth, and reports every {@code new} with its line number and enclosing method.
+ * by brace depth, and reports every allocation ({@code new}, {@code KeyBuilder.buildKey} and any
+ * {@code getInstance}) with its line number and enclosing method.
  */
 class NoAllocationTest {
 
@@ -40,14 +42,17 @@ class NoAllocationTest {
      *
      * <p>{@code keysFor} builds one slot's key pair at that slot's first GEN_KEY and never again,
      * so it allocates at most {@code SLOTS} times in the applet's life: bounded, not a leak.
+     * {@code setPin} builds the PIN's work keys once, behind a null check, at the first SET_PIN, and
+     * there calls {@code chipMulInit}, which builds the signer's RSA cipher and key the same way.
      */
     static final Map<String, Set<String>> ALLOWED = Map.of(
-        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor"),
-        "SchnorrHW.java", Set.of("SchnorrHW", "init"),
+        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor", "setPin", "attestInit", "fieldPInit"),
+        "SchnorrHW.java", Set.of("SchnorrHW", "init", "chipMulInit"),
+        "Secp256k1.java", Set.of("<static>"),
         "Opener.java", Set.of("Opener", "install"));
 
     static final List<String> SOURCES = List.of(
-        "FedimintCardApplet.java", "SchnorrHW.java", "Opener.java");
+        "FedimintCardApplet.java", "SchnorrHW.java", "Secp256k1.java", "Opener.java");
 
     /** Where the main sources live, relative to this module ({@code applet/}). */
     static Path sourceDir() {
@@ -75,13 +80,13 @@ class NoAllocationTest {
                 if (allowed.contains(a.method)) {
                     allowedSeen++;
                 } else {
-                    offences.add(file + ":" + a.line + ": `new` in " + describe(a.method)
+                    offences.add(file + ":" + a.line + ": an allocation in " + describe(a.method)
                         + " (allowed only in " + allowed + ")");
                 }
             }
         }
         // Anti-vacuity: the files do allocate, and the scan found the install-time allocations.
-        assertTrue(seen > 0, "the scan found no `new` at all; check sourceDir()");
+        assertTrue(seen > 0, "the scan found no allocation at all; check sourceDir()");
         assertTrue(allowedSeen > 0, "none of the install-time allocations were recognised; check ALLOWED");
         assertTrue(offences.isEmpty(), "allocations outside install time:\n  " + String.join("\n  ", offences));
     }
@@ -105,16 +110,39 @@ class NoAllocationTest {
             "        byte[] leak = new byte[3];",                 // 13 offending
             "    }",                                              // 14
             "    void helper() { byte[] h = new byte[1]; }",      // 15 offending
-            "}");                                                 // 16
+            "    void keys() { k = KeyBuilder.buildKey(t, l, false); }", // 16 offending
+            "    void engine() { e = Cipher.getInstance(a, false); }",   // 17 offending
+            "    void named() { rebuildKey(); myGetInstance(); }",       // 18 not an allocation
+            "}");                                                 // 19
         List<String> located = new ArrayList<>();
         for (Alloc a : allocations(synthetic)) located.add(a.line + ":" + a.method);
-        assertEquals(List.of("2:<static>", "5:Planted", "8:install", "13:command", "15:helper"), located);
+        assertEquals(List.of("2:<static>", "5:Planted", "8:install", "13:command", "15:helper", "16:keys", "17:engine"), located);
         // The fixture is held to its own allow-list, not the applet's: `<static>` is legal in the
         // applet, and borrowing that list here would let a planted allocation slip past.
         Set<String> allowed = Set.of("Planted", "install", "<static>");
         List<String> offending = new ArrayList<>();
         for (Alloc a : allocations(synthetic)) if (!allowed.contains(a.method)) offending.add(a.toString());
-        assertEquals(List.of("13:command", "15:helper"), offending);
+        assertEquals(List.of("13:command", "15:helper", "16:keys", "17:engine"), offending);
+    }
+
+    /**
+     * The methods outside install time that may allocate do so a fixed number of times, each behind
+     * a null check: two key objects in {@code keysFor}, the work keys in {@code setPin}, the RSA
+     * cipher and key in {@code chipMulInit}. One more allocation in any of them fails here.
+     */
+    @Test
+    void theAllocationsAfterInstallAreTheOnesCounted() throws IOException {
+        Map<String, Integer> want = Map.of(
+            "FedimintCardApplet.java:keysFor", 2, "FedimintCardApplet.java:setPin", 1, "SchnorrHW.java:chipMulInit", 2);
+        Map<String, Integer> got = new TreeMap<>();
+        for (String file : SOURCES) {
+            String src = Files.readString(sourceDir().resolve(file), StandardCharsets.UTF_8);
+            for (Alloc a : allocations(src)) {
+                String key = file + ":" + a.method;
+                if (want.containsKey(key)) got.merge(key, 1, Integer::sum);
+            }
+        }
+        assertEquals(new TreeMap<>(want), got);
     }
 
     /** Comment and literal stripping must not hide a real allocation either. */
@@ -171,7 +199,7 @@ class NoAllocationTest {
             }
             // Not `else if`: a one-line method body is `{ new X(); }`, and the `new` shares its
             // index with the brace that names the method it belongs to.
-            if (ch == 'n' && s.startsWith("new ", i)
+            if ((s.startsWith("new ", i) || s.startsWith("buildKey(", i) || s.startsWith("getInstance(", i))
                     && (i == 0 || !Character.isJavaIdentifierPart(s.charAt(i - 1)))) {
                 String method = "<static>";
                 for (String m : enclosing) {

@@ -213,8 +213,8 @@ final class ErrorMappingTests: XCTestCase {
     /// read as "Outcome unknown". The list is copied from the doc.
     func testEveryDocumentedChargeCodeIsKnown() {
         let documented = [
-            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
-            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_blocked", "card_changed", "unknown_card",
+            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "notes_held", "no_exact_plan",
+            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_wait", "old_card", "sign_check_failed", "card_changed", "unknown_card",
             "ops_unreachable", "ops_refused", "ops_not_connected", "card_limit", "offline_unsupported_card", "offline_not_ready",
             "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
             "offline_pool_exhausted", "internal",
@@ -224,13 +224,42 @@ final class ErrorMappingTests: XCTestCase {
         for code in documented { XCTAssertNotEqual(ChargeErrorCode.fromWire(code), .unknown, code) }
     }
 
-    func testTriesLeft() {
-        XCTAssertEqual(parseTriesLeft("wrong PIN; 2 tries left before the card blocks"), 2)
-        XCTAssertEqual(parseTriesLeft("1 try left"), 1)
-        XCTAssertNil(parseTriesLeft("wrong PIN"))
-        XCTAssertEqual(wrongPinCopy(1), "Wrong PIN — 1 try left")
-        XCTAssertEqual(wrongPinCopy(3), "Wrong PIN — 3 tries left")
+    /// What the screen says for each outcome the card or the till can report (DESIGN 4.0 sections 3, 5, 7).
+    func testOutcomeMessages() {
+        XCTAssertEqual(wrongPinCopy(1), "Wrong PIN. 1 wrong try in a row")
+        XCTAssertEqual(wrongPinCopy(15), "Wrong PIN. 15 wrong tries in a row")
         XCTAssertEqual(wrongPinCopy(nil), "Wrong PIN")
+        XCTAssertEqual(wrongPinCopy(0), "Wrong PIN")
+        XCTAssertEqual(errorCopy(.wrongPin, "d", wrongTries: 3).0, "Wrong PIN. 3 wrong tries in a row")
+        XCTAssertEqual(errorCopy(.pinWait, "d", waitS: 12).0, "Hold the card, about 12 s")
+        XCTAssertEqual(errorCopy(.pinWait, "d", waitS: 12).1, "Tap again to finish the wait")
+        XCTAssertEqual(errorCopy(.pinWait, "d").0, "Hold the card")
+        XCTAssertEqual(errorCopy(.signCheckFailed, "d").0, "Nothing was spent")
+        XCTAssertEqual(errorCopy(.signCheckFailed, "d").1, "The card did not sign. Tap again.")
+        XCTAssertEqual(errorCopy(.oldCard, "d").0, "Old card")
+        XCTAssertEqual(errorCopy(.oldCard, "d").1, "This card needs a reset and a new set-up.")
+        XCTAssertEqual(holdingCopy(5), "Hold the card, about 5 s")
+        XCTAssertEqual(holdingCopy(0), "Paying… keep the card on the phone")
+        for k in [ErrorKind.pinWait, .signCheckFailed, .wrongPin] { XCTAssertTrue(k.definitive, "\(k)") }
+        // Answered before the till settles an earlier attempt: it proves nothing about one.
+        XCTAssertFalse(ErrorKind.oldCard.definitive)
+    }
+
+    func testNoScreenSaysTriesLeftOrBlocked() {
+        for k in ErrorKind.allCases {
+            let (t, d) = errorCopy(k, "d", waitS: 3, wrongTries: 3)
+            for text in [t, d] { XCTAssertNil(text.range(of: "tries left|try left|blocked", options: [.regularExpression, .caseInsensitive]), "\(k): \(text)") }
+        }
+    }
+
+    func testDeclinedFieldsParse() {
+        let w = TillParse.charge(status: 423, body: Data(#"{"ok":false,"error":"pin_wait","detail":"d","wait_s":12}"#.utf8))
+        XCTAssertEqual(w, .declined(code: .pinWait, detail: "d", httpStatus: 423, suggestedMsat: nil, wrongTries: nil, waitS: 12))
+        let r = TillParse.charge(status: 403, body: Data(#"{"ok":false,"error":"wrong_pin","detail":"d","wrong_tries":3,"wait_s":4}"#.utf8))
+        XCTAssertEqual(r, .declined(code: .wrongPin, detail: "d", httpStatus: 403, suggestedMsat: nil, wrongTries: 3, waitS: 4))
+        XCTAssertEqual(ChargeErrorCode.fromWire("old_card"), .oldCard)
+        XCTAssertEqual(ChargeErrorCode.fromWire("sign_check_failed"), .signCheckFailed)
+        XCTAssertEqual(ChargeErrorCode.fromWire("pin_blocked"), .unknown)
     }
 
     func testKinds() {
@@ -239,7 +268,7 @@ final class ErrorMappingTests: XCTestCase {
             XCTAssertFalse(k.definitive, "\(k) proves nothing about an earlier attempt")
         }
         XCTAssertTrue(ErrorKind.wrongPin.definitive); XCTAssertTrue(ErrorKind.insufficient.definitive)
-        XCTAssertFalse(ErrorKind.pinBlocked.retryable); XCTAssertTrue(ErrorKind.busy.retryable)
+        XCTAssertFalse(ErrorKind.oldCard.retryable); XCTAssertTrue(ErrorKind.pinWait.retryable); XCTAssertTrue(ErrorKind.signCheckFailed.retryable); XCTAssertTrue(ErrorKind.busy.retryable)
         XCTAssertEqual(ErrorKind.from(TillError.unreachable), .tillUnreachable)
         XCTAssertEqual(ErrorKind.from(TillError.interrupted), .timeoutUnknown)
     }
@@ -258,16 +287,22 @@ final class ErrorMappingTests: XCTestCase {
 
     func testCopyIsPlainAndNeverEmptyTitle() {
         let kinds: [ErrorKind] = [.badRequest, .busy, .noCard, .relayUnreachable, .cardError, .insufficient, .noExactPlan, .declined,
-                                  .undecided, .recovering, .conflict, .pinRequired, .wrongPin, .pinBlocked, .cardChanged, .unknownCard,
+                                  .undecided, .recovering, .conflict, .pinRequired, .wrongPin, .pinWait, .oldCard, .signCheckFailed, .cardChanged, .unknownCard,
                                   .opsUnreachable, .opsRefused, .cardLinkGone, .unauthorized, .internal, .unknown, .tillUnreachable,
-                                  .timeoutUnknown, .notPaired, .offlineNoChangeRoom]
+                                  .timeoutUnknown, .notPaired, .offlineNoChangeRoom, .notesHeld]
         for k in kinds {
             let (t, d) = errorCopy(k, "")
             XCTAssertFalse(t.isEmpty)
             XCTAssertFalse((t + d).lowercased().contains("adb"), "\(k) mentions adb")
         }
-        XCTAssertEqual(errorCopy(.pinBlocked, "").0, "PIN blocked")
+        XCTAssertEqual(errorCopy(.pinWait, "", waitS: 12).0, "Hold the card, about 12 s")
         XCTAssertEqual(errorCopy(.insufficient, "").0, "Card balance too low")
+        // `notes_held` (402): a refusal of its own, never "Outcome unknown"; nothing moved; the till's msat detail is not shown.
+        XCTAssertEqual(ErrorKind.from(ChargeErrorCode.fromWire("notes_held")), .notesHeld)
+        XCTAssertTrue(ErrorKind.notesHeld.definitive)
+        XCTAssertFalse(ErrorKind.notesHeld.needsSalesCheck)
+        XCTAssertEqual(errorCopy(.notesHeld, "the card can pay 1000 msat now").0, "Part of the balance is on hold")
+        XCTAssertEqual(errorCopy(.notesHeld, "the card can pay 1000 msat now").1, "Some of this card's money can't be used. A smaller amount may work, or take another payment.")
         XCTAssertEqual(errorCopy(.noExactPlan, "").0, "Can't take this amount")
         XCTAssertEqual(errorCopy(.noExactPlan, "").1, "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
         // Offline with no slot for change is not a full card (OFFLINE-PLAN.md § 10).
@@ -297,7 +332,7 @@ final class ErrorMappingTests: XCTestCase {
             let answer = try JSONSerialization.data(withJSONObject: ["ok": false, "error": "no_exact_plan", "detail": detail] as [String: Any])
             let r = TillParse.charge(status: 422, body: answer)
             XCTAssertEqual(r, .declined(code: .noExactPlan, detail: detail, httpStatus: 422), detail)
-            guard case .declined(let code, let d, _, _) = r else { return XCTFail(detail) }
+            guard case .declined(let code, let d, _, _, _, _) = r else { return XCTFail(detail) }
             let (t, b) = errorCopy(ErrorKind.from(code), d)
             XCTAssertEqual(t, title, detail)
             XCTAssertEqual(b, body, detail)

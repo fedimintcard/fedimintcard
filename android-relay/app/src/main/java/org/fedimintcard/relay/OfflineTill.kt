@@ -19,8 +19,8 @@ sealed class CoreCharge {
         val replayed: Boolean,
     ) : CoreCharge()
 
-    /** Not charged: [code] is the till API's; [suggestedMsat] a price that pays instead; [triesLeft] `wrong_pin`'s. */
-    data class Refused(val code: String, val detail: String, val suggestedMsat: Long? = null, val triesLeft: Int? = null) : CoreCharge()
+    /** Not charged: [code] is the till API's; [suggestedMsat] a price that pays instead; [wrongTries] `wrong_pin`'s; [waitS] `pin_wait`'s seconds still owed or `wrong_pin`'s next wait. */
+    data class Refused(val code: String, val detail: String, val suggestedMsat: Long? = null, val wrongTries: Int? = null, val waitS: Int? = null) : CoreCharge()
 }
 
 /** The phone's store: [waiting] to sync, [signing] (held for their cards), [refused] by the till, [synced]. */
@@ -43,7 +43,7 @@ interface OfflineCore {
     fun phoneId(): String
 
     /** Takes [priceMsat] from [card] with [kitJson] for the sale [clientRef]. Blocks on the card. */
-    fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String): CoreCharge
+    fun charge(card: CardLink, kitJson: String, priceMsat: Long, clientRef: String, pin: String, onHolding: (Int) -> Unit = {}): CoreCharge
     fun stats(): CoreStats
     fun signingRefs(): List<String>
     fun drain(max: Int): CoreDrain
@@ -116,6 +116,9 @@ class OfflineTill(
     @Volatile var kitError: String? = null
         private set
 
+    /** Told the seconds left while the card serves a PIN wait during the phone's own charge (any thread). */
+    @Volatile var onHolding: ((Int) -> Unit)? = null
+
     /** Why the last sync stopped short, cleared by one that sends everything. */
     @Volatile var syncError: String? = null
         private set
@@ -163,7 +166,7 @@ class OfflineTill(
         localCharging = true
         val outcome: CoreCharge? = try {
             // The core takes the PIN as a String (an accepted limit of this slice); the Pin is wiped below.
-            c.charge(card(), kit.answer, priceMsat, ref, pin?.withChars { String(it) } ?: "")
+            c.charge(card(), kit.answer, priceMsat, ref, pin?.withChars { String(it) } ?: "") { s -> onHolding?.invoke(s) }
         } catch (e: Throwable) {
             null // the outcome is unknown, as for undecided: held, retried on the phone only
         } finally {
@@ -180,15 +183,11 @@ class OfflineTill(
                 // A held sale answers its card's checks first (expiry, attestation, PIN) and stays held.
                 val held = outcome.code == UNDECIDED || holds(c, ref)
                 if (!held) synchronized(lock) { localRefs -= ref }
-                ChargeResult.Declined(ChargeErrorCode.fromWire(outcome.code), detail(outcome), 0, outcome.suggestedMsat, held = held, local = true)
+                ChargeResult.Declined(ChargeErrorCode.fromWire(outcome.code), outcome.detail, 0, outcome.suggestedMsat, held = held, local = true, wrongTries = outcome.wrongTries, waitS = outcome.waitS)
             }
             null -> ChargeResult.Declined(ChargeErrorCode.UNDECIDED, "the phone's charge failed; its outcome is unknown", 0, held = true, local = true)
         }
     }
-
-    /** `wrong_pin`'s detail always carries the tries left, which the PIN screen reads. */
-    private fun detail(r: CoreCharge.Refused): String =
-        if (r.code == "wrong_pin" && r.triesLeft != null && parseTriesLeft(r.detail) == null) "wrong PIN; ${r.triesLeft} tries left" else r.detail
 
     private fun receipt(p: CoreCharge.Paid, ms: Long) = ChargeReceipt(
         saleId = 0, txid = p.txid, priceMsat = p.priceMsat, receivedMsat = p.tillMsat, overpaidMsat = p.overpayMsat,

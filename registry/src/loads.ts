@@ -25,7 +25,8 @@
  * wallet that did submit and comes back late can still post the outcome while the slots are
  * untouched; once another load used one of them, it cannot.
  */
-import {bump, heldChange, heldChangeSlots, requireVersion, slotCount, unkeyedSlots, versionOf} from './cards';
+import {bump, CHANGE_SLOT_MIN, heldChange, heldChangeSlots, repeatMatches, requireVersion, slotCount, unkeyedSlots, unsignedLive, versionOf} from './cards';
+import type {CheckedNote} from './offline';
 import {RateLimited} from './auth';
 import {BadRequest, Conflict, isCount, isHex, isPositiveInt, NotFound, Unprocessable} from './http';
 import {cardFederation, checkNotes, isTier, mintKeysFor} from './mint';
@@ -119,6 +120,7 @@ function spendIn(sql: Sql, shortId: string, now: number): void {
  * `heldChangeSlots`). No balances and no notes: anyone with the short id may ask.
  * `unkeyed_slots` are slots the card has but no key is on record for yet (a 32-slot card
  * registered with 8 keys): nothing can be loaded into them until a till keys them at a tap.
+ * Slots from `CHANGE_SLOT_MIN` up are never listed, free or unkeyed: they are kept for offline change.
  */
 export function freeSlots(sql: Sql, shortId: string) {
   const fed = cardFederation(sql, shortId);
@@ -131,7 +133,7 @@ export function freeSlots(sql: Sql, shortId: string) {
   // change opening there (docs/OFFLINE-PROTOCOL.md § 7): a load would reuse the late change's nonce.
   const held = heldChangeSlots(sql, shortId);
   const free = [...keys]
-    .filter(([slot, pubkey]) => !held.has(slot) && !keyUsed(sql, shortId, '02' + pubkey))
+    .filter(([slot, pubkey]) => slot < CHANGE_SLOT_MIN && !held.has(slot) && !keyUsed(sql, shortId, '02' + pubkey))
     .sort(([a], [b]) => a - b)
     .map(([slot, pubkey]) => ({slot, pubkey}));
   return {
@@ -139,7 +141,9 @@ export function freeSlots(sql: Sql, shortId: string) {
     federation_id: fed.federation_id,
     slot_count: count,
     free,
-    unkeyed_slots: unkeyedSlots(count, keys.keys()),
+    // Only slots a holder may load into once a till keys them; `/cards/:id/state` lists every
+    // unkeyed slot, since the till's spare reserve keys the change slots from there.
+    unkeyed_slots: unkeyedSlots(count, keys.keys()).filter(slot => slot < CHANGE_SLOT_MIN),
   };
 }
 
@@ -207,6 +211,9 @@ export function recordLoad(
     const slots = currentKeys(sql, shortId);
     const held = heldChangeSlots(sql, shortId);
     for (const n of load.notes) {
+      if (n.slot >= CHANGE_SLOT_MIN) {
+        throw new Conflict(`slot ${n.slot} of card ${shortId} is kept for offline change; read /slots again`);
+      }
       const pubkey = slots.get(n.slot);
       if (pubkey === undefined) {
         throw new Conflict(`card ${shortId} has no key in slot ${n.slot} yet; a till keys it at a tap`);
@@ -257,17 +264,21 @@ export function recordLoad(
  * checked against the federation's key for its note's tier, and only if all verify do the notes
  * become live; one bad signature is a 422 and changes nothing. `{accepted: false}`: the federation
  * refused the transaction, the notes are deleted and their slots free. A repeat of the recorded
- * outcome answers 200; a different one is a 409.
+ * outcome answers 200, and so does one that sends only some of its notes (`repeatMatches`); any
+ * other is a 409.
  *
  * A load that expired is still finished by its signatures while each of its slots holds the same
  * key and no note has been recorded under it since.
+ *
+ * `sign` names the notes that passed the check and are now live (on a repeat, those still
+ * unsigned); the caller signs them (`signNotes`).
  */
 export function recordLoadOutcome(
   storage: DurableObjectStorage,
   shortId: string,
   r: Record<string, unknown>,
   now: number,
-): {version: number; replayed: boolean} {
+): {version: number; replayed: boolean; sign: CheckedNote[]} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -296,8 +307,9 @@ export function recordLoadOutcome(
       throw new NotFound(`no load ${String(r.txid)} on card ${shortId}`);
     }
     if (load.status === 'accepted' || load.status === 'rejected') {
-      if (load.outcome === outcome) {
-        return {version: versionOf(sql, shortId), replayed: true};
+      if (repeatMatches(load.outcome, accepted, signatures)) {
+        const sign = accepted ? unsignedLive(sql, shortId, [...signatures.keys()]) : [];
+        return {version: versionOf(sql, shortId), replayed: true, sign};
       }
       throw new Conflict(`load ${String(r.txid)} is already resolved differently`);
     }
@@ -306,16 +318,18 @@ export function recordLoadOutcome(
       if (load.status === 'expired') {
         // Its notes went with the expiry; record what the wallet says, nothing else changes.
         sql.exec("UPDATE holder_loads SET status = 'rejected', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-        return {version: versionOf(sql, shortId), replayed: false};
+        return {version: versionOf(sql, shortId), replayed: false, sign: []};
       }
       sql.exec("DELETE FROM notes WHERE short_id = ? AND txid = ? AND status = 'pending'", shortId, r.txid);
       sql.exec("UPDATE holder_loads SET status = 'rejected', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-      return {version: bump(sql, shortId), replayed: false};
+      return {version: bump(sql, shortId), replayed: false, sign: []};
     }
     if (signatures.size !== notes.length || !notes.every(n => signatures.has(n.nonce))) {
       throw new BadRequest('an accepted load needs a signature for every note it recorded, and no others');
     }
     checkNotes(sql, shortId, notes.map(n => ({nonce: n.nonce, amount_msat: n.amount_msat, signature: signatures.get(n.nonce)!})));
+    // Checked: the caller signs these once this transaction has made them live (`signNotes`).
+    const sign = notes.map(n => ({slot: n.slot, nonce: n.nonce, amount_msat: n.amount_msat, signature: signatures.get(n.nonce)!}));
     if (load.status === 'expired') {
       const slots = currentKeys(sql, shortId);
       for (const n of notes) {
@@ -346,7 +360,68 @@ export function recordLoadOutcome(
         );
       }
     }
+    // `recordLoad` refuses a change slot, so only a load recorded before that rule names one. Its
+    // money is issued: finish it, and name it for the operator like a till's load there.
+    const kept = notes.map(n => n.slot).filter(slot => slot >= CHANGE_SLOT_MIN).sort((a, b) => a - b);
+    if (kept.length > 0) {
+      console.warn(`ALERT load_in_change_slot card=${shortId} holder txid=${String(r.txid)} slots=${kept.join(',')}`);
+    }
     sql.exec("UPDATE holder_loads SET status = 'accepted', outcome = ?, resolved_at = ? WHERE txid = ?", outcome, now, r.txid);
-    return {version: bump(sql, shortId), replayed: false};
+    return {version: bump(sql, shortId), replayed: false, sign};
   });
+}
+
+/**
+ * `GET /registry/change-slot-check`: what sits on the change slots (`CHANGE_SLOT_MIN` and up) of
+ * the operator's cards: live or pending notes on such a slot or under its key (with their txid,
+ * so an offline sale's change can be told apart), and holder loads that name one and are open or
+ * expired (an expired load's notes are gone, but its wallet may still finish it late). Read once
+ * when the rule that keeps those slots for offline change goes live; each card listed clears at
+ * its next online tap.
+ */
+export function changeSlotCheck(sql: Sql, operatorId: number) {
+  const notes = sql
+    .exec(
+      `SELECT n.short_id, n.slot, n.nonce, n.status, n.txid
+       FROM notes n
+       JOIN cards c ON c.short_id = n.short_id
+       JOIN batches b ON b.batch_id = c.batch_id
+       WHERE b.operator_id = ? AND n.status IN ('live', 'pending')
+         AND (n.slot >= ? OR EXISTS (
+           SELECT 1 FROM card_slots s
+           WHERE s.short_id = n.short_id AND s.slot >= ? AND n.nonce = '02' || s.pubkey))
+       ORDER BY n.short_id, n.slot`,
+      operatorId, CHANGE_SLOT_MIN, CHANGE_SLOT_MIN,
+    )
+    .toArray()
+    .map(r => ({
+      short_id: String(r.short_id),
+      slot: Number(r.slot),
+      nonce: String(r.nonce),
+      status: String(r.status),
+      txid: r.txid === null ? null : String(r.txid),
+    }));
+  const loads = sql
+    .exec(
+      `SELECT l.short_id, l.txid, l.status, l.body, l.expires_at
+       FROM holder_loads l
+       JOIN cards c ON c.short_id = l.short_id
+       JOIN batches b ON b.batch_id = c.batch_id
+       WHERE b.operator_id = ? AND l.status IN ('open', 'expired')
+       ORDER BY l.short_id, l.txid`,
+      operatorId,
+    )
+    .toArray()
+    .map(r => ({
+      short_id: String(r.short_id),
+      txid: String(r.txid),
+      status: String(r.status),
+      slots: (JSON.parse(String(r.body)) as {slot: number}[])
+        .map(n => n.slot)
+        .filter(slot => slot >= CHANGE_SLOT_MIN)
+        .sort((a, b) => a - b),
+      expires_at: Number(r.expires_at),
+    }))
+    .filter(l => l.slots.length > 0);
+  return {notes, loads};
 }

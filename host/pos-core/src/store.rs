@@ -140,9 +140,23 @@ impl Store {
     /// till refused at sync is `conflict`: that sale was not paid, and a new one needs a new
     /// `client_ref`. Charges on one store run one at a time: a second waits for the first.
     pub fn charge(&self, card: &mut dyn Card, kit_json: &str, price: u64, client_ref: &str, pin: &[u8]) -> Result<Taken> {
+        self.charge_held(card, kit_json, price, client_ref, pin, None)
+    }
+
+    /// [`charge`](Self::charge), with `holding` told about how many seconds the card still owes
+    /// while it serves a PIN wait (first before the wait, last 0).
+    pub fn charge_held(
+        &self,
+        card: &mut dyn Card,
+        kit_json: &str,
+        price: u64,
+        client_ref: &str,
+        pin: &[u8],
+        holding: Option<&dyn Fn(u32)>,
+    ) -> Result<Taken> {
         // A panic never leaves the queue half-changed (`Queue::commit`), so a poisoned lock is safe.
         let _one = self.charging.lock().unwrap_or_else(|e| e.into_inner());
-        let t = self.charge_inner(card, kit_json, price, client_ref, pin)?;
+        let t = self.charge_inner(card, kit_json, price, client_ref, pin, holding)?;
         if t.replayed && t.charge.state == ChargeState::Refused {
             bail!(OfflineError::Conflict(format!(
                 "the till refused sale {client_ref:?} at sync ({}); start it again with a new client_ref",
@@ -152,7 +166,15 @@ impl Store {
         Ok(t)
     }
 
-    fn charge_inner(&self, card: &mut dyn Card, kit_json: &str, price: u64, client_ref: &str, pin: &[u8]) -> Result<Taken> {
+    fn charge_inner(
+        &self,
+        card: &mut dyn Card,
+        kit_json: &str,
+        price: u64,
+        client_ref: &str,
+        pin: &[u8],
+        holding: Option<&dyn Fn(u32)>,
+    ) -> Result<Taken> {
         let kit = Kit::parse(kit_json)?;
         let keys = kit.decode(&self.phone_id)?;
         let now = now_ms().max(kit.issued_at_ms).max(self.q().file.high_water_ms);
@@ -170,6 +192,7 @@ impl Store {
             keyed_ok: None,
             now_ms: now,
             expires_at_ms: Some(kit.expires_at_ms),
+            holding,
         };
         charge(card, &self.queue, &env, price, Some(client_ref))
     }

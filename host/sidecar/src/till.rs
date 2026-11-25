@@ -93,6 +93,10 @@ pub struct Class {
 /// ([`fedimint_card_pos_core::class_of`]): one vocabulary.
 pub fn classify(err: &anyhow::Error) -> Class {
     let c = |status, code| Class { status, code };
+    // SIGN's `6F00` is a context on the card's error, so it is asked of the whole error first.
+    if fedimint_card_host_card::is_sign_check_failed(err) {
+        return c(409, "sign_check_failed");
+    }
     for cause in err.chain() {
         if let Some((status, code)) = fedimint_card_pos_core::class_of(cause) {
             return c(status, code);
@@ -105,26 +109,50 @@ pub fn classify(err: &anyhow::Error) -> Class {
                 OpsError::Refused(..) => c(502, "ops_refused"),
             };
         }
+        // The sealed PIN (applet 4.x): no key to check the card under, or a card that failed the
+        // check. Neither sent a PIN.
+        if cause.downcast_ref::<crate::glue::NoCertKey>().is_some() {
+            return c(503, "offline_not_ready");
+        }
+        if cause.downcast_ref::<fedimint_card_host_card::UntrustedCard>().is_some() {
+            return c(403, "card_not_genuine");
+        }
         if let Some(f) = cause.downcast_ref::<SpendFault>() {
             return match f {
                 SpendFault::Declined(_) => c(402, "declined"),
                 SpendFault::Undecided(_) => c(202, "undecided"),
                 SpendFault::Unresolved(_) => c(503, "recovering"),
                 SpendFault::WrongCard(_) => c(502, "card_error"),
+                SpendFault::Held(_) => c(402, "notes_held"),
             };
         }
     }
     c(500, "internal")
 }
 
-pub(crate) fn error_reply(err: &anyhow::Error) -> Reply {
+/// The API answer for `err`. A PIN refusal also carries what docs/TILL-API.md promises an app: `wrong_pin` adds
+/// `wrong_tries` (the wrong tries in a row) and `wait_s` (whole seconds the next try first
+/// waits); `pin_wait` adds `wait_s` (whole seconds still owed, 0 when not known). Both come from
+/// the core a phone shares ([`fedimint_card_pos_core::refusal`]), so till and phone agree.
+pub fn error_reply(err: &anyhow::Error) -> Reply {
     let class = classify(err);
-    let detail = match class.code {
+    match class.code {
         // Said plainly, for the holder, as a phone says it.
-        "wrong_pin" | "pin_blocked" => fedimint_card_pos_core::refusal(err).detail,
-        _ => format!("{err:#}"),
-    };
-    Reply::fail(class.status, class.code, detail)
+        "wrong_pin" | "pin_wait" | "old_card" | "sign_check_failed" => {
+            let r = fedimint_card_pos_core::refusal(err);
+            let mut reply = Reply::fail(class.status, class.code, &r.detail);
+            match class.code {
+                "wrong_pin" => {
+                    reply.body["wrong_tries"] = json!(r.wrong_tries.unwrap_or(0));
+                    reply.body["wait_s"] = json!(r.wait_s.unwrap_or(0));
+                }
+                "pin_wait" => reply.body["wait_s"] = json!(r.wait_s.unwrap_or(0)),
+                _ => {}
+            }
+            reply
+        }
+        _ => Reply::fail(class.status, class.code, format!("{err:#}")),
+    }
 }
 
 // ------------------------------------------------------------------ the till and the registry
@@ -355,7 +383,9 @@ pub fn open_link_card(link: &Link) -> Result<Box<dyn Card>> {
     open_card_over(link.transport(), &format!("card link {}", link.id))
 }
 
-/// [`open_relay_card`] over any transport: probe, then SELECT (a `6A82` is tolerated).
+/// [`open_relay_card`] over any transport: probe, then SELECT (a `6A82` is tolerated). The SELECT
+/// is the rule for every reader: a card whose applet answers older than 4.0 (or newer than this
+/// till knows) is refused here with the old-card error, before any command of a job reaches it.
 pub fn open_card_over<T: Transport + 'static>(transport: T, what: &str) -> Result<Box<dyn Card>> {
     let mut c = CardClient::new(transport);
     c.get_data_ff21()
@@ -364,9 +394,14 @@ pub fn open_card_over<T: Transport + 'static>(transport: T, what: &str) -> Resul
             None => Err(e),
         })
         .with_context(|| what.to_owned())?;
-    // A blank card, or one whose applet is absent, answers a status word; that is `precheck`'s
-    // subject, not a reason to refuse to hand the card over.
-    let _ = c.select();
+    match c.select() {
+        Ok(()) => {}
+        // A blank card, or one whose applet is absent, answers a status word; that is
+        // `precheck`'s subject, not a reason to refuse to hand the card over. Its PIN commands
+        // stay refused by the card library until a SELECT passes.
+        Err(e) if status_word(&e).is_some() => {}
+        Err(e) => return Err(e).with_context(|| what.to_owned()),
+    }
     Ok(Box::new(c))
 }
 
@@ -814,6 +849,7 @@ async fn actor(
         cw.card = Box::new(NoCard);
         // The holder's PIN lives for one job.
         cw.pin = None;
+        cw.cert_checked = false;
         *pending_refs.lock().unwrap() = refs_now(&cw, ops.as_ref());
         // Free the service before answering, so a client that retries at once is not told
         // "busy". Both are cleared under the lock admission takes, so no request can see "busy"
@@ -1079,6 +1115,12 @@ pub async fn charge_job_for(
         if reg != Some(true) || !fed {
             return offline_charge(cw, ops, off, price, client_ref, sales).await;
         }
+        // Settling a charge the card left signing sends the holder's PIN before the attach that
+        // gives the job the registry's certificate key; a 4.x card's PIN is sealed only to a card
+        // checked under it, so the job takes the kept key (or fetches it) first.
+        // A new tap: the key is checked against this card, and a rotated one fetched.
+        cw.cert_checked = false;
+        ops.check_cert_key(cw).await;
         if let Some(held) = left_signing(off, client_ref.as_deref()) {
             return finish_left_signing(cw, ops, off, price, client_ref, sales, held).await;
         }
@@ -1087,7 +1129,10 @@ pub async fn charge_job_for(
         let left = crate::offline::settle_left_signing(cw, off);
         record_finished_sales(sales, &left.finished);
         if let Some(e) = left.error {
-            if crate::ops::pin_refused(&e) {
+            // A refused PIN, or one the till would not send (no certificate key: 503; a card that
+            // fails the check: 403). The sale must not go on: it would plan from the note the card
+            // already signed, and a 500 reads to the app as "may have charged".
+            if crate::ops::pin_refused(&e) || crate::ops::pin_unsendable(&e) {
                 return error_reply(&e);
             }
             tracing::warn!("a charge a card left signing was not settled at this tap: {e:#}");
@@ -2008,7 +2053,8 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         }
         let ops = h.conn.lock().unwrap().ops.clone();
         let Some(ops) = ops else { return Reply::fail(503, "ops_not_connected", "this till is not connected to a registry") };
-        // Unkeyed slots (split keying) count as room: the load's tap keys them (`holder.rs`).
+        // Unkeyed slots (split keying) below 24 count as room: the load's tap keys them
+        // (`holder.rs`). `free_slots` lists no slot from 24 up.
         let free = match ops.client.free_slots(id).await {
             Ok(f) => (f.free.len() + f.unkeyed_slots.len()) as u32,
             Err(e) => return Reply::fail(503, "ops_unreachable", format!("the card's free slots: {e}")),

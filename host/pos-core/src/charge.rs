@@ -10,6 +10,9 @@
 //! next tap from the card's own answers (a SPENT slot repeats its signature for the same hash),
 //! and the tap that left it is answered `undecided`, never `no_card`, so the app keeps the sale.
 //!
+//! Change goes only into KEYED slots of those kept for the change of offline sales, 24 to 31
+//! ([`fedimint_card_host_card::is_change_slot`]), for a till and a phone alike.
+//!
 //! What differs between a till and a phone is in [`Env`]: the till makes its own outputs
 //! ([`TillOuts::Fresh`]) and knows from its copy of the card which KEYED slots once carried a note
 //! (`keyed_ok`); a phone takes the till's outputs from its offline kit's pool
@@ -21,7 +24,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, SW_OVER_LIMIT, header_time};
-use fedimint_card_host_card::{Card, Certificate, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, open_pin_session_with, status_word};
+use fedimint_card_host_card::{
+    Card, Opening, PIN_MAX, PIN_MIN, SlotState, StatusWord, TrustedCard, UnsupportedApplet, UntrustedCard, is_change_slot,
+    open_pin_session_held, status_word, trust_card, verify_pin_held,
+};
 use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::CommonModuleInit as _;
@@ -38,6 +44,7 @@ use tbs::{AggregatePublicKey, BlindedMessage, BlindingKey};
 use crate::files::{HostKind, HostPending, LoadNote};
 use crate::plan::{self, ALL_TIERS, MAX_CARD_NOTES, PlanError, Tiers};
 use crate::queue::{ChargeState, OfflineCharge, OfflineConfig, OfflineError, OfflineInput, PoolRef, Queue, Stats};
+use crate::refusal::{PinWait, wait_seconds};
 use crate::{blind, nonce_for, short_id_of};
 
 /// Largest price accepted (2^40 msat, about 11 BTC), as the till API.
@@ -77,7 +84,8 @@ pub enum TillOuts<'a> {
     Pool(&'a [PoolEntry]),
 }
 
-/// Given a card's short id and its KEYED slots, the ones change may go to.
+/// Given a card's short id and its KEYED slots among those kept for change
+/// ([`fedimint_card_host_card::is_change_slot`]), the ones change may go to.
 pub type KeyedFilter<'a> = &'a dyn Fn(&str, &[u8]) -> Result<Vec<u8>>;
 
 /// What an offline charge works with besides the card and the queue.
@@ -99,11 +107,15 @@ pub struct Env<'a> {
     pub pin: Pin,
     pub till_outs: TillOuts<'a>,
     /// A till's: change may not go to a KEYED slot whose key once carried a note (a load not yet
-    /// written to the card, or a dead change key the registry refuses). `None`: any KEYED slot.
+    /// written to the card, or a dead change key the registry refuses). `None`: any KEYED slot of
+    /// those kept for change.
     pub keyed_ok: Option<KeyedFilter<'a>>,
     pub now_ms: u64,
     /// A phone's offline kit expires: no charge from then on, by this clock or the card's.
     pub expires_at_ms: Option<u64>,
+    /// Called while the card serves a PIN wait, with about how many seconds it still owes (first
+    /// before the wait, last with 0 when the card takes the PIN): "Hold the card, about N s".
+    pub holding: Option<&'a dyn Fn(u32)>,
 }
 
 /// A decoder registry with only the mint module, at `mint_id`: all an offline charge holds.
@@ -132,7 +144,9 @@ fn lock(q: &Mutex<Queue>) -> MutexGuard<'_, Queue> {
 /// 2. a charge already queued under this `client_ref` is that charge (`conflict` for another price);
 /// 3. a phone's kit expiry, then the count cap (not for a retap of a sale this device holds
 ///    `signing`: finishing that charge adds none);
-/// 4. a 3.0 card, its certificate and attestation, its clock (and the kit's expiry by it), the PIN;
+/// 4. SELECT, and only applet 4.x goes on (the rule for every reader: an older card is `old_card`),
+///    its certificate and attestation, its clock (and the kit's expiry by it), the PIN, its wait
+///    served while the card is held (a card taken away during it is `pin_wait`);
 /// 5. charges this card left `signing` are finished: a repeat of one is that charge, and another
 ///    card for one is `undecided`; one that can never be finished is `abandoned` and frees its
 ///    `client_ref` and the notes the card never signed for it;
@@ -168,18 +182,24 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         }
     }
 
-    let v = card.applet_version()?;
-    if !v.sign_once() {
-        bail!(OfflineError::Unsupported(format!(
-            "applet {v} can sign a note twice, so it is taken only online; the registry or the federation is unreachable"
-        )));
+    // The rule for every reader: the card hears its first command only now, after the request
+    // and the kit were checked, and a card whose SELECT does not answer applet 4.x gets no PIN
+    // command. On a `CardClient` the version is that SELECT's answer, or its old-card error.
+    card.select_applet().context("selecting the applet")?;
+    let v = card.applet_version().context("the applet's version")?;
+    if !v.is_current() {
+        return Err(anyhow::Error::new(
+            UnsupportedApplet::check(&[v.major, v.minor]).err().unwrap_or(UnsupportedApplet::Old { answer: vec![v.major, v.minor] }),
+        )
+        .context(format!("applet {v}")));
     }
     let Some(cert_key) = env.cert_key else {
         bail!(OfflineError::NotReady(
             "no certificate key from the registry yet (a till fetches one while online, a phone gets it in its offline kit), so no card can be checked offline".into()
         ));
     };
-    let slot0 = attest_card(card, cert_key)?;
+    let trust = attest_card(card, cert_key)?;
+    let slot0 = trust.slot0();
     let short_id = short_id_of(&slot0);
     // The clock first: a header a day later starts the card's new day.
     let card_now = if env.header.is_some() || env.expires_at_ms.is_some() { sync_clock(card, env.header) } else { None };
@@ -191,7 +211,7 @@ pub fn charge(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, 
         )));
     }
     // The PIN, before anything on the card changes: a wrong one leaves the card as it was.
-    open_pin(card, &env.pin)?;
+    open_pin(card, &trust, &env.pin, env.holding)?;
 
     // A retap of a sale whose card was taken away mid-SIGN is that sale, finished from the card's
     // stored signatures, never a second transaction. Another card for it waits for the first.
@@ -239,21 +259,16 @@ fn cap_reached(s: &Stats, cfg: &OfflineConfig) -> OfflineError {
 }
 
 /// The card is one the registry certified (§ 2): its certificate under `cert_key_hex`, for this
-/// card's slot-0 key, and a fresh attestation under the certified key. Answers slot 0's key.
-pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<XOnlyPublicKey> {
+/// card's slot-0 key ([`trust_card`]), and a fresh attestation under the certified key. Answers the
+/// [`TrustedCard`] the sealed PIN needs; slot 0's key is [`TrustedCard::slot0`].
+pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<TrustedCard> {
     let not_genuine = |m: String| anyhow::Error::new(OfflineError::NotGenuine(m));
     let cert_key = hex::decode(cert_key_hex).context("the kept certificate key is not hex")?;
-    let slot0 = card.get_pub(0).context("reading the card's slot 0 key")?;
-    let raw = match card.get_cert() {
-        Ok(c) => c,
-        Err(e) if status_word(&e).is_some() => return Err(not_genuine(format!("the card has no certificate ({e:#})"))),
-        Err(e) => return Err(e),
-    };
-    let cert = Certificate::parse(&raw).map_err(|e| not_genuine(format!("{e:#}")))?;
-    cert.verify(&cert_key).map_err(|e| not_genuine(format!("{e:#}")))?;
-    if cert.slot0 != slot0.serialize() {
-        return Err(not_genuine("the certificate is for another card".into()));
-    }
+    let trust = trust_card(card, &cert_key).map_err(|e| match e.downcast_ref::<UntrustedCard>() {
+        Some(u) => not_genuine(u.0.clone()),
+        None => e,
+    })?;
+    let cert = trust.certificate();
     let challenge: [u8; 32] = rand::thread_rng().r#gen();
     let der = match card.attest(&challenge) {
         Ok(d) => d,
@@ -261,7 +276,7 @@ pub fn attest_card(card: &mut dyn Card, cert_key_hex: &str) -> Result<XOnlyPubli
         Err(e) => return Err(e),
     };
     cert.verify_attest(&challenge, &der).map_err(|e| not_genuine(format!("{e:#}")))?;
-    Ok(slot0)
+    Ok(trust)
 }
 
 /// Show a card whose clock is older the header (`SET_HEADER`). Answers the card's clock, or
@@ -277,11 +292,42 @@ fn sync_clock(card: &mut dyn Card, header: Option<[u8; HEADER_LEN]>) -> Option<u
     r.map_err(|e| tracing::warn!("the card's clock: {e:#}")).ok()
 }
 
-fn open_pin(card: &mut dyn Card, pin: &Pin) -> Result<()> {
-    match pin {
-        Pin::Verify(p) => card.verify_pin(p).context("verifying the holder's PIN"),
-        Pin::OpenWith(p) => open_pin_session_with(card, p).context("opening the PIN session"),
-    }
+/// VERIFY_PIN (or, for a till's own PIN, SET_PIN on a card with none) with the card's wait served
+/// as the card library serves it: the same VERIFY_PIN resent while the card answers `6A98`, with
+/// nothing between, `holding` told the seconds left. A wait cut short (the card left, or an
+/// asking the wait did not owe) is [`PinWait`] with what was still owed: no PIN was tried.
+///
+/// Applet 4.x: sealed to the PIN key of `trust`, the card checked under the registry's key.
+pub fn open_pin(card: &mut dyn Card, trust: &TrustedCard, pin: &Pin, holding: Option<&dyn Fn(u32)>) -> Result<()> {
+    serve_pin(card, holding, &mut |card, progress| match pin {
+        Pin::Verify(p) => verify_pin_held(card, trust, p, progress).context("verifying the holder's PIN"),
+        Pin::OpenWith(p) => open_pin_session_held(card, trust, p, progress).context("opening the PIN session"),
+    })
+}
+
+type PinRun<'a> = dyn FnMut(&mut dyn Card, &mut dyn FnMut(u16)) -> Result<()> + 'a;
+
+fn serve_pin(card: &mut dyn Card, holding: Option<&dyn Fn(u32)>, run: &mut PinRun<'_>) -> Result<()> {
+    let mut left = 0u16;
+    let r = {
+        let mut progress = |askings: u16| {
+            left = askings;
+            if let Some(h) = holding {
+                h(wait_seconds(askings));
+            }
+        };
+        run(card, &mut progress)
+    };
+    let cut_short = |e: anyhow::Error| anyhow::Error::new(PinWait { askings: left.max(1) }).context(format!("{e:#}"));
+    r.map_err(|e| match status_word(&e) {
+        // The card answered: a wrong PIN, no PIN set, or another refusal. Itself.
+        Some(sw) if sw != fedimint_card_host_card::v3::SW_KEEP_HOLDING => e,
+        // An asking past what the wait owed.
+        Some(_) => cut_short(e),
+        // The card left while it still owed askings.
+        None if left > 0 => cut_short(e),
+        None => e,
+    })
 }
 
 fn sig_of(sig48: &[u8; 48]) -> Result<tbs::Signature> {
@@ -378,7 +424,8 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
                 }
                 notes.push(n);
             }
-            SlotState::Keyed => keyed.push(slot),
+            // Change goes only into the slots kept for it.
+            SlotState::Keyed if is_change_slot(slot) => keyed.push(slot),
             _ => {}
         }
     }
@@ -387,7 +434,7 @@ fn take(card: &mut dyn Card, queue: &Mutex<Queue>, env: &Env, price: u64, client
         None => keyed,
     };
 
-    // The plan, from the card's own notes, change into KEYED slots, the till's notes in the tiers
+    // The plan, from the card's own notes, change into KEYED slots 24 to 31, the till's notes in the tiers
     // its outputs can have. On a federation that takes a surplus, with a fee margin
     // (OFFLINE-PLAN.md § 10): the charge is sent days later, perhaps under higher fees. Older
     // federations refuse any surplus: an exact balance.

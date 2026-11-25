@@ -115,8 +115,8 @@ class SignTest {
     }
 
     /**
-     * SIGN's own refusals, reached past the PIN gate: a blocked PIN answers 6983 to any SIGN, so
-     * each card here is emptied to that state after its PIN is set (and verified where it matters).
+     * SIGN's own refusals, reached past the PIN gate: each card here has its PIN set (and verified
+     * where it matters) before the refusal under test.
      */
     @Test
     void emptySlotAndBadLengths() {

@@ -222,6 +222,7 @@ final class PosController: ObservableObject {
             let card = NFCApduTransport(channel)
             localTransport = card
             let till = pairing
+            offline.onHolding = { [weak self] s in DispatchQueue.main.async { self?.reader.update(alert: holdingCopy(s)) } }
             Task { [weak self] in
                 guard let self else { pin?.wipe(); return }
                 let r = await self.offline.charge(card: card, priceMsat: price, clientRef: ref, pin: pin) { [weak self] in
@@ -272,7 +273,7 @@ final class PosController: ObservableObject {
     private func finishCharge(_ r: ChargeResult) {
         switch r {
         case .success(let rc): endCardJob(message: receiptHeadline(rc), ok: true)
-        case .declined(let code, _, _, _) where code == .wrongPin: endCardJob(message: "Wrong PIN", ok: false)
+        case .declined(let code, _, _, _, _, _) where code == .wrongPin: endCardJob(message: "Wrong PIN", ok: false)
         default: endCardJob(message: "Payment didn't go through", ok: false)
         }
     }

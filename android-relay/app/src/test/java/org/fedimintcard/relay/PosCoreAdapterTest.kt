@@ -57,7 +57,7 @@ class PosCoreAdapterTest {
         for (kit in listOf("{}", "not json", """{"ok":true,"kit":{"version":1,"phone_id":"ffffffffffffffffffffffffffffffff"}}""")) {
             val r = core.charge(card, kit, 5_000, "sale-1", "1234") as CoreCharge.Refused
             assertEquals(kit, "offline_not_ready", r.code)
-            assertNull(r.suggestedMsat); assertNull(r.triesLeft)
+            assertNull(r.suggestedMsat); assertNull(r.wrongTries); assertNull(r.waitS)
         }
         assertEquals(0, asked)
         assertEquals(CoreStats(), core.stats())

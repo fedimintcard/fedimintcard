@@ -41,12 +41,12 @@ class ConstantTimeArithmeticTest {
         BigInteger[] v = values();
         for (int i = 0; i < v.length; i++) {
             BigInteger a = v[i], b = v[(i * 7 + 3) % v.length];
-            SchnorrHW.addModN(Bip340.bytes32(a), (short) 0, Bip340.bytes32(b), (short) 0, out, (short) 0, work, (short) 288);
+            SchnorrHW.addModN(Bip340.bytes32(a), (short) 0, Bip340.bytes32(b), (short) 0, out, (short) 0);
             assertEquals(a.add(b).mod(N), read(out, 0), a.toString(16) + " + " + b.toString(16));
         }
         // b may be n itself, as d2 = d + (n - d1) is when d1 is 0
         for (BigInteger a : EDGES) {
-            SchnorrHW.addModN(Bip340.bytes32(a), (short) 0, Bip340.bytes32(N), (short) 0, out, (short) 0, work, (short) 288);
+            SchnorrHW.addModN(Bip340.bytes32(a), (short) 0, Bip340.bytes32(N), (short) 0, out, (short) 0);
             assertEquals(a.mod(N), read(out, 0));
         }
     }
@@ -57,7 +57,7 @@ class ConstantTimeArithmeticTest {
         BigInteger[] tops = { N, N.add(BigInteger.ONE), TWO256.subtract(BigInteger.ONE), N.subtract(BigInteger.ONE), BigInteger.ZERO };
         for (BigInteger x : tops) {
             byte[] a = Bip340.bytes32(x);
-            SchnorrHW.reduceModN(a, (short) 0, work, (short) 288);
+            SchnorrHW.reduceModN(a, (short) 0);
             assertEquals(x.mod(N), read(a, 0), x.toString(16));
         }
     }
@@ -71,19 +71,6 @@ class ConstantTimeArithmeticTest {
             BigInteger a = v[i], b = v[(i * 13 + 5) % v.length];
             SchnorrHW.mulModN(Bip340.bytes32(a), (short) 0, Bip340.bytes32(b), (short) 0, out, (short) 0, work, (short) 0);
             assertEquals(a.multiply(b).mod(N), read(out, 0), a.toString(16) + " * " + b.toString(16));
-        }
-    }
-
-    @Test
-    void condNegateTakesNMinusAOnlyUnderTheMask() {
-        byte[] work = new byte[SchnorrHW.WORK_LEN];
-        for (BigInteger x : values()) {
-            if (x.signum() == 0) continue;
-            byte[] a = Bip340.bytes32(x);
-            SchnorrHW.condNegateModN(a, (short) 0, (byte) 0x00, work, (short) 288);
-            assertEquals(x, read(a, 0));
-            SchnorrHW.condNegateModN(a, (short) 0, (byte) 0xFF, work, (short) 288);
-            assertEquals(N.subtract(x), read(a, 0));
         }
     }
 

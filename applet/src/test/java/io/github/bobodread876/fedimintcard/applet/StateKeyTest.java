@@ -40,6 +40,7 @@ class StateKeyTest {
     void refusedWithoutThisSelectionsVerify() {
         CardTestSupport c = new CardTestSupport();
         c.setPin(CardTestSupport.DEFAULT_PIN);
+        c.select();   // the selection that set the PIN counts as having it; a new one does not
         assertSw(0x6A94, c.tx(CardTestSupport.STATE_KEY, 0, null));
         c.verifyPin(CardTestSupport.DEFAULT_PIN);
         stateKey(c);

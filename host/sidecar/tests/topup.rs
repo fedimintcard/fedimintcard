@@ -12,14 +12,14 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use fedimint_card_host_card::{Card, SoftCard, StatusWord};
+use fedimint_card_host_card::{Card, SlotState, SoftCard, StatusWord};
 use fedimint_card_sidecar::glue::CardWallet;
 use fedimint_card_sidecar::holder::{CardFull, Loader};
 use fedimint_card_sidecar::ops::{Ops, OpsClient, OpsConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Conn, OpsState};
-use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, TopupStore, Topups};
+use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, TopupState, TopupStore, Topups};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
@@ -189,8 +189,27 @@ async fn outcome(
         r.fail_outcomes.fetch_sub(1, Ordering::SeqCst);
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
     }
+    let notes = sign_loaded(&r.loads.lock().unwrap(), &body);
     r.outcomes.lock().unwrap().push(body);
-    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3})))
+    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3, "notes": notes})))
+}
+
+/// As ops signs a load's notes once the load is accepted: each note of the outcome, under the test
+/// registry key the card was set up with, listed as an outcome's answer lists them.
+fn sign_loaded(loads: &[Value], body: &Value) -> Vec<Value> {
+    let key = fedimint_card_host_card::v3::test_registry_key();
+    let mut out = vec![];
+    for o in body["notes"].as_array().into_iter().flatten() {
+        let Some(n) = loads.iter().flat_map(|l| l["notes"].as_array().unwrap().iter()).find(|n| n["nonce"] == o["nonce"]) else {
+            continue;
+        };
+        let nonce = o["nonce"].as_str().unwrap();
+        let x: [u8; 32] = hex::decode(&nonce[2..]).unwrap().try_into().unwrap();
+        let sig48 = fedimint_card_sidecar::glue::sig48_of(o["signature"].as_str().unwrap()).unwrap();
+        let reg = fedimint_card_host_card::v3::sign_note(&key, &x, n["amount_msat"].as_u64().unwrap(), &sig48);
+        out.push(json!({"slot": n["slot"], "nonce": nonce, "reg_sig": hex::encode(reg)}));
+    }
+    out
 }
 
 async fn serve_registry(r: Arc<FakeRegistry>) -> String {
@@ -247,10 +266,16 @@ async fn start(setup: Setup) -> anyhow::Result<(Fx, impl std::future::Future<Out
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
 
-    let card = Arc::new(Mutex::new(SoftCard::new()));
+    // A 4.0 card set up as the Setup app does: keyed, the test registry's key, anchored, a PIN.
+    let card = Arc::new(Mutex::new(SoftCard::v4()));
     let mut keys = vec![];
-    for s in 0..8 {
-        keys.push(card.lock().unwrap().gen_key(s)?);
+    {
+        let mut c = card.lock().unwrap();
+        for s in 0..8 {
+            keys.push(c.gen_key(s)?);
+        }
+        fedimint_card_host_card::softkit::ready_for_pin(&mut *c)?;
+        fedimint_card_host_card::softkit::open_test_session(&mut *c)?;
     }
     let short_id = short_id_of(&keys[0]);
     let registry = Arc::new(FakeRegistry::new(wallet.federation_id().to_string(), keys.iter().map(|k| k.to_string()).collect(), 7));
@@ -335,6 +360,15 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 
 /// Open a phone's card link; the task answers APDUs until the till closes it.
 async fn open_link(addr: SocketAddr, card: Arc<Mutex<SoftCard>>) -> (String, tokio::task::JoinHandle<()>) {
+    open_link_logged(addr, card, Arc::new(Mutex::new(vec![]))).await
+}
+
+/// [`open_link`], keeping the INS byte of every APDU the card received in `heard`.
+async fn open_link_logged(
+    addr: SocketAddr,
+    card: Arc<Mutex<SoftCard>>,
+    heard: Arc<Mutex<Vec<u8>>>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let (mut ws, _): (Ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/card/link")).await.unwrap();
     let ready: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     let id = ready["link"].as_str().unwrap().to_owned();
@@ -343,6 +377,7 @@ async fn open_link(addr: SocketAddr, card: Arc<Mutex<SoftCard>>) -> (String, tok
             let Message::Text(t) = msg else { continue };
             let v: Value = serde_json::from_str(t.as_str()).unwrap();
             let apdu = hex::decode(v["apdu"].as_str().unwrap()).unwrap();
+            heard.lock().unwrap().push(apdu[1]);
             let frame = json!({"type": "rapdu", "id": v["id"], "rapdu": hex::encode(answer(&card, &apdu))}).to_string();
             if ws.send(Message::Text(frame.into())).await.is_err() {
                 break;
@@ -427,6 +462,48 @@ async fn a_paid_top_up_loads_the_card_once() -> anyhow::Result<()> {
         let v = until_state(addr, &id, "loaded").await;
         assert_eq!(v["load_txid"], txid);
         assert_eq!(topups.get(&id).unwrap().short_id.as_deref(), Some(short_id.as_str()));
+    })
+    .await;
+    Ok(())
+}
+
+/// A paid top-up tapped with a card older than 4.0 (2.0, 2.1, 3.0): 409 `old_card` at the tap, and
+/// the card hears only the probe and the SELECT that refuse it. No load is made, the top-up stays
+/// `paid` and is still offered, and a 4.0 card's tap loads it. A balance tap of the old card gets
+/// the same refusal. The invoice was made before any card was read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_older_than_4_0_takes_no_top_up_and_the_top_up_stays_paid() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        let (s, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        assert_eq!(s, 200, "{created}");
+        let id = created["topup_id"].as_str().unwrap().to_owned();
+        ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
+        until_state(addr, &id, "paid").await;
+        for (which, old) in [("2.0", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+            let old = Arc::new(Mutex::new(old));
+            for path in [format!("/v1/topup/{id}/load"), "/v1/card/balance".to_owned()] {
+                let heard = Arc::new(Mutex::new(vec![]));
+                let (link, phone) = open_link_logged(addr, old.clone(), heard.clone()).await;
+                let (s, v) = call(addr, "POST", &path, Some(&link), None).await;
+                phone.abort();
+                assert_eq!((s, v["error"].as_str()), (409, Some("old_card")), "{which} {path}: {v}");
+                assert_eq!(v["detail"].as_str(), Some(fedimint_card_host_card::OLD_CARD_MESSAGE), "{which} {path}: {v}");
+                let heard = heard.lock().unwrap().clone();
+                assert!(heard.iter().all(|i| [0xCA, 0xA4].contains(i)), "{which} {path}: the card received INS {heard:02x?}");
+            }
+            assert!(registry.loads.lock().unwrap().is_empty(), "{which}: no load");
+            assert!(topups.get(&id).unwrap().state == TopupState::Paid, "{which}: the top-up stays paid");
+        }
+        let (s, w) = call(addr, "GET", "/v1/topups/waiting", None, None).await;
+        assert_eq!((s, w["topups"][0]["topup_id"].as_str()), (200, Some(id.as_str())), "still offered: {w}");
+        let (link, phone) = open_link(addr, card.clone()).await;
+        let (s, loaded) = call(addr, "POST", &format!("/v1/topup/{id}/load"), Some(&link), None).await;
+        assert_eq!((s, loaded["state"].as_str()), (200, Some("loaded")), "{loaded}");
+        tokio::time::timeout(Duration::from_secs(5), phone).await.expect("the till closes the link").unwrap();
+        assert_eq!(registry.loads.lock().unwrap().len(), 1);
+        assert_eq!(ln.invoices.load(Ordering::SeqCst), 1, "one invoice");
     })
     .await;
     Ok(())
@@ -726,7 +803,7 @@ async fn holder_on(card: &mut SoftCard, funds: u64) -> anyhow::Result<(Federatio
 /// 50,000 sats is twelve notes: a fresh 32-slot card takes them in one load.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_50k_holder_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     assert_eq!(card.slot_len(), 32);
     let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
     let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await?;
@@ -736,21 +813,21 @@ async fn a_50k_holder_load_fits_a_fresh_32_slot_card() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same load on a 2.0 card (eight slots, seven free) is refused before anything is built, as
-/// it always was.
+/// A load onto a card older than 4.0 (2.0 with eight slots, 2.1, 3.0) is refused with the
+/// old-card error before any command of the load reaches the card: nothing is paid and no slot
+/// holds a note.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_50k_holder_load_is_refused_on_an_eight_slot_card() -> anyhow::Result<()> {
-    let mut card = SoftCard::with_slots(8);
-    let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
-    let before = wallet.balance_msat().await?;
-    let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("twelve notes, seven slots");
-    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
-    assert_eq!((full.free, full.needed), (7, 12));
-    assert_eq!(wallet.balance_msat().await?, before, "nothing was paid");
-    // A load that fits still loads.
-    let r = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[(1 << 20) + (1 << 18) + (1 << 16)]).await?;
-    assert_eq!(r.notes.len(), 3);
-    assert!(r.notes.iter().all(|(s, _)| (1..8).contains(s)), "{:?}", r.notes);
+async fn a_holder_load_onto_a_card_older_than_4_0_is_refused() -> anyhow::Result<()> {
+    for (which, mut card) in [("2.0", SoftCard::with_slots(8)), ("2.1", SoftCard::new()), ("3.0", SoftCard::v3())] {
+        let (_fed, wallet, url, dir) = holder_on(&mut card, 60_000).await?;
+        let before = wallet.balance_msat().await?;
+        card.forget_received();
+        let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[1 << 20]).await.expect_err(which);
+        assert!(fedimint_card_host_card::is_old_card(&err), "{which}: {err:#}");
+        assert!(card.received_ins().is_empty(), "{which}: the card received {:02x?}", card.received_ins());
+        assert_eq!(wallet.balance_msat().await?, before, "{which}: nothing was paid");
+        assert!((0..card.slot_len()).all(|s| !matches!(card.slot_state(s), Some(SlotState::Note))), "{which}: no note on the card");
+    }
     Ok(())
 }
 
@@ -823,7 +900,7 @@ async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow:
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!((s, v["amount_msat"].as_u64()), (200, Some(100_352)), "three notes fit: {v}");
 
-        *registry.unkeyed.lock().unwrap() = vec![31];
+        *registry.unkeyed.lock().unwrap() = vec![23];
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["amount_msat"].as_u64().unwrap().count_ones(), 1, "one unkeyed slot, one note: {v}");
@@ -832,6 +909,29 @@ async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow:
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
         assert!(registry.key_posts.lock().unwrap().is_empty(), "making an invoice keys nothing");
+    })
+    .await;
+    Ok(())
+}
+
+/// Slots 24 and up take the change of offline sales only: a top-up counts none of them as room,
+/// free or unkeyed, so its invoice never promises more notes than the tap can write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let (addr, registry) = (f.addr, f.registry.clone());
+    with_actor(actor, async move {
+        let create = |body: Value| async move { call(addr, "POST", "/v1/topup", None, Some(body)).await };
+        registry.free.store(0, Ordering::SeqCst);
+        registry.keyed.lock().unwrap().extend([(24, "k24".to_owned()), (25, "k25".to_owned())]);
+        *registry.unkeyed.lock().unwrap() = (26..32).collect();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
+
+        *registry.unkeyed.lock().unwrap() = (23..32).filter(|s| *s != 24 && *s != 25).collect();
+        let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["amount_msat"].as_u64().unwrap().count_ones(), 1, "slot 23 alone is room: {v}");
     })
     .await;
     Ok(())
@@ -895,11 +995,11 @@ async fn holder_on_split(
 /// refused and says why; the till's loader keys slots 8-15 (5 short plus `KEY_AHEAD`) and loads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let err = Loader::new(&wallet, &url, dir.path())?.load(&mut card, &[50_000_000]).await.expect_err("seven keyed slots");
     let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
-    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 24));
+    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 16), "unkeyed 8-23; 24-31 hold no load");
     assert!(full.to_string().contains("a till keys them"), "{full}");
     assert!(registry.key_posts.lock().unwrap().is_empty());
 
@@ -915,11 +1015,30 @@ async fn a_50k_load_onto_a_split_card_needs_a_till_to_key_it() -> anyhow::Result
     Ok(())
 }
 
+/// A till's loader keys and loads only slots below 24: with 7 free slots, a keyed slot 24 and
+/// unkeyed 22, 23 and 25-31, a 12-note load is refused as full and nothing is keyed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_keys_and_loads_no_slot_from_24_up() -> anyhow::Result<()> {
+    let mut card = SoftCard::v4();
+    let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
+    let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
+    let k24 = card.gen_key(24)?.to_string();
+    registry.keyed.lock().unwrap().push((24, k24));
+    *registry.unkeyed.lock().unwrap() = (22..32).filter(|s| *s != 24).collect();
+    let err = Loader::new(&wallet, &url, dir.path())?.with_keyer(till).load(&mut card, &[50_000_000]).await.expect_err("7 + 2 < 12");
+    let full = err.downcast_ref::<CardFull>().unwrap_or_else(|| panic!("{err:#}"));
+    assert_eq!((full.free, full.needed, full.unkeyed), (7, 12, 2));
+    assert!(registry.key_posts.lock().unwrap().is_empty(), "nothing keyed");
+    assert!(registry.loads.lock().unwrap().is_empty(), "nothing loaded");
+    assert!(card.get_pub(22).is_err() && card.get_pub(25).is_err());
+    Ok(())
+}
+
 /// A load that cannot fit even with every unkeyed slot keyed keys nothing; one that fits the free
 /// slots keys nothing either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_till_keys_only_when_keying_makes_the_load_fit() -> anyhow::Result<()> {
-    let mut card = SoftCard::new();
+    let mut card = SoftCard::v4();
     let (_fed, wallet, registry, url, dir) = holder_on_split(&mut card, 60_000).await?;
     let till = OpsClient::new(&OpsConfig { url: url.clone(), token: "till_test".into() })?;
     *registry.unkeyed.lock().unwrap() = vec![8, 9];

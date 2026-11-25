@@ -71,7 +71,7 @@ these commands is still jCardSim (`applet/src/test/.../PinTest.java`). `SIGN` be
 `VERIFY_PIN` is `6984` on a card with no PIN set and `6A94` once one is, so the order above
 matters: the SCRIPT checks the PIN gate before the slot, and a `6985` where `6984` belongs
 means that ordering broke. A `VERIFY_PIN` is not sticky across a
-card reset or a SELECT of another AID. Three wrong PINs block the card for good (`6983`), so
+card reset or a SELECT of another AID. Each wrong PIN is counted and makes the next askings of `VERIFY_PIN` answer `6A98` until the wait is served, so
 check the PIN before spending tries on a card you care about.
 
 Then the Rust tests over PC/SC, from `host/`:
@@ -245,3 +245,51 @@ Installs: Fedimint 9.3–9.7 s, Cashu 17.9–18.7 s (three instances). Beside ea
 Fedimint signatures. A power cycle (card lifted and replaced) kept both applets' state: spent
 slots, PIN, notes, owner and record. Cashu's transient take is 8 B of COD and 16 B of COR at
 install, so RAM is not the constraint for the pair. The card was left blank on factory keys.
+
+## Applet 4.0 (2026-11-24)
+
+The 4.0 load file is **14,752 bytes**, 60 LOAD commands at 247 bytes, sha256
+`61b7abd9d0d1874565fb889b42003e6441bc0b4efcdf3fdacdba76eaf644046f` (3.0: 9,890 bytes, 41 blocks).
+`python3 tools/cardkit/make-assets.py --check` compares `tools/cardkit/gp/load-file.ts` with the
+build; a CAP built twice has the same load file. SELECT answers `04 00`.
+
+Measured on a blank J3R180 (ATR `3B8A80014A546178436F7265563150`, SCP02, default keys) on 2026-11-24,
+package `fedimint-card-4.0.cap`:
+
+| What | Measured |
+|---|---|
+| Load, then create | 10 s, 1 s |
+| Persistent memory free, blank card / after install | 119,508 B / 94,920 B (24,588 B used) |
+| Persistent memory free, 32 slots keyed and the PIN set | 70,000 B (transient 2,356 B) |
+| SIGN, with the card's own check of the signature (20) | median 667 ms (652 to 674) |
+| SET_NOTE with the registry's signature check (24) | median 136 ms |
+| GEN_KEY (32) | median 316 ms |
+| SET_PIN, first (the signer's set-up and the work keys) | 1,982 ms |
+| One asking of a PIN wait (31) | median 600 ms |
+| Signer bits in GET_STATE | `03`: chip RSA path, nonce key in RAM |
+| Command buffer | the note message, buffer bytes 134 to 240, is accepted |
+
+At 600 ms an asking, the longest wait (16,384 askings) is about 2.7 hours. Not measured on a chip:
+a torn tap, the hash-round form of an asking (this chip takes the signature path), and the J3R452.
+
+## Applet 4.0 with the sealed PIN (2026-11-24)
+
+With the sealed PIN (OFFLINE-PROTOCOL § 9) and the rule that GEN_KEY P2=1 never re-keys slot 0
+after SET_CERT, the load file is **17,228 bytes**, 70 LOAD commands at 247 bytes, sha256
+`1c37437e40693233bf8b562567c1e6026c719bab47775178e69b989481398211` (+2,476 bytes on the 14,752 above).
+Built from `card-4.0` with the jc305u4 kit as above; a second build gave the same load file, and
+`make-assets.py --check` passes. The CLEAR_ON_DESELECT arrays come to 773 bytes (756 before): the
+applet's `x` 144, `tmp` 65, `held` 4, `nonce` 16, SchnorrHW's `sc` 256 and `work` 288. The PIN key,
+the RSA cipher and the three field keys are not in that sum. None of the chip figures in the table
+above was measured on this build: install, free memory (with the cipher's RAM), the J3R452's command
+buffer (the applet refuses one under 240 bytes) and the sealed VERIFY's time are for the chip day.
+
+With the curve check's powers over p itself (the padded field keys, built and held to known
+answers at ATTEST_INIT; the p*p keys stay for a chip that does not hold to them), the load file is
+**18,376 bytes**, 75 LOAD commands at 247 bytes, sha256
+`924c80828599e690f4b69ad19748e4c5dd7f38deab49e7d497928458e9c26496` (+1,148 bytes on the 17,228
+above, which is the build the first chip day of the sealed PIN ran). Built the same way; a second
+build gave the same load file, and `make-assets.py --check` passes. The CLEAR_ON_DESELECT arrays
+are unchanged at 773 bytes. Added outside that sum: three 512-bit RSA private keys, persistent,
+built at the first ATTEST_INIT. jCardSim refuses the padded modulus, so every run on it takes the
+p*p path; which path a chip takes, its install and its free memory are for the chip day.

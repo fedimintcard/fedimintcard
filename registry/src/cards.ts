@@ -27,7 +27,7 @@ import {
   NotFound,
 } from './http';
 import {isChip, linkChip} from './managerKeys';
-import {adoptPendingAttestation} from './offline';
+import {adoptPendingAttestation, type CheckedNote} from './offline';
 import {checkNotes, putMintKeys} from './mint';
 
 /**
@@ -42,6 +42,22 @@ export const SLOT_COUNTS = [8, 32] as const;
  * the rest later, at a tap, through `addSlotKeys`.
  */
 export const MIN_REGISTERED_KEYS = 8;
+/**
+ * The first of the slots kept for the change of offline sales: 24 to 31 of a 32-slot card.
+ * A note under one of their keys is recorded from an offline sale's report. A holder's load
+ * and a charge recorded before the card signs keep to the slots below.
+ */
+export const CHANGE_SLOT_MIN = 24;
+
+/** The keys on record for the card's change slots, each as a note nonce (`02` and the key). */
+export function changeSlotNonces(sql: Sql, shortId: string): Set<string> {
+  return new Set(
+    sql
+      .exec('SELECT pubkey FROM card_slots WHERE short_id = ? AND slot >= ?', shortId, CHANGE_SLOT_MIN)
+      .toArray()
+      .map(r => '02' + String(r.pubkey)),
+  );
+}
 /** A transaction's consensus encoding, hex; a charge's is a few KB. */
 export const MAX_TX_HEX = 64 * 1024;
 
@@ -436,6 +452,8 @@ export interface NoteView {
   readonly status: 'live' | 'pending' | 'spent' | 'dead';
   readonly txid: string | null;
   readonly out_idx: number | null;
+  /** The registry's signature over the note (`noteMessage`), DER hex; null until it is signed. */
+  readonly reg_sig: string | null;
 }
 
 /**
@@ -474,9 +492,11 @@ export const STRANDED_GRACE_MS = 37 * 24 * 60 * 60 * 1000;
  * An offline report that counts as the registry having seen its transaction: any but the money
  * gate's refusal (`recordOfflineCharge`), whose conflicts are all `released`. The gate refuses a
  * transaction because a stranding of it was released, so its refusal leaves the transaction's
- * other held slots to their own release rather than holding them for good.
+ * other held slots to their own release rather than holding them for good. A refusal for a change
+ * nonce that already carries a note (`change_used`) is not either: the registry never took the
+ * transaction, and the inputs the card spent under it come back through a stranding.
  */
-const SEEN_REPORT = `json_extract(o.detail, '$.conflicts[0].status') IS NOT 'released'`;
+const SEEN_REPORT = `IFNULL(json_extract(o.detail, '$.conflicts[0].status'), '') NOT IN ('released', 'change_used')`;
 
 /**
  * Whether the registry has seen the transaction: a charge on record, or an offline report of it
@@ -561,7 +581,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
   // a till keeps off those slots but does not try to collect them (`loads.ts`).
   const notes: NoteView[] = sql
     .exec(
-      `SELECT slot, amount_msat, nonce, signature, status, out_idx,
+      `SELECT slot, amount_msat, nonce, signature, status, out_idx, reg_sig,
          CASE WHEN held THEN NULL ELSE txid END AS txid,
          CASE WHEN held THEN NULL ELSE blinding_key END AS blinding_key
        FROM (SELECT *, status = 'pending' AND txid IN (SELECT txid FROM holder_loads) AS held FROM notes)
@@ -581,6 +601,7 @@ export function cardState(sql: Sql, shortId: string, now: number) {
       status: String(r.status) as NoteView['status'],
       txid: r.txid === null ? null : String(r.txid),
       out_idx: r.out_idx === null ? null : Number(r.out_idx),
+      reg_sig: r.reg_sig === null ? null : String(r.reg_sig),
     }));
   const open = sql
     .exec(
@@ -728,6 +749,11 @@ export function parseIntent(r: Record<string, unknown>, slots: number) {
  * stale version, a second open charge, an input that is not a live note of
  * this card, or change into an occupied, unknown or held slot is refused (a
  * held slot is a stranded CHANGE slot, docs/OFFLINE-PROTOCOL.md § 7).
+ *
+ * A charge's change keeps below the change slots (`CHANGE_SLOT_MIN`), by slot and by key: it is
+ * refused here, before the card signs. A load (no inputs) is told to the registry after the
+ * federation issued its notes, so one that names a change slot or its key is recorded all the
+ * same, with the log line `ALERT load_in_change_slot`.
  */
 export function recordIntent(
   storage: DurableObjectStorage,
@@ -781,6 +807,13 @@ export function recordIntent(
       ),
     );
     const strandedChange = heldChangeSlots(sql, shortId);
+    const changeNonces = changeSlotNonces(sql, shortId);
+    const kept = intent.body.change.filter(c => c.slot >= CHANGE_SLOT_MIN || changeNonces.has(c.nonce));
+    if (kept.length > 0 && intent.body.inputs.length > 0) {
+      throw new Conflict(
+        `change in slot ${kept[0]!.slot} of card ${shortId} names a slot or key kept for offline change (slots ${CHANGE_SLOT_MIN} and up); use a lower slot`,
+      );
+    }
     for (const c of intent.body.change) {
       if (!slots.has(c.slot)) {
         throw new Conflict(`card ${shortId} has no key in slot ${c.slot} yet; key it first (POST /slots/${c.slot}/key)`);
@@ -832,6 +865,10 @@ export function recordIntent(
         c.out_idx,
       );
     }
+    if (kept.length > 0) {
+      const where = kept.map(c => c.slot).sort((a, b) => a - b).join(',');
+      console.warn(`ALERT load_in_change_slot card=${shortId} till=${tillId} txid=${intent.txid} slots=${where}`);
+    }
     return {version: bump(sql, shortId), replayed: false};
   });
 }
@@ -843,19 +880,29 @@ export function recordIntent(
  * offline one held them pending under its txid, and they are live again).
  * Any till of the operator may record it, so a charge whose till died is
  * finished by the next one to see the card. A repeat of the recorded outcome
- * answers 200; a different one is a 409.
+ * answers 200, and so does one that sends only some of its change (a till asks
+ * again with the notes still waiting for a signature: `repeatMatches`); any
+ * other is a 409.
  *
  * `release` names, for a charge newly recorded rejected, every slot the card
  * may have left SPENT (its inputs') or CHANGE (its change's) for it: the
  * caller signs a release for each (`recordReleases`). A load (no inputs) never
  * touched the card's slot states and has none.
+ *
+ * `sign` names, for an accepted charge, the change notes that passed the federation check and
+ * are now live; on a repeat, those of them it sent still unsigned. The caller signs them (`signNotes`).
  */
 export function recordOutcome(
   storage: DurableObjectStorage,
   shortId: string,
   r: Record<string, unknown>,
   now: number,
-): {version: number; replayed: boolean; release: {txid: string; slots: number[]} | null} {
+): {
+  version: number;
+  replayed: boolean;
+  release: {txid: string; slots: number[]} | null;
+  sign: CheckedNote[];
+} {
   if (!isHex(r.txid, 32)) {
     throw new BadRequest('txid must be 32 bytes, hex');
   }
@@ -885,13 +932,16 @@ export function recordOutcome(
       throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
     }
     if (tx.status !== 'open') {
-      if (tx.outcome === outcome) {
-        return {version: versionOf(sql, shortId), replayed: true, release: null};
+      if (repeatMatches(tx.outcome, r.accepted as boolean, signatures)) {
+        // Only the notes the repeat sent, all of them this charge's change.
+        const sign = r.accepted ? unsignedLive(sql, shortId, [...signatures.keys()]) : [];
+        return {version: versionOf(sql, shortId), replayed: true, release: null, sign};
       }
       throw new Conflict(`charge ${String(r.txid)} is already resolved differently`);
     }
     const body = JSON.parse(tx.body) as {inputs: string[]; change: ChangeOut[]};
     let release: {txid: string; slots: number[]} | null = null;
+    let sign: CheckedNote[] = [];
     if (r.accepted) {
       if (
         signatures.size !== body.change.length ||
@@ -906,6 +956,8 @@ export function recordOutcome(
         shortId,
         body.change.map(c => ({nonce: c.nonce, amount_msat: c.amount_msat, signature: signatures.get(c.nonce)!})),
       );
+      // Checked: the caller signs these once this transaction has made them live (`signNotes`).
+      sign = body.change.map(c => ({slot: c.slot, nonce: c.nonce, amount_msat: c.amount_msat, signature: signatures.get(c.nonce)!}));
       for (const nonce of body.inputs) {
         sql.exec(
           "UPDATE notes SET status = 'spent' WHERE short_id = ? AND nonce = ?",
@@ -956,15 +1008,60 @@ export function recordOutcome(
       now,
       r.txid,
     );
-    return {version: bump(sql, shortId), replayed: false, release};
+    return {version: bump(sql, shortId), replayed: false, release, sign};
   });
+}
+
+/**
+ * Whether a repeat matches the outcome recorded (`recorded`, as `recordOutcome` and
+ * `recordLoadOutcome` store it): the same `accepted`, and every sent `{nonce, signature}` among the
+ * recorded ones. Fewer is a match: a till repeats with only the notes still waiting for the
+ * registry's signature, which leaves out its spent ones and any already signed (an offline
+ * charge's inputs carry its txid too, so "every note with the txid" is never the recorded set).
+ * A note or a signature not recorded is no match.
+ */
+export function repeatMatches(recorded: string | null, accepted: boolean, sent: ReadonlyMap<string, string>): boolean {
+  if (recorded === null) {
+    return false;
+  }
+  const r = JSON.parse(recorded) as {accepted: boolean; change?: [string, string][]; notes?: [string, string][]};
+  if (r.accepted !== accepted) {
+    return false;
+  }
+  const pairs = new Map(r.change ?? r.notes ?? []);
+  return [...sent].every(([nonce, signature]) => pairs.get(nonce) === signature);
+}
+
+/**
+ * Of `nonces`, the card's live notes that still have no registry signature (a signing that failed,
+ * or a key that was unset), checked again against the federation's keys, for a repeated outcome to
+ * sign. Nothing when the check fails: the repeat answers as before and signs nothing.
+ */
+export function unsignedLive(sql: Sql, shortId: string, nonces: readonly string[]): CheckedNote[] {
+  const wanted = new Set(nonces);
+  const rows = sql
+    .exec(
+      `SELECT slot, nonce, amount_msat, signature FROM notes
+       WHERE short_id = ? AND status = 'live' AND reg_sig IS NULL AND signature IS NOT NULL`,
+      shortId,
+    )
+    .toArray()
+    .map(r => ({slot: Number(r.slot), nonce: String(r.nonce), amount_msat: Number(r.amount_msat), signature: String(r.signature)}))
+    .filter(n => wanted.has(n.nonce));
+  try {
+    checkNotes(sql, shortId, rows);
+  } catch {
+    return [];
+  }
+  return rows;
 }
 
 /**
  * The signed bytes of an open charge, posted after the card signs and before
  * the till sends them. A till sends only after this succeeds; a charge
  * resolved meanwhile (another till recorded it rejected) is a 409, and the
- * till must not send. Repeating the same bytes answers 200.
+ * till must not send. Repeating the same bytes answers 200 while the charge is
+ * open or accepted; a rejected charge is a 409 whatever bytes are posted.
  */
 export function recordSubmitted(
   storage: DurableObjectStorage,
@@ -990,6 +1087,11 @@ export function recordSubmitted(
       .toArray()[0] as {short_id: string; status: string; signed_hex: string | null} | undefined;
     if (!tx || tx.short_id !== shortId) {
       throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
+    }
+    // A rejected charge is not accepted for sending, whatever bytes are posted: its notes may
+    // already pay another charge, and its slots are released.
+    if (tx.status === 'rejected') {
+      throw new Conflict(`charge ${String(r.txid)} is recorded rejected; do not send it`);
     }
     if (tx.signed_hex !== null) {
       if (tx.signed_hex === r.tx_hex) {
@@ -1063,8 +1165,9 @@ export function listFederationNames(
 }
 
 /**
- * A slot's new key after the till renewed it (GEN_KEY with P2 = 01): only a
- * slot that backs no live or pending note, and only from the key on record.
+ * A slot's new key after the till renewed it (GEN_KEY with P2 = 01): only from
+ * the key on record, and only for a slot that backs no live or pending note but
+ * notes under the new key itself (`notesFitKey`).
  */
 export function renewSlot(
   storage: DurableObjectStorage,
@@ -1103,7 +1206,7 @@ export function renewSlot(
         slot,
       )
       .toArray();
-    if (held.length > 0) {
+    if (held.length > 0 && !notesFitKey(sql, shortId, slot, String(r.pubkey))) {
       throw new Conflict(`slot ${slot} of card ${shortId} still backs a note`);
     }
     sql.exec(
@@ -1117,6 +1220,23 @@ export function renewSlot(
     sql.exec('DELETE FROM strandings WHERE short_id = ? AND slot = ?', shortId, slot);
     return {version: bump(sql, shortId)};
   });
+}
+
+/**
+ * Whether `pubkey` may become `slot`'s key although the slot holds notes, or notes were recorded
+ * under that key: the card made the key and a till put change under it before the registry heard
+ * of it (a key another till made, a post of it that failed, a renewal still queued). It may when
+ * every note ever recorded under the key is live or pending on that slot, and every live or pending
+ * note on that slot is under the key. The note is then signed under it like any other (`signNotes`).
+ */
+function notesFitKey(sql: Sql, shortId: string, slot: number, pubkey: string): boolean {
+  const nonce = '02' + pubkey;
+  const under = sql.exec('SELECT slot, status FROM notes WHERE short_id = ? AND nonce = ?', shortId, nonce).toArray();
+  if (under.some(n => Number(n.slot) !== slot || (n.status !== 'live' && n.status !== 'pending'))) return false;
+  return sql
+    .exec("SELECT nonce FROM notes WHERE short_id = ? AND slot = ? AND status IN ('live', 'pending')", shortId, slot)
+    .toArray()
+    .every(n => String(n.nonce) === nonce);
 }
 
 /** Most keys one `addSlotKeys` call takes: every slot of the largest card. */
@@ -1163,8 +1283,8 @@ export function parseSlotKeys(r: Record<string, unknown>, pathSlot?: number): {s
  * - A slot must be below the card's slot count (400).
  * - A slot that already holds the same key is a replay and changes nothing; one
  *   holding another key is 409: replacing a key is a renewal (`renewSlot`).
- * - A key already on another slot of the card, or one a note was ever recorded
- *   under, is 409.
+ * - A key already on another slot of the card is 409, and so is one a note was
+ *   ever recorded under, unless those notes are the slot's own (`notesFitKey`).
  * - Slot 0's key must end in the short id (409), though registration always keys it.
  *
  * No `version` is asked: filling an empty slot cannot clash with a charge,
@@ -1203,7 +1323,10 @@ export function addSlotKeys(
       if (onCard.has(k.pubkey)) {
         throw new Conflict(`that key is already on another slot of card ${shortId}`);
       }
-      if (sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, '02' + k.pubkey).toArray().length > 0) {
+      if (
+        sql.exec('SELECT 1 FROM notes WHERE short_id = ? AND nonce = ?', shortId, '02' + k.pubkey).toArray().length > 0 &&
+        !notesFitKey(sql, shortId, k.slot, k.pubkey)
+      ) {
         throw new Conflict(`a note was already recorded under the key for slot ${k.slot}`);
       }
       if (k.slot === 0 && k.pubkey.slice(-8) !== shortId) {

@@ -25,7 +25,10 @@
  *   (the proof) → the completion into the outbox → ops
  *
  * The holder's PIN is the consent: ops cannot see a load made around it. A
- * wrong PIN stops with the tries left and is never retried here. A blocked
+ * wrong PIN stops with the tries left (applet 4.0: the wrong tries in a row,
+ * the card never blocks) and is never retried here. A wait applet 4.0 owes
+ * before the try is served within the tap, the same VERIFY_PIN sent again while
+ * the card answers 6A98; a tap lifted during it is tapped again. A blocked
  * card (or one whose PIN was never set) can be reset only when ops shows it
  * empty and the operator has confirmed a second warning.
  *
@@ -68,7 +71,7 @@ import {
   INS_GET_PUB,
   INS_VERIFY_PIN,
   keyApdu,
-  pinApdu,
+  oldCardResetPinApdu,
   pinStatusApdu,
   selectApdu,
   SW_BLOCKED,
@@ -78,6 +81,8 @@ import {
   SW_WRONG_LENGTH,
   type PinStatus,
 } from './cardSetup';
+import {isCurrentApplet, readPinStatus, verifyPinHeld} from './cardSetup';
+import {TrustedCard} from './sealedPin';
 import {chipAndKeys, forget} from './installTap';
 import type {CardOps, ResetCheck, ResetCompletion, ResetRecorded} from './ops';
 import {shortIdOf} from './store';
@@ -293,6 +298,8 @@ export type Identified =
       readonly pin: PinStatus;
       /** The chip's CPLC id, which ops finds a card by when it has no row for the short id. */
       readonly chip: string;
+      /** The card's SELECT says it is older than 4.0: its reset sends the holder's PIN unprotected. */
+      readonly older: boolean;
     }
   | {
       readonly ok: false;
@@ -317,15 +324,9 @@ export async function identifyCard(tx: Transceiver): Promise<Identified> {
   if (slot0.sw !== SW_OK || slot0.body.length !== 32) {
     return {ok: false, why: 'refused', sw: slot0.sw};
   }
-  const status = await exchange(tx, pinStatusApdu());
-  const pin: PinStatus | null =
-    status.sw === SW_WRONG_LENGTH
-      ? 'set'
-      : status.sw === SW_BLOCKED
-      ? 'blocked'
-      : status.sw === SW_PIN_NOT_SET
-      ? 'notSet'
-      : null;
+  // Applet 4.0: GET_STATE's PIN byte; an older applet: the three-byte probe.
+  const status = await readPinStatus(tx, selected);
+  const pin: PinStatus | null = status.pin;
   if (pin === null) {
     return {ok: false, why: 'refused', sw: status.sw};
   }
@@ -338,7 +339,7 @@ export async function identifyCard(tx: Transceiver): Promise<Identified> {
     }
     throw e;
   }
-  return {ok: true, shortId: shortIdOf(slot0.body), pin, chip};
+  return {ok: true, shortId: shortIdOf(slot0.body), pin, chip, older: !isCurrentApplet(selected)};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -350,7 +351,10 @@ export type ResetStop =
   | {readonly kind: 'differentCard'; readonly reason: string}
   /** Ops refuses: value or work in flight, already reset, or not this operator's. */
   | {readonly kind: 'notResettable'; readonly reasons: readonly string[]}
+  /** An applet before 4.0: the tries left. */
   | {readonly kind: 'wrongPin'; readonly triesLeft: number}
+  /** Applet 4.0, which never blocks: the wrong tries in a row (15 or more reads 15). */
+  | {readonly kind: 'wrongTries'; readonly inARow: number}
   /** The PIN is blocked or was never set: the second warning, then a confirmed tap. */
   | {readonly kind: 'pinBlocked'; readonly pin: 'blocked' | 'notSet'}
   /** The card's PIN works, so the holder must type it. */
@@ -401,6 +405,12 @@ export interface ResetTapOptions {
   readonly expectedChip?: string | null;
   /** The holder's PIN, typed for this tap only; null on the blocked path. */
   readonly holderPin: string | null;
+  /**
+   * The registry's certificate key (`GET /registry/cert-key`, 65 bytes), to
+   * check a 4.0 card before the holder's PIN is sealed to it. Null: a 4.0
+   * card's PIN cannot be sent, and the reset stops before it.
+   */
+  readonly certKey: readonly number[] | null;
   /** The operator confirmed the second warning for a blocked (or unset) PIN. */
   readonly blockedConfirmed: boolean;
   readonly ops: Pick<CardOps, 'managerKeys' | 'resetCheck'>;
@@ -409,6 +419,8 @@ export interface ResetTapOptions {
   readonly now: () => number;
   readonly onPhase?: (phase: ResetPhase) => void;
   readonly onEvent?: (event: RunEvent) => void;
+  /** Applet 4.0: a wait the card owes before the holder's PIN is tried is being served; about how many seconds are left. */
+  readonly onPinWait?: (seconds: number) => void;
 }
 
 const stop = (s: ResetStop, resumable = false): ResetTapResult => ({
@@ -427,18 +439,20 @@ const CARD_PHASES: Record<string, ResetPhase> = {
 };
 
 /** What the card holds now: a keyed applet with its short id, an unkeyed one, or none. */
+type Selected = {readonly body: readonly number[]; readonly sw: number | null};
+
 async function readCard(
   tx: Transceiver,
-): Promise<{kind: 'keyed'; id: string} | {kind: 'unkeyed' | 'none'}> {
+): Promise<{kind: 'keyed'; id: string; selected: Selected} | {kind: 'unkeyed' | 'none'; selected: Selected}> {
   const selected = await exchange(tx, selectApdu());
   if (selected.sw !== SW_OK) {
-    return {kind: 'none'};
+    return {kind: 'none', selected};
   }
   const slot0 = await exchange(tx, keyApdu(INS_GET_PUB, 0));
   if (slot0.sw === SW_OK && slot0.body.length === 32) {
-    return {kind: 'keyed', id: shortIdOf(slot0.body)};
+    return {kind: 'keyed', id: shortIdOf(slot0.body), selected};
   }
-  return {kind: slot0.sw === SW_CONDITIONS ? 'unkeyed' : 'none'};
+  return {kind: slot0.sw === SW_CONDITIONS ? 'unkeyed' : 'none', selected};
 }
 
 /**
@@ -448,11 +462,15 @@ async function readCard(
 async function consent(
   tx: Transceiver,
   options: ResetTapOptions,
+  selected: Selected,
 ): Promise<ResetStop | null> {
+  if (isCurrentApplet(selected)) {
+    return consentCurrent(tx, options, selected);
+  }
   if (options.holderPin !== null) {
     const verified = await exchange(
       tx,
-      pinApdu(INS_VERIFY_PIN, options.holderPin),
+      oldCardResetPinApdu(INS_VERIFY_PIN, options.holderPin),
     );
     if (verified.sw === SW_OK) {
       return null;
@@ -485,6 +503,43 @@ async function consent(
         };
   }
   return options.blockedConfirmed ? null : {kind: 'pinBlocked', pin};
+}
+
+/**
+ * Applet 4.0's consent: GET_STATE's PIN byte and the wait owed, then the
+ * holder's PIN with that wait served in this selection (`verifyPinHeld`).
+ * The card never blocks: a wrong PIN stops with the wrong tries in a row.
+ */
+async function consentCurrent(
+  tx: Transceiver,
+  options: ResetTapOptions,
+  selected: Selected,
+): Promise<ResetStop | null> {
+  const read = await readPinStatus(tx, selected);
+  if (read.pin === null || read.state === undefined) {
+    return {kind: 'refused', sw: read.sw, reason: 'the PIN state could not be read'};
+  }
+  if (read.pin === 'notSet') {
+    return options.blockedConfirmed ? null : {kind: 'pinBlocked', pin: 'notSet'};
+  }
+  if (options.holderPin === null) {
+    return {kind: 'pinRequired'};
+  }
+  const trusted = await TrustedCard.check(apdu => exchange(tx, apdu), options.certKey);
+  if (!trusted.ok) {
+    return {kind: 'refused', sw: trusted.sw, reason: trusted.reason};
+  }
+  const verified = await verifyPinHeld(tx, trusted.trust, options.holderPin, read.state.owed, options.onPinWait);
+  if (verified.refused !== undefined) {
+    return {kind: 'refused', sw: verified.sw, reason: verified.refused};
+  }
+  if (verified.sw === SW_OK) {
+    return null;
+  }
+  if (verified.sw !== null && verified.sw >> 4 === 0x63c) {
+    return {kind: 'wrongTries', inARow: verified.sw & 0x0f};
+  }
+  return {kind: 'refused', sw: verified.sw, reason: 'VERIFY_PIN was refused'};
 }
 
 /**
@@ -557,7 +612,7 @@ export async function resetTap(
     if (check.needs_holder_pin || expectedChip === null) {
       options.onPhase?.('consent');
       // The applet is still selected from `readCard`: the PIN is proved for the card just read.
-      const refused = await consent(tx, options);
+      const refused = await consent(tx, options, card.selected);
       if (refused) {
         return stop(refused);
       }

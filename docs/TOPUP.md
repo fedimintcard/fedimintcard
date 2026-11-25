@@ -32,20 +32,36 @@ The gateway's receive fee, if any, is the till's cost (zero on the gateways seen
 ## Room on the card
 
 A top-up started from the balance screen names the card (`short_id`, from `/v1/card/balance`).
-The till asks the registry for that card's free slots and rounds to at most that many notes (still
+The till asks the registry for that card's free slots, which on a 32-slot card are slots 0 to 23
+only (slots 24 to 31 take the change of offline sales, `OFFLINE-PROTOCOL.md` § 8), and rounds
+to at most that many notes (still
 at most 3); a card with no free slot is refused with 409 `card_full` before any invoice exists, so
 nobody pays for a load that cannot land. (Without `short_id` the till assumes 3 and the load itself
 answers `card_full`, keeping the top-up `paid`.)
 
+## Cards older than 4.0
+
+A till takes no card older than 4.0 for a top-up, as for a sale: its tap answers 409 `old_card`
+(the old-card message in `detail`) before any command of the load reaches the card, and nothing
+goes on it. The invoice is made before any card is read, so a top-up created from the keypad can be
+paid before the card is tapped; it then stays `paid`, the eCash waits in the till's wallet,
+`GET /v1/topups/waiting` lists it, and it loads at the tap of a 4.x card. A top-up started from the
+balance screen never reaches an invoice for an older card: that card's balance tap is refused with
+the same 409 `old_card`, so the screen has no `short_id` to start from.
+
+A top-up that was paid and meets a card with no room at its tap stays `paid`: the eCash waits in
+the till's wallet, `GET /v1/topups/waiting` lists it, and it loads at a later tap, once the holder
+has spent from the card (`POST /v1/topup/{id}/load`). It is not refunded.
+
 A 32-slot card may be registered with keys for slots 0–7 only (split keying). Its unkeyed slots
-count as free here, because the load's tap keys the ones it needs: the shortfall plus
+below 24 count as free here, because the load's tap keys the ones it needs (never one from 24 up): the shortfall plus
 `ops::KEY_AHEAD` (3), each a `GEN_KEY` of about 318 ms, recorded in ops in one post before the
 load. If the registry does not take the keys, the load answers 502 `ops_unreachable`, nothing is
 sent and the top-up stays `paid`. The next tap records the keys the card already made.
 
 Charges keep room too: when the cheapest charge plan would leave fewer than 3 free slots
 (`plan::ROOM_AFTER_CHARGE`), the planner spends more of the card's notes so the change comes back
-as fewer, larger notes. Unkeyed slots count as free here as well. A charge whose change needs
+as fewer, larger notes. Unkeyed slots below 24 count as free here as well. A charge whose change needs
 more keyed slots than the card has keys them at that tap, the same way a load does. Each extra input is one more card signature (about a second), and only on
 a nearly full card.
 
@@ -70,7 +86,8 @@ load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
 - Invoices expire after 10 minutes.
 - `load` on `waiting` answers 409 `not_paid`; on `expired` 410 `expired`; on `failed` 409
   `topup_failed` (with the `detail`); on `loaded` it answers the load again without touching the
-  card. Card errors answer as `/v1/charge` does (`card_lost`, `card_link_gone`, …); a card without
+  card. Card errors answer as `/v1/charge` does (`card_lost`, `card_link_gone`, …); a card older
+  than 4.0 answers 409 `old_card` and the top-up stays `paid` (above); a card without
   enough free slots answers 409 `card_full` and the top-up stays `paid` (spend on the card, then tap
   again). A load is tagged with its top-up id in the loader's journal (`holder_loads.json`), and
   every load first finishes the loads an earlier run left: one cut short after it was sent is

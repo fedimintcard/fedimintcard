@@ -96,30 +96,27 @@ final class PosFlowTests: XCTestCase {
     func testWrongPinGoesBackToPadSameAmountSameRef() {
         let f = flow()
         let (id, ref, _) = chargeToSigning(f)
-        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .wrongPin, detail: "wrong PIN; 2 tries left before the card blocks", httpStatus: 403)))
-        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: true, triesLeft: 2, returnTo: nil))
+        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .wrongPin, detail: "wrong PIN", httpStatus: 403, wrongTries: 2, waitS: 2)))
+        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: true, wrongTries: 2, returnTo: nil))
         XCTAssertFalse(f.holdsPin)
         let (_, ref2, pin2) = chargeToSigning(f, pin: "4321")
         XCTAssertEqual(ref2, ref, "a wrong-PIN retry resends the same client_ref")
         XCTAssertEqual(pin2?.withBytes { String(decoding: $0, as: UTF8.self) }, "4321")
     }
 
-    func testWrongPinWithNoTriesLeftIsBlocked() {
+    func testManyWrongTriesStillAskForThePinAgain() {
         let f = flow()
-        let (id, _, _) = chargeToSigning(f)
-        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .wrongPin, detail: "wrong PIN; 0 tries left", httpStatus: 403)))
-        guard case .error(let e) = f.state else { return XCTFail() }
-        XCTAssertEqual(e.kind, .pinBlocked); XCTAssertFalse(e.kind.retryable)
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .wrongPin, detail: "wrong PIN", httpStatus: 403, wrongTries: 15, waitS: 12288)))
+        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: true, wrongTries: 15, returnTo: nil))
     }
 
-    func testPinBlocked() {
+    func testPinWaitIsRetryableNeverADeadEnd() {
         let f = flow()
         let (id, _, _) = chargeToSigning(f)
-        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .pinBlocked, detail: "", httpStatus: 423)))
+        f.dispatch(.chargeDone(chargeId: id, result: .declined(code: .pinWait, detail: "", httpStatus: 423, waitS: 7)))
         guard case .error(let e) = f.state else { return XCTFail() }
-        XCTAssertEqual(e.kind, .pinBlocked); XCTAssertNil(e.unresolvedRef)
-        f.dispatch(.retryPressed)
-        guard case .error = f.state else { return XCTFail("blocked must not offer the PIN pad again") }
+        XCTAssertEqual(e.kind, .pinWait); XCTAssertEqual(e.waitS, 7); XCTAssertNil(e.unresolvedRef); XCTAssertTrue(e.kind.retryable)
         f.dispatch(.backPressed)
         XCTAssertEqual(f.state, .entering)
     }
@@ -189,6 +186,47 @@ final class PosFlowTests: XCTestCase {
         XCTAssertNil(f.unresolvedRef)
     }
 
+    /// A lost reply leaves the sale unresolved. An old card tapped on Try again says nothing about
+    /// the first card's attempt: the sale stays unresolved, with no Back, until it is found or abandoned.
+    func testAnOldCardOnTheRetryOfALostReplyLeavesTheSaleUnresolved() {
+        let f = flow()
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .failed(.timeout)))
+        f.dispatch(.retryPressed)
+        let (id2, _, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id2, result: declined(.oldCard)))
+        guard case .error(let e) = f.state else { return XCTFail("\(f.state)") }
+        XCTAssertEqual(e.kind, .oldCard); XCTAssertEqual(e.unresolvedRef, ref); XCTAssertEqual(f.unresolvedRef, ref)
+        f.dispatch(.backPressed)
+        guard case .error = f.state else { return XCTFail("no Back while the sale is unresolved") }
+        f.dispatch(.abandonPressed); XCTAssertEqual(f.state, .entering)
+    }
+
+    private func saysNothingWasSpent(_ f: PosFlow) -> Bool {
+        guard case .error(let e) = f.state else { return false }
+        let (t, d) = errorCopy(e.kind, e.detail, suggestedMsat: e.suggestedMsat, unresolved: e.unresolvedRef != nil, waitS: e.waitS)
+        return "\(t)\n\(d)".range(of: "nothing was spent", options: .caseInsensitive) != nil
+    }
+
+    /// Every answer the till can give, and every kind's copy: only a refused signature says nothing was spent.
+    func testOnlyARefusedSignatureSaysNothingWasSpent() {
+        var answers: [(ChargeResult, Bool)] = ChargeErrorCode.allCases.map { (declined($0), $0 == .signCheckFailed) }
+        let failures: [TillError] = [.notPaired, .unreachable, .timeout, .interrupted, .unauthorized, .badResponse("x")]
+        answers += failures.map { (ChargeResult.failed($0), false) }
+        for (r, says) in answers {
+            let f = flow()
+            let (id, _, _) = chargeToSigning(f)
+            f.dispatch(.chargeDone(chargeId: id, result: r))
+            XCTAssertEqual(saysNothingWasSpent(f), says, "\(r)")
+        }
+        for k in ErrorKind.allCases {
+            for u in [false, true] {
+                let (t, d) = errorCopy(k, "d", suggestedMsat: 1000, unresolved: u, waitS: 3, wrongTries: 3)
+                XCTAssertEqual("\(t)\n\(d)".range(of: "nothing was spent", options: .caseInsensitive) != nil, k == .signCheckFailed, "\(k)")
+            }
+        }
+    }
+
     func testAbandonUnresolved() {
         let f = flow()
         let (id, _, _) = chargeToSigning(f)
@@ -211,7 +249,7 @@ final class PosFlowTests: XCTestCase {
         f.dispatch(.backPressed)
         XCTAssertEqual(f.state, .error(e), "\(answer): no Back while the outcome is unknown", file: file, line: line)
         f.dispatch(.retryPressed)
-        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: false, triesLeft: nil, returnTo: e),
+        XCTAssertEqual(f.state, .enteringPin(priceMsat: 5000, clientRef: ref, wrongPin: false, wrongTries: nil, returnTo: e),
                        "\(answer)", file: file, line: line)
         let (id2, ref2, _) = chargeToSigning(f)
         XCTAssertEqual(ref2, ref, "\(answer): Try again sends the same client_ref", file: file, line: line)

@@ -623,7 +623,7 @@ describe('provision: the Fedimint card', () => {
     );
   });
 
-  it('fails verify when SELECT lands on the opener: 9000 with no data is not 03 00', async () => {
+  it('fails verify when SELECT lands on the opener: 9000 with no data is not 04 00', async () => {
     const card = new FakeCard();
     const tx: Transceiver = async apdu => {
       // a card whose card applet was not instantiated: the whole-AID SELECT
@@ -636,8 +636,31 @@ describe('provision: the Fedimint card', () => {
     const r = await provision(tx, PLAN, options());
     assert.equal(r.ok, false);
     assert.equal(r.phase, 'verify');
-    assert.match(r.reason ?? '', /answered .*not 0300/);
+    assert.match(r.reason ?? '', /answered .*not 0400/);
   });
+
+  for (const old of [
+    [0x02, 0x00],
+    [0x03, 0x00],
+  ]) {
+    it(`fails verify when the card applet answers an older version, ${toHex(old)}`, async () => {
+      const card = new FakeCard();
+      const tx: Transceiver = async apdu => {
+        // an older applet still answering the whole-AID SELECT after the run
+        if (apdu[1] === 0xa4 && toHex(apdu.slice(5, 5 + apdu[4])) === CARD) {
+          return [...old, 0x90, 0x00];
+        }
+        return card.transceive(apdu);
+      };
+      const r = await provision(tx, PLAN, options());
+      assert.equal(r.ok, false);
+      assert.equal(r.phase, 'verify');
+      assert.match(
+        r.reason ?? '',
+        new RegExp(`answered ${toHex(old)}, not 0400`),
+      );
+    });
+  }
 });
 
 describe('provision: the fake card', () => {
@@ -672,7 +695,7 @@ describe('provision: the fake card', () => {
     // and the card applet, whose AID also begins with the package's, still answers as itself
     assert.deepEqual(
       await card.transceive(selectAid(CARD_AID)),
-      [0x03, 0x00, 0x90, 0x00],
+      [0x04, 0x00, 0x90, 0x00],
     );
   });
 

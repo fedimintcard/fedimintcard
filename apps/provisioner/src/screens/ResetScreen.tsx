@@ -34,9 +34,10 @@ import {
   type ResetPhase,
   type ResetStop,
 } from '../reset';
+import {fromHex} from '../cardkit';
 import {secureRandomBytes} from '../secureRandom';
 import {CANCELLED, createCardSession} from '../session';
-import {RESET} from '../strings';
+import {RESET, WAIT} from '../strings';
 import {formatShortId, useStore} from '../store';
 import {
   Card,
@@ -60,6 +61,8 @@ type Step =
       shortId: string;
       chip: string;
       pin: PinStatus;
+      /** Older than 4.0: the holder's PIN goes to it unprotected. */
+      older: boolean;
       check: ResetCheck;
     }
   | {kind: 'done'; oldId: string; recorded: boolean; stranded: number};
@@ -69,6 +72,8 @@ function stopLine(stop: ResetStop): string {
   switch (stop.kind) {
     case 'wrongPin':
       return RESET.stops.wrongPin(stop.triesLeft);
+    case 'wrongTries':
+      return RESET.stops.wrongTries(stop.inARow);
     case 'notResettable':
       return `${RESET.stops.notResettable}: ${stop.reasons.join('; ')}`;
     case 'differentCard':
@@ -173,6 +178,7 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
         shortId: id.shortId,
         chip: id.chip,
         pin: id.pin,
+        older: id.older,
         check,
       });
     } catch (e) {
@@ -208,7 +214,18 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
     setBusy(true);
     setProblem(null);
     setLine(RESET.resetting);
+    // Set once a wait the card owes before the holder's PIN is being served.
+    let waited = false;
     try {
+      // The registry's certificate key, fetched before the tap: a 4.0 card is
+      // checked under it before the holder's PIN is sealed to it. Without it
+      // the reset stops before the PIN, and the card is untouched.
+      let certKey: number[] | null = null;
+      try {
+        certKey = fromHex(await ops.registryCertKey());
+      } catch {
+        certKey = null;
+      }
       const {value: r} = await card.run(RESET.resetting, tx =>
         resetTap(tx, {
           operatorId,
@@ -222,12 +239,17 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
             step.pin === 'set'
               ? holderPin.value
               : null,
+          certKey,
           blockedConfirmed,
           ops,
           journal,
           random: secureRandomBytes,
           now: Date.now,
           onPhase: (p: ResetPhase) => setLine(RESET.phase[p]),
+          onPinWait: (seconds: number) => {
+            waited = true;
+            setLine(WAIT.hold(seconds));
+          },
         }),
       );
       holderPin.wipe();
@@ -253,7 +275,9 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
       holderPin.wipe();
       setProblem(
         e instanceof Error && e.message !== CANCELLED
-          ? `${RESET.stops.pulled}. ${RESET.untouched}`
+          ? waited
+            ? WAIT.lifted
+            : `${RESET.stops.pulled}. ${RESET.untouched}`
           : RESET.noCard,
       );
       await reload();
@@ -438,6 +462,13 @@ export function ResetScreen({onBack}: {onBack: () => void}) {
                   style={[s.input, local.pinInput]}
                   testID="reset-holder-pin"
                 />
+                {review.older ? (
+                  <Text
+                    style={[local.body, {color: t.danger}]}
+                    testID="reset-older-pin">
+                    {RESET.olderCardPin}
+                  </Text>
+                ) : null}
               </View>
             ) : (
               <View

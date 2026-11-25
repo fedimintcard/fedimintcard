@@ -40,11 +40,12 @@ import {ScrollView, StyleSheet, Text, View} from 'react-native';
 import {CardFigure} from '../CardFigure';
 
 import {fromHex, toHex} from '../cardkit';
+import {checkHeader} from '../header';
 import {holdsPlace, installTap} from '../installTap';
 import {generatePin, useAttemptedPin, useBatchPin, usePinReveal} from '../pin';
 import {secureRandomBytes} from '../secureRandom';
 import {phaseMessage, setCardMessage, withCard} from '../session';
-import {CALM, LOOP, STATE, registryHeldWhat} from '../strings';
+import {CALM, LOOP, STATE, registryHeldWhat, stopLines, WAIT} from '../strings';
 import {
   useLoop,
   type CardPhase,
@@ -112,7 +113,7 @@ function foldedPhase(phase: string): CardPhase {
  * from a dead connection.
  */
 function stopWhat(stop: CardStop, reason: string | undefined): string {
-  return stop === 'noManagerKeys' && reason ? `${CALM[stop]} Ops said: ${reason}` : CALM[stop];
+  return stopLines(stop, reason).what;
 }
 
 export function LoopScreen({
@@ -140,7 +141,13 @@ export function LoopScreen({
   const [line, setLine] = useState<string | null>(null);
   const [stopShown, setStopShown] = useState<CardStop | null>(null);
   // A tap that kept the batch's place for the same card: what to say about it.
-  const [held, setHeld] = useState<{kind?: CardStop; reason?: string; registry?: boolean} | null>(null);
+  const [held, setHeld] = useState<{
+    kind?: CardStop;
+    reason?: string;
+    registry?: boolean;
+    anchor?: boolean;
+    wait?: boolean;
+  } | null>(null);
   const attempted = useAttemptedPin();
   const cancelled = useRef(false);
   // The registry's certificate key (SET_REGISTRY_KEY), fetched once before a
@@ -186,6 +193,23 @@ export function LoopScreen({
       setBusy(false);
     }
     const certKey = registryKey.current;
+    // The anchor: the latest block header, fetched and checked before the
+    // tap, per card. Without one no card is touched: set-up needs the internet.
+    let anchor: number[];
+    setBusy(true);
+    setLine(LOOP.fetchingHeader);
+    try {
+      anchor = fromHex(await ops.chainTip());
+      const checked = checkHeader(anchor, Date.now());
+      if (!checked.ok) {
+        throw new Error(checked.reason);
+      }
+    } catch (e) {
+      setLine(LOOP.headerFailed(e instanceof Error ? e.message : String(e)));
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
     // The previous card's PIN leaves the screen as this card's tap starts.
     reveal.wipe();
     setShownPin(null);
@@ -195,6 +219,8 @@ export function LoopScreen({
     // on the phone, and a stop is that card's outcome. Before it, nothing was
     // touched.
     let touched = false;
+    // Set once a wait the card owes before its PIN try is being served.
+    let waited = false;
     setWaiting(true);
     setBusy(true);
     setStopShown(null);
@@ -242,10 +268,15 @@ export function LoopScreen({
             offline: {
               limitMsat: dailyLimitOf(config) * 1000,
               registryKey: certKey,
+              header: anchor,
               certify: async (attestPub, slot0) =>
                 fromHex(await ops.attestCard(shortIdOf(slot0), toHex([...attestPub]), toHex([...slot0]))),
             },
             attemptedPin: chip => attempted.forChip(chip),
+            onPinWait: seconds => {
+              waited = true;
+              setLine(WAIT.hold(seconds));
+            },
             onChip: chip => {
               chipSeen = chip;
             },
@@ -282,7 +313,7 @@ export function LoopScreen({
               if (step === 'setPin') {
                 pinSent = true;
               }
-              if (step === 'keys' || step === 'attest') {
+              if (step === 'keys' || step === 'attest' || step === 'anchor') {
                 enter('keySetup', LOOP.phaseKeys);
               } else if (step === 'setPin') {
                 enter('setPin', LOOP.phasePin);
@@ -303,7 +334,7 @@ export function LoopScreen({
         setHeld(
           installed.ok
             ? setup && !setup.ok
-              ? {reason: setup.reason, registry: setup.registry === true}
+              ? {reason: setup.reason, registry: setup.registry === true, anchor: setup.step === 'anchor'}
               : {}
             : {kind: installed.kind, reason: installed.reason},
         );
@@ -331,7 +362,8 @@ export function LoopScreen({
         dropAttempt();
         const keysDone = setup !== null && setup.step !== 'select' &&
           setup.step !== 'keys' &&
-          setup.step !== 'attest';
+          setup.step !== 'attest' &&
+          setup.step !== 'anchor';
         actions.recordCard({
           ok: false,
           phase: keysDone ? 'setPin' : 'keySetup',
@@ -387,7 +419,7 @@ export function LoopScreen({
         // the card is ours and finishes on its next tap, so the batch keeps
         // its place and nothing is recorded.
         keepAttempt();
-        setHeld({});
+        setHeld(waited ? {wait: true} : {});
         setLine(LOOP.sameCard);
         return;
       }
@@ -573,9 +605,8 @@ export function LoopScreen({
             title={LOOP.heldTitle}
             name={LOOP.heldName}
             what={
-              held.kind === 'noManagerKeys'
-                ? stopWhat(held.kind, held.reason)
-                : registryHeldWhat(held) ?? LOOP.heldWhat
+              registryHeldWhat(held) ??
+              (held.kind === 'noManagerKeys' ? stopWhat(held.kind, held.reason) : LOOP.heldWhat)
             }
             now={LOOP.heldNow}
             testID="loop-held"
@@ -585,7 +616,7 @@ export function LoopScreen({
             title={LOOP.cardStopped}
             name={STOP_NAMES[stopShown]}
             what={stopWhat(stopShown, records[records.length - 1]?.reason)}
-            now={STATE[stopShown]}
+            now={stopLines(stopShown, records[records.length - 1]?.reason).now}
             testID="loop-stop"
           />
         ) : null}

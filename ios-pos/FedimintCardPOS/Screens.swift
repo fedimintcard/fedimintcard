@@ -131,7 +131,7 @@ struct PinScreen: View {
     @EnvironmentObject var pos: PosController
     let priceMsat: Int64
     let wrongPin: Bool
-    let triesLeft: Int?
+    let wrongTries: Int?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -139,7 +139,7 @@ struct PinScreen: View {
             Text("Card holder: enter your PIN").font(Fig.extraBold(28)).kerning(-0.5).foregroundStyle(Palette.ink)
                 .multilineTextAlignment(.center).padding(.top, 8)
             if wrongPin {
-                Text(wrongPinCopy(triesLeft)).font(Fig.regular(16)).foregroundStyle(Palette.bad).padding(.top, 8)
+                Text(wrongPinCopy(wrongTries)).font(Fig.regular(16)).foregroundStyle(Palette.bad).padding(.top, 8)
             }
             PadStack(onKey: { pos.pinKey($0) }) {
                 Text(String(repeating: "●", count: pos.pinLength))

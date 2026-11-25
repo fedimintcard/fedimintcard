@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use fedimint_card_host_card::{Card, SoftCard, open_pin_session};
+use fedimint_card_host_card::{Card, SoftCard};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
 use fedimint_card_sidecar::pay::{self, PayConfig, PayCrash, PayLightning, PayState, PayStore, Pays};
 use fedimint_card_sidecar::sales::SalesStore;
@@ -289,17 +289,44 @@ async fn fx_with(cfg: PayConfig, crash: Option<CrashPoint>) -> anyhow::Result<Fx
     Ok(Fx { _fed: fed, dir, handle, actor, ln, opens, signs, card, wallet })
 }
 
+/// A 4.0 soft card as the Setup app leaves one before its PIN: the test registry's key and the
+/// anchor. Its first `softkit::open_test_session` sets the PIN, sealed.
+fn card4() -> SoftCard {
+    let mut c = SoftCard::v4();
+    fedimint_card_host_card::softkit::ready_for_pin(&mut c).unwrap();
+    c
+}
+
+/// Top the card up, then stand in for the registry this till does not have, as `pos_link.rs`
+/// does: sign each new note under the test registry key the card was set up with, and write the
+/// notes to the card.
+async fn load(cw: &mut CardWallet, amounts: &[u64]) -> anyhow::Result<()> {
+    cw.topup(amounts).await?;
+    let key = fedimint_card_host_card::v3::test_registry_key();
+    for n in cw.store.state.notes.iter_mut().filter(|n| n.reg_sig.is_none() && n.signature.is_some()) {
+        let x: [u8; 32] = hex::decode(&n.nonce[2..])?.try_into().unwrap();
+        let sig48 = fedimint_card_sidecar::glue::sig48_of(n.signature.as_deref().unwrap()).unwrap();
+        n.reg_sig = Some(hex::encode(fedimint_card_host_card::v3::sign_note(&key, &x, n.amount_msat, &sig48)));
+    }
+    cw.store.save()?;
+    cw.sync_card_notes();
+    Ok(())
+}
+
 type Till = (tempfile::TempDir, TillHandle, Actor, Rc<Cell<u32>>, Rc<Cell<u32>>, Rc<RefCell<SoftCard>>);
 
 async fn till_on(wallet: Wallet, cfg: PayConfig, ln: Arc<dyn PayLightning>, crash: Option<CrashPoint>) -> anyhow::Result<Till> {
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(card4()));
     let signs = Rc::new(Cell::new(0));
-    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone(), signs.clone())));
+    let mut cw = CardWallet::new(wallet, store, Box::new(Shared(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     cw.card_setup(false)?;
-    open_pin_session(cw.card.as_mut())?;
-    cw.topup(&[1 << 17, 1 << 16]).await?;
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
+    // More notes than a 2.x card needed: with no registry to sign them, change and refunds stay
+    // waiting on a 4.0 card, so each later charge spends a note loaded here.
+    load(&mut cw, &[1 << 17, 1 << 16, 1 << 15, 1 << 14, 1 << 14, 1 << 14]).await?;
     cw.crash_point = crash;
     let sales = SalesStore::open(dir.path().join("sales.json"))?;
     let opens = Rc::new(Cell::new(0));
@@ -379,7 +406,8 @@ impl Fx {
     /// (the federation, the card and the wallet side are the same), no crash point.
     async fn reopen(&mut self, cfg: PayConfig) -> anyhow::Result<()> {
         let store = StateStore::open(self.dir.path().join("card_state.json"))?;
-        let cw = CardWallet::new(self.wallet.clone(), store, Box::new(Shared(self.card.clone(), self.signs.clone())));
+        let cw = CardWallet::new(self.wallet.clone(), store, Box::new(Shared(self.card.clone(), self.signs.clone())))
+            .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
         let sales = SalesStore::open(self.dir.path().join("sales.json"))?;
         let (o, s, c) = (self.opens.clone(), self.signs.clone(), self.card.clone());
         let opener = Box::new(move || {
@@ -884,6 +912,28 @@ async fn a_crash_after_each_step_neither_loses_nor_doubles_money() -> anyhow::Re
     Ok(())
 }
 
+/// KNOWN GAP, pinned on purpose (tracked, not fixed): a
+/// charge the card signed but the till never sent (a till off ops, crashed before the submit) is
+/// settled `not_charged` and its input note goes back to live, while the 4.0 card holds that slot
+/// as spent. The next charge that picks the note fails `internal`, and the value stays stranded on
+/// the card (nobody else can take it). The fix is to submit the stored signed transaction instead
+/// of abandoning it, but only where ops cannot have refused it: an on-ops till that saved the bytes
+/// and crashed before ops had them must not send them, as the registry records that intent
+/// rejected and releases its slots. When the fix lands, this test changes with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn known_gap_a_charge_signed_but_never_sent_strands_its_note_on_a_4_0_card() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), Some(CrashPoint::BeforeSubmit)).await?;
+    let (s, b) = f.post(req(&hour_invoice(10_000), "unresolved")).await;
+    assert_eq!((s, b["state"].as_str()), (202, Some("charging")), "{b}");
+    let id = b["pay_id"].as_u64().unwrap();
+    f.sweep().await;
+    assert_eq!(f.state_of(id), PayState::NotCharged);
+    let (s, b) = f.post(req(&hour_invoice(10_000), "next")).await;
+    assert_eq!((s, b["error"].as_str()), (500, Some("internal")), "{b}");
+    assert!(b["detail"].as_str().is_some_and(|d| d.contains("already signed another transaction")), "{b}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_charge_whose_answer_was_lost_pays_once_and_an_unresolved_one_never_pays() -> anyhow::Result<()> {
     // The federation took the charge, then the charge errored: its sale is recorded, so the pay
@@ -918,6 +968,10 @@ async fn a_charge_whose_answer_was_lost_pays_once_and_an_unresolved_one_never_pa
 
     // Recorded not_charged, as a refusal read before the charge showed up would leave it: a
     // repeat finds the charge unresolved and settles it without the card, never charging again.
+    // A till of its own: on a 4.0 card the slot the first charge signed with signs nothing else,
+    // and this part is about the record, not that slot.
+    drop(f);
+    let mut f = fx_with(cfg(), Some(CrashPoint::BeforeSubmit)).await?;
     let again = hour_invoice(10_000);
     let (s, b) = f.post(req(&again, "repeat")).await;
     assert_eq!((s, b["state"].as_str()), (202, Some("charging")), "{b}");
@@ -1068,7 +1122,7 @@ async fn a_card_that_cannot_say_which_card_it_is_is_not_charged_for_a_pay() -> a
     let card_id = fedimint_card_sidecar::ops::short_id_of(&f.card.borrow_mut().get_pub(0)?);
     let bolt11 = hour_invoice(10_000);
     // Slot 0 answers no key: the till cannot tell which card would pay, so it charges nothing.
-    let real = std::mem::replace(&mut *f.card.borrow_mut(), SoftCard::new());
+    let real = std::mem::replace(&mut *f.card.borrow_mut(), card4());
     let signed = f.signs.get();
     let (s, b) = f.post(req(&bolt11, "who")).await;
     assert_ne!(s, 200, "{b}");

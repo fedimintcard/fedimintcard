@@ -285,6 +285,11 @@ export const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (short_id, slot, txid)
   );
   `,
+  // v14 (DESIGN § 6): the registry's signature over each live note, which a till writes to the card
+  // with the note. Null until signed (a note made live before this, or while the key was unset).
+  `
+  ALTER TABLE notes ADD COLUMN reg_sig TEXT;
+  `,
 ];
 
 /** Runs every migration not yet applied, each with its version bump. */

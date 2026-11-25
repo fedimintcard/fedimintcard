@@ -21,6 +21,13 @@
       <version>${junit.version}</version>
       <scope>test</scope>
     </dependency>
+    <!-- the tear harness (TearLoader): the applet's bytecode rewritten so that every persistent write can be torn -->
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm</artifactId>
+      <version>9.6</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
   <build>
     <plugins>

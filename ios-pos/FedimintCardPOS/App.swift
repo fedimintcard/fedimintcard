@@ -67,7 +67,7 @@ struct RootView: View {
     @ViewBuilder private var other: some View {
         switch pos.state {
         case .entering: AmountScreen(openSettings: { showSettings = true })
-        case .enteringPin(let price, _, let wrong, let left, _): PinScreen(priceMsat: price, wrongPin: wrong, triesLeft: left)
+        case .enteringPin(let price, _, let wrong, let left, _): PinScreen(priceMsat: price, wrongPin: wrong, wrongTries: left)
         case .waitingForCard, .signing, .balanceWaiting, .balanceReading, .topUpWaitingForCard, .topUpLoading: EmptyView()
         case .topUpEntering: TopUpScreen(creating: false)
         case .topUpCreating: TopUpScreen(creating: true)

@@ -14,6 +14,7 @@
  * Routes, by who may call them:
  *
  *   anyone     GET  /health
+ *              GET  /v1/chain/tip                the latest Bitcoin header, from two sources (chain.ts)
  *              GET  /registry/cert-key           the certificate key's public point (65 bytes hex)
  *              POST /auth/operator/session       {name, password} -> {operator_id, token}
  *              POST /till-claims                 {name} -> {claim_id, code, poll_secret, expires_at}
@@ -38,6 +39,7 @@
  *              GET  /registry/backup-status      last backup; 503 if none or stale
  *              POST /registry/cards/:id/attestation  {attest_pub} -> {cert}: the card's certificate
  *              GET  /registry/offline-reports?short_id=  offline charges reported, newest first
+ *              GET  /registry/change-slot-check  live or pending notes and open holder loads on slots 24 to 31
  *   operator   GET  /cards/:short_id/state
  *   or till    POST /cards/:short_id/slots/:n/key   {pubkey}: the first key of a never-keyed slot
  *              POST /cards/:short_id/slot-keys      {keys: [{slot, pubkey}]}: the same, several at once
@@ -93,6 +95,7 @@ import {
   renewSlot,
 } from './cards';
 import {backupStatus, nextBackupAt, runBackup} from './backup';
+import {CHAIN_TIP_TTL_MS, chainTip, newTipCache, webFetch} from './chain';
 import {approveClaim, pollClaim, readClaim, startClaim} from './claims';
 import {migrate} from './db';
 import {
@@ -105,16 +108,18 @@ import {
   ServiceUnavailable,
   Unprocessable,
 } from './http';
-import {expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
+import {changeSlotCheck, expireLoads, freeSlots, recordLoad, recordLoadOutcome, spendBudget} from './loads';
 import {
   certPublicKey,
   chargeRejected,
   listOfflineReports,
+  noteSigs,
   recordAttestation,
   recordOfflineCharge,
   recordReleases,
   recordStranded,
   reportRefused,
+  signNotes,
 } from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
 import {completeReset, resetCheck, resetOwner} from './reset';
@@ -375,6 +380,9 @@ export class Registry {
       if (id !== null && !isShortId(id)) return fail(400, 'short_id must be 8 lower-case hex characters');
       return json(200, {ok: true, reports: listOfflineReports(sql, op, id)});
     }
+    if (path === '/registry/change-slot-check' && method === 'GET') {
+      return json(200, {ok: true, ...changeSlotCheck(sql, op)});
+    }
     if (path === '/registry/backup-status' && method === 'GET') {
       // 503 until a backup succeeded, and when the last success is over 26 hours old.
       const status = backupStatus(sql, Boolean(this.env.BACKUPS && this.env.BACKUP_RECIPIENT), now);
@@ -470,9 +478,13 @@ export class Registry {
       return json(200, {ok: true, ...recordSubmitted(storage, shortId, body)});
     }
     if (rest === '/outcome' && method === 'POST') {
-      const {release, ...done} = recordOutcome(storage, shortId, body, now);
+      const {release, sign, ...done} = recordOutcome(storage, shortId, body, now);
       if (release) {
         await recordReleases(storage, this.certSecret(), shortId, release.txid, release.slots, chargeRejected(release.txid), now);
+      }
+      if (body.accepted === true) {
+        await signNotes(storage, this.certSecret(), shortId, sign);
+        return json(200, {ok: true, ...done, notes: noteSigs(storage.sql, shortId, String(body.txid))});
       }
       return json(200, {ok: true, ...done});
     }
@@ -532,7 +544,12 @@ export class Registry {
     if (what === 'load') {
       return json(200, {ok: true, ...recordLoad(storage, shortId, body, now)});
     }
-    return json(200, {ok: true, ...recordLoadOutcome(storage, shortId, body, now)});
+    const {sign, ...done} = recordLoadOutcome(storage, shortId, body, now);
+    if (body.accepted === false) {
+      return json(200, {ok: true, ...done});
+    }
+    await signNotes(storage, this.certSecret(), shortId, sign);
+    return json(200, {ok: true, ...done, notes: noteSigs(storage.sql, shortId, String(body.txid))});
   }
 
   /**
@@ -600,11 +617,23 @@ export class Registry {
   }
 }
 
+/** The Worker isolate's tip cache (`chain.ts`). */
+const TIP_CACHE = newTipCache();
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/health') {
       return json(200, {ok: true});
+    }
+    if (url.pathname === '/v1/chain/tip') {
+      // Answered by the Worker, not the object: it holds no state and must not queue behind writes.
+      if (request.method !== 'GET') return fail(405, 'use GET');
+      const tip = await chainTip(TIP_CACHE, webFetch, Date.now());
+      if (!tip.ok) return fail(tip.status, tip.reason);
+      const res = json(200, tip);
+      res.headers.set('cache-control', `public, max-age=${CHAIN_TIP_TTL_MS / 1000}`);
+      return res;
     }
     if (url.pathname.startsWith('/test/') || url.pathname.startsWith('/internal/')) {
       return fail(404, 'no such route');

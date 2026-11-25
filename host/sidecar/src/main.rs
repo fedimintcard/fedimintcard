@@ -285,7 +285,10 @@ async fn card_wallet(cli: &Cli) -> Result<CardWallet> {
     let wallet = Wallet::open(&cli.data_dir).await?;
     let store = StateStore::open(state_path(&cli.data_dir))?;
     let card = open_from_env().context("opening the card")?;
-    let mut cw = CardWallet::new(wallet, store, card);
+    // The registry's certificate key the till keeps: a 4.x card's PIN is sealed only to a card
+    // checked under it, and none is sent without it.
+    let cert_key = fedimint_card_sidecar::claim::read_cert_key(&cli.data_dir).ok().flatten();
+    let mut cw = CardWallet::new(wallet, store, card).with_cert_key(cert_key);
     // The applet drops its PIN session on every SELECT (`select()` calls `pin.reset()`), and
     // `open_from_env` has just done the one SELECT this connection will make, so verifying here
     // covers every later command on it. A card whose PIN nobody named answers `CARD_PIN` or the

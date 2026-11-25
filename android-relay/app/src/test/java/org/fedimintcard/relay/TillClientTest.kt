@@ -85,8 +85,8 @@ class TillClientTest {
      */
     @Test fun everyDocumentedChargeCodeIsKnown() {
         val documented = listOf(
-            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "no_exact_plan",
-            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_blocked", "card_changed", "unknown_card",
+            "bad_request", "conflict", "busy", "no_card", "relay_unreachable", "card_error", "insufficient", "notes_held", "no_exact_plan",
+            "declined", "undecided", "recovering", "pin_required", "wrong_pin", "pin_wait", "old_card", "sign_check_failed", "card_changed", "unknown_card",
             "ops_unreachable", "ops_refused", "ops_not_connected", "card_limit", "offline_unsupported_card", "offline_not_ready",
             "card_not_genuine", "offline_no_change_room", "offline_cap_reached", "offline_note_invalid", "offline_kit_expired",
             "offline_pool_exhausted", "internal",

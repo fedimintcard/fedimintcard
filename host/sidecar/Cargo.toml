@@ -51,6 +51,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [dev-dependencies]
+# The P1 00 PIN of cards older than 4.0, for tests only: never a [dependencies] entry.
+fedimint-card-old-card-pin = { path = "../old-card-pin" }
 # The lnv2 test gateway (tests/wallet_pay.rs) implements a fedimint trait declared with async-trait.
 async-trait = "0.1"
 fedimint-card-host-card = { path = "../card", features = ["softkit"] }

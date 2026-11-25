@@ -34,6 +34,7 @@
  * it acted and the reply was lost; every APDU after that throws until
  * `reset()` (the next tap).
  */
+import {SealedPinCard, testCertify} from './sealedCard';
 import {
   CARD_AID,
   FACTORY_KEYS,
@@ -101,6 +102,27 @@ export interface AppletState {
   cert?: number[] | null;
   /** The registry's certificate key (65 bytes) once SET_REGISTRY_KEY took it. */
   registryKey?: number[] | null;
+  /** Applet 4.0: the clock (seconds), set by SET_HEADER. */
+  now?: number;
+  /** Applet 4.0: this selection anchored the clock (cleared by SELECT and a new tap). */
+  anchored?: boolean;
+  /** Applet 4.0: wrong PIN tries in a row, and askings owed before the next try. */
+  wrong?: number;
+  owed?: number;
+  /** Applet 4.0: askings of the current stretch, in this selection (held[H_ASKED]; SELECT and any other INS clear it). */
+  asked?: number;
+  /** Applet 4.0: the PIN key, the attestation key, the binding and the live nonce. */
+  sealed?: SealedPinCard;
+}
+
+/** A card an earlier tap took through SET_CERT: its keys made at ATTEST_INIT and the test registry's certificate. */
+function certified(applet: AppletState): AppletState {
+  applet.sealed = new SealedPinCard('fake card');
+  applet.attest = applet.sealed.attestInit();
+  if (applet.slots[0]) {
+    applet.cert = testCertify(applet.attest, applet.slots[0]);
+  }
+  return applet;
 }
 
 interface Instance {
@@ -215,7 +237,7 @@ export class FakeGpCard {
     for (let slot = 0; slot < keyed; slot++) {
       applet.slots[slot] = this.newKey(slot);
     }
-    this.instances.set(CARD, {pkg: PKG, module: CARD, applet});
+    this.instances.set(CARD, {pkg: PKG, module: CARD, applet: pin === null ? applet : certified(applet)});
     return this;
   }
 
@@ -237,7 +259,7 @@ export class FakeGpCard {
     for (let slot = 0; slot < this.appletSlots; slot++) {
       applet.slots.push(slot < keyed ? this.newKey(slot) : null);
     }
-    this.instances.set(CARD, {pkg: PKG, module: CARD, applet});
+    this.instances.set(CARD, {pkg: PKG, module: CARD, applet: certified(applet)});
     return this;
   }
 
@@ -274,6 +296,9 @@ export class FakeGpCard {
     this.loading = null;
     if (this.applet) {
       this.applet.verified = false;
+      this.applet.anchored = false;
+      this.applet.asked = 0;
+      this.applet.sealed?.forget();
     }
   }
 
@@ -322,6 +347,9 @@ export class FakeGpCard {
     const aid = h(apdu.slice(5, 5 + apdu[4]));
     if (this.applet) {
       this.applet.verified = false; // CLEAR_ON_DESELECT
+      this.applet.anchored = false;
+      this.applet.asked = 0;
+      this.applet.sealed?.forget();
     }
     this.session = null;
     this.handshake = null;
@@ -336,9 +364,7 @@ export class FakeGpCard {
     if (aid !== CARD) {
       return ok();
     }
-    // The applet's version: 3.0 has 32 slots, 2.0 had 8.
-    const slots = this.instances.get(aid)?.applet?.slots.length ?? 8;
-    return ok(slots === 32 ? [0x03, 0x00] : [0x02, 0x00]);
+    return ok(this.appletVersion);
   }
 
   private derive(seq: number[]) {
@@ -675,6 +701,26 @@ export class FakeGpCard {
     return ok([this.kvn]);
   }
 
+  /**
+   * What the Fedimint applet answers SELECT with: 4.0, the load file the app
+   * carries. A test sets 03 00 or 02 00 for a card set up by an older build,
+   * which then answers as that applet did (6983 for a blocked PIN, no anchor).
+   */
+  appletVersion: number[] = [0x04, 0x00];
+
+  /** Applet 4.0: the askings that did a wait's work (6A98 within a stretch), over the card's life. */
+  askings = 0;
+
+  /** Applet 4.0: the INS of every sealed PIN command that reached its opening. */
+  sealedSent: number[] = [];
+
+  /** Applet 4.0's SET_HEADER answers 6A93 (too little work, or weak) while this is set. */
+  refuseHeaders = false;
+
+  private get v4(): boolean {
+    return this.appletVersion[0] >= 4;
+  }
+
   /** FedimintCardApplet's slot and PIN commands, as the applet answers them. */
   private cardApplet(a: AppletState, apdu: number[]): number[] {
     const [cla, ins, p1] = apdu;
@@ -683,6 +729,10 @@ export class FakeGpCard {
     }
     const lc = apdu.length > 5 ? apdu[4] : 0;
     const data = apdu.slice(5, 5 + lc);
+    // The askings of a stretch count only while VERIFY_PIN follows VERIFY_PIN (FedimintCardApplet.process).
+    if (ins !== 0x40) {
+      a.asked = 0;
+    }
     // A slot past the last answers 6B00 before anything else (FedimintCardApplet.slot).
     if ((ins === 0x10 || ins === 0x11) && p1 >= a.slots.length) {
       return sw(0x6b00);
@@ -712,7 +762,48 @@ export class FakeGpCard {
         a.slots[p1] = this.newKey(p1);
         return ok(a.slots[p1]!);
       }
+      case 0x44:
+        // 4.0 GET_NONCE (OFFLINE-PROTOCOL § 9): no PIN needed, the certificate is.
+        if (!this.v4) {
+          return sw(0x6d00);
+        }
+        if (p1 !== 0x01 || apdu[3] !== 0x00) {
+          return sw(0x6b00);
+        }
+        if (!a.cert || !a.sealed) {
+          return sw(0x6985);
+        }
+        return ok(a.sealed.getNonce()!);
       case 0x41:
+        if (this.v4) {
+          // 4.0, sealed only, in § 9's order: a PIN once; only in a selection
+          // that anchored the clock; only with the registry key; only under a
+          // live nonce. The selection that set it has the PIN.
+          if (p1 !== 0x01 || apdu[3] !== 0x00) {
+            return sw(0x6b00);
+          }
+          if (a.pin !== null) {
+            return sw(0x6985);
+          }
+          if (lc !== 90) {
+            return sw(0x6700);
+          }
+          if (!a.anchored) {
+            return sw(0x6a96);
+          }
+          if (!a.registryKey || !a.sealed?.live) {
+            return sw(0x6985);
+          }
+          this.sealedSent.push(ins);
+          const opened = a.sealed.open(0x41, data);
+          const pins = opened && opened.length === 9 ? SealedPinCard.pins(opened) : null;
+          if (!pins) {
+            return sw(0x6700);
+          }
+          a.pin = pins[0];
+          a.verified = true;
+          return ok();
+        }
         if (a.blocked) {
           return sw(0x6983);
         }
@@ -722,6 +813,61 @@ export class FakeGpCard {
         a.pin = String.fromCharCode(...data);
         return ok();
       case 0x40: {
+        if (this.v4) {
+          // 4.0, in FedimintCardApplet.verifyPin's order: no PIN, the
+          // length, P1/P2, then the wait owed (waitOwed), then the try. No
+          // blocked state. A wait is served in stretches of at most 16
+          // askings within one selection, each answered 6A98; the asking
+          // after a stretch writes what is left, and answers 6A98 again or
+          // goes on to the try. A wrong try owes 2^(wrong tries before it)
+          // askings and answers 63CX with the wrong tries in a row.
+          // Sealed only (§ 9): no PIN, P1/P2, the length, a live nonce, the
+          // wait; then the opening spends the nonce, and an envelope that does
+          // not open is a wrong try like any other.
+          if (a.pin === null) {
+            return sw(0x6984);
+          }
+          if (p1 !== 0x01 || apdu[3] !== 0) {
+            return sw(0x6b00);
+          }
+          if (lc !== 90) {
+            return sw(0x6700);
+          }
+          if (!a.sealed?.live) {
+            return sw(0x6985);
+          }
+          const owed = a.owed ?? 0;
+          if (owed > 0) {
+            const stretch = Math.min(owed, 16);
+            const asked = (a.asked ?? 0) + 1;
+            if (asked <= stretch) {
+              a.asked = asked;
+              this.askings += 1;
+              return sw(0x6a98);
+            }
+            a.asked = 0;
+            a.owed = owed - stretch;
+            if (a.owed !== 0) {
+              return sw(0x6a98);
+            }
+          }
+          this.sealedSent.push(ins);
+          const opened = a.sealed.open(0x40, data);
+          const pins = opened === null ? null : SealedPinCard.pins(opened);
+          if (opened !== null && pins === null) {
+            return sw(0x6700);
+          }
+          if (pins !== null && pins[0] === a.pin) {
+            a.wrong = 0;
+            a.verified = true;
+            return ok();
+          }
+          a.verified = false;
+          const w = a.wrong ?? 0;
+          a.owed = w < 14 ? 1 << w : 0x4000;
+          a.wrong = Math.min(15, w + 1);
+          return sw(0x63c0 | a.wrong);
+        }
         if (a.blocked) {
           return sw(0x6983);
         }
@@ -744,7 +890,7 @@ export class FakeGpCard {
         return sw(0x63c0 | a.tries);
       }
       default:
-        return a.slots.length === 32 ? this.offlineApplet(a, ins, data) : sw(0x6d00);
+        return this.v4 || a.slots.length === 32 ? this.offlineApplet(a, ins, data) : sw(0x6d00);
     }
   }
 
@@ -754,7 +900,7 @@ export class FakeGpCard {
    * GET_STATE's length: 59 from the applet that has SET_REGISTRY_KEY, 58 before
    * it (an older 3.0 build, which answers INS 34 with `6D 00`).
    */
-  stateLength: 58 | 59 = 59;
+  stateLength: 58 | 59 | 65 = 65;
 
   /** Applet 3.0's GET_STATE, SET_LIMIT, ATTEST_INIT, SET_CERT and GET_CERT (FedimintCardApplet). */
   private offlineApplet(a: AppletState, ins: number, data: number[]): number[] {
@@ -762,10 +908,21 @@ export class FakeGpCard {
     switch (ins) {
       case 0x16: {
         const out: number[] = a.slots.map(s => (s ? 1 : 0));
-        out.push(0, 0, 0, 0, 0, 0, 0, 0, ...(a.limit ?? new Array(8).fill(0)));
+        if (this.v4) {
+          while (out.length < 32) {
+            out.push(0);
+          }
+        }
+        const t = a.now ?? 0;
+        out.push((t >>> 24) & 0xff, (t >>> 16) & 0xff, (t >>> 8) & 0xff, t & 0xff, 0, 0, 0, 0);
+        out.push(...(a.limit ?? new Array(8).fill(0)));
         out.push(...new Array(8).fill(0), a.cert ? a.cert.length : 0, a.attest ? 1 : 0);
-        if (this.stateLength === 59) {
+        if (this.stateLength >= 59) {
           out.push(a.registryKey ? 1 : 0);
+        }
+        if (this.stateLength === 65) {
+          const owed = a.owed ?? 0;
+          out.push(a.pin === null ? 0 : 1, a.wrong ?? 0, owed >> 8, owed & 0xff, a.anchored ? 1 : 0, 0);
         }
         return ok(out);
       }
@@ -786,7 +943,8 @@ export class FakeGpCard {
           return sw(0x6985);
         }
         this.attestations++;
-        a.attest = [0x04, ...new Array(64).fill(0).map((_, i) => (this.attestations * 7 + i) & 0xff)];
+        a.sealed ??= new SealedPinCard('fake card');
+        a.attest = a.sealed.attestInit();
         return ok(a.attest);
       case 0x31:
         if (data.length < 1 || data.length > 160) {
@@ -799,8 +957,27 @@ export class FakeGpCard {
         return ok();
       case 0x32:
         return a.cert ? ok(a.cert) : sw(0x6a83);
+      case 0x19: {
+        // SET_HEADER: on a card with no PIN (this fake holds no value) any
+        // header it takes is an anchor; after the PIN only a later one moves the clock.
+        if (data.length !== 80) {
+          return sw(0x6700);
+        }
+        if (this.refuseHeaders) {
+          return sw(0x6a93);
+        }
+        const time = (data[68] | (data[69] << 8) | (data[70] << 16) | (data[71] << 24)) >>> 0;
+        if (a.pin === null) {
+          a.now = time;
+          a.anchored = true;
+        } else if (time > (a.now ?? 0)) {
+          a.now = time;
+        }
+        const n = a.now ?? 0;
+        return ok([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+      }
       case 0x34:
-        if (this.stateLength !== 59) {
+        if (this.stateLength < 59) {
           return sw(0x6d00);
         }
         if (data.length !== 65 || data[0] !== 0x04) {

@@ -34,7 +34,9 @@ data class CardBalance(
     val shortId: String? = null,
     /**
      * Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
-     * in [liveMsat], until the registry releases them. 0 from a till from before these fields.
+     * in [liveMsat], held for a sale that was never settled. Most are freed by the registry's
+     * release after the grace; a double spend's still-live inputs stay held. 0 from a till from
+     * before these fields.
      */
     val strandedMsat: Long = 0,
     /**
@@ -85,6 +87,8 @@ enum class ChargeErrorCode(val wire: String) {
     RELAY_UNREACHABLE("relay_unreachable"),
     CARD_ERROR("card_error"),
     INSUFFICIENT("insufficient"),
+    /** The live notes do not pay; with the notes held for a sale the registry refused they would. Nothing ran. */
+    NOTES_HELD("notes_held"),
     NO_EXACT_PLAN("no_exact_plan"),
     DECLINED("declined"),
     UNDECIDED("undecided"),
@@ -92,7 +96,12 @@ enum class ChargeErrorCode(val wire: String) {
     CONFLICT("conflict"),
     PIN_REQUIRED("pin_required"),
     WRONG_PIN("wrong_pin"),
-    PIN_BLOCKED("pin_blocked"),
+    /** The card is serving its PIN wait; tap again to finish it (`wait_s`). */
+    PIN_WAIT("pin_wait"),
+    /** An applet before 4.0: needs a reset and a new set-up. */
+    OLD_CARD("old_card"),
+    /** The card refused the signature; nothing was spent. */
+    SIGN_CHECK_FAILED("sign_check_failed"),
     CARD_CHANGED("card_changed"),
     UNKNOWN_CARD("unknown_card"),
     OPS_UNREACHABLE("ops_unreachable"),
@@ -132,7 +141,3 @@ enum class ChargeErrorCode(val wire: String) {
             if (s == "card_link_gone") NO_CARD else values().firstOrNull { it.wire.isNotEmpty() && it.wire == s } ?: UNKNOWN
     }
 }
-
-/** Tries left from a `wrong_pin` detail ("wrong PIN; 2 tries left before the card blocks"), or null. */
-fun parseTriesLeft(detail: String): Int? =
-    Regex("""(\d+)\s+tr(?:y|ies)\s+left""", RegexOption.IGNORE_CASE).find(detail)?.groupValues?.get(1)?.toIntOrNull()

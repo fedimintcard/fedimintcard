@@ -1,0 +1,836 @@
+{
+  "about": "The sealed PIN (docs/OFFLINE-PROTOCOL.md § 9). Made by host/card/tests/sealed_pin_vectors.rs, never by hand; that test fails if this file differs from what it makes. Hex is lower case. `sw` is the card's answer to `apdu` on a card holding `card_nonce` live, with no wrong try before it; an `apdu` carries no Le, and a host may append Le 00.",
+  "binding": [
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "30450221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e02200cb237045281292dfdd0f0c5a157c02b63344bb5bcdaef02e4f26549c8a3a550",
+      "der_len": 71,
+      "high_s": false,
+      "message": "666564696d696e74636172642f70696e3102cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "name": "the vectors' card: its PIN key bound",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "pin_scalar": "3141592653589793238462643383279502884197169399375105820974944592",
+      "signed_by": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "valid": true
+    },
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "30460221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e022100f34dc8faad7ed6d3022f0f3a5ea83fd459b2aef7ea3caf820ec7657933bf8001",
+      "der_len": 72,
+      "high_s": true,
+      "message": "666564696d696e74636172642f70696e3102cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "name": "the same binding with s replaced by n - s: still the card's",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "pin_scalar": "3141592653589793238462643383279502884197169399375105820974944592",
+      "signed_by": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "valid": true
+    },
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "3046022100aa490f3c138462f7e7a95edde55c84bacf0210f6cc6b47acd571f70801c59087022100fab96d21c7546d24cf1a2aefa608f8c2f3d6d5b870e7d6020953aef20c7240de",
+      "der_len": 72,
+      "high_s": true,
+      "message": "666564696d696e74636172642f70696e3103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "name": "a PIN key of scalar 04…04: a 72-byte DER",
+      "pin_key": "03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "pin_scalar": "0404040404040404040404040404040404040404040404040404040404040404",
+      "signed_by": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "valid": true
+    },
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "3044022050b816fe8158e24dcd51818b8e35fd0d36352d3c73e162ce69b13ab61221f26e02200b6828852cb16c384162a25960fbfa96e2613b7d8e906ccb738e0b8e5a104699",
+      "der_len": 70,
+      "high_s": false,
+      "message": "666564696d696e74636172642f70696e3102989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "name": "a PIN key of scalar 07…07: a 70-byte DER",
+      "pin_key": "02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "pin_scalar": "0707070707070707070707070707070707070707070707070707070707070707",
+      "signed_by": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "valid": true
+    },
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "30440220607dde112ef7cd4c5913123ecce7b24974469e48f3d7035b4b4e114e72d2178b0220646d379d9df15e11d8878abafe79b396acf8b49cf409b303173cffaf0d25e065",
+      "der_len": 70,
+      "high_s": false,
+      "message": "666564696d696e74636172642f70696e3102cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "name": "signed by another P-256 key: refused",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "pin_scalar": "3141592653589793238462643383279502884197169399375105820974944592",
+      "signed_by": "03b7f39b25f313aa17f709109b7474040164ae8c2786b13c96883cd900c26ec7e7",
+      "valid": false
+    },
+    {
+      "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "der": "30450221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e02200cb237045281292dfdd0f0c5a157c02b63344bb5bcdaef02e4f26549c8a3a550",
+      "der_len": 71,
+      "high_s": false,
+      "message": "666564696d696e74636172642f70696e3102989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "name": "the card's signature over another PIN key: refused",
+      "pin_key": "02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "pin_scalar": "0707070707070707070707070707070707070707070707070707070707070707",
+      "signed_by": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+      "valid": false
+    }
+  ],
+  "card": {
+    "attest_key": "03533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4",
+    "attest_key_uncompressed": "04533fd01736c97ce37fda262e49541d7ed5d39eeb6d6daaa63ba3d7eb8923c6c4b00ccbceaf7ded2c11cda82ca78fec9948b5051dee943d95715a7062e1772c49",
+    "attest_scalar": "a77e57a77e57a77e57a77e57a77e57a77e57a77e57a77e57a77e57a77e57a77e",
+    "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+    "pin_scalar": "3141592653589793238462643383279502884197169399375105820974944592"
+  },
+  "cashu": [
+    {
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1e9f9e4dc6104c7cd7d2ae6bd1c1ae547938a343849295b9fe0",
+      "clear": "043536373800000000",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "label": "4361736875436172642f7365616c",
+      "name": "SET_PIN sealed, under the PIN given: the new PIN as a PIN block, under the second nonce",
+      "nonce": "5b16a08c7a0c5f1570f966ef5fb5d400",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4"
+    },
+    {
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278af19bf8993ec84ec104be76ea038bcda180c47ab21c6b6fa8d4",
+      "clear": "043536373800000000",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "label": "4361736875436172642f7365616c",
+      "name": "VERIFY_PIN sealed, the right PIN",
+      "nonce": "b2f3a2d4fbb002d9f0b51258af43e98a",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4"
+    },
+    {
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a5b26b96c8c618f65b21de117f13c6ead54caea2b2bb355d613",
+      "clear": "043939393900000000",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "label": "4361736875436172642f7365616c",
+      "name": "VERIFY_PIN sealed, a wrong PIN on a card with no owner: one wrong try in a row",
+      "nonce": "5257ae460342361c2199d380415c0907",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4"
+    },
+    {
+      "answer": "5b16a08c7a0c5f1570f966ef5fb5d40002cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d47fb4580ccd7149a9ea7a362e270cd4c7a466c77b01ecc952633a8071c9962f50d8e17bd0dd9883e9630ddf4dbc14e026bada6202833b06e17b866151019fd348",
+      "card_key": "02fa05ed0a3649886270bacec5ddc1a3643009a759bee996f9a6ac060c9992a82e",
+      "label": "4361736875436172642f70696e6b6579",
+      "name": "GET_NONCE P1 = 1: the card key's BIP-340 signature over SHA-256(\"CashuCard/pinkey\" || PIN key)"
+    }
+  ],
+  "get_nonce": [
+    {
+      "answer": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a002cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d430450221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e02200cb237045281292dfdd0f0c5a157c02b63344bb5bcdaef02e4f26549c8a3a550",
+      "answer_len": 120,
+      "apdu": "b044010000",
+      "der": "30450221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e02200cb237045281292dfdd0f0c5a157c02b63344bb5bcdaef02e4f26549c8a3a550",
+      "name": "GET_NONCE answer, a 71-byte DER",
+      "nonce": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sw": "9000"
+    },
+    {
+      "answer": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a002cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d430460221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e022100f34dc8faad7ed6d3022f0f3a5ea83fd459b2aef7ea3caf820ec7657933bf8001",
+      "answer_len": 121,
+      "apdu": "b044010000",
+      "der": "30460221009b428811cfd84f5dccb0efdd4fd72051c6ca09b1fa4073f1add4015dda909a5e022100f34dc8faad7ed6d3022f0f3a5ea83fd459b2aef7ea3caf820ec7657933bf8001",
+      "name": "GET_NONCE answer, a 72-byte DER",
+      "nonce": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sw": "9000"
+    },
+    {
+      "answer": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a403462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b3046022100aa490f3c138462f7e7a95edde55c84bacf0210f6cc6b47acd571f70801c59087022100fab96d21c7546d24cf1a2aefa608f8c2f3d6d5b870e7d6020953aef20c7240de",
+      "answer_len": 121,
+      "apdu": "b044010000",
+      "der": "3046022100aa490f3c138462f7e7a95edde55c84bacf0210f6cc6b47acd571f70801c59087022100fab96d21c7546d24cf1a2aefa608f8c2f3d6d5b870e7d6020953aef20c7240de",
+      "name": "GET_NONCE answer, a 72-byte DER",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "pin_key": "03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "sw": "9000"
+    },
+    {
+      "answer": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a702989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f3044022050b816fe8158e24dcd51818b8e35fd0d36352d3c73e162ce69b13ab61221f26e02200b6828852cb16c384162a25960fbfa96e2613b7d8e906ccb738e0b8e5a104699",
+      "answer_len": 119,
+      "apdu": "b044010000",
+      "der": "3044022050b816fe8158e24dcd51818b8e35fd0d36352d3c73e162ce69b13ab61221f26e02200b6828852cb16c384162a25960fbfa96e2613b7d8e906ccb738e0b8e5a104699",
+      "name": "GET_NONCE answer, a 70-byte DER",
+      "nonce": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+      "pin_key": "02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "sw": "9000"
+    }
+  ],
+  "labels": {
+    "binding": "666564696d696e74636172642f70696e31",
+    "seal": "666564696d696e74636172642f7365616c31"
+  },
+  "pin_blocks": [
+    {
+      "block": "043132333400000000",
+      "pin": "1234"
+    },
+    {
+      "block": "063536373839300000",
+      "pin": "567890"
+    },
+    {
+      "block": "083132333435363738",
+      "pin": "12345678"
+    }
+  ],
+  "refusals": {
+    "40": [
+      {
+        "check": "no PIN set",
+        "sw": "6984"
+      },
+      {
+        "check": "P1 != 01 or P2 != 00 (the clear form, P1 = 00, included)",
+        "sw": "6b00"
+      },
+      {
+        "check": "Lc != 90",
+        "sw": "6700"
+      },
+      {
+        "check": "no live nonce (writes nothing)",
+        "sw": "6985"
+      },
+      {
+        "check": "a wait owed: the same command again",
+        "sw": "6a98"
+      },
+      {
+        "check": "fewer than Lc bytes received",
+        "sw": "6700"
+      },
+      {
+        "check": "the envelope does not open: the nonce is spent and it is a wrong try",
+        "sw": "63cx"
+      },
+      {
+        "check": "the PIN block's length not 4..8: the nonce is spent, no try",
+        "sw": "6700"
+      },
+      {
+        "check": "the PIN: wrong",
+        "sw": "63cx"
+      },
+      {
+        "check": "the PIN: right; this selection has the PIN",
+        "sw": "9000"
+      }
+    ],
+    "41": [
+      {
+        "check": "P1 != 01 or P2 != 00 (the clear form, P1 = 00, included)",
+        "sw": "6b00"
+      },
+      {
+        "check": "a PIN is already set",
+        "sw": "6985"
+      },
+      {
+        "check": "Lc != 90",
+        "sw": "6700"
+      },
+      {
+        "check": "the clock not anchored in this selection",
+        "sw": "6a96"
+      },
+      {
+        "check": "no registry key, or a slot holds value",
+        "sw": "6985"
+      },
+      {
+        "check": "no live nonce",
+        "sw": "6985"
+      },
+      {
+        "check": "the signer's engine check fails",
+        "sw": "6f00"
+      },
+      {
+        "check": "fewer than Lc bytes received",
+        "sw": "6700"
+      },
+      {
+        "check": "the envelope does not open: the nonce is spent, nothing written",
+        "sw": "6700"
+      },
+      {
+        "check": "the PIN block's length not 4..8: nothing written",
+        "sw": "6700"
+      },
+      {
+        "check": "the PIN is set; this selection has the PIN",
+        "sw": "9000"
+      }
+    ],
+    "42": [
+      {
+        "check": "no PIN set",
+        "sw": "6984"
+      },
+      {
+        "check": "P1 != 01 or P2 != 00 (P1 00 included)",
+        "sw": "6b00"
+      },
+      {
+        "check": "this selection does not have the PIN",
+        "sw": "6a94"
+      },
+      {
+        "check": "Lc != 99",
+        "sw": "6700"
+      },
+      {
+        "check": "no live nonce",
+        "sw": "6985"
+      },
+      {
+        "check": "fewer than Lc bytes received",
+        "sw": "6700"
+      },
+      {
+        "check": "the envelope does not open: the nonce is spent, a wrong try, the session ends",
+        "sw": "63cx"
+      },
+      {
+        "check": "either PIN block's length not 4..8: the nonce is spent, no try",
+        "sw": "6700"
+      },
+      {
+        "check": "the old PIN wrong: the session ends",
+        "sw": "63cx"
+      },
+      {
+        "check": "the old PIN right: the new PIN is set and the session ends",
+        "sw": "9000"
+      }
+    ],
+    "44": [
+      {
+        "check": "P1 != 01 or P2 != 00",
+        "sw": "6b00"
+      },
+      {
+        "check": "no certificate on the card (before SET_CERT)",
+        "sw": "6985"
+      },
+      {
+        "check": "the answer: nonce (16) || PIN key (33) || binding (DER, 8..72); the nonce is live from here",
+        "sw": "9000"
+      }
+    ]
+  },
+  "sealed": [
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1db205f9b188f58f0f68769f4505b0d23a0b575ec66a751d0b2",
+      "block0": "8769f4505b0d23a0b575ec66a751d0b2637683b5a33705fc9260fa0bcf0627c9",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "db205f9b188f58f0f6",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "df116da82c8f58f0f672d2d804c1d7e8cbc5c803d44ab0fa0bbec2ff124128da"
+      ],
+      "name": "SET_PIN sealed, PIN 1234",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "043132333400000000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "",
+      "sw": "9000",
+      "tag": "8769f4505b0d23a0b575ec66a751d0b2",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a53f506581f283be4367cc1b4e031a1a78fb8f1fbe6d771522f",
+      "block0": "7cc1b4e031a1a78fb8f1fbe6d771522f9a09e232a6320cf66afead130e1b65f9",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "53f506581f283be436",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "57c4346b2b283be436c7d5e255811a9f2af0e09583efcdbd796f3ae7f03a9991"
+      ],
+      "name": "VERIFY_PIN sealed, PIN 1234",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "043132333400000000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "",
+      "sw": "9000",
+      "tag": "7cc1b4e031a1a78fb8f1fbe6d771522f",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "043c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b13b306b0fe085665d8fc1b28ae1676cd3ad6e08eaeda225fe38d0da4de55703e0",
+      "apdu": "b04001005a043c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b13b306b0fe085665d8fc1b28ae1676cd3ad6e08eaeda225fe38d0da4de55703e0695483c858c216bc5339b891c4da2e8a50c6915a03fe02bb1a",
+      "block0": "39b891c4da2e8a50c6915a03fe02bb1a4dae335f25d5f0dc444ea0a68ebd9fc2",
+      "card_nonce": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+      "clear": "083132333435363738",
+      "ct": "695483c858c216bc53",
+      "eph_scalar": "3333333333333333333333333333333333333333333333333333333333333333",
+      "ins": "40",
+      "keystream": [
+        "6165b1fb6cf7208b6bb77e301eb504d30e742b4729d61c5af11d23588fe2c441"
+      ],
+      "name": "VERIFY_PIN sealed, PIN 12345678",
+      "nonce": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+      "opened": "083132333435363738",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "",
+      "sw": "9000",
+      "tag": "39b891c4da2e8a50c6915a03fe02bb1a",
+      "x": "e1952b48ac6599a70778096398357371084e0e40433e65b7df650aad4fa451de"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2fb17f2057a4ee7686544acc4afef8083db3e849ade3d058f938e94094410492ca3ada",
+      "block0": "49ade3d058f938e94094410492ca3ada791434bfb60c33db65cd0896208aac94",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "b17f2057a4ee7686544acc4afef8083db3e8",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "b54e126490ee7686544cf97cc9c0310db3e8f989b3fbf533c57dbbf7467be4ef"
+      ],
+      "name": "CHANGE_PIN sealed, 1234 to 567890: old block then new block",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "043132333400000000063536373839300000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "",
+      "sw": "9000",
+      "tag": "49ade3d058f938e94094410492ca3ada",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a53f506581f283be4367cc1b4e031a1a78fb8f1fbe6d771522e",
+      "block0": "7cc1b4e031a1a78fb8f1fbe6d771522f9a09e232a6320cf66afead130e1b65f9",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "53f506581f283be436",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "57c4346b2b283be436c7d5e255811a9f2af0e09583efcdbd796f3ae7f03a9991"
+      ],
+      "name": "INS 40: the last byte of the tag changed",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "tag",
+      "sw": "63c1",
+      "tag": "7cc1b4e031a1a78fb8f1fbe6d771522f",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a52f506581f283be4367cc1b4e031a1a78fb8f1fbe6d771522f",
+      "block0": "7cc1b4e031a1a78fb8f1fbe6d771522f9a09e232a6320cf66afead130e1b65f9",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "53f506581f283be436",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "57c4346b2b283be436c7d5e255811a9f2af0e09583efcdbd796f3ae7f03a9991"
+      ],
+      "name": "INS 40: the first byte of ct changed",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "body",
+      "sw": "63c1",
+      "tag": "7cc1b4e031a1a78fb8f1fbe6d771522f",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000053f506581f283be4367cc1b4e031a1a78fb8f1fbe6d771522f",
+      "block0": "7cc1b4e031a1a78fb8f1fbe6d771522f9a09e232a6320cf66afead130e1b65f9",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "53f506581f283be436",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "57c4346b2b283be436c7d5e255811a9f2af0e09583efcdbd796f3ae7f03a9991"
+      ],
+      "name": "INS 40: E replaced by 04 and zeros, no point",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "point",
+      "sw": "63c1",
+      "tag": "7cc1b4e031a1a78fb8f1fbe6d771522f",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a7ca9c7b6e1310776ed1f220ab440cda41e3493ecd135156aa6",
+      "block0": "1f220ab440cda41e3493ecd135156aa601d9fc34b795c8031c69aa4a3127d4ef",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "7ca9c7b6e1310776ed",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "7898f585d5310776ed70588d302e9282c1930bd6959f0331dce59220f3d4b241"
+      ],
+      "name": "INS 40: sealed for INS 41",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "for_ins",
+      "sw": "63c1",
+      "tag": "1f220ab440cda41e3493ecd135156aa6",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a7427b5109bc87a3c81e32e3030fdf560df90f4de259ebb1afd",
+      "block0": "e32e3030fdf560df90f4de259ebb1afd1b5ef3d16424e181b5f36d179413057a",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "043132333400000000",
+      "ct": "7427b5109bc87a3c81",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "70168723afc87a3c815991321949c9aa1dc6ead6ad058ede09fc4a6a25b22077"
+      ],
+      "name": "INS 40: sealed under a nonce the card does not hold (a nonce asked again mid-wait)",
+      "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "stale_nonce",
+      "sw": "63c1",
+      "tag": "e32e3030fdf560df90f4de259ebb1afd",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "apdu": "b04001005a04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a54f506581f283be436e5cb64670358fac95c3cd8e85524edc5",
+      "block0": "e5cb64670358fac95c3cd8e85524edc50c4d852853bd40c28fd6381700563315",
+      "card_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "clear": "033132333400000000",
+      "ct": "54f506581f283be436",
+      "eph_scalar": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ins": "40",
+      "keystream": [
+        "57c4346b2b283be436c7d5e255811a9f2af0e09583efcdbd796f3ae7f03a9991"
+      ],
+      "name": "INS 40: opens to a PIN block of length 3: no try",
+      "nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "opened": "033132333400000000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "block_len",
+      "sw": "6700",
+      "tag": "e5cb64670358fac95c3cd8e85524edc5",
+      "x": "792f17dbb5291a1ca697949c50c2344619a60c04216adf9397308a5ab54e4d4c"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1db205f9b188f58f0f68769f4505b0d23a0b575ec66a751d0b3",
+      "block0": "8769f4505b0d23a0b575ec66a751d0b2637683b5a33705fc9260fa0bcf0627c9",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "db205f9b188f58f0f6",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "df116da82c8f58f0f672d2d804c1d7e8cbc5c803d44ab0fa0bbec2ff124128da"
+      ],
+      "name": "INS 41: the last byte of the tag changed",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "tag",
+      "sw": "6700",
+      "tag": "8769f4505b0d23a0b575ec66a751d0b2",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1da205f9b188f58f0f68769f4505b0d23a0b575ec66a751d0b2",
+      "block0": "8769f4505b0d23a0b575ec66a751d0b2637683b5a33705fc9260fa0bcf0627c9",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "db205f9b188f58f0f6",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "df116da82c8f58f0f672d2d804c1d7e8cbc5c803d44ab0fa0bbec2ff124128da"
+      ],
+      "name": "INS 41: the first byte of ct changed",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "body",
+      "sw": "6700",
+      "tag": "8769f4505b0d23a0b575ec66a751d0b2",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000db205f9b188f58f0f68769f4505b0d23a0b575ec66a751d0b2",
+      "block0": "8769f4505b0d23a0b575ec66a751d0b2637683b5a33705fc9260fa0bcf0627c9",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "db205f9b188f58f0f6",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "df116da82c8f58f0f672d2d804c1d7e8cbc5c803d44ab0fa0bbec2ff124128da"
+      ],
+      "name": "INS 41: E replaced by 04 and zeros, no point",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "point",
+      "sw": "6700",
+      "tag": "8769f4505b0d23a0b575ec66a751d0b2",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1976e1bff7ad28b29e48874494c2a3e255b77d346dc2f77bac2",
+      "block0": "8874494c2a3e255b77d346dc2f77bac2d8f05e39e7cb7ab6a9802b1eeaf0af40",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "976e1bff7ad28b29e4",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "935f29cc4ed28b29e4463b92b6bf01d8dcc22ec31bdb60626920d8779384d1a0"
+      ],
+      "name": "INS 41: sealed for INS 40",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "40",
+      "spoil": "for_ins",
+      "sw": "6700",
+      "tag": "8874494c2a3e255b77d346dc2f77bac2",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1fb627af730d91b09ccd31155aaf6971148eaaafb3107f1a178",
+      "block0": "d31155aaf6971148eaaafb3107f1a1789141829c4eea2ca88e9fd78d07316bfa",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "043132333400000000",
+      "ct": "fb627af730d91b09cc",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "ff5348c404d91b09cc121b44722247f281ed9b4c7114963d5f47dc4baae8c966"
+      ],
+      "name": "INS 41: sealed under a nonce the card does not hold (a nonce asked again mid-wait)",
+      "nonce": "a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "stale_nonce",
+      "sw": "6700",
+      "tag": "d31155aaf6971148eaaafb3107f1a178",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "apdu": "b04101005a044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1dc205f9b188f58f0f66694e897e75626d0d4c05917f45255f3",
+      "block0": "6694e897e75626d0d4c05917f45255f3fc147fbafe94e8e7ea46eda151d5b198",
+      "card_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "clear": "033132333400000000",
+      "ct": "dc205f9b188f58f0f6",
+      "eph_scalar": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ins": "41",
+      "keystream": [
+        "df116da82c8f58f0f672d2d804c1d7e8cbc5c803d44ab0fa0bbec2ff124128da"
+      ],
+      "name": "INS 41: opens to a PIN block of length 3: no try",
+      "nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "opened": "033132333400000000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "block_len",
+      "sw": "6700",
+      "tag": "6694e897e75626d0d4c05917f45255f3",
+      "x": "d6c8ac7915db637ac2b6bd0795b47f1f76c0310dd45ed80902dd32ed86cf3abf"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2fb17f2057a4ee7686544acc4afef8083db3e849ade3d058f938e94094410492ca3adb",
+      "block0": "49ade3d058f938e94094410492ca3ada791434bfb60c33db65cd0896208aac94",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "b17f2057a4ee7686544acc4afef8083db3e8",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "b54e126490ee7686544cf97cc9c0310db3e8f989b3fbf533c57dbbf7467be4ef"
+      ],
+      "name": "INS 42: the last byte of the tag changed",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "tag",
+      "sw": "63c1",
+      "tag": "49ade3d058f938e94094410492ca3ada",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2fb07f2057a4ee7686544acc4afef8083db3e849ade3d058f938e94094410492ca3ada",
+      "block0": "49ade3d058f938e94094410492ca3ada791434bfb60c33db65cd0896208aac94",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "b17f2057a4ee7686544acc4afef8083db3e8",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "b54e126490ee7686544cf97cc9c0310db3e8f989b3fbf533c57dbbf7467be4ef"
+      ],
+      "name": "INS 42: the first byte of ct changed",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "body",
+      "sw": "63c1",
+      "tag": "49ade3d058f938e94094410492ca3ada",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b0420100630400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b17f2057a4ee7686544acc4afef8083db3e849ade3d058f938e94094410492ca3ada",
+      "block0": "49ade3d058f938e94094410492ca3ada791434bfb60c33db65cd0896208aac94",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "b17f2057a4ee7686544acc4afef8083db3e8",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "b54e126490ee7686544cf97cc9c0310db3e8f989b3fbf533c57dbbf7467be4ef"
+      ],
+      "name": "INS 42: E replaced by 04 and zeros, no point",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "point",
+      "sw": "63c1",
+      "tag": "49ade3d058f938e94094410492ca3ada",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f2c79288191de666df52f63504341d0b8ac27e3fcb12ef11cd900a782f51e59cde1ad",
+      "block0": "e3fcb12ef11cd900a782f51e59cde1adee81bda2368511391ee3182f5bc54b76",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "2c79288191de666df52f63504341d0b8ac27",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "28481ab2a5de666df52956667479e988ac2768e00e577a1ac7bb66afc3047eb0"
+      ],
+      "name": "INS 42: sealed for INS 41",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "41",
+      "spoil": "for_ins",
+      "sw": "63c1",
+      "tag": "e3fcb12ef11cd900a782f51e59cde1ad",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f42d4b23fc4d168336a43ad4c1ea7f93088066e3c6ef27afc37a82fa00828d801bc33",
+      "block0": "6e3c6ef27afc37a82fa00828d801bc333cf212dbf13b4d7f7c145089a4779401",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000063536373839300000",
+      "ct": "42d4b23fc4d168336a43ad4c1ea7f9308806",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "46e5800cf0d168336a45987a299fc00088063acb21a1d86c67c643d15a0ac620"
+      ],
+      "name": "INS 42: sealed under a nonce the card does not hold (a nonce asked again mid-wait)",
+      "nonce": "acacacacacacacacacacacacacacacac",
+      "opened": "",
+      "opens": false,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "stale_nonce",
+      "sw": "63c1",
+      "tag": "6e3c6ef27afc37a82fa00828d801bc33",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    },
+    {
+      "E": "042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2f",
+      "apdu": "b042010063042c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ae31a9c671a36543f46cea8fce6984608aa316aa0472a7eed08847440218cb2fb17f2057a4ee7686544fcc4afef8083db3e8646870f002e90fc210584058cb5b6340",
+      "block0": "646870f002e90fc210584058cb5b6340684d140f9e09b077b07fbb2506ab05dd",
+      "card_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "clear": "043132333400000000033536373839300000",
+      "ct": "b17f2057a4ee7686544fcc4afef8083db3e8",
+      "eph_scalar": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ins": "42",
+      "keystream": [
+        "b54e126490ee7686544cf97cc9c0310db3e8f989b3fbf533c57dbbf7467be4ef"
+      ],
+      "name": "INS 42: opens to a PIN block of length 3: no try",
+      "nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "opened": "043132333400000000033536373839300000",
+      "opens": true,
+      "pin_key": "02cf9bfbdca0c087fdea7097d5482d3a7b30b5fa1cb52b621f89c0a61619b782d4",
+      "sealed_for_ins": "42",
+      "spoil": "block_len",
+      "sw": "6700",
+      "tag": "646870f002e90fc210584058cb5b6340",
+      "x": "ed39e9396e3ee288f1cdba37084015a1fc89a64a8243a583dd1f34435c7c2c00"
+    }
+  ]
+}

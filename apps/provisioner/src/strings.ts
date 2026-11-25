@@ -1,3 +1,5 @@
+import {NEEDS_INTERNET, OLD_APPLET} from './cardSetup';
+
 /**
  * The words the five screens show. Kept in one file so a copy change is not a
  * code change, and because the rule the whole app keeps: every stop says what
@@ -100,11 +102,17 @@ export const LOOP = {
   /** A tap lifted while the card's keys or PIN were written: the same card finishes it. */
   sameCard: 'Hold the same card to the phone and press Finish to complete it.',
   fetchingKey: 'Asking the registry for its certificate key…',
+  fetchingHeader: 'Asking the registry for the latest Bitcoin block…',
+  headerFailed: (reason: string) =>
+    `Setting up a card needs the internet: the latest Bitcoin block could not be fetched (${reason}). No card was touched.`,
   finishCard: (n: number) => `Finish card ${n}`,
   heldTitle: 'Card not finished',
   heldName: 'Tap the same card again',
   heldWhat: 'The card left the phone while its keys or its PIN were being written.',
   /** The registry, not the card, stopped the finish: its own reason, verbatim. */
+  anchorHeld: (reason: string) =>
+    `The card did not set its clock from the latest Bitcoin block (${reason}). Its keys are kept and it has no PIN yet.`,
+  oldAppletNow: 'Settings → Reset a card takes it back to blank. Then set it up again in a batch.',
   registryRefused: (reason: string) => `The registry refused the card's certificate: ${reason}`,
   registryKeyFailed: (reason: string) => `The registry's certificate key could not be fetched: ${reason}`,
   heldNow: 'Nothing is lost and it did not use up a place in this batch. Hold the same card to the phone again to finish it.',
@@ -138,7 +146,21 @@ export const LOOP = {
  * (`SetupResult.registry`): its own reason. Null for a tap that really was
  * lifted, which keeps `LOOP.heldWhat`.
  */
-export function registryHeldWhat(held: {reason?: string; registry?: boolean}): string | null {
+export function registryHeldWhat(held: {
+  reason?: string;
+  registry?: boolean;
+  anchor?: boolean;
+  wait?: boolean;
+}): string | null {
+  if (held.wait) {
+    return WAIT.lifted;
+  }
+  if (held.reason?.startsWith(NEEDS_INTERNET)) {
+    return held.reason;
+  }
+  if (held.anchor && held.reason) {
+    return LOOP.anchorHeld(held.reason);
+  }
   return held.registry && held.reason ? LOOP.registryRefused(held.reason) : null;
 }
 
@@ -166,6 +188,17 @@ export const STATE = {
   needsReset: 'Do not hand this card out. Settings → Reset a card takes it back to blank, and asks for no PIN: this card was never finished. Then install it again.',
   outboxPending: 'The card work is done; only the registry row waits.',
 } as const;
+
+/** The stop panel's two lines, what happened and what the card is now; a card with an older applet gets its own. */
+export function stopLines(stop: keyof typeof STATE, reason: string | undefined): {what: string; now: string} {
+  if (stop === 'guarded' && reason === OLD_APPLET) {
+    return {what: OLD_APPLET, now: LOOP.oldAppletNow};
+  }
+  return {
+    what: stop === 'noManagerKeys' && reason ? `${CALM[stop]} Ops said: ${reason}` : CALM[stop],
+    now: STATE[stop],
+  };
+}
 
 export const SUMMARY = {
   title: 'Summary',
@@ -300,8 +333,10 @@ export const RESET = {
   refusedBody: 'Handle what ops still shows first, then read the card again.',
   holderPin: 'Holder\'s PIN',
   holderPinHelp:
-    'The holder types their PIN here. It is sent to the card once, to show they agree, and is not kept. A wrong PIN uses one of the card\'s three tries.',
+    'The holder types their PIN here. It is sent to the card once, to show they agree, and is not kept. A wrong PIN counts against the card: an older card blocks after three wrong tries, a newer one asks for a longer wait before each next try.',
   holderPinPlaceholder: 'Holder\'s PIN',
+  olderCardPin:
+    'This card is older than 4.0, so its PIN is sent unprotected: reset old cards away from other people\'s phones and readers.',
   blockedTitle: (pin: 'blocked' | 'notSet') =>
     pin === 'blocked' ? 'This card\'s PIN is blocked' : 'This card never had a PIN set',
   blockedBody:
@@ -348,6 +383,7 @@ export const RESET = {
     differentCard: 'Not the same card',
     notResettable: 'Ops will not reset this card',
     wrongPin: (left: number) => `Wrong PIN · ${left} ${left === 1 ? 'try' : 'tries'} left`,
+    wrongTries: (n: number) => `Wrong PIN · ${n} wrong ${n === 1 ? 'try' : 'tries'} in a row`,
     pinBlocked: 'The PIN is blocked',
     pinRequired: 'The holder\'s PIN is needed',
     journal: 'The reset could not be saved on this phone; nothing was changed',
@@ -386,3 +422,9 @@ export const SCAN = {
   tillNoPermission: 'The camera is off for this app. Allow it, or type the code instead.',
   tillNoCamera: 'This phone has no camera the app can use. Type the code instead.',
 };
+
+/** A wait the card owes before its next PIN try (applet 4.0), served while the card is held. */
+export const WAIT = {
+  hold: (seconds: number) => `Hold the card, about ${seconds} s`,
+  lifted: 'The card left the phone during its wait. Tap it again to finish the wait.',
+} as const;

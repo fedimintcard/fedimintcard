@@ -22,11 +22,13 @@ func balanceErrorCopy(_ p: BalanceProblem) -> (String, String) {
 /// kit) says the card can pay instead, for `offline_no_change_room` and `offline_pool_exhausted`.
 /// `unresolved`: an earlier attempt at this sale has no known outcome, so a till out of reach is
 /// a lost reply, and the phone does not take the sale itself.
-func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil, unresolved: Bool = false) -> (String, String) {
+func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil, unresolved: Bool = false, waitS: Int? = nil, wrongTries: Int? = nil) -> (String, String) {
     let unreachable = tillUnreachableCopy.0
     switch kind {
     case .noCard: return ("Card not detected", "Hold the card to the top of the phone and keep it there")
     case .insufficient: return ("Card balance too low", "")
+    // The till's detail speaks of msat; the copy says only that part of the balance does not pay now.
+    case .notesHeld: return ("Part of the balance is on hold", "Some of this card's money can't be used. A smaller amount may work, or take another payment.")
     // The till's detail is not shown: it speaks of msat and notes, and may say "cash out and reload".
     case .noExactPlan: return ("Can't take this amount", "This card can't pay it in one tap. Try a smaller amount, or take this sale another way.")
     // Not a full card: offline, change needs a fresh slot the till cannot key without the registry.
@@ -59,8 +61,10 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     case .cardLimit: return ("Card limit reached", "This card has reached its daily limit.")
     case .unauthorized: return ("The till refused this phone", "Pair with the till again in Settings")
     case .notPaired: return ("No till paired", "Open Settings and pair with the till")
-    case .wrongPin: return (wrongPinCopy(parseTriesLeft(detail)), "Ask the card holder to enter it again")
-    case .pinBlocked: return ("PIN blocked", "This card's PIN is blocked. The card can't pay.")
+    case .wrongPin: return (wrongPinCopy(wrongTries), "Ask the card holder to enter it again")
+    case .pinWait: return (holdCardCopy(waitS), "Tap again to finish the wait")
+    case .signCheckFailed: return ("Nothing was spent", "The card did not sign. Tap again.")
+    case .oldCard: return ("Old card", "This card needs a reset and a new set-up.")
     case .pinRequired: return ("Something went wrong", "The app sent the charge without the holder's PIN. This is an app bug; the card was not touched.")
     case .conflict: return ("Something went wrong", detail)
     case .cardChanged: return ("Card changed", "The card was used elsewhere. Hold it to the phone and try again.")
@@ -81,10 +85,21 @@ func abandonCopy(held: Bool) -> String {
 }
 
 /// The line over the PIN pad after a refused PIN. Never includes the PIN.
-func wrongPinCopy(_ triesLeft: Int?) -> String {
-    switch triesLeft {
-    case nil: return "Wrong PIN"
-    case 1: return "Wrong PIN — 1 try left"
-    case let n?: return "Wrong PIN — \(n) tries left"
+func wrongPinCopy(_ wrongTries: Int?) -> String {
+    switch wrongTries {
+    case nil, 0?: return "Wrong PIN"
+    case 1: return "Wrong PIN. 1 wrong try in a row"
+    case let n?: return "Wrong PIN. \(n) wrong tries in a row"
     }
+}
+
+/// "Hold the card, about N s" for a wait of `seconds`; no number when none is known.
+func holdCardCopy(_ seconds: Int?) -> String {
+    if let s = seconds, s > 0 { return "Hold the card, about \(s) s" }
+    return "Hold the card"
+}
+
+/// The line while the card serves its PIN wait during a charge: the seconds left, or the usual line at zero.
+func holdingCopy(_ secondsLeft: Int) -> String {
+    secondsLeft > 0 ? holdCardCopy(secondsLeft) : "Paying… keep the card on the phone"
 }

@@ -110,7 +110,7 @@ fn a_refusal_carries_its_code_tries_and_prices() {
     let card = fx.card(32, &[1 << 16]);
     let k = kit(&fx, &pc);
     let r = pc.charge(Nfc::new(&card), k.clone(), 20_000, "pin".into(), "9999".into()).unwrap();
-    assert!(matches!(&r, ChargeOutcome::Refused { code, tries_left: Some(2), .. } if code == "wrong_pin"), "{r:?}");
+    assert!(matches!(&r, ChargeOutcome::Refused { code, wrong_tries: Some(1), wait_s: Some(1), .. } if code == "wrong_pin"), "{r:?}");
     // The card leaves the field: no_card.
     let gone = Nfc::new(&card);
     gone.gone.store(true, Ordering::SeqCst);
@@ -191,4 +191,27 @@ fn a_panic_is_an_error_and_the_store_goes_on() {
 fn one_process_has_the_store() {
     let (dir, _pc) = open();
     assert!(matches!(PosCore::open(dir.path().to_str().unwrap().to_owned()), Err(PosCoreError::Store(_))));
+}
+
+struct Heard(std::sync::Mutex<Vec<u32>>);
+
+impl fedimint_card_pos_core::ffi::PinWaitProgress for Heard {
+    fn holding(&self, seconds_left: u32) {
+        self.0.lock().unwrap().push(seconds_left);
+    }
+}
+
+/// A card that owes a PIN wait: the app hears the seconds left going down to 0, then the charge pays.
+#[test]
+fn the_app_hears_the_pin_wait_go_down_while_the_card_is_held() {
+    let fx = Fx::new(true);
+    let (_dir, pc) = open();
+    let card = fx.card(32, &[1 << 16]);
+    card.0.lock().unwrap().set_pin_marks(3, 4);
+    let heard = Arc::new(Heard(std::sync::Mutex::new(vec![])));
+    let r = pc.charge_held(Nfc::new(&card), kit(&fx, &pc), 20_000, "held".into(), "1234".into(), heard.clone()).unwrap();
+    assert!(matches!(r, ChargeOutcome::Paid { .. }), "{r:?}");
+    let heard = heard.0.lock().unwrap().clone();
+    assert_eq!((heard.first(), heard.last(), heard.len()), (Some(&3), Some(&0), 5), "{heard:?}");
+    assert!(heard.windows(2).all(|w| w[0] >= w[1]), "{heard:?}");
 }

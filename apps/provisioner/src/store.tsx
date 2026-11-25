@@ -812,6 +812,7 @@ export function StoreProvider({
         apiRef.current?.attestCard?.(shortId, attestPub, slot0) ?? missing('the card certificate'),
       registryCertKey: () =>
         apiRef.current?.registryCertKey?.() ?? missing('the registry key'),
+      chainTip: () => apiRef.current?.chainTip?.() ?? missing('the chain tip'),
       completeReset: completion =>
         apiRef.current?.completeReset?.(completion) ?? missing('recording a reset'),
     };

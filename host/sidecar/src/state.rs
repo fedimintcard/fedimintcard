@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use fedimint_card_host_card::is_change_slot;
 use serde::{Deserialize, Serialize};
 
 // Moved to the core the POS phones share (docs/POS-OFFLINE.md); kept at the old paths.
@@ -56,6 +57,10 @@ pub struct NoteRec {
     /// Index of the note's output in that transaction, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_idx: Option<u64>,
+    /// The registry's signature over the note (DER ECDSA P-256, hex), from ops once the note is
+    /// live there. A 4.0 card takes a note (`SET_NOTE`) only with it; a note without one waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reg_sig: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +156,49 @@ pub struct CardState {
     /// reads the card again (`CardWallet::card_strands` in `crate::ops`).
     #[serde(skip)]
     pub held: Vec<Held>,
+    /// Registry signatures over notes that this card refused (`6982`) or that did not verify
+    /// under the registry's key, newest last, at most [`MAX_REFUSED_REG_SIGS`]. Never kept again,
+    /// so such a note waits and is asked for again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_reg_sigs: Vec<String>,
+    /// The transactions whose note signatures this till asked the registry for again, by txid
+    /// (`crate::ops`): kept while one of their notes still waits.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sig_asks: std::collections::BTreeMap<String, SigAsk>,
+    /// When this till last asked the holder's load route for note signatures (ms; 0: never).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub load_ask_ms: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// At most this many refused registry signatures a card file keeps.
+pub const MAX_REFUSED_REG_SIGS: usize = 64;
+
+/// One transaction whose note signatures a till asked the registry for again.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SigAsk {
+    /// When it was last asked (ms).
+    pub last_ms: u64,
+    /// Askings in a row that brought no signature, and card refusals of what they brought.
+    pub misses: u32,
+    /// The registry does not know it as a transaction (`404`): a holder's load, asked at the
+    /// load route.
+    #[serde(default)]
+    pub load: bool,
+}
+
+impl CardState {
+    /// Remember a registry signature the card refused, so no answer brings it back.
+    pub fn refuse_reg_sig(&mut self, der_hex: &str) {
+        if !self.refused_reg_sigs.iter().any(|s| s == der_hex) {
+            self.refused_reg_sigs.push(der_hex.to_owned());
+        }
+        let over = self.refused_reg_sigs.len().saturating_sub(MAX_REFUSED_REG_SIGS);
+        self.refused_reg_sigs.drain(..over);
+    }
 }
 
 /// Why an online tap holds a slot back (ENG-867).
@@ -182,8 +230,9 @@ impl HeldKind {
 pub struct Held {
     pub slot: u8,
     pub kind: HeldKind,
-    /// The transaction the card signed or waits on, hex. `None`: held on doubt, the card not
-    /// asked (`GET_SLOT`) this tap; it is reported at a later one.
+    /// The transaction the card signed or waits on, hex. `None`: not reported this tap. Either
+    /// held on doubt, the card not asked (`GET_SLOT`) this tap, and reported at a later one; or
+    /// signed for a charge this job abandoned, which the registry's release for that charge frees.
     pub txid: Option<String>,
     /// The note's amount (a spent slot); 0 for a change slot, which holds no note.
     pub msat: u64,
@@ -280,9 +329,24 @@ impl CardState {
         self.held.iter().any(|h| h.slot == slot && h.kind == kind)
     }
 
-    /// Slots whose key has never carried a note: usable for a new note right now. A held CHANGE
-    /// slot is not: the card is owed another transaction's change there.
+    /// Slots below [`CHANGE_SLOTS_FROM`] whose key has never carried a note: usable for a load or
+    /// an online charge's change right now. A held CHANGE slot is not: the card is owed another
+    /// transaction's change there.
+    ///
+    /// [`CHANGE_SLOTS_FROM`]: fedimint_card_host_card::CHANGE_SLOTS_FROM
     pub fn free_slots(&self) -> Vec<u8> {
+        self.unused_slots().into_iter().filter(|s| !is_change_slot(*s)).collect()
+    }
+
+    /// Slots from [`CHANGE_SLOTS_FROM`] up whose key has never carried a note: the only slots an
+    /// offline charge puts change into, so no load or online change goes there.
+    ///
+    /// [`CHANGE_SLOTS_FROM`]: fedimint_card_host_card::CHANGE_SLOTS_FROM
+    pub fn free_change_slots(&self) -> Vec<u8> {
+        self.unused_slots().into_iter().filter(|s| is_change_slot(*s)).collect()
+    }
+
+    fn unused_slots(&self) -> Vec<u8> {
         self.slots
             .iter()
             .filter(|s| !s.unknown)
@@ -316,6 +380,21 @@ impl CardState {
             .collect()
     }
 
+    /// Whether `slot` is a change slot ([`free_change_slots`](Self::free_change_slots)) whose
+    /// current key carried notes that are all dead: the change of a sale the federation rejected.
+    /// The key is burned; the till releases and re-keys the slot as one unit once a tap has
+    /// checked the PIN (`CardWallet::card_dead_change`).
+    pub fn dead_change_slot(&self, slot: u8) -> bool {
+        let mut any = false;
+        for n in self.notes_on_current_key(slot) {
+            if n.status != NoteStatus::Dead {
+                return false;
+            }
+            any = true;
+        }
+        any && is_change_slot(slot)
+    }
+
     /// The live notes the card can pay with: a note on a held SPENT slot is not one.
     pub fn live_notes(&self) -> Vec<&NoteRec> {
         self.notes.iter().filter(|n| n.status == NoteStatus::Live && !self.is_held(n.slot, HeldKind::Spent)).collect()
@@ -326,7 +405,8 @@ impl CardState {
     }
 
     /// The live notes this job holds back ([`Held`]): the card signed them away for a transaction
-    /// nobody here knows, so they are on hold until the registry releases them.
+    /// nobody here knows, so they are on hold. Most are freed by the registry's release after the
+    /// grace; a double spend's still-live inputs stay held.
     pub fn stranded_notes(&self) -> Vec<&NoteRec> {
         self.notes.iter().filter(|n| n.status == NoteStatus::Live && self.is_held(n.slot, HeldKind::Spent)).collect()
     }
@@ -419,6 +499,7 @@ mod tests {
             blinding_key: None,
             txid: None,
             out_idx: None,
+            reg_sig: None,
         }
     }
 
@@ -470,6 +551,20 @@ mod tests {
         // A pending overwrite blocks reuse until resolved.
         st.pending_overwrites.push(PendingOverwrite { slot: 2, old_pubkey: pk(3) });
         assert!(st.free_slots().is_empty());
+    }
+
+    #[test]
+    fn loads_take_slots_below_24_and_offline_change_slots_24_to_31() {
+        let mut st = CardState::default();
+        for i in 0..32 {
+            st.set_slot_pubkey(i, pk(i + 1));
+        }
+        assert_eq!(st.free_slots(), (0..24).collect::<Vec<u8>>());
+        assert_eq!(st.free_change_slots(), (24..32).collect::<Vec<u8>>());
+        st.notes.push(note(1, 2, NoteStatus::Live));
+        st.notes.push(note(25, 26, NoteStatus::Pending));
+        assert!(!st.free_slots().contains(&1) && st.free_slots().len() == 23);
+        assert_eq!(st.free_change_slots(), vec![24, 26, 27, 28, 29, 30, 31]);
     }
 
     fn held(slot: u8, kind: HeldKind) -> Held {

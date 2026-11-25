@@ -80,11 +80,13 @@ import {
   type Transceiver,
 } from './cardkit';
 import {
+  checkedAnchor,
   finishCard,
   finishVerified,
   probeCard,
   type CardProbe,
   type OfflineSetup,
+  OLD_APPLET,
   type SetupResult,
   type SetupStep,
 } from './cardSetup';
@@ -163,7 +165,10 @@ export function holdsPlace(seen: SeenTap): boolean {
   return (
     setup !== null &&
     !setup.ok &&
-    (setup.step === 'select' || setup.step === 'keys' || setup.step === 'attest')
+    (setup.step === 'select' ||
+      setup.step === 'keys' ||
+      setup.step === 'attest' ||
+      setup.step === 'anchor')
   );
 }
 
@@ -179,9 +184,12 @@ export interface TapOptions {
   /** This tap's own steps: `managerKeys` before the install, `rotate` after it. */
   readonly onPhase?: (phase: 'managerKeys' | 'rotate') => void;
   readonly onSetupStep?: (step: SetupStep) => void;
+  /** A wait the card owes before its PIN try is being served: about how many seconds are left. */
+  readonly onPinWait?: (seconds: number) => void;
   /**
-   * Applet 3.0's offline steps (limit, certificate), sent after the keys and
-   * before the PIN; a card that answers SELECT below 3.0 gets none.
+   * Applet 4.0's offline steps (limit, certificate, registry key, anchor),
+   * sent after the keys and before the PIN. Without a header that passes the
+   * phone's checks the tap touches no card.
    */
   readonly offline?: OfflineSetup;
   /** The chip, as soon as it is read: the loop keys the PIN it sends by it. */
@@ -357,9 +365,6 @@ async function resumeTap(
   if (probe.slot0 === null || probe.pin === null) {
     return guard(KEYED);
   }
-  if (probe.pin === 'blocked') {
-    return guard('the card’s PIN is blocked; this app never installs over it');
-  }
   const resumeCheck = options.resumeCheck;
   if (!resumeCheck) {
     return guard(KEYED);
@@ -474,7 +479,13 @@ async function resumeTap(
         resumedFrom: oldId,
       };
     }
-    const setup = await finishVerified(tx, sentPin, options.onSetupStep);
+    const setup = await finishVerified(
+      tx,
+      sentPin,
+      options.offline?.registryKey ?? null,
+      options.onSetupStep,
+      options.onPinWait,
+    );
     if (!setup.ok && setup.step === 'verifyPin') {
       return {
         installed: {
@@ -553,7 +564,23 @@ export async function installTap(
   // installed over, since the sweep would delete them with any value they
   // hold; one with the applet but no keys skips the install, and one with
   // keys and no PIN is resumed (`resumeTap`).
+  // First of all the anchor: set-up cannot finish without a block header, so
+  // without one the card is not touched at all, and the next tap of the same
+  // card starts it.
+  const anchor = checkedAnchor(options.offline);
+  if (!anchor.ok) {
+    return {
+      installed: {ok: false, kind: 'noManagerKeys', phase: 'probe', reason: anchor.reason},
+      setup: null,
+      resumable: true,
+    };
+  }
   const before = await probeCard(tx);
+  if (before.kind === 'old') {
+    // An applet before 4.0: never installed over, keyed or given a PIN here.
+    // The stop's reason is the old-card message, which offers its reset.
+    return {installed: {ok: false, kind: 'guarded', phase: 'probe', reason: OLD_APPLET}, setup: null};
+  }
   if (before.kind === 'keyed') {
     return resumeTap(tx, before, options);
   }

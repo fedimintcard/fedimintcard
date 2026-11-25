@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env, open_pin_session};
+use fedimint_card_host_card::{BridgeError, Card, SoftCard, StatusWord, open_from_env};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint, SpendFault};
 use fedimint_card_sidecar::ops::OpsError;
 use fedimint_card_sidecar::plan::PlanError;
@@ -67,15 +67,63 @@ async fn fx(fees: bool, funds: Amount) -> anyhow::Result<Fx> {
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
     let store = StateStore::open(dir.path().join("card_state.json"))?;
-    let card = open_from_env()?;
-    let mut cw = CardWallet::new(wallet, store, card);
     // A persistent card (pcsc, bridge) already holds keys from earlier runs: re-key it so it
-    // behaves like a new one.
+    // behaves like a new one. The soft one is a 4.0 card, as every reader now meets.
     let soft = std::env::var("CARD_BACKEND").map(|b| b == "soft").unwrap_or(true);
-    cw.card_setup(!soft)?;
+    let card: Box<dyn Card> = if soft { Box::new(card4()) } else { persistent_card()? };
+    let mut cw = CardWallet::new(wallet, store, card).with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
+    cw.card_setup(rekey_backend())?;
     // `topup` and every charge sign, and SIGN needs a PIN in this selection.
-    open_pin_session(cw.card.as_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(cw.card.as_mut())?;
     Ok(Fx { _fed: fed, cw, _dir: dir })
+}
+
+/// A persistent card (`CARD_BACKEND` bridge or pcsc) for the fixture. The bridge's jCardSim card
+/// is reset first, so every fixture starts from a blank applet, and a 4.0 card without a
+/// certificate is then set up as the Setup app leaves one before its PIN
+/// ([`softkit::ready_for_pin`](fedimint_card_host_card::softkit::ready_for_pin): certified by the
+/// test registry, its key, the anchor); the fixture's `open_test_session` sets the PIN, sealed. A
+/// pcsc card is taken as it is.
+fn persistent_card() -> anyhow::Result<Box<dyn Card>> {
+    if std::env::var("CARD_BACKEND").as_deref() == Ok("bridge") {
+        fedimint_card_host_card::BridgeTransport::new(&fedimint_card_host_card::bridge::url_from_env()).reset()?;
+    }
+    let mut card = open_from_env()?;
+    if card.applet_version()?.is_current() && card.get_cert().is_err() {
+        fedimint_card_host_card::softkit::ready_for_pin(card.as_mut())?;
+    }
+    Ok(card)
+}
+
+/// Whether the fixture re-keys the card (`card_setup(true)`): only a pcsc card, which keeps keys
+/// from earlier runs. The reset bridge card is blank, and a certified 4.x card refuses a re-key of
+/// slot 0 by design.
+fn rekey_backend() -> bool {
+    std::env::var("CARD_BACKEND").as_deref() == Ok("pcsc")
+}
+
+/// A 4.0 soft card as the Setup app leaves one before its PIN: the test registry's key and the
+/// anchor. Its first `softkit::open_test_session` sets the PIN, sealed.
+fn card4() -> SoftCard {
+    let mut c = SoftCard::v4();
+    fedimint_card_host_card::softkit::ready_for_pin(&mut c).unwrap();
+    c
+}
+
+/// Top the card up, then stand in for the registry this till does not have, as `pos_link.rs`
+/// does: sign each new note under the test registry key the card was set up with, and write the
+/// notes to the card.
+async fn load(cw: &mut CardWallet, amounts: &[u64]) -> anyhow::Result<()> {
+    cw.topup(amounts).await?;
+    let key = fedimint_card_host_card::v3::test_registry_key();
+    for n in cw.store.state.notes.iter_mut().filter(|n| n.reg_sig.is_none() && n.signature.is_some()) {
+        let x: [u8; 32] = hex::decode(&n.nonce[2..])?.try_into().unwrap();
+        let sig48 = fedimint_card_sidecar::glue::sig48_of(n.signature.as_deref().unwrap()).unwrap();
+        n.reg_sig = Some(hex::encode(fedimint_card_host_card::v3::sign_note(&key, &x, n.amount_msat, &sig48)));
+    }
+    cw.store.save()?;
+    cw.sync_card_notes();
+    Ok(())
 }
 
 fn sales_of(f: &Fx) -> Arc<Mutex<SalesStore>> {
@@ -85,7 +133,7 @@ fn sales_of(f: &Fx) -> Arc<Mutex<SalesStore>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn charge_happy_path_records_a_sale() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     let r = charge_with(&mut f.cw, 50_000, Some("ref-1".into()), &sales).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
@@ -119,14 +167,16 @@ async fn charge_happy_path_records_a_sale() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_holder_pin_is_its_own_error_and_moves_nothing() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 16]).await?;
+    load(&mut f.cw, &[1 << 16]).await?;
     let sales = sales_of(&f);
     // A fresh selection, as the till's opener gives every job: no PIN session yet.
     on_select(&mut f.cw);
     f.cw.pin = Some(b"9999".to_vec());
     let r = charge_with(&mut f.cw, 20_000, Some("pin".into()), &sales).await;
     assert_eq!((r.status, r.body["error"].as_str()), (403, Some("wrong_pin")), "{:?}", r.body);
-    assert!(r.body["detail"].as_str().unwrap().contains("2 tries left"), "{:?}", r.body);
+    // The first wrong try in a row: the card answers 63C1, and the next try first waits 1 asking.
+    assert_eq!((r.body["wrong_tries"].as_u64(), r.body["wait_s"].as_u64()), (Some(1), Some(1)), "{:?}", r.body);
+    assert!(r.body["detail"].as_str().unwrap().starts_with("wrong PIN; 1 wrong in a row"), "{:?}", r.body);
     assert!(!r.body.to_string().contains("9999"));
     assert!(f.cw.store.state.pending_txs.is_empty(), "nothing left to recover");
     assert_eq!(f.cw.store.state.live_total_msat(), 1 << 16);
@@ -156,7 +206,7 @@ async fn bad_prices_are_rejected_before_the_card_is_touched() -> anyhow::Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn insufficient_leaves_card_state_unchanged() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 14]).await?;
+    load(&mut f.cw, &[1 << 14]).await?;
     let before = std::fs::read(f._dir.path().join("card_state.json"))?;
     let sales = sales_of(&f);
     let r = charge_with(&mut f.cw, 5_000_000, None, &sales).await;
@@ -174,7 +224,7 @@ async fn insufficient_leaves_card_state_unchanged() -> anyhow::Result<()> {
 async fn a_card_spread_over_too_many_notes_is_no_exact_plan_in_plain_words() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     // 65,536 msat in four notes, but the three a tap may spend (`plan::MAX_INPUTS`) hold 49,152.
-    f.cw.topup(&[1 << 14; 4]).await?;
+    load(&mut f.cw, &[1 << 14; 4]).await?;
     let before = std::fs::read(f._dir.path().join("card_state.json"))?;
     let sales = sales_of(&f);
     let r = charge_with(&mut f.cw, 60_000, None, &sales).await;
@@ -189,7 +239,7 @@ async fn a_card_spread_over_too_many_notes_is_no_exact_plan_in_plain_words() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn sales_persist_and_a_repeated_client_ref_does_not_charge_twice() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     let first = charge_with(&mut f.cw, 20_000, Some("same".into()), &sales).await;
     assert_eq!(first.status, 200, "{:?}", first.body);
@@ -215,7 +265,7 @@ async fn sales_persist_and_a_repeated_client_ref_does_not_charge_twice() -> anyh
 #[tokio::test(flavor = "multi_thread")]
 async fn same_ref_after_success_returns_the_identical_body() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     let first = charge_with(&mut f.cw, 20_000, Some("r".into()), &sales).await;
     assert_eq!(first.status, 200, "{:?}", first.body);
@@ -252,13 +302,13 @@ type Counted = (Fx, Rc<RefCell<SoftCard>>, Rc<Cell<u32>>);
 /// A federation, a topped-up card (notes of 2^16 and 2^14 msat) and a signature counter.
 async fn fx_counted() -> anyhow::Result<Counted> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(card4()));
     let signs = Rc::new(Cell::new(0));
     f.cw.card = Box::new(CountCard(card.clone(), signs.clone()));
     f.cw.card_setup(false)?;
-    // A fresh SoftCard has no PIN session, and this one replaces the card fx() already opened.
-    open_pin_session(f.cw.card.as_mut())?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    // A fresh card has no PIN session, and this one replaces the card fx() already opened.
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     Ok((f, card, signs))
 }
 
@@ -309,7 +359,8 @@ async fn restart_after_crash_finds_the_transaction_through_card_state() -> anyho
     // Restart: everything is read back from disk.
     drop(sales);
     let store = StateStore::open(f._dir.path().join("card_state.json"))?;
-    let mut cw2 = CardWallet::new(f.cw.wallet.clone(), store, Box::new(CountCard(card.clone(), signs.clone())));
+    let mut cw2 = CardWallet::new(f.cw.wallet.clone(), store, Box::new(CountCard(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     let sales2 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales.json"))?));
     let r = charge_with(&mut cw2, 20_000, Some("c".into()), &sales2).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
@@ -415,7 +466,7 @@ async fn same_ref_with_another_price_is_a_conflict() -> anyhow::Result<()> {
 async fn a_different_card_is_refused_before_anything_moves() -> anyhow::Result<()> {
     let (mut f, _card, signs) = fx_counted().await?;
     let sales = sales_of(&f);
-    f.cw.card = Box::new(SoftCard::new());
+    f.cw.card = Box::new(card4());
     let before = std::fs::read(f._dir.path().join("card_state.json"))?;
     let signed = signs.get();
     let r = charge_with(&mut f.cw, 20_000, Some("x".into()), &sales).await;
@@ -499,13 +550,15 @@ async fn a_hookless_cli_balance_cannot_turn_a_sale_into_a_second_charge() -> any
 
     // The CLI (no sales hook) resolves the transaction, as `card balance` does.
     let state_path = f._dir.path().join("card_state.json");
-    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())));
+    let mut cli = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card.clone(), signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     cli.balance().await?;
     assert!(cli.pending_for_ref("t").is_none());
     assert_eq!(cli.store.state.tombstones.len(), 1, "the sale must not vanish");
 
     // The service, with a ledger that never heard of it, must not charge again.
-    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())));
+    let mut cw3 = CardWallet::new(f.cw.wallet.clone(), StateStore::open(&state_path)?, Box::new(CountCard(card, signs.clone())))
+        .with_cert_key(Some(fedimint_card_host_card::softkit::test_cert_key_hex()));
     let sales3 = Arc::new(Mutex::new(SalesStore::open(f._dir.path().join("sales3.json"))?));
     let r = charge_with(&mut cw3, 20_000, Some("t".into()), &sales3).await;
     assert_eq!(r.status, 200, "{:?}", r.body);
@@ -519,13 +572,13 @@ async fn a_hookless_cli_balance_cannot_turn_a_sale_into_a_second_charge() -> any
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(card4()));
     let mode = Rc::new(Cell::new(0u8));
     f.cw.card = Box::new(LostAnswerCard(card.clone(), mode.clone()));
     f.cw.card_setup(false)?;
-    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    // Each of these swaps in a fresh card, which carries no PIN session.
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = sales_of(&f);
     mode.set(1);
     let first = charge_with(&mut f.cw, 20_000, Some("o1".into()), &sales).await;
@@ -535,6 +588,40 @@ async fn a_slot_mid_overwrite_does_not_lock_the_merchant_out_of_their_own_card()
     // The card now holds a key the state file has not adopted yet. The next charge must work.
     let second = charge_with(&mut f.cw, 10_000, Some("o2".into()), &sales).await;
     assert_eq!(second.status, 200, "{:?}", second.body);
+    Ok(())
+}
+
+/// A till with no registry never re-keys slot 0 of a certified 4.x card: the certificate names
+/// that key and the card takes SET_CERT only once, so a renewed slot 0 would leave a card no host
+/// seals a PIN to again. After a sale spends slot 0 the card still passes `trust_card` and the
+/// next sale takes its PIN; an explicit overwrite of slot 0 and a `card_setup(fresh)` are refused
+/// before anything is written. (A 2.x card's slot 0 is still renewed off ops: card_wallet.rs.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_till_without_the_registry_never_re_keys_a_certified_cards_slot_0() -> anyhow::Result<()> {
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    assert!(f.cw.ops.is_none(), "this till has no registry");
+    let slot0 = f.cw.card.get_pub(0)?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
+    let sales = sales_of(&f);
+    let first = charge_with(&mut f.cw, 20_000, Some("a".into()), &sales).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert!(f.cw.store.state.overwritable_slots().contains(&0), "the sale spent slot 0 and left it for renewal");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0, "slot 0 keeps the key its certificate names");
+    fedimint_card_host_card::softkit::test_trust(f.cw.card.as_mut())?;
+
+    let e = f.cw.overwrite_slot(0).unwrap_err();
+    assert!(format!("{e:#}").contains("certificate names"), "{e:#}");
+    assert!(f.cw.store.state.pending_overwrites.is_empty(), "refused before anything was written");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0);
+    assert!(!f.cw.renew_spent_slots().await?.contains(&0), "renewal passes slot 0 by");
+
+    let e = f.cw.card_setup(true).unwrap_err();
+    assert!(format!("{e:#}").contains("--fresh would re-key slot 0"), "{e:#}");
+    assert_eq!(f.cw.card.get_pub(0)?, slot0);
+    fedimint_card_host_card::softkit::test_trust(f.cw.card.as_mut())?;
+
+    let second = charge_with(&mut f.cw, 10_000, Some("b".into()), &sales).await;
+    assert_eq!(second.status, 200, "the card still takes its PIN: {:?}", second.body);
     Ok(())
 }
 
@@ -564,7 +651,16 @@ fn classify_pins_codes_and_statuses() {
     assert_eq!(c(wrap(SpendFault::Undecided("u".into()).into())), k(202, "undecided"));
     assert_eq!(c(wrap(SpendFault::Unresolved("r".into()).into())), k(503, "recovering"));
     assert_eq!(c(wrap(StatusWord(0x63C2).into())), k(403, "wrong_pin"));
-    assert_eq!(c(wrap(StatusWord(0x6983).into())), k(423, "pin_blocked"));
+    assert_eq!(c(wrap(StatusWord(0x6A98).into())), k(423, "pin_wait"));
+    assert_eq!(c(wrap(fedimint_card_pos_core::PinWait { askings: 4 }.into())), k(423, "pin_wait"));
+    assert_eq!(c(wrap(StatusWord(0x6983).into())), k(502, "card_error"));
+    assert_eq!(c(wrap(fedimint_card_host_card::UnsupportedApplet::Old { answer: vec![3, 0] }.into())), k(409, "old_card"));
+    assert_eq!(
+        c(wrap(
+            anyhow::Error::from(StatusWord(0x6F00)).context(fedimint_card_host_card::SignCheckFailed).context("card signature, slot 0")
+        )),
+        k(409, "sign_check_failed")
+    );
     assert_eq!(c(wrap(OpsError::Changed("v".into()).into())), k(409, "card_changed"));
     assert_eq!(c(wrap(OpsError::UnknownCard("n".into()).into())), k(404, "unknown_card"));
     assert_eq!(c(wrap(OpsError::Unreachable("u".into()).into())), k(502, "ops_unreachable"));
@@ -572,6 +668,48 @@ fn classify_pins_codes_and_statuses() {
     assert_eq!(c(anyhow::anyhow!("something else")), k(500, "internal"));
     // Display text is unchanged from the old anyhow strings.
     assert_eq!(SpendFault::Declined("federation rejected the spend: e".into()).to_string(), "federation rejected the spend: e");
+}
+
+/// What an app reads from a refused PIN, in the JSON the till sends: `wrong_pin` carries
+/// `wrong_tries` (the wrong tries in a row) and `wait_s` (whole seconds the next try first waits),
+/// `pin_wait` carries `wait_s` (whole seconds still owed), as docs/TILL-API.md names them.
+#[tokio::test]
+async fn a_pin_refusal_carries_the_wrong_tries_and_the_wait_as_the_api_names_them() {
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct AppRefusal {
+        ok: bool,
+        error: String,
+        wrong_tries: Option<u8>,
+        wait_s: Option<u32>,
+    }
+    async fn read(e: anyhow::Error) -> (u16, AppRefusal, Value) {
+        let resp = axum::response::IntoResponse::into_response(till::error_reply(&e.context("charging")));
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap(), serde_json::from_slice(&bytes).unwrap())
+    }
+    let refusal = |error: &str, wrong_tries, wait_s| AppRefusal { ok: false, error: error.into(), wrong_tries, wait_s };
+    // The first wrong try: the next one first owes 1 asking (0.75 s), about 1 s.
+    let (s, r, raw) = read(StatusWord(0x63C1).into()).await;
+    assert_eq!((s, r), (403, refusal("wrong_pin", Some(1), Some(1))));
+    assert!(raw["detail"].as_str().unwrap().starts_with("wrong PIN; 1 wrong in a row"), "{raw}");
+    // Three in a row: 2^2 askings, 3 s.
+    let (s, r, _) = read(StatusWord(0x63C3).into()).await;
+    assert_eq!((s, r), (403, refusal("wrong_pin", Some(3), Some(3))));
+    // Fifteen in a row: the longest wait a PIN can owe.
+    let (s, r, _) = read(StatusWord(0x63CF).into()).await;
+    assert_eq!((s, r), (403, refusal("wrong_pin", Some(15), Some(12_288))));
+    // A wait broken off after 4 askings were known owed: about 3 s left, and no count.
+    let (s, r, raw) = read(fedimint_card_pos_core::PinWait { askings: 4 }.into()).await;
+    assert_eq!((s, r), (423, refusal("pin_wait", None, Some(3))));
+    assert!(raw.get("wrong_tries").is_none(), "{raw}");
+    // A bare 6A98: the wait left is not known, so 0.
+    let (s, r, _) = read(StatusWord(0x6A98).into()).await;
+    assert_eq!((s, r), (423, refusal("pin_wait", None, Some(0))));
+    // Any other refusal carries neither field.
+    let (s, _, raw) = read(StatusWord(0x6985).into()).await;
+    assert_eq!(s, 502);
+    assert!(raw.get("wrong_tries").is_none() && raw.get("wait_s").is_none(), "{raw}");
 }
 
 /// The codes a phone's offline charge adds (docs/TILL-API.md) come out of `classify` as every
@@ -685,12 +823,12 @@ async fn call(app: axum::Router, method: &str, uri: &str, body: &str) -> (u16, V
 async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     // Replace the card with one shared with the opener below.
-    let shared = Rc::new(RefCell::new(SoftCard::new()));
+    let shared = Rc::new(RefCell::new(card4()));
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
-    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    // Each of these swaps in a fresh card, which carries no PIN session.
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
     let dead_relay = closed_port_url();
@@ -753,12 +891,12 @@ async fn router_serves_one_charge_at_a_time_and_reports_status() -> anyhow::Resu
 #[tokio::test(flavor = "multi_thread")]
 async fn same_ref_while_in_flight_gets_202_not_busy() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
-    let shared = Rc::new(RefCell::new(SoftCard::new()));
+    let shared = Rc::new(RefCell::new(card4()));
     f.cw.card = Box::new(SlowCard(shared.clone()));
     f.cw.card_setup(false)?;
-    // Each of these swaps in a fresh SoftCard, which carries no PIN session.
-    open_pin_session(f.cw.card.as_mut())?;
-    f.cw.topup(&[1 << 16, 1 << 14]).await?;
+    // Each of these swaps in a fresh card, which carries no PIN session.
+    fedimint_card_host_card::softkit::open_test_session(f.cw.card.as_mut())?;
+    load(&mut f.cw, &[1 << 16, 1 << 14]).await?;
     let sales = SalesStore::open(f._dir.path().join("sales.json"))?;
     let opener_card = shared.clone();
     let (handle, actor) =
@@ -816,7 +954,7 @@ async fn an_ops_till_refuses_a_charge_without_the_holders_pin() -> anyhow::Resul
         sales,
         Box::new(move || {
             counter.set(counter.get() + 1);
-            Ok(Box::new(SoftCard::new()) as Box<dyn Card>)
+            Ok(Box::new(card4()) as Box<dyn Card>)
         }),
         Some(ops),
     )

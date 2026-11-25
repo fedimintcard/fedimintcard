@@ -22,7 +22,7 @@ pub mod queue;
 pub mod refusal;
 pub mod store;
 
-pub use refusal::{Refusal, class_of, refusal};
+pub use refusal::{PinWait, Refusal, class_of, class_of_error, refusal, wait_seconds};
 
 /// The nonce for a card key. Parity is fixed to even so the 33 bytes blinded at issue are the
 /// 33 bytes the federation sees at spend.

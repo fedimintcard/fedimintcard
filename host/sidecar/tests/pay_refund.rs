@@ -55,6 +55,8 @@ struct FakeRegistry {
     /// have taken the load: the till's journal keeps it, and the federation never sees it).
     fail_loads: AtomicUsize,
     version: AtomicU64,
+    /// Slots listed as having no key on record yet.
+    unkeyed: Mutex<Vec<u8>>,
 }
 
 async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> Json<Value> {
@@ -68,7 +70,8 @@ async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> J
         .collect();
     let free: Vec<Value> =
         (1..r.keys.len() as u64).filter(|s| !used.contains(s)).take(n).map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]})).collect();
-    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": []}))
+    let unkeyed = r.unkeyed.lock().unwrap().clone();
+    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": unkeyed}))
 }
 
 async fn load(
@@ -93,8 +96,27 @@ async fn outcome(
         r.fail_outcomes.fetch_sub(1, Ordering::SeqCst);
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false, "reason": "down for a moment"})));
     }
+    let notes = sign_loaded(&r.loads.lock().unwrap(), &body);
     r.outcomes.lock().unwrap().push(body);
-    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3})))
+    (axum::http::StatusCode::OK, Json(json!({"ok": true, "version": 3, "notes": notes})))
+}
+
+/// As ops signs a load's notes once the load is accepted: each note of the outcome, under the test
+/// registry key the card was set up with, listed as an outcome's answer lists them.
+fn sign_loaded(loads: &[Value], body: &Value) -> Vec<Value> {
+    let key = fedimint_card_host_card::v3::test_registry_key();
+    let mut out = vec![];
+    for o in body["notes"].as_array().into_iter().flatten() {
+        let Some(n) = loads.iter().flat_map(|l| l["notes"].as_array().unwrap().iter()).find(|n| n["nonce"] == o["nonce"]) else {
+            continue;
+        };
+        let nonce = o["nonce"].as_str().unwrap();
+        let x: [u8; 32] = hex::decode(&nonce[2..]).unwrap().try_into().unwrap();
+        let sig48 = fedimint_card_sidecar::glue::sig48_of(o["signature"].as_str().unwrap()).unwrap();
+        let reg = fedimint_card_host_card::v3::sign_note(&key, &x, n["amount_msat"].as_u64().unwrap(), &sig48);
+        out.push(json!({"slot": n["slot"], "nonce": nonce, "reg_sig": hex::encode(reg)}));
+    }
+    out
 }
 
 async fn serve_registry(r: Arc<FakeRegistry>) -> String {
@@ -159,10 +181,16 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
     let wallet = Wallet::from_client(client).await?;
     let dir = tempfile::tempdir()?;
 
-    let card = Arc::new(Mutex::new(SoftCard::new()));
+    // A 4.0 card set up as the Setup app does: keyed, the test registry's key, anchored, a PIN.
+    let card = Arc::new(Mutex::new(SoftCard::v4()));
     let mut keys = vec![];
-    for s in 0..8 {
-        keys.push(card.lock().unwrap().gen_key(s)?);
+    {
+        let mut c = card.lock().unwrap();
+        for s in 0..8 {
+            keys.push(c.gen_key(s)?);
+        }
+        fedimint_card_host_card::softkit::ready_for_pin(&mut *c)?;
+        fedimint_card_host_card::softkit::open_test_session(&mut *c)?;
     }
     let short_id = short_id_of(&keys[0]);
     let registry = Arc::new(FakeRegistry {
@@ -174,6 +202,7 @@ async fn start(on_ops: bool) -> anyhow::Result<(Fx, impl std::future::Future<Out
         fail_outcomes: AtomicUsize::new(0),
         fail_loads: AtomicUsize::new(0),
         version: AtomicU64::new(1),
+        unkeyed: Mutex::new(vec![]),
     });
     let url = serve_registry(registry.clone()).await;
     let conn = if on_ops {
@@ -438,6 +467,25 @@ async fn only_the_card_that_paid_and_only_a_pay_failed_pay_is_refunded() -> anyh
         // No such pay.
         assert_eq!(refund(addr, 99, None).await.0, 404);
         assert_eq!(call(addr, "POST", "/v1/pay/x/refund", None).await.0, 404);
+        assert!(registry.loads.lock().unwrap().is_empty(), "nothing was loaded");
+    })
+    .await;
+    Ok(())
+}
+
+/// Slots 24 and up take the change of offline sales only: a refund counts none of them as room,
+/// so a card with no free or unkeyed slot below 24 is refused as full and the pay stays owed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refund_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
+    let (f, actor) = start(true).await?;
+    let id = put_pay(&f.pays, "full24", PayState::PayFailed, PRICE, Some(&f.short_id));
+    let (addr, pays, registry, card) = (f.addr, f.pays.clone(), f.registry.clone(), f.card.clone());
+    with_actor(actor, async move {
+        registry.free.store(0, Ordering::SeqCst);
+        *registry.unkeyed.lock().unwrap() = (24..32).collect();
+        let (s, v) = refund(addr, id, Some(card)).await;
+        assert_eq!((s, v["error"].as_str(), v["state"].as_str()), (409, Some("card_full"), Some("pay_failed")), "{v}");
+        assert_eq!(pays.get(id).unwrap().state, PayState::PayFailed);
         assert!(registry.loads.lock().unwrap().is_empty(), "nothing was loaded");
     })
     .await;

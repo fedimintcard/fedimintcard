@@ -52,8 +52,8 @@ android {
         applicationId = "org.fedimintcard.pos"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.0.0"
+        versionCode = 5
+        versionName = "1.1.0"
         // The ABIs the core is built for (and JNA's libraries are kept for): phones and the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }

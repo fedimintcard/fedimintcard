@@ -1,12 +1,12 @@
-//! Fixtures for the core's tests, with no federation and no network: a 3.0 SoftCard the registry
+//! Fixtures for the core's tests, with no federation and no network: a 4.0 SoftCard the registry
 //! certified, loaded by a one-guardian mint (`softkit`), and an offline kit for it.
 
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
-use fedimint_card_host_card::softkit::{SoftMint, SoftTransport};
-use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, TEST_PIN, Transport, open_pin_session_with};
+use fedimint_card_host_card::softkit::{SoftMint, SoftTransport, ready_for_pin};
+use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, TEST_PIN, Transport};
 use fedimint_card_pos_core::kit::{KIT_VERSION, Kit, PoolTier};
 use fedimint_card_pos_core::plan::{self, FeeHeadroom};
 use fedimint_core::encoding::Encodable;
@@ -46,19 +46,28 @@ impl Fx {
         self.fee.min_economical_denomination().msats
     }
 
-    /// A 3.0 card set up as the Setup app does it, under this fixture's registry key: `keyed`
-    /// slots with keys, the attestation key certified, the registry key, the PIN `1234`; then
-    /// `notes` (msat) loaded into slots 0, 1, ...
+    /// A 4.0 card set up as the Setup app does it, under this fixture's registry key: `keyed`
+    /// slots with keys, the attestation key certified, the registry key, the anchor and the PIN
+    /// `1234` in one selection; then `notes` (msat) loaded into slots 0, 1, ..., each signed by
+    /// this fixture's registry.
     pub fn card(&self, keyed: u8, notes: &[u64]) -> SoftTransport {
-        let mut c = SoftCard::v3();
-        let keys: Vec<_> = (0..keyed).map(|s| c.gen_key(s).unwrap()).collect();
+        self.card_with_keys(&(0..keyed).collect::<Vec<u8>>(), notes)
+    }
+
+    /// The same card with keys in `slots` only (slot 0 first: its key is the certified one).
+    pub fn card_with_keys(&self, slots: &[u8], notes: &[u64]) -> SoftTransport {
+        assert_eq!(slots.first(), Some(&0), "slot 0 carries the certificate");
+        let mut c = SoftCard::v4();
+        let keys: Vec<_> = slots.iter().map(|s| c.gen_key(*s).unwrap()).collect();
         let w = c.attest_init().unwrap();
         let cert = Certificate::sign(&self.registry, &keys[0].serialize(), &w).unwrap();
         c.set_cert(&cert.to_bytes()).unwrap();
         c.set_registry_key(&self.registry.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap()).unwrap();
-        open_pin_session_with(&mut c, TEST_PIN).unwrap();
+        ready_for_pin(&mut c).unwrap();
+        let t = fedimint_card_host_card::trust_card(&mut c, self.registry.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+        fedimint_card_host_card::open_pin_session_held(&mut c, &t, TEST_PIN, &mut |_| {}).unwrap();
         for (slot, amount) in notes.iter().enumerate() {
-            self.mint.load(&mut c, slot as u8, *amount).unwrap();
+            self.mint.load_with(&mut c, slot as u8, *amount, &self.registry).unwrap();
         }
         SoftTransport::new(c)
     }

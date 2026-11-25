@@ -315,6 +315,7 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             // The till first, unless the phone holds the sale; on the phone when the link cannot
             // open and nothing was ever posted for the sale (OfflineTill.runCharge). Wipes fx.pin.
             is PosEffect.StartCharge -> Thread {
+                offline.onHolding = { left -> runOnUiThread { ui.setHolding(left) } }
                 val r = offline.runCharge(fx.priceMsat, fx.clientRef, fx.pin, ::currentCard) { sent ->
                     withCard(
                         { link -> sent(); client.charge(fx.priceMsat, fx.clientRef, fx.pin, link) },

@@ -26,7 +26,9 @@ struct CardBalance: Equatable {
     /// the balance screen sends it so the till fits the amount to this card's free slots.
     var shortId: String? = nil
     /// Notes the till holds back as stranded (`stranded_msat`, docs/TILL-API.md): on the card, not
-    /// in `liveMsat`, until the registry releases them. 0 from a till from before these fields.
+    /// in `liveMsat`, held for a sale that was never settled. Most are freed by the registry's
+    /// release after the grace; a double spend's still-live inputs stay held. 0 from a till from
+    /// before these fields.
     var strandedMsat: Int64 = 0
     /// When the last of them may be released, by the registry's clock (`stranded_until_ms`); nil
     /// when there is no date to wait for, or the till does not say.
@@ -75,6 +77,8 @@ enum ChargeErrorCode: String, CaseIterable {
     case relayUnreachable = "relay_unreachable"
     case cardError = "card_error"
     case insufficient
+    /// The live notes do not pay; with the notes held for a sale the registry refused they would. Nothing ran.
+    case notesHeld = "notes_held"
     case noExactPlan = "no_exact_plan"
     case declined
     case undecided
@@ -82,7 +86,12 @@ enum ChargeErrorCode: String, CaseIterable {
     case conflict
     case pinRequired = "pin_required"
     case wrongPin = "wrong_pin"
-    case pinBlocked = "pin_blocked"
+    /// The card is serving its PIN wait; tap again to finish it (`wait_s`).
+    case pinWait = "pin_wait"
+    /// An applet before 4.0: needs a reset and a new set-up.
+    case oldCard = "old_card"
+    /// The card refused the signature; nothing was spent.
+    case signCheckFailed = "sign_check_failed"
     case cardChanged = "card_changed"
     case unknownCard = "unknown_card"
     case opsUnreachable = "ops_unreachable"
@@ -120,12 +129,4 @@ enum ChargeErrorCode: String, CaseIterable {
         guard let s, !s.isEmpty else { return .unknown }
         return ChargeErrorCode(rawValue: s) ?? .unknown
     }
-}
-
-/// Tries left from a `wrong_pin` detail ("wrong PIN; 2 tries left before the card blocks"), or nil.
-func parseTriesLeft(_ detail: String) -> Int? {
-    guard let re = try? NSRegularExpression(pattern: #"(\d+)\s+tr(?:y|ies)\s+left"#, options: .caseInsensitive),
-          let m = re.firstMatch(in: detail, range: NSRange(detail.startIndex..., in: detail)),
-          let r = Range(m.range(at: 1), in: detail) else { return nil }
-    return Int(detail[r])
 }

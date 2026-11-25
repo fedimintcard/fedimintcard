@@ -121,10 +121,10 @@ function containsAid(payload: number[], aid: readonly number[]): boolean {
 }
 
 /**
- * The applet's own answer to a selected card, at its version: `03 00` (applet 3.0) from
+ * The applet's own answer to a selected card, at its version: `04 00` (applet 4.0) from
  * VERSION_MAJOR/VERSION_MINOR, which cardkit's fedimint plan checks on SELECT.
  */
-const APLET_VERSION = [0x03, 0x00];
+const APLET_VERSION = [0x04, 0x00];
 
 /**
  * A `Transceiver` wired to a fake card in `profile`. `speed` scales every delay
@@ -206,7 +206,9 @@ export function fakeCard(
     return tlv[0] === 0x4f && tlv.length >= 3 ? tlv.slice(2, 2 + tlv[1]) : tlv;
   };
 
-  // Applet 3.0's offline state, as a fresh applet holds it.
+  // Applet 4.0's offline state, as a fresh applet holds it.
+  let now: number[] = [0, 0, 0, 0];
+  let anchored = 0;
   let limit: number[] = new Array(8).fill(0);
   let attest: number[] | null = null;
   let cert: number[] | null = null;
@@ -216,13 +218,27 @@ export function fakeCard(
       case 0x16:
         return ok([
           ...new Array(32).fill(0), // no slot has a key
-          ...new Array(8).fill(0), // now, window
+          ...now,
+          ...new Array(4).fill(0), // window
           ...limit,
           ...new Array(8).fill(0), // spent in the window
           cert ? cert.length : 0,
           attest ? 1 : 0,
           registryKey ? 1 : 0,
+          0, // no PIN
+          0, // wrong tries in a row
+          0, 0, // askings owed
+          anchored,
+          0, // signer
         ]);
+      case 0x19:
+        // SET_HEADER: with no PIN and no value, the header is an anchor.
+        if (data.length !== 80) {
+          return sw(0x6700);
+        }
+        now = [data[71], data[70], data[69], data[68]];
+        anchored = 1;
+        return ok(now);
       case 0x18:
         if (data.length !== 8) {
           return sw(0x6700);
@@ -295,6 +311,7 @@ export function fakeCard(
 
       case 0x16:
       case 0x18:
+      case 0x19:
       case 0x30:
       case 0x31:
       case 0x32:

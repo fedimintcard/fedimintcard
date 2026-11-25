@@ -53,6 +53,10 @@ sealed class ChargeResult {
         val suggestedMsat: Long? = null,
         val held: Boolean = false,
         val local: Boolean = false,
+        /** `wrong_pin`: the wrong tries in a row. */
+        val wrongTries: Int? = null,
+        /** `wrong_pin`: seconds the next try waits; `pin_wait`: seconds still owed. */
+        val waitS: Int? = null,
     ) : ChargeResult()
     data class Failed(val error: TillError) : ChargeResult()
 }
@@ -280,6 +284,8 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
             if (o.isNull("detail")) "" else o.optString("detail", ""),
             httpStatus,
             if (o.isNull("suggested_msat")) null else o.optLong("suggested_msat", 0L).takeIf { it > 0 },
+            wrongTries = if (o.has("wrong_tries") && !o.isNull("wrong_tries")) o.optInt("wrong_tries") else null,
+            waitS = if (o.has("wait_s") && !o.isNull("wait_s")) o.optInt("wait_s") else null,
         )
     } else {
         val w = o.optJSONArray("warnings")
