@@ -4,7 +4,10 @@
 //! `wrangler dev` (from `registry/`):
 //!
 //! ```text
-//! npx wrangler dev --port 8799 --persist-to <scratch dir> \
+//! openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+//!   | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 | tr -d '\n' > <scratch dir>/cert.key
+//! npx wrangler dev --local --ip 127.0.0.1 --port 8799 --persist-to <scratch dir> \
+//!   --var "CERT_SIGNING_KEY:$(cat <scratch dir>/cert.key)" \
 //!   --var 'OPERATOR_SETUP:{"action":"bootstrap","nonce":"local-o4-nonce-0001","name":"op","password":"local o4 password"}'
 //! OPS_TEST_URL=http://127.0.0.1:8799 cargo test -p fedimint-card-sidecar --test ops_till
 //! ```
@@ -16,18 +19,18 @@
 //! batch, till tokens and cards (random short ids), so a persisted registry can be reused. Never
 //! point this at the staging or production registry: it writes rows there.
 //!
-//! The federation is the in-process fixture of `till_service.rs`; the card is a [`SoftCard`],
-//! registered with a key for every slot it has (32 on a 2.1 card, 8 on a 2.0 one) as the
-//! provisioner registers one, and loaded through the till's
-//! own `topup` (a load, recorded in ops as an intent with no inputs).
+//! The federation is the in-process fixture of `till_service.rs`; the card is a 4.0 [`SoftCard`]
+//! set up as the Setup app sets one up: registered with its keys, its attestation key certified by
+//! this registry (`CERT_SIGNING_KEY`, which the registry also signs every note with), the
+//! registry's key and the anchor on the card, and its PIN set sealed under that certificate. It is
+//! loaded through the till's own `topup` (a load, recorded in ops as an intent with no inputs).
 
-use fedimint_card_old_card_pin::open_pin_session;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fedimint_card_host_card::{Card, SoftCard};
+use fedimint_card_host_card::{Card, SoftCard, softkit};
 use fedimint_card_sidecar::glue::{CardWallet, CrashPoint};
 use fedimint_card_sidecar::holder::{LoadCrash, Loader, outcome_body};
 use fedimint_card_sidecar::ops::{FederationReport, Ops, OpsConfig, report_federation, short_id_of};
@@ -105,37 +108,28 @@ impl Registry {
         Ops::new(&cfg, dir)
     }
 
-    /// Key a blank card, set its PIN, and register its row with a key per slot the card has.
+    /// Set up a blank 4.0 card with a key in every slot it has, registered with all of them.
     async fn provision(&self, card: &Rc<RefCell<SoftCard>>) -> anyhow::Result<String> {
-        let mut keys = vec![];
         let n = card.borrow().slot_len();
-        for slot in 0..n {
-            keys.push(card.borrow_mut().gen_key(slot)?);
-        }
-        open_pin_session(&mut *card.borrow_mut())?;
-        let short_id = short_id_of(&keys[0]);
-        let row = json!({
-            "short_id": short_id,
-            "batch_id": self.batch_id,
-            "installed_at": 1_762_000_000_000u64,
-            "load_sha256": "a".repeat(64),
-            "pin_set": true,
-            "pin_policy": "batch",
-            "notes_issued": 0,
-            "slot_pubkeys": keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
-        });
-        self.op_post("/registry/cards", row).await?;
-        Ok(short_id)
+        self.set_up(card, n, None).await
     }
 
-    /// Split keying: a 32-slot card whose install tap keyed slots 0-7 only, registered with those
-    /// eight keys and `slot_count` 32. A till keys 8-31 at later taps.
+    /// Split keying: a 32-slot 4.0 card whose install tap keyed slots 0-7 only, registered with
+    /// those eight keys and `slot_count` 32. A till keys 8-31 at later taps.
     async fn provision_split(&self, card: &Rc<RefCell<SoftCard>>) -> anyhow::Result<String> {
         assert_eq!(card.borrow().slot_len(), 32);
-        let keys: Vec<XOnlyPublicKey> = (0..8).map(|s| card.borrow_mut().gen_key(s)).collect::<anyhow::Result<_>>()?;
-        open_pin_session(&mut *card.borrow_mut())?;
+        self.set_up(card, 8, Some(32)).await
+    }
+
+    /// What the Setup app does to a blank 4.0 card: key slots `0..keyed`, register the card with
+    /// those keys, have this registry certify the card's attestation key over slot 0's, put the
+    /// certificate, the registry's key and the anchor on the card, and set the PIN sealed to the
+    /// card checked under that key.
+    async fn set_up(&self, card: &Rc<RefCell<SoftCard>>, keyed: u8, slot_count: Option<u8>) -> anyhow::Result<String> {
+        assert!(card.borrow().version().sign_once(), "a till takes 4.0 cards only");
+        let keys: Vec<XOnlyPublicKey> = (0..keyed).map(|s| card.borrow_mut().gen_key(s)).collect::<anyhow::Result<_>>()?;
         let short_id = short_id_of(&keys[0]);
-        let row = json!({
+        let mut row = json!({
             "short_id": short_id,
             "batch_id": self.batch_id,
             "installed_at": 1_762_000_000_000u64,
@@ -143,10 +137,23 @@ impl Registry {
             "pin_set": true,
             "pin_policy": "batch",
             "notes_issued": 0,
-            "slot_count": 32,
             "slot_pubkeys": keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
         });
+        if let Some(n) = slot_count {
+            row["slot_count"] = json!(n);
+        }
         self.op_post("/registry/cards", row).await?;
+
+        let key: Value = self.http.get(format!("{}/registry/cert-key", self.url)).send().await?.error_for_status()?.json().await?;
+        let key = hex::decode(key["key"].as_str().expect("the registry's certificate key"))?;
+        let attest_pub = card.borrow_mut().attest_init()?;
+        let cert =
+            self.op_post(&format!("/registry/cards/{short_id}/attestation"), json!({"attest_pub": hex::encode(&attest_pub)})).await?;
+        let mut c = card.borrow_mut();
+        c.set_cert(&hex::decode(cert["cert"].as_str().expect("a certificate"))?)?;
+        c.set_registry_key(key.as_slice().try_into()?)?;
+        softkit::ready_for_pin(&mut *c)?;
+        softkit::open_test_session_under(&mut *c, &key)?;
         Ok(short_id)
     }
 
@@ -269,7 +276,7 @@ async fn a_charge_runs_through_ops_end_to_end() -> anyhow::Result<()> {
     let fed = federation().await?;
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let mut till = Till::new(&fed, &reg, "o3 front desk", Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
 
     till.load(&card, &[1 << 16, 1 << 14]).await?;
@@ -322,7 +329,7 @@ async fn a_charge_killed_between_sign_and_outcome_is_finished_by_a_second_till()
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let mut first = Till::new(&fed, &reg, "o3 first", Amount::from_sats(10_000)).await?;
     let mut second = Till::new(&fed, &reg, "o3 second", Amount::ZERO).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
     first.load(&card, &[1 << 16, 1 << 14]).await?;
 
@@ -366,8 +373,8 @@ async fn two_cards_are_charged_on_one_till() -> anyhow::Result<()> {
     let fed = federation().await?;
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let mut till = Till::new(&fed, &reg, "o3 two cards", Amount::from_sats(20_000)).await?;
-    let a = Rc::new(RefCell::new(SoftCard::new()));
-    let b = Rc::new(RefCell::new(SoftCard::new()));
+    let a = Rc::new(RefCell::new(SoftCard::v4()));
+    let b = Rc::new(RefCell::new(SoftCard::v4()));
     let id_a = reg.provision(&a).await?;
     let id_b = reg.provision(&b).await?;
     assert_ne!(id_a, id_b);
@@ -399,7 +406,7 @@ async fn signed_bytes_ops_never_answered_for_are_posted_again_never_abandoned() 
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let mut till = Till::new(&fed, &reg, "o3 unanswered", Amount::from_sats(20_000)).await?;
     let mut other = Till::new(&fed, &reg, "o3 other", Amount::ZERO).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
     till.load(&card, &[1 << 16, 1 << 15, 1 << 14]).await?;
     let local = |t: &Till| StateStore::open(t.ops.card_path(&short_id)).unwrap().state;
@@ -435,8 +442,12 @@ async fn signed_bytes_ops_never_answered_for_are_posted_again_never_abandoned() 
     till.cw.crash_point = None;
     assert_eq!(status, 202);
     let lost = local(&till).pending_txs[0].txid.clone();
+    // The card signed the lost charge, so the other till pays from the card's other notes, and
+    // the registry signs the release that frees the signed slots for a later tap.
     let (status, body) = other.charge(&card, 10_000, "o3-other", "1234").await;
     assert_eq!(status, 200, "{body}");
+    let s = reg.state(&short_id).await?;
+    assert!(s["releases"].as_array().unwrap().iter().any(|r| r["txid"] == lost.as_str()), "{s}");
     till.tap(&card);
     let b = card_balance_job(&mut till.cw, Some(&till.ops), &till.sales).await;
     assert_eq!(b.status, 200, "{:?}", b.body);
@@ -474,7 +485,7 @@ async fn a_card_loaded_from_the_holders_wallet_is_charged_at_a_till() -> anyhow:
     // The till only reports the federation's keys; it puts no value on the card.
     let mut till = Till::new(&fed, &reg, "o4 till", Amount::ZERO).await?;
     let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
     let before = holder.wallet.balance_msat().await?;
 
@@ -507,13 +518,14 @@ async fn a_load_with_forged_signatures_is_refused_and_the_real_ones_finish_it() 
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let _till = Till::new(&fed, &reg, "o4 keys", Amount::ZERO).await?;
     let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
 
     // The wallet submits, then dies before ops has the outcome.
     let mut loader = holder.loader(&reg)?;
     loader.crash = Some(LoadCrash::AfterCommit);
-    assert!(loader.load(&mut Shared(card.clone()), &[(1 << 16) + (1 << 14)]).await.is_err());
+    let err = loader.load(&mut Shared(card.clone()), &[(1 << 16) + (1 << 14)]).await.expect_err("the load stops after commit");
+    assert!(format!("{err:#}").contains("simulated crash after commit"), "{err:#}");
     let pending = loader.pending()?;
     assert_eq!(pending.len(), 1);
     let p = &pending[0];
@@ -562,13 +574,14 @@ async fn a_load_that_never_left_the_wallet_frees_its_slots_on_the_next_run() -> 
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let _till = Till::new(&fed, &reg, "o4 uncommitted", Amount::ZERO).await?;
     let holder = Holder::new(&fed, Amount::from_sats(10_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision(&card).await?;
     let before = holder.wallet.balance_msat().await?;
 
     let mut loader = holder.loader(&reg)?;
     loader.crash = Some(LoadCrash::BeforeCommit);
-    assert!(loader.load(&mut Shared(card.clone()), &[1 << 16]).await.is_err());
+    let err = loader.load(&mut Shared(card.clone()), &[1 << 16]).await.expect_err("the load stops before commit");
+    assert!(format!("{err:#}").contains("simulated crash before commit"), "{err:#}");
     assert_eq!(holder.wallet.balance_msat().await?, before, "nothing left the wallet");
     let free = |s: &Value| s["notes"].as_array().unwrap().is_empty();
     assert!(!free(&reg.state(&short_id).await?), "ops holds the load pending");
@@ -598,12 +611,13 @@ fn key_in(state: &Value, slot: u64) -> Option<String> {
 /// earlier tap made but never recorded is recorded as it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -> anyhow::Result<()> {
-    use fedimint_card_sidecar::ops::KEY_AHEAD;
+    use fedimint_card_host_card::CHANGE_SLOTS_FROM;
+    use fedimint_card_sidecar::ops::{KEY_AHEAD, MIN_CHANGE_SPARES};
     let fed = federation().await?;
     let Some(reg) = Registry::connect(&fed_id(&fed)).await? else { return Ok(()) };
     let mut till = Till::new(&fed, &reg, "split keying", Amount::from_sats(10_000)).await?;
     let holder = Holder::new(&fed, Amount::from_sats(100_000)).await?;
-    let card = Rc::new(RefCell::new(SoftCard::new()));
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
     let short_id = reg.provision_split(&card).await?;
     let s = reg.state(&short_id).await?;
     assert_eq!(s["slot_count"], 32, "{s}");
@@ -626,7 +640,9 @@ async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -
     assert!(change > 0, "a charge with change: {body}");
     let s = reg.state(&short_id).await?;
     let keyed_now = (change + KEY_AHEAD) as u64;
-    assert_eq!(unkeyed(&s), (8 + keyed_now..32).collect::<Vec<u64>>(), "{s}");
+    // A 4.0 till also keeps MIN_CHANGE_SPARES of the offline-change slots (24 and up) keyed.
+    let spares = CHANGE_SLOTS_FROM as u64..(CHANGE_SLOTS_FROM as usize + MIN_CHANGE_SPARES) as u64;
+    assert_eq!(unkeyed(&s), (8 + keyed_now..32).filter(|s| !spares.contains(s)).collect::<Vec<u64>>(), "{s}");
     assert_eq!(key_in(&s, 8).as_deref(), Some(earlier.as_str()), "the earlier tap's key, recorded as it is");
     for slot in 8..8 + keyed_now {
         assert_eq!(key_in(&s, slot), Some(card.borrow_mut().get_pub(slot as u8)?.to_string()), "slot {slot}");

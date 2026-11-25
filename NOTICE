@@ -20,6 +20,10 @@ The sealed PIN in FedimintCardApplet.java (GET_NONCE, unseal, sealBlock, unblock
 requireFullPoint with its field code: isSquareModP, powModP, reduceModP and their helpers) is
 ported from the same applet (Cashu Card 1.9, its unseal, sealBlock, unblockPin and
 processGetPinKey), and SealedPinTest in applet/src/test ports its sealed-PIN tests. Same licence.
+The field powers over p itself padded to 64 bytes (rsaCubeP, rsaRootP, rsaEulerP, fieldP,
+fieldPInit, powRaw and powModP's choice between the two paths) are ported from the same applet
+(Cashu Card 3.1), and FieldPaddedKeysTest in applet/src/test ports its FieldReductionTest and
+the field tests of its ChipEnginesTest. Same licence.
 
 tools/cardkit is ported from cashucard's tools/cardkit. Its own NOTICE, in
 that directory, names what was copied and carries the same licence.

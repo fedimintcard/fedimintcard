@@ -759,6 +759,47 @@ describe('card state', () => {
     expect(late.status).toBe(409);
   });
 
+  it('a rejected charge is not accepted for sending, even for the bytes it already holds', async () => {
+    const token = await signIn();
+    const first = await newTill(token, 'first');
+    const second = await newTill(token, 'second');
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, first.token, intent(0));
+    const signed = {txid: txid(7), tx_hex: 'cd'.repeat(120)};
+    // The second till read the card before the bytes were taken, and records the charge rejected.
+    const open = (await (await get(`/cards/${shortId}/state`, second.token)).json()) as {
+      open_txs: {signed_hex: string | null}[];
+    };
+    expect(open.open_txs[0]!.signed_hex).toBeNull();
+    expect((await post(`/cards/${shortId}/submitted`, first.token, signed)).status).toBe(200);
+    expect((await post(`/cards/${shortId}/outcome`, second.token, {txid: txid(7), accepted: false})).status).toBe(200);
+    // The first till posts the same bytes again: 409, so it does not send them.
+    const again = await post(`/cards/${shortId}/submitted`, first.token, signed);
+    expect(again.status).toBe(409);
+    expect((await post(`/cards/${shortId}/submitted`, second.token, signed)).status).toBe(409);
+    const s = await state(first.token, shortId);
+    expect(s.notes).toEqual([expect.objectContaining({slot: 0, status: 'live'})]);
+  });
+
+  it('an accepted charge still answers 200 to a repeat of its bytes', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const {shortId} = await cardWithNote(token);
+    await post(`/cards/${shortId}/intent`, till.token, intent(0));
+    const signed = {txid: txid(7), tx_hex: 'cd'.repeat(120)};
+    expect((await post(`/cards/${shortId}/submitted`, till.token, signed)).status).toBe(200);
+    const accepted = await post(`/cards/${shortId}/outcome`, till.token, {
+      txid: txid(7),
+      accepted: true,
+      change: [{nonce: nonce(2), signature: sign(nonce(2), 24_000)}],
+    });
+    expect(accepted.status).toBe(200);
+    const again = await post(`/cards/${shortId}/submitted`, till.token, signed);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual(expect.objectContaining({ok: true, replayed: true}));
+    expect((await post(`/cards/${shortId}/submitted`, till.token, {...signed, tx_hex: 'ef'.repeat(120)})).status).toBe(409);
+  });
+
   it('renews a spent slot’s key, never one that backs a note, and only from the key on record', async () => {
     const token = await signIn();
     const till = await newTill(token);

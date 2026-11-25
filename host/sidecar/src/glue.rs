@@ -1509,7 +1509,10 @@ impl CardWallet {
     /// Recover, and refuse to go on while any earlier transaction is unresolved.
     async fn start_clean(&mut self) -> Result<Recovered> {
         self.recover_overwrites()?;
+        let from = self.abandoned.len();
+        let open: Vec<(String, Vec<String>)> = self.store.state.pending_txs.iter().map(|p| (p.txid.clone(), p.inputs.clone())).collect();
         let rec = self.resolve_pending(RECOVER_TIMEOUT).await?;
+        self.hold_abandoned_inputs(&open, from);
         if let Some(t) = self.unresolved().first() {
             return Err(SpendFault::Unresolved(format!(
                 "transaction {t} from an earlier command is not resolved yet ({}); run `card balance` until it is",
@@ -1518,6 +1521,52 @@ impl CardWallet {
             .into());
         }
         Ok(rec)
+    }
+
+    /// Hold out of this job's plans each slot a sign-once card shows signed for a charge this job
+    /// has just abandoned (`open`: the charges and their inputs before [`resolve_pending`], `from`:
+    /// the length of `abandoned` then). The card signs no other transaction with such a note until
+    /// the registry's release for the abandoned charge reaches it, at a later tap
+    /// ([`card_releases`](Self::card_releases)); the job pays from the other notes. Card reads
+    /// only; a slot whose read fails is held too.
+    ///
+    /// [`resolve_pending`]: Self::resolve_pending
+    fn hold_abandoned_inputs(&mut self, open: &[(String, Vec<String>)], from: usize) {
+        if self.abandoned.len() == from || self.ops.is_none() || !self.card_sign_once().unwrap_or(false) {
+            return;
+        }
+        let abandoned = self.abandoned[from..].to_vec();
+        for (txid, inputs) in open.iter().filter(|(t, _)| abandoned.contains(t)) {
+            for nonce in inputs {
+                let Some((slot, msat)) = self
+                    .store
+                    .state
+                    .notes
+                    .iter()
+                    .find(|n| &n.nonce == nonce && n.status == NoteStatus::Live)
+                    .map(|n| (n.slot, n.amount_msat))
+                else {
+                    continue;
+                };
+                if self.store.state.is_held(slot, crate::state::HeldKind::Spent) {
+                    continue;
+                }
+                let signed = match on_card(|| self.card.get_slot(slot)) {
+                    Ok(info) => info.state == SlotState::Spent && hex::encode(info.spent_hash) == *txid,
+                    Err(_) => true,
+                };
+                if signed {
+                    self.store.state.held.push(crate::state::Held {
+                        slot,
+                        kind: crate::state::HeldKind::Spent,
+                        txid: None,
+                        msat,
+                        release_after_ms: None,
+                        due: false,
+                    });
+                }
+            }
+        }
     }
 
     /// Pay `price_msat` to the till from the card. The till notes are reissued into the wallet;

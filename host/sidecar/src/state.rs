@@ -230,8 +230,9 @@ impl HeldKind {
 pub struct Held {
     pub slot: u8,
     pub kind: HeldKind,
-    /// The transaction the card signed or waits on, hex. `None`: held on doubt, the card not
-    /// asked (`GET_SLOT`) this tap; it is reported at a later one.
+    /// The transaction the card signed or waits on, hex. `None`: not reported this tap. Either
+    /// held on doubt, the card not asked (`GET_SLOT`) this tap, and reported at a later one; or
+    /// signed for a charge this job abandoned, which the registry's release for that charge frees.
     pub txid: Option<String>,
     /// The note's amount (a spent slot); 0 for a change slot, which holds no note.
     pub msat: u64,

@@ -283,3 +283,13 @@ applet's `x` 144, `tmp` 65, `held` 4, `nonce` 16, SchnorrHW's `sc` 256 and `work
 the RSA cipher and the three field keys are not in that sum. None of the chip figures in the table
 above was measured on this build: install, free memory (with the cipher's RAM), the J3R452's command
 buffer (the applet refuses one under 240 bytes) and the sealed VERIFY's time are for the chip day.
+
+With the curve check's powers over p itself (the padded field keys, built and held to known
+answers at ATTEST_INIT; the p*p keys stay for a chip that does not hold to them), the load file is
+**18,376 bytes**, 75 LOAD commands at 247 bytes, sha256
+`924c80828599e690f4b69ad19748e4c5dd7f38deab49e7d497928458e9c26496` (+1,148 bytes on the 17,228
+above, which is the build the first chip day of the sealed PIN ran). Built the same way; a second
+build gave the same load file, and `make-assets.py --check` passes. The CLEAR_ON_DESELECT arrays
+are unchanged at 773 bytes. Added outside that sum: three 512-bit RSA private keys, persistent,
+built at the first ATTEST_INIT. jCardSim refuses the padded modulus, so every run on it takes the
+p*p path; which path a chip takes, its install and its free memory are for the chip day.

@@ -22,7 +22,7 @@ export * from '@fedimintcard/cardkit';
 /** sha256 of the load file, read off the asset rather than restated. */
 export const LOAD_FILE_SHA256: string = FEDIMINT_LOAD_FILE.sha256;
 
-/** The load file's size in bytes; 5,513, which is 23 LOAD commands at 247 bytes. */
+/** The load file's size in bytes, as tools/cardkit/make-assets.py pins it (LOAD commands of 247 bytes). */
 export const LOAD_FILE_SIZE: number = FEDIMINT_LOAD_FILE.size;
 
 /**

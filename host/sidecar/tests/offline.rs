@@ -389,6 +389,20 @@ async fn submitted(State(r): S, Path(id): Path<String>, Json(b): Json<Value>) ->
     let mut g = r.cards.lock().unwrap();
     let c = g.get_mut(&id).unwrap();
     let Some(t) = c.txs.iter_mut().find(|t| t["txid"] == b["txid"]) else { return fail(404, "no such charge") };
+    // As `cards.ts recordSubmitted`: a rejected charge is not accepted for sending, whatever bytes
+    // are posted; the same bytes again replay while the charge is open or accepted.
+    if t["status"] == "rejected" {
+        return fail(409, "the charge is recorded rejected; do not send it");
+    }
+    if !t["signed_hex"].is_null() {
+        if t["signed_hex"] == b["tx_hex"] {
+            return ok(json!({"ok": true, "version": c.version, "replayed": true}));
+        }
+        return fail(409, "the charge already has other signed bytes");
+    }
+    if t["status"] != "open" {
+        return fail(409, "the charge is already resolved; do not send it");
+    }
     t["signed_hex"] = b["tx_hex"].clone();
     c.version += 1;
     ok(json!({"ok": true, "version": c.version}))
@@ -3652,6 +3666,98 @@ async fn repeat_after_a_charge_proven_never_sent(same_card: bool) -> anyhow::Res
     } else {
         assert!(spent_slots(&b) > 0, "card B signed");
     }
+    Ok(())
+}
+
+/// A charge the card signed whose signed bytes the registry never answered for (not sent), as a
+/// second till sees it: open in the registry with no signed bytes. The second till is this till
+/// with no local file for the card. It records the charge rejected and charges `price` from the
+/// card. Returns the till, the card, its id, the first charge, the first till's file for the card
+/// and the second till's answer.
+async fn second_till_after_a_dropped_charge(
+    price: u64,
+) -> anyhow::Result<(Till, Rc<RefCell<SoftCard>>, String, PendingTx, Vec<u8>, (u16, Value))> {
+    let mut t = Till::new(OfflineConfig::default()).await?;
+    let card = v3_card();
+    let id = provision(&t.reg, &card);
+    t.load(&card, &[1 << 16, 1 << 16]).await?;
+    t.cw.crash_point = Some(CrashPoint::SubmittedUnreachable);
+    let (status, body) = t.charge(&card, 20_000, "a1").await;
+    t.cw.crash_point = None;
+    assert_eq!((status, body["error"].as_str()), (202, Some("undecided")), "{body}");
+    let first = t.pending(&id)[0].clone();
+    assert!(first.ops_unconfirmed && !first.submitted && first.tx_hex.is_some(), "{first:?}");
+    let signed = input_slots(&t, &id, &first);
+    assert!(!signed.is_empty(), "the first charge has inputs");
+    for s in &signed {
+        assert_eq!(card.borrow().slot_state(*s as u8), Some(SlotState::Spent), "slot {s} signed the first charge");
+    }
+    let first_file = std::fs::read(t.ops.card_path(&id))?;
+    std::fs::remove_file(t.ops.card_path(&id))?;
+    let answer = t.charge(&card, price, "b1").await;
+    Ok((t, card, id, first, first_file, answer))
+}
+
+/// The slots of `p`'s inputs, from the registry's notes.
+fn input_slots(t: &Till, id: &str, p: &PendingTx) -> Vec<u64> {
+    t.reg.cards.lock().unwrap()[id]
+        .notes
+        .iter()
+        .filter(|n| n["nonce"].as_str().is_some_and(|x| p.inputs.iter().any(|i| i == x)))
+        .map(|n| n["slot"].as_u64().unwrap())
+        .collect()
+}
+
+/// A second till pays around the slots the card signed for a charge it records rejected, and the
+/// registry lists the releases of those slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_till_pays_around_the_slots_a_card_signed_for_a_dropped_charge() -> anyhow::Result<()> {
+    let (t, _card, id, first, _, (status, body)) = second_till_after_a_dropped_charge(20_000).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["txid"], json!(first.txid), "{body}");
+    let signed = input_slots(&t, &id, &first);
+    let sale = t.sale("b1");
+    assert!(sale.inputs.iter().all(|i| !signed.contains(&u64::from(i.slot))), "signed {signed:?}, inputs {:?}", sale.inputs);
+    let released = t.reg.released(&id, &first.txid);
+    assert!(signed.iter().all(|s| released.contains(s)), "signed {signed:?}, released {released:?}");
+    assert_eq!(t.open_charges(&id), 0);
+    Ok(())
+}
+
+/// A second till that only the notes the card signed for the dropped charge could pay answers 402
+/// `notes_held`, and signs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_till_that_only_the_signed_notes_could_pay_answers_notes_held() -> anyhow::Result<()> {
+    let (t, card, id, first, _, (status, body)) = second_till_after_a_dropped_charge(70_000).await?;
+    assert_eq!((status, body["error"].as_str()), (402, Some("notes_held")), "{body}");
+    assert_eq!(spent_slots(&card), input_slots(&t, &id, &first).len(), "nothing more signed");
+    assert_eq!(t.sales_count(), 0);
+    Ok(())
+}
+
+/// The first till posts the bytes of a charge the second till recorded rejected, after its own
+/// post reached the registry late: the registry answers 409, the first till does not send them,
+/// and the card pays its next sale.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_till_does_not_send_a_charge_recorded_rejected_and_the_card_pays_again() -> anyhow::Result<()> {
+    let (mut t, card, id, first, first_file, (status, body)) = second_till_after_a_dropped_charge(20_000).await?;
+    assert_eq!(status, 200, "{body}");
+    // The first till's post of the signed bytes reaches the registry late.
+    {
+        let mut g = t.reg.cards.lock().unwrap();
+        let tx = g.get_mut(&id).unwrap().txs.iter_mut().find(|x| x["txid"] == json!(first.txid)).unwrap();
+        assert_eq!(tx["status"], "rejected");
+        tx["signed_hex"] = json!(first.tx_hex);
+    }
+    std::fs::write(t.ops.card_path(&id), &first_file)?;
+    let (status, body) = t.charge(&card, 20_000, "a2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["txid"], json!(first.txid), "{body}");
+    assert!(t.pending(&id).is_empty(), "{:?}", t.pending(&id));
+    let old: fedimint_core::TransactionId = first.txid.parse().map_err(|_| anyhow::anyhow!("txid"))?;
+    let sent = tokio::time::timeout(Duration::from_secs(3), t.cw.wallet.client.api().await_transaction(old)).await;
+    assert!(sent.is_err(), "the rejected charge never reached the federation");
+    assert_eq!(t.sales_count(), 2);
     Ok(())
 }
 

@@ -275,11 +275,21 @@ async fn key_setup_refuses_a_foreign_card() -> anyhow::Result<()> {
 
 // ------------------------------------------------------------------ issue
 
+/// A 4.0 card as the Setup app leaves it for `issue`, in a till that checks it: keyed by this
+/// wallet, certified by the test registry over slot 0's key, the registry's key and the anchor on
+/// it, and its PIN set sealed.
+async fn issuable_card(funds: Amount) -> anyhow::Result<(Rc<RefCell<SoftCard>>, Fx)> {
+    let shared = Rc::new(RefCell::new(SoftCard::v4()));
+    let mut f = fx_with(Box::new(Shared(shared.clone())), funds).await?;
+    installed_card(&mut f);
+    fedimint_card_host_card::softkit::ready_for_pin(&mut *shared.borrow_mut())?;
+    fedimint_card_host_card::softkit::open_test_session(&mut *shared.borrow_mut())?;
+    Ok((shared, till_for_v4(f)?))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn issue_replays_a_client_ref() -> anyhow::Result<()> {
-    let (shared, card) = blank_card();
-    let mut f = fx_with(card, Amount::from_sats(100_000)).await?;
-    installed_card(&mut f);
+    let (shared, f) = issuable_card(Amount::from_sats(100_000)).await?;
     let (h, actor) = serve(f, shared.clone()).await;
     let mut actor = Box::pin(actor);
 
@@ -307,9 +317,7 @@ async fn issue_replays_a_client_ref() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn issue_refuses_a_card_that_already_holds_notes() -> anyhow::Result<()> {
-    let (shared, card) = blank_card();
-    let mut f = fx_with(card, Amount::from_sats(100_000)).await?;
-    installed_card(&mut f);
+    let (shared, mut f) = issuable_card(Amount::from_sats(100_000)).await?;
     // Put notes on it the way an earlier batch would have, without a client_ref.
     f.cw.topup(&[1 << 16]).await?;
     let (h, actor) = serve(f, shared.clone()).await;
@@ -327,7 +335,8 @@ async fn issue_refuses_a_card_that_already_holds_notes() -> anyhow::Result<()> {
 /// internal` until `PlanError::NoFreeSlots` existed. Measured on a real J3R180 on 2026-10-28.
 #[tokio::test(flavor = "multi_thread")]
 async fn issue_onto_a_full_card_is_no_exact_plan_not_a_server_fault() -> anyhow::Result<()> {
-    let (shared, card) = blank_card();
+    let shared = Rc::new(RefCell::new(SoftCard::v4()));
+    let card: Box<dyn Card> = Box::new(Shared(shared.clone()));
     {
         let mut c = shared.borrow_mut();
         c.install_foreign_keys();

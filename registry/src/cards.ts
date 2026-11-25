@@ -1060,7 +1060,8 @@ export function unsignedLive(sql: Sql, shortId: string, nonces: readonly string[
  * The signed bytes of an open charge, posted after the card signs and before
  * the till sends them. A till sends only after this succeeds; a charge
  * resolved meanwhile (another till recorded it rejected) is a 409, and the
- * till must not send. Repeating the same bytes answers 200.
+ * till must not send. Repeating the same bytes answers 200 while the charge is
+ * open or accepted; a rejected charge is a 409 whatever bytes are posted.
  */
 export function recordSubmitted(
   storage: DurableObjectStorage,
@@ -1086,6 +1087,11 @@ export function recordSubmitted(
       .toArray()[0] as {short_id: string; status: string; signed_hex: string | null} | undefined;
     if (!tx || tx.short_id !== shortId) {
       throw new NotFound(`no charge ${String(r.txid)} on card ${shortId}`);
+    }
+    // A rejected charge is not accepted for sending, whatever bytes are posted: its notes may
+    // already pay another charge, and its slots are released.
+    if (tx.status === 'rejected') {
+      throw new Conflict(`charge ${String(r.txid)} is recorded rejected; do not send it`);
     }
     if (tx.signed_hex !== null) {
       if (tx.signed_hex === r.tx_hex) {

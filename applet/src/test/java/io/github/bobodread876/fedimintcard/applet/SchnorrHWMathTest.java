@@ -303,6 +303,9 @@ class SchnorrHWMathTest {
         { "FedimintCardApplet.java", "private void attestInit(", "rsaCube = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
         { "FedimintCardApplet.java", "private void attestInit(", "rsaRoot = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
         { "FedimintCardApplet.java", "private void attestInit(", "rsaEuler = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
+        { "FedimintCardApplet.java", "private boolean fieldPInit(", "rsaCubeP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
+        { "FedimintCardApplet.java", "private boolean fieldPInit(", "rsaRootP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
+        { "FedimintCardApplet.java", "private boolean fieldPInit(", "rsaEulerP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);" },
     };
 
     /**

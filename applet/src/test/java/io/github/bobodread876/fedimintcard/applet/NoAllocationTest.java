@@ -46,7 +46,7 @@ class NoAllocationTest {
      * there calls {@code chipMulInit}, which builds the signer's RSA cipher and key the same way.
      */
     static final Map<String, Set<String>> ALLOWED = Map.of(
-        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor", "setPin", "attestInit"),
+        "FedimintCardApplet.java", Set.of("FedimintCardApplet", "install", "<static>", "keysFor", "setPin", "attestInit", "fieldPInit"),
         "SchnorrHW.java", Set.of("SchnorrHW", "init", "chipMulInit"),
         "Secp256k1.java", Set.of("<static>"),
         "Opener.java", Set.of("Opener", "install"));

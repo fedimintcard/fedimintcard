@@ -245,7 +245,9 @@ public final class FedimintCardApplet extends Applet {
     /**
      * The field's arithmetic for the curve check, by the chip's RSA (Cashu's p*p path, its applet's RSA_PP): the
      * modulus p*p, 64 bytes, and the exponents 3 (x^3), (p-1)/2 (Euler's test) and (p+1)/4 + (p-1)/2 (the root). Each
-     * answer is taken mod p after (reduceModP).
+     * answer is taken mod p after (reduceModP). Where the chip holds to a modulus of p itself padded to 64 bytes
+     * (fieldP), the same exponents go to the padded keys instead, whose answers are under p at once; the p*p keys stay
+     * for a chip that does not.
      */
     private static final byte[] RSA_PP = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
@@ -399,6 +401,20 @@ public final class FedimintCardApplet extends Applet {
     private RSAPrivateKey rsaCube;
     private RSAPrivateKey rsaRoot;
     private RSAPrivateKey rsaEuler;
+    /**
+     * The same three powers over a modulus that is p itself, padded to 64 bytes with 32 zeros before it (Cashu Card's
+     * applet, its rsaCubeP, rsaRootP and rsaEulerP): the chip's RSA then answers under p at once, and the answer needs no
+     * reduction. Built at the first ATTEST_INIT and held to known answers at every one ({@link #fieldPInit}); null where
+     * the chip refused one.
+     */
+    private RSAPrivateKey rsaCubeP;
+    private RSAPrivateKey rsaRootP;
+    private RSAPrivateKey rsaEulerP;
+    /**
+     * Whether the padded keys held to their known answers at the last ATTEST_INIT: written there and nowhere else, false
+     * until the first and false while one runs. Where false, every power is the p*p keys' with the reduction after.
+     */
+    private boolean fieldP;
 
     private FedimintCardApplet() {
         // A slot's key objects are built at its first GEN_KEY (keysFor), not here: the J3R180
@@ -1496,9 +1512,13 @@ public final class FedimintCardApplet extends Applet {
             rsaEuler = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
         }
         // set at every ATTEST_INIT, so a key built by one torn before its modulus is set is set by the next
-        fieldKey(rsaCube, RSA_D_CUBE);
-        fieldKey(rsaRoot, RSA_D_ROOT);
-        fieldKey(rsaEuler, RSA_D_EULER);
+        fieldKey(rsaCube, RSA_D_CUBE, RSA_PP, (short) 0);
+        fieldKey(rsaRoot, RSA_D_ROOT, RSA_PP, (short) 0);
+        fieldKey(rsaEuler, RSA_D_EULER, RSA_PP, (short) 0);
+        // The padded keys and their known answers, in the APDU buffer's field room (the answer is written after). fieldP
+        // is false while they run, so an ATTEST_INIT torn among them leaves the p*p keys in use, never a key half set.
+        fieldP = false;
+        fieldP = fieldPInit(buf);
         pinKey.genKeyPair();
         pinKeySig[0] = 0;
         attest.genKeyPair();
@@ -1843,25 +1863,141 @@ public final class FedimintCardApplet extends Applet {
     }
 
     /**
-     * The power of the 64 bytes at a[off] by the chip's RSA mod p*p, into a[off + 64 .. off + 128), then taken mod p:
-     * the answer is the last 32 of those 64.
+     * The value at a[off + 32 .. off + 64) (a[off .. off + 32) zeros) to the key's power, mod p, into
+     * a[off + 96 .. off + 128): with {@link #fieldP}, the same power by the padded key, whose answer is under p at once;
+     * otherwise the chip's RSA mod p*p ({@link #powRaw}) and then the reduction. 128 bytes of `a` from `off` are its room.
      */
     private void powModP(RSAPrivateKey key, byte[] a, short off) {
+        if (fieldP) {
+            // The chip answers garbage, with no error, for an x at or over its modulus, so none is given: every caller
+            // holds its x under p, and one that slips is refused (6F00).
+            if (SchnorrHW.cmp32(a, (short) (off + 32), Secp256k1.SECP256K1_P, (short) 0) >= 0) {
+                ISOException.throwIt(Secp256k1.SW_CRYPTO_ERROR);
+            }
+            powRaw(key == rsaCube ? rsaCubeP : key == rsaRoot ? rsaRootP : rsaEulerP, a, off);
+            return;
+        }
+        powRaw(key, a, off);
+        reduceModP(a, (short) (off + 64), x, X_RED);
+    }
+
+    /**
+     * The power by the chip's RSA alone: the 64 bytes at a[off] in, the 64 after them out. An answer may come back
+     * shorter than the modulus, without its leading zeros (the simulator's does): it is set right-aligned in the 64.
+     */
+    private void powRaw(RSAPrivateKey key, byte[] a, short off) {
         rsa.init(key, Cipher.MODE_DECRYPT);
         short out = (short) (off + 64);
         short n = rsa.doFinal(a, off, (short) 64, a, out);
         if (n < (short) 64) {
-            // an answer without its leading zeros (the simulator's): set right-aligned
             Util.arrayCopyNonAtomic(a, out, a, (short) (out + 64 - n), n);
             Util.arrayFillNonAtomic(a, out, (short) (64 - n), (byte) 0);
         }
-        reduceModP(a, out, x, X_RED);
     }
 
-    /** `k` made the 512-bit RSA key of one power mod p*p, exponent d. */
-    private static void fieldKey(RSAPrivateKey k, byte[] d) {
-        k.setModulus(RSA_PP, (short) 0, (short) 64);
+    /** `k` made the 512-bit RSA key of one power: the 64 bytes at m[mOff] the modulus (p*p, or p padded), d the exponent. */
+    private static void fieldKey(RSAPrivateKey k, byte[] d, byte[] m, short mOff) {
+        k.setModulus(m, mOff, (short) 64);
         k.setExponent(d, (short) 0, (short) d.length);
+    }
+
+    /**
+     * The padded keys, built once and held to known answers at every ATTEST_INIT (Cashu Card's applet holds them so at its
+     * set-up): p with 32 zero bytes before it, 64 in all, the modulus of each, and then the chip's powers held to known
+     * answers: 2^3 = 8, Euler's test of 4 is 1 and the root of 4 is 2 (p is 7 mod 8: 2 is a square); at full width, G's x
+     * cubed with 7 added is the square of G's y (its Euler's test is 1 and its root is y or p - y); and at the top of the
+     * range, x = p - 1, whose cube, Euler's test and root are all p - 1, and x = p - 2, a non-square, whose cube is p - 8
+     * and whose Euler's test is p - 1. True where all hold; false on a wrong answer, on a buffer too short for the room,
+     * and on any exception: a chip that refuses the key, its room or its use (the simulator refuses the modulus as "not
+     * composite"). A key built stays built. The room is the APDU buffer's [FIELD, FIELD_END), zeroed before this returns;
+     * nothing in it is secret.
+     */
+    private boolean fieldPInit(byte[] buf) {
+        if ((short) buf.length < FIELD_END) {
+            return false;
+        }
+        short o = FIELD;
+        try {
+            Util.arrayFillNonAtomic(buf, o, (short) 32, (byte) 0);
+            Util.arrayCopyNonAtomic(Secp256k1.SECP256K1_P, (short) 0, buf, (short) (o + 32), (short) 32);
+            if (rsaCubeP == null) {
+                rsaCubeP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+            }
+            if (rsaRootP == null) {
+                rsaRootP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+            }
+            if (rsaEulerP == null) {
+                rsaEulerP = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+            }
+            fieldKey(rsaCubeP, RSA_D_CUBE, buf, o);
+            fieldKey(rsaRootP, RSA_D_ROOT, buf, o);
+            fieldKey(rsaEulerP, RSA_D_EULER, buf, o);
+            // 2^3 = 8, 4 is a square, and its root is 2
+            Util.arrayFillNonAtomic(buf, o, (short) 128, (byte) 0);
+            buf[(short) (o + 63)] = (byte) 2;
+            powRaw(rsaCubeP, buf, o);
+            if (buf[(short) (o + 127)] != (byte) 8 || !isZero(buf, (short) (o + 64), (short) 63)) {
+                return false;
+            }
+            Util.arrayFillNonAtomic(buf, o, (short) 128, (byte) 0);
+            buf[(short) (o + 63)] = (byte) 4;
+            powRaw(rsaEulerP, buf, o);
+            if (buf[(short) (o + 127)] != (byte) 1 || !isZero(buf, (short) (o + 64), (short) 63)) {
+                return false;
+            }
+            Util.arrayFillNonAtomic(buf, o, (short) 128, (byte) 0);
+            buf[(short) (o + 63)] = (byte) 4;
+            powRaw(rsaRootP, buf, o);
+            if (buf[(short) (o + 127)] != (byte) 2 || !isZero(buf, (short) (o + 64), (short) 63)) {
+                return false;
+            }
+            // at full width: x = G's x, s = x^3 + 7 is G's y squared; Euler's test of s is 1 and its root is y or p - y
+            Util.arrayFillNonAtomic(buf, o, (short) 128, (byte) 0);
+            Util.arrayCopyNonAtomic(Secp256k1.SECP256K1_G, (short) 1, buf, (short) (o + 32), (short) 32);
+            powRaw(rsaCubeP, buf, o);
+            if (!isZero(buf, (short) (o + 64), (short) 32)) {
+                return false;
+            }
+            add7ModP(buf, (short) (o + 96));
+            Util.arrayCopyNonAtomic(buf, (short) (o + 96), buf, (short) (o + 32), (short) 32);
+            Util.arrayFillNonAtomic(buf, o, (short) 32, (byte) 0);
+            powRaw(rsaEulerP, buf, o);
+            if (buf[(short) (o + 127)] != (byte) 1 || !isZero(buf, (short) (o + 64), (short) 63)) {
+                return false;
+            }
+            // the input half is as it was: s again, for the root
+            powRaw(rsaRootP, buf, o);
+            if (!isZero(buf, (short) (o + 64), (short) 32)) {
+                return false;
+            }
+            if (!sameBytes(buf, (short) (o + 96), Secp256k1.SECP256K1_G, (short) 33, (short) 32)) {
+                SchnorrHW.sub32(Secp256k1.SECP256K1_P, (short) 0, buf, (short) (o + 96), buf, o);
+                if (!sameBytes(buf, o, Secp256k1.SECP256K1_G, (short) 33, (short) 32)) {
+                    return false;
+                }
+            }
+            // at the top of the range: the cube, Euler's test and root of p - 1, then the cube and Euler's test of p - 2
+            for (short r = 0; r < (short) 5; r++) {
+                Util.arrayFillNonAtomic(buf, o, (short) 128, (byte) 0);
+                Util.arrayCopyNonAtomic(Secp256k1.SECP256K1_P, (short) 0, buf, (short) (o + 32), (short) 32);
+                buf[(short) (o + 63)] -= (byte) (r < (short) 3 ? 1 : 2);
+                powRaw(r == 0 || r == 3 ? rsaCubeP : r == 1 || r == 4 ? rsaEulerP : rsaRootP, buf, o);
+                if (!isZero(buf, (short) (o + 64), (short) 32)) {
+                    return false;
+                }
+                // the answer: p - 1 for the first three and for the Euler's test of p - 2, p - 8 for the cube of p - 2
+                Util.arrayCopyNonAtomic(Secp256k1.SECP256K1_P, (short) 0, buf, o, (short) 32);
+                buf[(short) (o + 31)] -= (byte) (r == 3 ? 8 : 1);
+                if (!sameBytes(buf, o, buf, (short) (o + 96), (short) 32)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        } finally {
+            Util.arrayFillNonAtomic(buf, o, (short) (FIELD_END - FIELD), (byte) 0);
+        }
     }
 
     /**
