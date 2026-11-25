@@ -76,10 +76,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload tested architecture and capture digest
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          ref="$IMAGE:build-$GITHUB_RUN_ID-${{ matrix.arch }}-$GITHUB_RUN_ATTEMPT"
-          docker push "$ref"
-          docker image inspect "$ref" --format '{{index .RepoDigests 0}}' > "digest-${{ matrix.arch }}"
+          ref="$IMAGE:build-$GITHUB_RUN_ID-$ARCH-$GITHUB_RUN_ATTEMPT"
+          for attempt in 1 2 3; do
+            if docker push --platform "linux/$ARCH" "$ref" > push.log 2>&1; then break; fi
+            cat push.log >&2
+            if [[ "$attempt" == 3 ]] || ! grep -Eiq 'unknown blob|blob unknown|blob_unknown' push.log; then exit 1; fi
+            sleep $((attempt * 5))
+          done
+          docker image save -o "$RUNNER_TEMP/tested.tar" "$ref"
+          path=$(tar -xOf "$RUNNER_TEMP/tested.tar" manifest.json | jq -er '.[0].Config')
+          config=$(tar -xOf "$RUNNER_TEMP/tested.tar" "$path" | sha256sum | cut -d' ' -f1)
+          docker buildx imagetools inspect "$ref" --raw > child.json
+          jq -e --arg config "sha256:$config" '.config.digest == $config and (.layers | length > 0)' child.json >/dev/null
+          echo "$IMAGE@sha256:$(sha256sum child.json | cut -d' ' -f1)" > "digest-$ARCH"
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
@@ -99,6 +111,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: oras-project/setup-oras@ac735097e22fe643015b0d19645f7c9a69942128 # v2.0.4
+        with:
+          version: 1.3.0
       - name: Publish the tested multi-architecture index
         env:
           VERSION: ${{ needs.source.outputs.tag }}
@@ -108,18 +123,33 @@ jobs:
             grep -Eq '^ghcr\.io/fedimintcard/till@sha256:[a-f0-9]{64}$' "digest-$arch" || exit 1
           done
           reference="$IMAGE:$VERSION"
-          if docker buildx imagetools inspect "$reference" --raw > existing.json 2>lookup-error; then
-            for arch in amd64 arm64; do
-              digest="$(cut -d@ -f2 "digest-$arch")"
-              jq -e --arg digest "$digest" --arg arch "$arch" 'any(.manifests[]; .digest == $digest and .platform.os == "linux" and .platform.architecture == $arch)' existing.json >/dev/null || exit 1
-            done
+          amd64=$(cat digest-amd64)
+          arm64=$(cat digest-arm64)
+          media_type=application/vnd.oci.image.index.v1+json
+          # Keep the original child descriptors and add compatibility metadata to their parent.
+          docker buildx imagetools create --dry-run "$amd64" "$arm64" > children.json
+          jq -e --arg amd "${amd64#*@}" --arg arm "${arm64#*@}" '
+            .schemaVersion == 2 and (.manifests | length == 2) and
+            all(.manifests[]; .size > 0 and .platform.os == "linux" and
+              (.mediaType == "application/vnd.docker.distribution.manifest.v2+json" or
+               .mediaType == "application/vnd.oci.image.manifest.v1+json")) and
+            any(.manifests[]; .platform.architecture == "amd64" and .digest == $amd) and
+            any(.manifests[]; .platform.architecture == "arm64" and .digest == $arm)
+          ' children.json >/dev/null
+          jq --arg mt "$media_type" --arg revision "$REVISION" '
+            .mediaType = $mt | .annotations = {
+              "org.opencontainers.image.title": "Fedimint Card 4.0 Till",
+              "org.opencontainers.image.description": "Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry.",
+              "org.opencontainers.image.source": "https://github.com/fedimintcard/fedimintcard",
+              "org.opencontainers.image.revision": $revision
+            }
+          ' children.json > index.json
+          if docker buildx imagetools inspect "$reference" --raw > published.json 2>lookup-error; then
+            jq -e --slurpfile expected index.json '. == $expected[0]' published.json >/dev/null
           elif grep -Fq "$reference: not found" lookup-error || grep -Eiq '(^|: )manifest[_ ]unknown(:|$)' lookup-error; then
-            docker buildx imagetools create \
-              --annotation 'index:org.opencontainers.image.title=Fedimint Card 4.0 Till' \
-              --annotation 'index:org.opencontainers.image.description=Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry.' \
-              --annotation 'index:org.opencontainers.image.source=https://github.com/fedimintcard/fedimintcard' \
-              --annotation "index:org.opencontainers.image.revision=$REVISION" \
-              -t "$reference" "$(cat digest-amd64)" "$(cat digest-arm64)"
+            oras manifest push --media-type "$media_type" "$reference" index.json
+            docker buildx imagetools inspect "$reference" --raw > published.json
+            cmp index.json published.json
           else
             cat lookup-error >&2
             exit 1

@@ -2,6 +2,8 @@
 
 This image accepts **Fedimint Card 4.x cards only** and requires a **Card 4.0 registry**. Check your cards and registry version before upgrading a till that serves older cards. Use the Card 4.0 generation of the POS app for these cards.
 
+The till uses `https://registry.fedimintcard.org` when `OPS_URL` is unset. To use another Card 4.0 registry, add a line such as `OPS_URL=https://registry.example.org` to the `.env` file beside `compose.yaml`. Use your registry’s HTTPS origin. Run `docker compose up -d` to apply the setting before connecting the till to the registry.
+
 For a build published by source commit, set `TILL_IMAGE=ghcr.io/fedimintcard/till:sha-FULL_COMMIT_SHA` in your Compose environment. For an exact copy, use the published multi-architecture index digest (`ghcr.io/fedimintcard/till@sha256:INDEX_DIGEST`).
 
 Use the Compose file supplied with the till release. The image supports Linux amd64 and arm64. Choose a private admin password of at least 16 visible ASCII characters in your Compose environment. Keep the password in your password manager. The image name is `ghcr.io/fedimintcard/till`. Enter these commands in Bash.
