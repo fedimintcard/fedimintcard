@@ -637,7 +637,7 @@ final class OfflineFlowTests: XCTestCase {
         let noPlan = "a spend of 5000 msat needs more than 3 of the card's notes; spend a smaller amount, or pay another way"
         let cases: [(CoreOutcome, ErrorKind, String)] = [
             (.refused(code: "offline_kit_expired", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineKitExpired, "Till service unreachable"),
-            (.refused(code: "offline_note_invalid", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineNoteInvalid, "Till service unreachable"),
+            (.refused(code: "offline_note_invalid", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineNoteInvalid, "Couldn’t verify card notes"),
             (.refused(code: "offline_cap_reached", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineCapReached, "Till service unreachable"),
             (.refused(code: "offline_not_ready", detail: "d", suggestedMsat: nil, wrongTries: nil, waitS: nil), .offlineNoKit, "Till service unreachable"),
             (.refused(code: "offline_pool_exhausted", detail: "d", suggestedMsat: 12_000, wrongTries: nil, waitS: nil), .offlinePoolExhausted, "Amount not available offline"),
@@ -704,7 +704,7 @@ final class OfflineFlowTests: XCTestCase {
 
     func testTheTillsOwnOfflineCodesReadAsBefore() {
         // The till answers these for its own offline path: not this phone's kit or queue.
-        for code: ChargeErrorCode in [.offlineCapReached, .offlineNotReady, .offlineNoteInvalid, .offlineKitExpired, .offlinePoolExhausted] {
+        for code: ChargeErrorCode in [.offlineCapReached, .offlineNotReady, .offlineKitExpired, .offlinePoolExhausted] {
             let f = flow()
             _ = toWaiting(f)
             guard case .startCharge(let id, _, _, _)? = f.dispatch(.cardPresent).first else { return XCTFail() }
@@ -712,7 +712,7 @@ final class OfflineFlowTests: XCTestCase {
             XCTAssertEqual(errorInfo(f)?.kind, .unknown, code.rawValue)
             XCTAssertEqual(errorCopy(.unknown, "the till's words").1, "the till's words")
         }
-        for (code, kind): (ChargeErrorCode, ErrorKind) in [(.offlineUnsupportedCard, .offlineUnsupportedCard), (.cardNotGenuine, .cardNotGenuine),
+        for (code, kind): (ChargeErrorCode, ErrorKind) in [(.offlineUnsupportedCard, .offlineUnsupportedCard), (.offlineNoteInvalid, .offlineNoteInvalid), (.cardNotGenuine, .cardNotGenuine),
                                                            (.cardLimit, .cardLimit), (.undecided, .undecided)] {
             let f = flow()
             _ = toWaiting(f)

@@ -4,10 +4,13 @@ import Foundation
 let tillUnreachableCopy = ("Till service unreachable", "Check that the till is running and this phone is on its network.")
 
 /// Title and detail for a failed balance read, in words the card holder can act on.
+private let federationMismatchCopy = ("Different federation or mint", "Use a till connected to this card's federation and mint.")
+
 func balanceErrorCopy(_ p: BalanceProblem) -> (String, String) {
     switch p {
     case .cardMoved: return ("The card moved away", "Hold the card still against the top of the phone until the balance shows.")
     case .notOurCard: return ("Not a card for this till", "This card isn't set up here. Try another card.")
+    case .wrongFederation: return federationMismatchCopy
     case .tillUnreachable: return tillUnreachableCopy
     case .relayUnreachable: return ("The till lost the card", "Hold the card to the phone and try again.")
     case .busy: return ("The till is busy", "Try again in a moment.")
@@ -50,7 +53,7 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     case .offlineNoKit: return (unreachable, "No offline kit yet. Reach the till once while online.")
     case .offlineKitExpired: return (unreachable, "The offline kit has expired. Reach the till to renew it.")
     case .offlineCapReached: return (unreachable, "Offline limit reached. Reach the till so waiting payments can sync.")
-    case .offlineNoteInvalid: return (unreachable, "This card can't be checked without the till. It pays online only.")
+    case .offlineNoteInvalid: return ("Couldn’t verify card notes", "Connect to the till to check this card’s federation and mint.")
     case .offlinePoolExhausted:
         let tip = suggestedMsat.map { "Try \(formatSats($0)) sats" } ?? "Try another amount"
         return ("Amount not available offline", tip + ", or reach the till for a new kit.")
@@ -71,6 +74,9 @@ func errorCopy(_ kind: ErrorKind, _ detail: String, suggestedMsat: Int64? = nil,
     case .unknownCard: return ("Card not recognised", "This card is not set up for this till")
     case .opsUnreachable: return ("Card service unreachable", "Check the network, then try again")
     case .opsRefused: return ("Card service refused the till", "Check the till token")
+    case .wrongFederation:
+        let checkSales = unresolved ? " Check Sales on this till before trying again." : ""
+        return (federationMismatchCopy.0, federationMismatchCopy.1 + checkSales)
     case .badRequest, .internal, .unknown: return ("Something went wrong", detail)
     }
 }

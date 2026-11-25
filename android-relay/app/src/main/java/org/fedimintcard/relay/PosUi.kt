@@ -586,6 +586,8 @@ fun balanceShownCopy(s: PosState.BalanceShown, nowMs: Long = System.currentTimeM
     return BalanceCopy("${formatSats(s.liveMsat)} sats", onHold, balanceDescription(s.liveMsat, onHold))
 }
 
+internal val wrongFederationCopy = "Different federation or mint" to "Use a till connected to this card's federation and mint."
+
 /** Title and detail for a failed balance read, in words the card holder can act on. */
 fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
     BalanceProblem.CARD_MOVED -> "The card moved away" to "Hold the card still against the back of the phone until the balance shows."
@@ -593,6 +595,7 @@ fun balanceErrorCopy(p: BalanceProblem): Pair<String, String> = when (p) {
     BalanceProblem.TILL_UNREACHABLE -> "Can't reach the till" to "Check that the till is running, then try again."
     BalanceProblem.RELAY_UNREACHABLE -> "The till can't reach this phone" to "Check the connection in Settings, then try again."
     BalanceProblem.BUSY -> "The till is busy" to "Try again in a moment."
+    BalanceProblem.WRONG_FEDERATION -> wrongFederationCopy
     BalanceProblem.CARD_SERVICE -> "Card service unreachable" to "Check the network, then try again."
     BalanceProblem.TIMEOUT -> "The till took too long" to "Hold the card to the phone and try again."
     BalanceProblem.OTHER -> "Couldn't read the card" to "Hold the card to the phone and try again."
@@ -628,7 +631,7 @@ fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unre
     ErrorKind.OFFLINE_NOT_READY -> TILL_UNREACHABLE_TITLE to "No offline kit yet. Reach the till once while online."
     ErrorKind.OFFLINE_KIT_EXPIRED -> TILL_UNREACHABLE_TITLE to "The offline kit has expired. Reach the till to renew it."
     ErrorKind.OFFLINE_CAP_REACHED -> TILL_UNREACHABLE_TITLE to "Offline limit reached. Reach the till so waiting payments can sync."
-    ErrorKind.OFFLINE_NOTE_INVALID -> TILL_UNREACHABLE_TITLE to "This card can't be checked without the till. It pays online only."
+    ErrorKind.OFFLINE_NOTE_INVALID -> "Couldn’t verify card notes" to "Connect to the till to check this card’s federation and mint."
     ErrorKind.OFFLINE_POOL_EXHAUSTED -> "Amount not available offline" to
         ((suggestedMsat?.let { "Try ${formatSats(it)} sats" } ?: "Try another amount") + ", or reach the till for a new kit.")
     ErrorKind.HELD_ON_PHONE -> "Payment not finished" to
@@ -645,6 +648,9 @@ fun errorCopy(kind: ErrorKind, detail: String, suggestedMsat: Long? = null, unre
     ErrorKind.CARD_CHANGED -> "Card changed" to "The card was used elsewhere. Hold it to the phone and try again."
     ErrorKind.UNKNOWN_CARD -> "Card not recognised" to "This card is not set up for this till"
     ErrorKind.OPS_UNREACHABLE -> "Card service unreachable" to "Check the network, then try again"
+    ErrorKind.WRONG_FEDERATION -> if (unresolved) {
+        wrongFederationCopy.first to "${wrongFederationCopy.second} Check Sales on this till before trying again."
+    } else wrongFederationCopy
     ErrorKind.OPS_REFUSED -> "Card service refused the till" to "Check the till token"
     ErrorKind.BAD_REQUEST, ErrorKind.INTERNAL, ErrorKind.UNKNOWN -> "Something went wrong" to detail
 }

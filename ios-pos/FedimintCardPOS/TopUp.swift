@@ -50,7 +50,7 @@ enum TopUpProblem: Equatable {
     case noRoom
     /// Paid, and the card step was cancelled: the top-up waits in the till until a tap loads it.
     case notLoaded
-    case cardMoved, notOurCard, tillUnreachable, timeout, cardService, badAmount, busy, notPaired
+    case cardMoved, notOurCard, wrongFederation, tillUnreachable, timeout, cardService, badAmount, busy, notPaired
     /// The till gave up on this top-up (`state: failed`); any eCash received stays in the till.
     case failed
     case other
@@ -67,6 +67,7 @@ func topUpProblem<T>(_ r: TopUpReply<T>) -> TopUpProblem {
         case .badResponse: return .other
         }
     case .refused(let code, let detail, _):
+        if ChargeErrorCode.fromWire(code, detail: detail) == .wrongFederation { return .wrongFederation }
         switch code {
         case "expired": return .expired
         case "card_full": return .cardFull
@@ -95,6 +96,9 @@ func topUpErrorCopy(_ p: TopUpProblem, paid: Bool, detail: String) -> (String, S
     case .noRoom: return ("This card is full", "Spend from it first, then top up.")
     case .cardMoved: return ("The card moved away", "Hold the card still until it's loaded.\(waiting)")
     case .notOurCard: return ("Not a card for this till", "Try the holder's card.\(waiting)")
+    case .wrongFederation:
+        let copy = balanceErrorCopy(.wrongFederation)
+        return (copy.0, paid ? "This top-up is paid and waiting at this till. Tap a card set up for this till's federation and mint." : copy.1)
     case .tillUnreachable: return ("Can't reach the till", "Check that the till is running, then try again.\(waiting)")
     case .timeout: return ("The till took too long", "Try again: the same top-up is never loaded twice.\(waiting)")
     case .cardService: return ("Card service unreachable", "Check the network, then try again.\(waiting)")

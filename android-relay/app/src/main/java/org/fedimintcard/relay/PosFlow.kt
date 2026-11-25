@@ -5,7 +5,7 @@ import java.util.UUID
 enum class ErrorKind {
     BAD_REQUEST, BUSY, NO_CARD, RELAY_UNREACHABLE, CARD_ERROR, INSUFFICIENT, NOTES_HELD, NO_EXACT_PLAN,
     DECLINED, UNDECIDED, RECOVERING, CONFLICT, PIN_REQUIRED, WRONG_PIN, PIN_WAIT, OLD_CARD, SIGN_CHECK_FAILED, CARD_CHANGED,
-    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN,
+    UNKNOWN_CARD, OPS_UNREACHABLE, OPS_REFUSED, WRONG_FEDERATION, OFFLINE_NO_CHANGE_ROOM, INTERNAL, UNKNOWN, TILL_UNREACHABLE, TIMEOUT_UNKNOWN,
     OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED,
     OFFLINE_UNSUPPORTED_CARD, CARD_NOT_GENUINE, CARD_LIMIT,
     /** The phone holds the sale signing: only that card's next tap on this phone finishes it. */
@@ -22,7 +22,7 @@ enum class ErrorKind {
      * the till's own offline path they read as [UNKNOWN], as before the phone took charges.
      */
     val phoneOnly: Boolean get() = this in setOf(
-        OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_NOTE_INVALID, OFFLINE_POOL_EXHAUSTED, OFFLINE_UNSUPPORTED_CARD,
+        OFFLINE_NOT_READY, OFFLINE_KIT_EXPIRED, OFFLINE_CAP_REACHED, OFFLINE_POOL_EXHAUSTED, OFFLINE_UNSUPPORTED_CARD,
     )
 
     /**
@@ -130,7 +130,7 @@ sealed class PosState {
 }
 
 /** Why a balance read failed, in the terms the holder's screen needs. */
-enum class BalanceProblem { CARD_MOVED, NOT_OUR_CARD, TILL_UNREACHABLE, RELAY_UNREACHABLE, BUSY, CARD_SERVICE, TIMEOUT, OTHER }
+enum class BalanceProblem { CARD_MOVED, NOT_OUR_CARD, WRONG_FEDERATION, TILL_UNREACHABLE, RELAY_UNREACHABLE, BUSY, CARD_SERVICE, TIMEOUT, OTHER }
 
 /** The till's reply to `POST /v1/card/balance`. */
 sealed class BalanceResult {
@@ -150,6 +150,7 @@ fun balanceProblem(r: BalanceResult): BalanceProblem = when (r) {
     is BalanceResult.Refused -> when (r.code) {
         ChargeErrorCode.NO_CARD, ChargeErrorCode.CARD_CHANGED -> BalanceProblem.CARD_MOVED
         ChargeErrorCode.UNKNOWN_CARD -> BalanceProblem.NOT_OUR_CARD
+        ChargeErrorCode.WRONG_FEDERATION -> BalanceProblem.WRONG_FEDERATION
         // A key that does not match, or an applet that is not there, is a card this till does
         // not know; anything else from the card mid-read is the card leaving the field.
         ChargeErrorCode.CARD_ERROR ->

@@ -184,7 +184,7 @@ extension TillClient {
         let path = "/v1/topup/" + Self.pathSegment(topupId) + "/load"
         switch await call(request("POST", path, body: Data("{}".utf8), timeout: Self.chargeTimeout, cardLink: cardLink)) {
         case .failure(let e): return .failed(e)
-        case .success(let r): return TillParse.topUpStatus(status: r.status, body: r.body)
+        case .success(let r): return TillParse.topUpStatus(status: r.status, body: r.body, loadingPaidCard: true)
         }
     }
 
@@ -311,7 +311,8 @@ enum TillParse {
             guard let okv = o["ok"] as? NSNumber else { throw Bad(msg: "missing ok") }
             if !okv.boolValue {
                 let suggested = (o["suggested_msat"] as? NSNumber)?.int64Value
-                return .declined(code: .fromWire(optStr(o, "error")), detail: optStr(o, "detail") ?? "", httpStatus: status,
+                let detail = optStr(o, "detail") ?? ""
+                return .declined(code: .fromWire(optStr(o, "error"), detail: detail), detail: detail, httpStatus: status,
                                  suggestedMsat: suggested.flatMap { $0 > 0 ? $0 : nil },
                                  wrongTries: (o["wrong_tries"] as? NSNumber)?.intValue, waitS: (o["wait_s"] as? NSNumber)?.intValue)
             }
@@ -359,7 +360,8 @@ enum TillParse {
             if !((o["ok"] as? NSNumber)?.boolValue ?? false) {
                 // A card error or a missing card is a normal answer from this route, not a parse failure.
                 let code = optStr(o, "error")
-                return .refused(code: .fromWire(code), detail: optStr(o, "detail") ?? code ?? "card unreadable")
+                let detail = optStr(o, "detail") ?? code ?? "card unreadable"
+                return .refused(code: .fromWire(code, detail: detail), detail: detail)
             }
             let rows = try ((o["notes"] as? [[String: Any]]) ?? []).map {
                 CardNote(slot: Int(try reqLong($0, "slot")), msat: try reqLong($0, "msat"), status: optStr($0, "status") ?? "")
@@ -412,11 +414,24 @@ enum TillParse {
         return out
     }
 
-    static func topUpStatus(status: Int, body: Data) -> TopUpReply<TopUpStatus> {
+    private static func legacyLoadFederationMismatch(_ detail: String) -> Bool {
+        if detail == "the registry mint version differs from this wallet" { return true }
+        let pattern = #/card [0-9a-f]{8} belongs to federation ([0-9a-f]{64}), and this wallet is in ([0-9a-f]{64})/#
+        guard let match = detail.wholeMatch(of: pattern) else { return false }
+        return match.1 != match.2
+    }
+
+    static func topUpStatus(status: Int, body: Data, loadingPaidCard: Bool = false) -> TopUpReply<TopUpStatus> {
         do {
             let o = try obj(body)
             if topUpRefused(status, o) {
-                return .refused(error: optStr(o, "error") ?? (status == 401 ? "unauthorized" : ""), detail: optStr(o, "detail") ?? "", httpStatus: status)
+                let code = optStr(o, "error") ?? (status == 401 ? "unauthorized" : "")
+                let detail = optStr(o, "detail") ?? ""
+                // :11 reports these two holder checks as internal only on the paid load route.
+                if loadingPaidCard, status == 500, code == "internal", legacyLoadFederationMismatch(detail) {
+                    return .refused(error: "wrong_federation", detail: "", httpStatus: status)
+                }
+                return .refused(error: code, detail: detail, httpStatus: status)
             }
             let txid = optStr(o, "load_txid").flatMap { $0.isEmpty ? nil : $0 }
             let detail = optStr(o, "detail").flatMap { $0.isEmpty ? nil : $0 }

@@ -47,6 +47,20 @@ class CardBalanceTest {
         assertTrue((parseCardBalance(200, "not json") as BalanceResult.Failed).error is TillError.BadResponse)
     }
 
+    @Test
+    fun distinguishesFederationMismatchFromRegistryFailure() {
+        fun result(status: Int, code: String, detail: String) = balanceProblem(
+            parseCardBalance(status, """{"ok":false,"error":"$code","detail":"$detail"}""")
+        )
+        val deployed = "ops refused (409): the card belongs to a different federation or mint"
+        assertEquals(BalanceProblem.WRONG_FEDERATION, result(502, "ops_refused", deployed))
+        assertEquals(BalanceProblem.WRONG_FEDERATION, result(409, "wrong_federation", ""))
+        assertEquals(BalanceProblem.CARD_SERVICE, result(502, "ops_refused", "ops refused (403): forbidden"))
+        assertEquals(BalanceProblem.CARD_SERVICE, result(502, "ops_refused", "$deployed elsewhere"))
+        assertEquals(BalanceProblem.CARD_SERVICE, result(502, "ops_unreachable", deployed))
+        assertEquals("Different federation or mint" to "Use a till connected to this card's federation and mint.", balanceErrorCopy(BalanceProblem.WRONG_FEDERATION))
+    }
+
     private fun refused(c: ChargeErrorCode, d: String = "") = balanceProblem(BalanceResult.Refused(c, d))
 
     @Test

@@ -229,8 +229,8 @@ final class PosController: ObservableObject {
                     await self?.renewKit(till)
                 } // wipes pin
                 if self.localTransport === card { self.localTransport = nil }
-                self.finishCharge(r)
                 self.phone = self.offline.snapshot
+                self.finishCharge(r, held: self.phone.localOnlyRefs.contains(ref))
                 self.send(.chargeDone(chargeId: cid, result: r))
             }
         case .createTopUp(let cid, let msat, let ref, let card):
@@ -251,6 +251,7 @@ final class PosController: ObservableObject {
                 guard let self else { return }
                 let r = await self.client.loadTopUp(tid, cardLink: linkId)
                 if case .ok(let st) = r, st.state == "loaded" { self.endCardJob(message: "Loaded \(formatSats(st.amountMsat)) sats", ok: true) }
+                else if topUpProblem(r) == .wrongFederation { self.endCardJob(message: balanceErrorCopy(.wrongFederation).0, ok: false) }
                 else { self.endCardJob(message: "Not loaded", ok: false) }
                 self.send(.topUpLoadDone(loadId: lid, result: r))
             }
@@ -259,21 +260,28 @@ final class PosController: ObservableObject {
             Task { [weak self] in
                 guard let self else { return }
                 let r = await self.client.cardBalance(cardLink: linkId)
-                if case .read(let b) = r {
+                switch r {
+                case .read(let b):
                     let onHold = onHoldText(strandedMsat: b.strandedMsat, untilMs: b.strandedUntilMs, nowMs: Self.clockMs(), timeZone: .current)
                     self.endCardJob(message: balanceSpoken(liveMsat: b.liveMsat, onHold: onHold), ok: true)
+                case .refused where balanceProblem(r) == .wrongFederation:
+                    self.endCardJob(message: balanceErrorCopy(.wrongFederation).0, ok: false)
+                default:
+                    self.endCardJob(message: "Couldn't read the card", ok: false)
                 }
-                else { self.endCardJob(message: "Couldn't read the card", ok: false) }
                 self.send(.balanceDone(readId: rid, result: r))
             }
         }
     }
 
     /// The NFC sheet's last word on a charge, the till's or the phone's ("Paid offline · N sats").
-    private func finishCharge(_ r: ChargeResult) {
+    private func finishCharge(_ r: ChargeResult, held: Bool = false) {
         switch r {
         case .success(let rc): endCardJob(message: receiptHeadline(rc), ok: true)
         case .declined(let code, _, _, _, _, _) where code == .wrongPin: endCardJob(message: "Wrong PIN", ok: false)
+        case .declined(let code, _, _, _, _, _) where code.isFederationCheck:
+            let kind: ErrorKind = held ? .heldOnPhone : .from(code)
+            endCardJob(message: errorCopy(kind, "").0, ok: false)
         default: endCardJob(message: "Payment didn't go through", ok: false)
         }
     }
