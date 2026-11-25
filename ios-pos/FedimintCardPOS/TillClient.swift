@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 struct HTTPRequest {
     let method: String
@@ -154,10 +155,10 @@ extension TillClient {
     /// `shortId` the till fits the amount to that card's free slots, or refuses a full card
     /// (`card_full`) before any invoice exists.
     func createTopUp(amountMsat: Int64, clientRef: String, shortId: String? = nil) async -> TopUpReply<TopUp> {
-        var o: [String: Any] = ["amount_msat": amountMsat, "client_ref": clientRef]
+        var o: [String: Any] = ["amount_msat": amountMsat, "client_ref": clientRef, "fee_quote_version": 1]
         if let shortId { o["short_id"] = shortId }
         let body = try? JSONSerialization.data(withJSONObject: o)
-        switch await call(request("POST", "/v1/topup", body: body, timeout: Self.topUpCreateTimeout)) {
+        switch await call(request("POST", "/v1/topup/fee-inclusive", body: body, timeout: Self.topUpCreateTimeout)) {
         case .failure(let e): return .failed(e)
         case .success(let r): return TillParse.topUp(status: r.status, body: r.body)
         }
@@ -384,16 +385,33 @@ enum TillParse {
         return status >= 400
     }
 
-    /// `POST /v1/topup`: `{topup_id, amount_msat, invoice, expires_at_ms, state}`, or `{ok:false,…}`.
+    /// Require an exact JSON integer. NSNumber.int64Value truncates fractions and wraps overflow.
+    private static func quoteInteger(_ o: [String: Any], _ key: String) -> Int64? {
+        guard let number = o[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        return Int64(number.stringValue)
+    }
+
     static func topUp(status: Int, body: Data) -> TopUpReply<TopUp> {
+        let invalid: TopUpReply<TopUp> = .refused(error: "invalid_topup_quote", detail: "", httpStatus: status)
+        if status == 404 || status == 405 { return .refused(error: "topup_quote_version", detail: "", httpStatus: status) }
         do {
             let o = try obj(body)
             if topUpRefused(status, o) {
                 return .refused(error: optStr(o, "error") ?? (status == 401 ? "unauthorized" : ""), detail: optStr(o, "detail") ?? "", httpStatus: status)
             }
-            return .ok(TopUp(topupId: try reqStr(o, "topup_id"), amountMsat: try reqLong(o, "amount_msat"),
-                             invoice: try reqStr(o, "invoice"), expiresAtMs: try reqLong(o, "expires_at_ms"),
-                             state: optStr(o, "state") ?? "waiting"))
+            let id = try reqStr(o, "topup_id"), state = try reqStr(o, "state")
+            guard !id.isEmpty, let face = quoteInteger(o, "amount_msat"), face > 0 else { return invalid }
+            // An idempotent replay may find an older, already-paid invoice. It only needs loading.
+            if ["paid", "loaded", "expired", "failed"].contains(state) {
+                return .ok(TopUp(topupId: id, amountMsat: face, invoice: "", expiresAtMs: 0, state: state, loadTxid: optStr(o, "load_txid")))
+            }
+            guard state == "waiting", quoteInteger(o, "fee_quote_version") == 1,
+                  let fee = quoteInteger(o, "topup_fee_msat"), let total = quoteInteger(o, "invoice_amount_msat"),
+                  fee >= 0, total >= face, total - face == fee,
+                  let invoice = o["invoice"] as? String, verifiedInvoiceTotal(invoice, total),
+                  let expiry = quoteInteger(o, "expires_at_ms"), expiry > 0 else { return invalid }
+            return .ok(TopUp(topupId: id, amountMsat: face, invoice: invoice, expiresAtMs: expiry, state: state,
+                             quote: TopUpQuote(invoiceAmountMsat: total, topupFeeMsat: fee)))
         } catch {
             if status == 401 { return .failed(.unauthorized) }
             return .failed(.badResponse((error as? Bad)?.msg ?? "bad json"))
@@ -407,7 +425,7 @@ enum TillParse {
               let a = o["topups"] as? [[String: Any]] else { return nil }
         var out: [WaitingTopUp] = []
         for t in a {
-            guard let id = try? reqStr(t, "topup_id"), let amount = try? reqLong(t, "amount_msat") else { return nil }
+            guard let id = try? reqStr(t, "topup_id"), !id.isEmpty, let amount = quoteInteger(t, "amount_msat"), amount > 0 else { return nil }
             let card = optStr(t, "for_card").flatMap { $0.isEmpty ? nil : $0 }
             out.append(WaitingTopUp(topupId: id, amountMsat: amount, forCard: card, createdAtMs: optLong(t, "created_at_ms")))
         }
@@ -435,7 +453,8 @@ enum TillParse {
             }
             let txid = optStr(o, "load_txid").flatMap { $0.isEmpty ? nil : $0 }
             let detail = optStr(o, "detail").flatMap { $0.isEmpty ? nil : $0 }
-            return .ok(TopUpStatus(topupId: try reqStr(o, "topup_id"), amountMsat: try reqLong(o, "amount_msat"),
+            guard let face = quoteInteger(o, "amount_msat"), face > 0 else { throw Bad(msg: "invalid top-up amount") }
+            return .ok(TopUpStatus(topupId: try reqStr(o, "topup_id"), amountMsat: face,
                                    state: try reqStr(o, "state"), loadTxid: txid, detail: detail))
         } catch {
             if status == 401 { return .failed(.unauthorized) }

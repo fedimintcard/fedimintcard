@@ -176,7 +176,7 @@ enum PosState: Equatable {
     /// Asking the till for the invoice; `clientRef` makes a repeat answer the same top-up.
     case topUpCreating(createId: Int, requestedMsat: Int64, clientRef: String)
     /// The invoice is on screen and the till is polled until it is paid.
-    case topUpInvoice(TopUp, clientRef: String)
+    case topUpInvoice(TopUp, clientRef: String, showQR: Bool = false)
     /// Paid: the NFC sheet is up, waiting for the card.
     case topUpWaitingForCard(TopUp)
     case topUpLoading(loadId: Int, TopUp)
@@ -220,7 +220,7 @@ enum PosEvent: Equatable {
     /// On the balance screen: top up this card.
     case topUpPressed
     /// On the top-up keypad.
-    case createInvoicePressed
+    case createInvoicePressed, showInvoicePressed
     case topUpCreated(createId: Int, result: TopUpReply<TopUp>)
     /// A poll of the invoice on screen.
     case topUpPolled(topupId: String, result: TopUpReply<TopUpStatus>)
@@ -253,7 +253,7 @@ enum PosEffect {
     /// Ends the NFC session, `message` on its sheet.
     case failCardSession(message: String)
     case startBalanceRead(readId: Int)
-    /// `POST /v1/topup`.
+    /// `POST /v1/topup/fee-inclusive`.
     case createTopUp(createId: Int, amountMsat: Int64, clientRef: String, shortId: String?)
     /// `POST /v1/topup/{id}/load` over the card now linked.
     case loadTopUp(loadId: Int, topupId: String)
@@ -381,18 +381,28 @@ final class PosFlow {
             return waitForCard(w.asTopUp)
         case (.createInvoicePressed, .topUpEntering):
             return topUpPad.isChargeable ? createTopUp(topUpPad.msat, newRef()) : []
+        case (.showInvoicePressed, .topUpInvoice(let t, let ref, false)) where t.quote != nil:
+            state = .topUpInvoice(t, clientRef: ref, showQR: true)
         case (.cancelPressed, .topUpEntering), (.cancelPressed, .topUpInvoice):
             state = .entering
         case (.topUpCreated(let cid, let r), .topUpCreating(let cur, let msat, let ref)) where cid == cur:
-            if case .ok(let t) = r { state = .topUpInvoice(t, clientRef: ref) }
-            else {
+            if case .ok(let t) = r {
+                switch t.state {
+                case "waiting" where t.quote != nil: state = .topUpInvoice(t, clientRef: ref)
+                case "paid": return waitForCard(t)
+                case "loaded": state = .topUpLoaded(amountMsat: t.amountMsat, loadTxid: t.loadTxid ?? "")
+                case "expired": state = .topUpFailed(TopUpFailure(problem: .expired, detail: "", requestedMsat: msat, clientRef: ref))
+                case "failed": state = .topUpFailed(TopUpFailure(problem: .failed, detail: "", requestedMsat: msat, clientRef: ref))
+                default: state = .topUpFailed(TopUpFailure(problem: .unverifiedQuote, detail: "", requestedMsat: msat, clientRef: ref))
+                }
+            } else {
                 // A full card refused before any invoice exists: nothing was paid, nothing to retry.
                 let p = topUpProblem(r)
                 state = .topUpFailed(TopUpFailure(problem: p == .cardFull ? .noRoom : p, detail: r.refusedDetail, requestedMsat: msat, clientRef: ref))
             }
-        case (.topUpPolled(let tid, let r), .topUpInvoice(let t0, let ref)) where tid == t0.topupId:
-            guard case .ok(let st) = r else { return [] } // a failed poll: poll again
-            let t = TopUp(topupId: t0.topupId, amountMsat: st.amountMsat, invoice: t0.invoice, expiresAtMs: t0.expiresAtMs, state: st.state)
+        case (.topUpPolled(let tid, let r), .topUpInvoice(var t, let ref, _)) where tid == t.topupId:
+            guard case .ok(let st) = r, st.topupId == tid, st.amountMsat == t.amountMsat else { return [] }
+            t.state = st.state
             switch st.state {
             case "paid": return waitForCard(t)
             case "loaded": state = .topUpLoaded(amountMsat: st.amountMsat, loadTxid: st.loadTxid ?? "")
@@ -414,7 +424,9 @@ final class PosFlow {
             return [.endCardSession]
         case (.topUpLoadDone(let lid, let r), .topUpLoading(let cur, let t)) where lid == cur:
             switch r {
-            case .ok(let st) where st.state == "loaded": state = .topUpLoaded(amountMsat: st.amountMsat, loadTxid: st.loadTxid ?? "")
+            case .ok(let st) where st.topupId != t.topupId || st.amountMsat != t.amountMsat:
+                state = paidFailure(.other, "The till returned a different top-up.", t)
+            case .ok(let st) where st.state == "loaded": state = .topUpLoaded(amountMsat: t.amountMsat, loadTxid: st.loadTxid ?? "")
             case .ok(let st): state = paidFailure(st.state == "failed" ? .failed : .other, st.detail ?? "", t)
             default: state = paidFailure(topUpProblem(r), r.refusedDetail, t)
             }

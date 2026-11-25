@@ -1,12 +1,19 @@
 import Foundation
 
-/// A top-up the till made (`POST /v1/topup`, docs/TOPUP.md): the invoice is for `amountMsat`.
+struct TopUpQuote: Equatable {
+    let invoiceAmountMsat: Int64
+    let topupFeeMsat: Int64
+}
+
+/// The face amount goes on the card. A payable invoice also requires verified fee terms.
 struct TopUp: Equatable {
     let topupId: String
     let amountMsat: Int64
     let invoice: String
     let expiresAtMs: Int64
-    let state: String
+    var state: String
+    var quote: TopUpQuote? = nil
+    var loadTxid: String? = nil
 }
 
 /// A paid top-up the till holds that is not on a card yet (`GET /v1/topups/waiting`, docs/TOPUP.md
@@ -43,7 +50,7 @@ enum TopUpReply<T: Equatable>: Equatable {
 /// Why a top-up step failed, in the terms the screen needs.
 enum TopUpProblem: Equatable {
     /// Unpaid at expiry: nothing moved.
-    case expired
+    case expired, unverifiedQuote
     /// The card has no room for the notes; the top-up stays paid.
     case cardFull
     /// The card has no free slot, found before any invoice was made: nothing was paid.
@@ -69,6 +76,7 @@ func topUpProblem<T>(_ r: TopUpReply<T>) -> TopUpProblem {
     case .refused(let code, let detail, _):
         if ChargeErrorCode.fromWire(code, detail: detail) == .wrongFederation { return .wrongFederation }
         switch code {
+        case "topup_quote_version", "invalid_topup_quote": return .unverifiedQuote
         case "expired": return .expired
         case "card_full": return .cardFull
         case "no_card", "card_link_gone", "card_changed", "card_lost": return .cardMoved
@@ -90,6 +98,7 @@ func topUpProblem<T>(_ r: TopUpReply<T>) -> TopUpProblem {
 func topUpErrorCopy(_ p: TopUpProblem, paid: Bool, detail: String) -> (String, String) {
     let waiting = paid ? " The top-up is paid and waiting." : ""
     switch p {
+    case .unverifiedQuote: return ("Can't verify this top-up", "The till must provide a matching invoice and fee breakdown. Check that the till and POS are up to date.")
     case .expired: return ("The invoice expired", "Nothing was paid. Make a new invoice to try again.")
     case .notLoaded: return ("Not loaded yet", "The top-up is paid and waiting. Tap the card to load it; Done leaves the payment with the till.")
     case .cardFull: return ("This card is full", "Spend from it, then tap again.\(waiting)")
@@ -112,7 +121,8 @@ func topUpErrorCopy(_ p: TopUpProblem, paid: Bool, detail: String) -> (String, S
 
 /// `m:ss` left until `expiresAtMs`; 0:00 once past.
 func timeLeft(expiresAtMs: Int64, nowMs: Int64) -> String {
-    let s = (max(0, expiresAtMs - nowMs) + 999) / 1000
+    let remaining = max(0, expiresAtMs) - max(0, nowMs)
+    let s = remaining > 0 ? remaining / 1000 + (remaining % 1000 == 0 ? 0 : 1) : 0
     return "\(s / 60):" + String(format: "%02d", s % 60)
 }
 

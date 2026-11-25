@@ -1790,7 +1790,6 @@ impl CardWallet {
             .with_context(|| format!("a {} msat note cannot pay its own fee", note.amount_msat))?;
         self.require_tiers(&amounts)?;
         let outs = self.build_outs(&amounts, |_| Ok(OwnerKind::Host(HostKind::Till)))?;
-        let bal0 = self.wallet.balance_msat().await?;
         let txid = self.sign_and_submit(std::slice::from_ref(&note), outs, PendingTx::default()).await?;
 
         let mut warnings = vec![];
@@ -1823,7 +1822,9 @@ impl CardWallet {
             );
             return Ok(report);
         }
-        let gained = self.wallet.balance_msat().await?.saturating_sub(bal0);
+        // start_clean resolved earlier card operations before this spend. Export just the notes
+        // collected for this cashout, even if an independent Lightning receipt arrived meanwhile.
+        let gained = rec.till_received.saturating_sub(rec.till_fee);
         report.gained_msat = gained;
         match self.export_after_cashout(gained).await {
             Ok(Some((text, amount))) => {
@@ -1845,6 +1846,13 @@ impl CardWallet {
         if amount == 0 {
             return Ok(None);
         }
+        let dir = self.store.path().parent().context("card state has no directory")?;
+        crate::payout::funds::protect_fee_inclusive_topups(
+            &self.wallet,
+            dir,
+            crate::payout::funds::TopupDebit::Mint { amount_msat: amount, load_tag: None },
+        )
+        .await?;
         let (notes, face) = self.wallet.export_ecash(amount, false, true).await?;
         Ok(Some((notes, face.msats)))
     }

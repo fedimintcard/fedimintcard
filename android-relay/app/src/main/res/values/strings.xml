@@ -28,7 +28,15 @@
     <string name="top_up_card">Top up card</string>
     <string name="load_waiting_top_up">Load waiting top-up · %1$s sats</string>
     <string name="top_up">Top up</string>
-    <string name="create_invoice">Create invoice</string>
+    <string name="create_invoice">Review top-up</string>
+    <string name="getting_topup_total">Getting total…</string>
+    <string name="on_your_card">On your card</string>
+    <string name="topup_fee">Top-up fee</string>
+    <string name="total_to_pay">Total to pay</string>
+    <string name="amount_in_sats">%1$s sats</string>
+    <string name="topup_fee_retention">The top-up fee is fixed. Any amount left after costs stays in the merchant’s till.</string>
+    <string name="topup_wallet_fee">Your Lightning wallet may charge a separate routing fee.</string>
+    <string name="show_payment_qr">Show payment QR</string>
     <string name="scan_with_wallet">Scan with a Lightning wallet</string>
     <string name="invoice_qr_description">Lightning invoice QR code</string>
     <string name="new_invoice">New invoice</string>

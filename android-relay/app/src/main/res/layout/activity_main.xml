@@ -219,28 +219,56 @@
     </LinearLayout>
 
     <!-- top-up invoice: the holder scans it with their own wallet -->
-    <LinearLayout android:id="@+id/screen_invoice" android:layout_width="match_parent" android:layout_height="match_parent"
-        android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp" android:visibility="gone">
-        <TextView android:id="@+id/invoice_amount" style="@style/Heading" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="24dp" android:maxLines="1"
-            android:autoSizeTextType="uniform" android:autoSizeMinTextSize="24sp" android:autoSizeMaxTextSize="40sp"
-            android:autoSizeStepGranularity="2sp" />
-        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
-        <FrameLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:background="@drawable/bg_qr" android:padding="18dp">
-            <ImageView android:id="@+id/invoice_qr" android:layout_width="match_parent" android:layout_height="wrap_content"
-                android:adjustViewBounds="true" android:scaleType="fitCenter"
-                android:contentDescription="@string/invoice_qr_description" />
-        </FrameLayout>
-        <TextView style="@style/Body" android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="20dp" android:text="@string/scan_with_wallet" android:textSize="20sp" />
-        <TextView android:id="@+id/invoice_time_left" style="@style/Body" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="6dp" android:textColor="@color/dim"
-            android:textSize="15sp" android:accessibilityLiveRegion="none" />
-        <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
-        <Button android:id="@+id/btn_invoice_cancel" style="@style/OutlineButton" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:text="@string/cancel" />
-    </LinearLayout>
+    <ScrollView android:id="@+id/screen_invoice" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:fillViewport="true" android:visibility="gone">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:gravity="center_horizontal" android:padding="24dp">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:layout_marginBottom="6dp">
+                <TextView style="@style/Body" android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:gravity="start" android:text="@string/on_your_card" android:textSize="18sp" />
+                <TextView android:id="@+id/invoice_on_your_card" style="@style/Body" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:gravity="end" android:textSize="18sp" />
+            </LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:layout_marginBottom="6dp">
+                <TextView style="@style/Body" android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:gravity="start" android:text="@string/topup_fee" android:textSize="18sp" />
+                <TextView android:id="@+id/invoice_topup_fee" style="@style/Body" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:gravity="end" android:textSize="18sp" />
+            </LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:layout_marginBottom="6dp">
+                <TextView style="@style/Heading" android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:gravity="start" android:text="@string/total_to_pay" android:textSize="22sp" />
+                <TextView android:id="@+id/invoice_total_to_pay" style="@style/Heading" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:gravity="end" android:textSize="22sp" />
+            </LinearLayout>
+            <TextView android:id="@+id/invoice_fee_retention" style="@style/Body" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="8dp" android:gravity="start"
+                android:text="@string/topup_fee_retention" android:textSize="16sp" />
+            <TextView android:id="@+id/invoice_wallet_fee" style="@style/Body" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="6dp" android:gravity="start"
+                android:text="@string/topup_wallet_fee" android:textSize="16sp" />
+            <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+            <LinearLayout android:id="@+id/invoice_payment" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:gravity="center_horizontal" android:visibility="gone">
+                <ImageView android:id="@+id/invoice_qr" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:adjustViewBounds="true" android:maxHeight="265dp" android:scaleType="fitCenter"
+                    android:background="@drawable/bg_qr" android:padding="14dp" android:contentDescription="@string/invoice_qr_description" />
+                <TextView style="@style/Body" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp" android:text="@string/scan_with_wallet" android:textSize="18sp" />
+            </LinearLayout>
+            <TextView android:id="@+id/invoice_time_left" style="@style/Body" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="6dp" android:textColor="@color/dim"
+                android:textSize="15sp" android:accessibilityLiveRegion="none" />
+            <View android:layout_width="0dp" android:layout_height="0dp" android:layout_weight="1" />
+            <Button android:id="@+id/btn_show_invoice" style="@style/PrimaryButton" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginBottom="8dp" android:text="@string/show_payment_qr" />
+            <Button android:id="@+id/btn_invoice_cancel" style="@style/OutlineButton" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:text="@string/cancel" />
+        </LinearLayout>
+    </ScrollView>
 
     <!-- relay (old status screen) -->
     <LinearLayout android:id="@+id/screen_relay" android:layout_width="match_parent" android:layout_height="match_parent"

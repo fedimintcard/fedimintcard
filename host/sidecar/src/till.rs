@@ -902,17 +902,33 @@ async fn topup_load_job(
     let loader = match crate::holder::Loader::new(wallet, ops_url, dir) {
         // With the till's own client, a split-keyed card's unkeyed slots are keyed at this tap.
         Ok(l) => match keyer {
-            Some(k) => l.with_tag(id).with_keyer(k),
-            None => l.with_tag(id),
-        },
+            Some(k) => l.with_keyer(k),
+            None => l,
+        }
+        .with_tag(id)
+        .keep_finished(),
         Err(e) => return error_reply(&e),
     };
     match loader.resume_each().await {
         Ok(done) => {
             for f in done {
-                if let (Some(tag), Some(_)) = (&f.load.tag, &f.live) {
-                    mark_loaded(topups, tag, &f.load.txid, &f.load.short_id);
+                if let (Some(tag), Some(_)) = (&f.load.tag, &f.live)
+                    && let Err(e) = mark_loaded(&loader, topups, tag, &f.load.txid, &f.load.short_id, Some(&f.load.operation_id)).await
+                {
+                    return error_reply(&e);
                 }
+            }
+        }
+        Err(e) => return error_reply(&e),
+    }
+    // If the process stopped between the accepted load and the top-up store write, replay that
+    // result before opening a card or building a second transaction.
+    match loader.kept(id) {
+        Ok(kept) => {
+            if let Some(done) = kept.iter().find(|k| k.accepted)
+                && let Err(e) = mark_loaded(&loader, topups, id, &done.txid, &done.short_id, done.operation_id.as_deref()).await
+            {
+                return error_reply(&e);
             }
         }
         Err(e) => return error_reply(&e),
@@ -929,7 +945,9 @@ async fn topup_load_job(
     };
     match loader.load(card.as_mut(), &[amount_msat]).await {
         Ok(r) => {
-            mark_loaded(topups, id, &r.txid, &r.short_id);
+            if let Err(e) = mark_loaded(&loader, topups, id, &r.txid, &r.short_id, Some(&r.operation_id)).await {
+                return error_reply(&e);
+            }
             match topups.get(id) {
                 Some(t) => Reply::ok(t.to_json()),
                 None => unknown_topup(),
@@ -942,16 +960,28 @@ async fn topup_load_job(
     }
 }
 
-pub(crate) fn mark_loaded(topups: &Topups, id: &str, txid: &str, short_id: &str) {
-    let r = topups.store.lock().unwrap().update(id, |t| {
+pub(crate) async fn mark_loaded(
+    loader: &crate::holder::Loader<'_>,
+    topups: &Topups,
+    id: &str,
+    txid: &str,
+    short_id: &str,
+    load_op: Option<&str>,
+) -> Result<()> {
+    let found = topups.store.lock().unwrap().update(id, |t| {
         t.state = TopupState::Loaded;
         t.load_txid = Some(txid.to_owned());
+        if let Some(op) = load_op {
+            t.load_operation_id = Some(op.to_owned());
+        }
         t.short_id = Some(short_id.to_owned());
         t.detail = None;
-    });
-    if let Err(e) = r {
-        eprintln!("top-up {id}: loaded in {txid} but could not record it: {e:#}");
+    })?;
+    if found {
+        loader.acknowledge(id)?;
+        topups.reconcile(id).await;
     }
+    Ok(())
 }
 
 fn unknown_topup() -> Reply {
@@ -1002,7 +1032,7 @@ async fn holder_room(
     // The issue's own transaction: its card outputs are mint outputs, so its fees are bounded as
     // any mint transaction from this balance (`crate::payout::fees`).
     let fee = crate::payout::fees::mint_fee_bound(&snap.schedules, snap.balance_msat, 0);
-    Ok(Some(snap.balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(fee)))
+    Ok(Some(snap.debit_balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(fee)))
 }
 
 async fn issue_job(
@@ -1777,7 +1807,8 @@ pub fn router(h: TillHandle) -> Router {
         .route("/v1/cards/keySetup", post(cards_key_setup))
         .route("/v1/cards/issue", post(cards_issue))
         .route("/v1/card/link", get(card_link))
-        .route("/v1/topup", post(topup_create))
+        .route("/v1/topup", post(topup_legacy))
+        .route("/v1/topup/fee-inclusive", post(topup_fee_inclusive))
         .route("/v1/topup/{topup_id}", get(topup_get))
         .route("/v1/topups/waiting", get(topups_waiting))
         .route("/v1/topup/{topup_id}/load", post(topup_load))
@@ -2046,6 +2077,7 @@ const TOPUP_MAX_CLIENT_REF: usize = 64;
 
 #[derive(Deserialize)]
 struct TopupReq {
+    fee_quote_version: Option<u32>,
     amount_msat: Option<u64>,
     client_ref: Option<String>,
     /// The card the top-up is for (`short_id` from `/v1/card/balance`): the amount is then rounded
@@ -2092,7 +2124,19 @@ async fn topups_waiting(State(h): State<TillHandle>, Query(q): Query<WaitingQuer
     Reply::ok(json!({"ok": true, "topups": list}))
 }
 
-async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
+async fn topup_legacy(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    topup_create(&h, body, false).await
+}
+
+async fn topup_fee_inclusive(State(h): State<TillHandle>, body: Bytes) -> Reply {
+    topup_create(&h, body, true).await
+}
+
+fn topup_quote_version() -> Reply {
+    Reply::fail(409, "topup_quote_version", "Update POS to see the top-up fee and invoice total before payment.")
+}
+
+async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply {
     let Some(t) = h.topups.clone() else { return topups_unavailable() };
     let req: TopupReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -2109,9 +2153,8 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
     if requested > crate::topup::MAX_TOPUP_MSAT {
         return Reply::fail(400, "bad_amount", format!("a top-up is at most {} msat", crate::topup::MAX_TOPUP_MSAT));
     }
-    if let Err(r) = topup_ops_url(&h) {
-        return r;
-    }
+    let supports_quote = fee_endpoint && req.fee_quote_version == Some(crate::topup::FEE_QUOTE_VERSION);
+    let for_card = req.short_id.as_ref().map(|s| s.to_ascii_lowercase());
     let _one = t.create.lock().await;
     if let Some(cref) = req.client_ref.as_deref()
         && let Some(had) = t.store.lock().unwrap().by_ref(cref).cloned()
@@ -2123,7 +2166,19 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
                 format!("client_ref {cref} was a top-up of {} msat, not {requested}", had.requested_msat),
             );
         }
+        if had.for_card != for_card {
+            return Reply::fail(409, "client_ref_conflict", "this top-up reference was used for a different card");
+        }
+        if had.state == TopupState::Waiting && had.quote.is_some() && !supports_quote {
+            return topup_quote_version();
+        }
         return Reply::ok(had.to_json());
+    }
+    if !supports_quote {
+        return topup_quote_version();
+    }
+    if let Err(r) = topup_ops_url(h) {
+        return r;
     }
     let mut max_notes = crate::topup::MAX_TOPUP_NOTES;
     if let Some(id) = req.short_id.as_deref() {
@@ -2153,39 +2208,52 @@ async fn topup_create(State(h): State<TillHandle>, body: Bytes) -> Reply {
         Some(a) if a <= crate::topup::MAX_TOPUP_MSAT => a,
         _ => return Reply::fail(400, "bad_amount", format!("{requested} msat rounds to no amount a card can hold")),
     };
-    let (operation_id, invoice) = match t.ln.invoice(amount, crate::topup::INVOICE_EXPIRY_SECS).await {
+    // The solver's fee bound holds across wallet inventory changes. Gateway negotiation can
+    // run independently of existing card loads; the wallet guard covers durable publication.
+    let invoice = match t.ln.fee_invoice(amount, crate::topup::INVOICE_EXPIRY_SECS).await {
         Ok(x) => x,
-        Err(e) => return Reply::fail(502, "invoice_failed", format!("{e:#}")),
+        Err(e) => return Reply::fail(503, "topup_quote_unavailable", format!("A funded top-up quote is unavailable: {e:#}")),
     };
+    let quote = crate::topup::TopupQuote {
+        version: crate::topup::FEE_QUOTE_VERSION,
+        invoice_amount_msat: invoice.invoice_amount_msat,
+        topup_fee_msat: invoice.topup_fee_msat,
+        load_fee_bound_msat: invoice.load_fee_bound_msat,
+    };
+    if let Err(e) = quote.validate(amount) {
+        return Reply::fail(503, "topup_quote_unavailable", format!("The invoice quote could not be verified: {e:#}"));
+    }
     let now = crate::topup::now_ms();
     let rec = TopupRec {
         topup_id: crate::topup::new_id(),
         client_ref: req.client_ref,
         requested_msat: requested,
         amount_msat: amount,
-        invoice,
-        operation_id,
+        quote: Some(quote),
+        invoice: invoice.invoice,
+        operation_id: invoice.operation_id,
         created_at_ms: now,
         expires_at_ms: now + crate::topup::INVOICE_EXPIRY_SECS * 1000,
         state: TopupState::Waiting,
         load_txid: None,
+        load_operation_id: None,
+        realized_costs: None,
         short_id: None,
         detail: None,
-        for_card: req.short_id.as_ref().map(|c| c.to_ascii_lowercase()),
+        for_card,
     };
-    // A new liability, recorded under the wallet's admission guard (after `create`): a payout's
-    // final snapshot sees it before the invoice can be paid.
-    let liability = h.wallet.spend.debit().await;
+    let admission = h.wallet.spend.exclusive().await;
     if let Err(e) = t.store.lock().unwrap().insert(rec.clone()) {
         return error_reply(&e);
     }
-    drop(liability);
+    drop(admission);
     t.watch(&rec);
     Reply::ok(rec.to_json())
 }
 
 async fn topup_get(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>) -> Reply {
     let Some(t) = h.topups.clone() else { return topups_unavailable() };
+    t.reconcile(&id).await;
     match t.get(&id) {
         Some(rec) => Reply::ok(rec.to_json()),
         None => unknown_topup(),

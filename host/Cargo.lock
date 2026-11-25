@@ -2484,6 +2484,7 @@ dependencies = [
  "fedimint-tbs",
  "fs4",
  "hex",
+ "lightning-invoice",
  "p256",
  "rand 0.8.8",
  "serde",

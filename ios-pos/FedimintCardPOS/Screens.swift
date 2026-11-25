@@ -308,7 +308,7 @@ extension ReceiptScreen {
     init(receipt: ChargeReceipt) { self.init(headline: receiptHeadline(receipt), txid: receipt.txid) }
 }
 
-/// The top-up amount: the amount keypad again, with "Create invoice".
+/// The card amount the holder wants to review.
 struct TopUpScreen: View {
     @EnvironmentObject var pos: PosController
     let creating: Bool
@@ -322,7 +322,7 @@ struct TopUpScreen: View {
                     .minimumScaleFactor(0.4).lineLimit(1)
             }
             let ok = pos.topUpChargeable && !creating
-            Button(creating ? "Creating invoice…" : "Create invoice") { pos.send(.createInvoicePressed) }
+            Button(creating ? "Getting total…" : "Review top-up") { pos.send(.createInvoicePressed) }
                 .buttonStyle(GoldButtonStyle(enabled: ok))
                 .disabled(!ok)
                 .padding(.top, 8)
@@ -338,23 +338,59 @@ struct TopUpScreen: View {
 struct InvoiceScreen: View {
     @EnvironmentObject var pos: PosController
     let topUp: TopUp
+    let showQR: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            Text("Top up \(formatSats(topUp.amountMsat)) sats").font(Fig.extraBold(40)).kerning(-0.8)
-                .foregroundStyle(Palette.ink).lineLimit(1).minimumScaleFactor(0.5).padding(.top, 24)
-            Spacer()
-            InvoiceQR(text: invoiceQrText(topUp.invoice))
-                .padding(18)
-                .background(RoundedRectangle(cornerRadius: 20).fill(Color.white))
-                .accessibilityLabel("Lightning invoice QR code")
-            Text("Scan with a Lightning wallet").font(Fig.regular(20)).foregroundStyle(Palette.mist).padding(.top, 20)
-            Text("Expires in \(timeLeft(expiresAtMs: topUp.expiresAtMs, nowMs: pos.nowMs))")
-                .font(Fig.regular(15)).foregroundStyle(Palette.dim).monospacedDigit().padding(.top, 6)
-            Spacer()
-            Button("Cancel") { pos.send(.cancelPressed) }.buttonStyle(OutlineButtonStyle())
+        if let quote = topUp.quote {
+            VStack(spacing: 12) {
+                VStack(spacing: 8) {
+                    quoteRow("On your card", topUp.amountMsat)
+                    quoteRow("Top-up fee", quote.topupFeeMsat)
+                    Divider()
+                    quoteRow("Total to pay", quote.invoiceAmountMsat, total: true)
+                }.padding(.top, 20)
+                if !showQR {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if quote.topupFeeMsat > 0 {
+                            Text("The top-up fee is fixed. Any amount left after costs stays in the merchant’s till.")
+                        }
+                        Text("Your Lightning wallet may charge a separate routing fee.")
+                    }
+                    .font(Fig.regular(16)).foregroundStyle(Palette.mist)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 4)
+                if showQR {
+                    InvoiceQR(text: invoiceQrText(topUp.invoice))
+                        .padding(14)
+                        .frame(maxWidth: 280, maxHeight: 280)
+                        .background(RoundedRectangle(cornerRadius: 20).fill(Color.white))
+                        .accessibilityLabel("Lightning invoice QR code")
+                    Text("Scan with a Lightning wallet").font(Fig.regular(18)).foregroundStyle(Palette.mist)
+                }
+                Text("Expires in \(timeLeft(expiresAtMs: topUp.expiresAtMs, nowMs: pos.nowMs))")
+                    .font(Fig.regular(15)).foregroundStyle(Palette.dim).monospacedDigit()
+                Spacer(minLength: 4)
+                if !showQR {
+                    Button("Show payment QR") { pos.send(.showInvoicePressed) }.buttonStyle(GoldButtonStyle(enabled: true))
+                }
+                Button("Cancel") { pos.send(.cancelPressed) }.buttonStyle(OutlineButtonStyle())
+            }
+            .padding(8)
         }
-        .padding(8)
+    }
+
+    private func quoteRow(_ label: LocalizedStringKey, _ msat: Int64, total: Bool = false) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            Text("\(formatSats(msat)) sats").monospacedDigit()
+        }
+        .font(total ? Fig.extraBold(23) : Fig.regular(18))
+        .foregroundStyle(total ? Palette.ink : Palette.mist)
+        .accessibilityElement(children: .combine)
     }
 }
 

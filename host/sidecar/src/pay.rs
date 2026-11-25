@@ -457,11 +457,20 @@ pub trait PayLightning: Send + Sync {
 /// The till's own wallet.
 pub struct WalletPayer {
     pub wallet: Wallet,
+    dir: PathBuf,
 }
 
 impl PayLightning for WalletPayer {
     fn pay(&self, bolt11: String, max_fee_msat: u64, wait: Duration) -> BoxFuture<'_, Result<WalletPay>> {
-        Box::pin(async move { self.wallet.pay_invoice(&bolt11, max_fee_msat, wait).await })
+        Box::pin(async move {
+            crate::payout::funds::protect_fee_inclusive_topups(
+                &self.wallet,
+                &self.dir,
+                crate::payout::funds::TopupDebit::Lightning { bolt11: &bolt11, max_fee_msat: Some(max_fee_msat) },
+            )
+            .await?;
+            self.wallet.pay_invoice(&bolt11, max_fee_msat, wait).await
+        })
     }
 
     fn resolve(&self, operation_id: String, wait: Duration) -> BoxFuture<'_, Result<WalletPay>> {
@@ -618,7 +627,13 @@ impl Pays {
     pub async fn for_wallet(dir: &Path, wallet: &Wallet, cfg: PayConfig) -> Result<Option<Arc<Self>>> {
         let Some(currency) = wallet.invoice_currency().await else { return Ok(None) };
         let store = PayStore::open(PayStore::path_in(dir))?;
-        Ok(Some(Self::new_guarded(store, Arc::new(WalletPayer { wallet: wallet.clone() }), cfg, currency, wallet.spend.clone())))
+        Ok(Some(Self::new_guarded(
+            store,
+            Arc::new(WalletPayer { wallet: wallet.clone(), dir: dir.to_owned() }),
+            cfg,
+            currency,
+            wallet.spend.clone(),
+        )))
     }
 
     pub fn get(&self, id: u64) -> Option<PayRec> {
@@ -909,7 +924,7 @@ fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Rep
 async fn pay_step(pays: &Pays, mut rec: PayRec, wait: Duration) -> Reply {
     // The wallet's debit and its record, under the admission guard: a payout's final snapshot never
     // falls between them. Nothing below acquires it again.
-    let _debit = pays.spend.debit().await;
+    let _debit = pays.spend.exclusive().await;
     match pays.ln.status(rec.bolt11.clone(), STATUS_WAIT.min(wait)).await {
         Ok(Some(o)) => return apply(pays, rec, o),
         Ok(None) => {}
@@ -1585,8 +1600,11 @@ pub(crate) async fn refund_job(
                         Err(e) => return refund_error(pays, &loader, id, min, error_reply(&e)),
                     },
                     None => {
-                        if let (Some(tp), Some(_)) = (topups, &f.live) {
-                            crate::till::mark_loaded(tp, t, &f.load.txid, &f.load.short_id);
+                        if let (Some(tp), Some(_)) = (topups, &f.live)
+                            && let Err(e) =
+                                crate::till::mark_loaded(&loader, tp, t, &f.load.txid, &f.load.short_id, Some(&f.load.operation_id)).await
+                        {
+                            return refund_error(pays, &loader, id, min, error_reply(&e));
                         }
                     }
                 }

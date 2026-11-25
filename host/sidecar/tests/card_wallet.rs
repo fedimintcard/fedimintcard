@@ -356,6 +356,27 @@ async fn change_note_is_spendable() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cashout_export_preserves_outstanding_topup_funds() -> anyhow::Result<()> {
+    use fedimint_card_sidecar::topup::{TopupRec, TopupStore};
+    let mut f = fx(true, Amount::from_sats(10_000)).await?;
+    topup(&mut f.cw, &[1 << 18]).await?;
+    let slot = f.cw.store.state.live_notes()[0].slot;
+    let before = f.cw.wallet.balance_msat().await?;
+    let outstanding: TopupRec = serde_json::from_value(serde_json::json!({
+        "topup_id":"another-customer","requested_msat":10_000_000,"amount_msat":10_000_000,
+        "quote":{"version":1,"invoice_amount_msat":10_020_000,"topup_fee_msat":20_000,"load_fee_bound_msat":10_000},
+        "invoice":"synthetic","operation_id":"another-receive","created_at_ms":1,"expires_at_ms":2,"state":"paid"
+    }))?;
+    TopupStore::open(TopupStore::path_in(f._dir.path()))?.insert(outstanding)?;
+    let report = f.cw.cashout(slot).await?;
+    assert!(report.gained_msat > 0 && report.gained_msat <= 1 << 18);
+    assert!(report.ecash.is_none());
+    assert!(report.warnings.iter().any(|w| w.contains("reserved for customer top-ups")), "{:?}", report.warnings);
+    assert!(f.cw.wallet.balance_msat().await? > before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cashout_produces_ecash_the_stock_client_reissues() -> anyhow::Result<()> {
     let mut f = fx(true, Amount::from_sats(10_000)).await?;
     topup(&mut f.cw, &[1 << 18]).await?;

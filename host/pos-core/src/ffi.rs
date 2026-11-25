@@ -184,6 +184,16 @@ fn guarded<T>(what: &str, f: impl FnOnce() -> Result<T, PosCoreError>) -> Result
     })
 }
 
+/// Verify the signed BOLT11 before a phone offers its Lightning QR for this exact total.
+#[uniffi::export]
+pub fn invoice_matches_total(invoice: String, total_msat: i64) -> Result<bool, PosCoreError> {
+    guarded("invoice", || {
+        let Ok(total) = u64::try_from(total_msat) else { return Ok(false) };
+        let amount = invoice.parse::<lightning_invoice::Bolt11Invoice>().ok().and_then(|i| i.amount_milli_satoshis());
+        Ok(total > 0 && amount == Some(total))
+    })
+}
+
 fn slots(v: impl Iterator<Item = (u8, u64)>) -> Vec<SlotMsat> {
     v.map(|(slot, msat)| SlotMsat { slot, msat }).collect()
 }

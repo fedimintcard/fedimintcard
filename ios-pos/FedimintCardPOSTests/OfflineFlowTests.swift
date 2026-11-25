@@ -282,7 +282,7 @@ final class OfflineFlowTests: XCTestCase {
         g.dispatch(.topUpPressed)
         g.topUpPad.press(1)
         guard case .createTopUp(let cid, _, _, _)? = g.dispatch(.createInvoicePressed).first else { return XCTFail() }
-        let t = TopUp(topupId: "t1", amountMsat: 1000, invoice: "lnbc", expiresAtMs: 1, state: "waiting")
+        let t = TopUp(topupId: "t1", amountMsat: 1000, invoice: "lnbc", expiresAtMs: 1, state: "waiting", quote: TopUpQuote(invoiceAmountMsat: 1_100, topupFeeMsat: 100))
         g.dispatch(.topUpCreated(createId: cid, result: .ok(t)))
         g.dispatch(.topUpPolled(topupId: "t1", result: .ok(TopUpStatus(topupId: "t1", amountMsat: 1000, state: "paid", loadTxid: nil, detail: nil))))
         let fx2 = g.dispatch(.linkFailed(.unreachable))

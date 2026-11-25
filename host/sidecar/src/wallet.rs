@@ -1,5 +1,7 @@
 //! The till's persistent Fedimint client, Bitcoin eCash, and Lightning operations.
 
+mod fee_inclusive;
+mod topup_costs;
 mod mint;
 pub use fedimint_card_pos_core::mint::MintVersion;
 pub use mint::{CardMintConfig, MintUnavailable, UnsupportedMint, encode_v2_ecash};
@@ -322,7 +324,8 @@ impl Wallet {
     pub async fn ln_receive_settled(&self, operation_id: &str, wait: Duration) -> Result<Option<bool>> {
         use fedimint_ln_client::LnReceiveState;
         let bytes: [u8; 32] = hex::decode(operation_id.trim()).ok().and_then(|b| b.try_into().ok()).context("not an operation id")?;
-        if self.lightning().is_err() {
+        let entry = self.client.operation_log().get_operation(OperationId(bytes)).await.context("unknown Lightning receive operation")?;
+        if entry.operation_module_kind() == fedimint_lnv2_client::common::KIND.as_str() {
             use fedimint_lnv2_client::FinalReceiveOperationState;
             let ln = self.lightning_v2()?;
             let result = tokio::time::timeout(wait, ln.await_final_receive_operation_state(OperationId(bytes))).await;

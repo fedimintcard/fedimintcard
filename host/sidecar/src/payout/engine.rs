@@ -158,7 +158,7 @@ impl Engine<'_> {
         let open_msat = store.open_records().fold(0u64, |a, r| a.saturating_add(r.held_msat()));
         let reserve_msat = store.file().settings.reserve_sat.saturating_mul(1000);
         let spendable_msat =
-            snap.balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(open_msat).saturating_sub(reserve_msat);
+            snap.debit_balance_msat.saturating_sub(snap.obligations.total()).saturating_sub(open_msat).saturating_sub(reserve_msat);
         Ok(Funds {
             balance_msat: snap.balance_msat,
             obligations: snap.obligations,
