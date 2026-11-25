@@ -13,6 +13,12 @@ app for merchants. Results on silicon and end to end: [docs/CAP-BUILD.md](docs/C
 
 This is experimental software. Put on a card only what you can afford to lose.
 
+## Card 4.0 merchant till
+
+The merchant till accepts Card 4.x and requires a Card 4.0 registry. Merchants with older cards still need a compatible till to spend or withdraw their balance. Use the web page to set up a till, pair a POS phone, review sales and withdraw proceeds.
+
+[Docker installation and backup](docs/TILL-DOCKER.md) · [Merchant overview](docs/images/till/overview.png) · [Payouts](docs/images/till/payouts.png)
+
 ## Layout
 
 ```

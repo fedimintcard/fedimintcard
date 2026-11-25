@@ -1280,3 +1280,117 @@ async fn a_card_pays_an_invoice_through_the_till_wallet() -> anyhow::Result<()> 
     assert_eq!((s, &again), (200, &body));
     Ok(())
 }
+
+// ------------------------------------------------------------------ payouts and the till's spends
+
+/// A payout's snapshot counts a `not_charged` pay's price until the till's own records prove its
+/// card never paid: a refused PIN is released, a charge the federation took that a refusal read
+/// recorded `not_charged` is not, however long ago. Without the till's records, every one counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_not_charged_pay_is_released_only_by_the_tills_own_evidence() -> anyhow::Result<()> {
+    use fedimint_card_sidecar::payout::backend::{Backend, TillBackend};
+
+    let mut f = fx_with(cfg(), None).await?;
+    // Refused for certain: a wrong PIN, nothing signed.
+    let (s, b) = f.post(json!({"bolt11": hour_invoice(10_000), "max_fee_msat": 1_000, "client_ref": "pin", "pin": "9999"})).await;
+    assert_eq!((s, b["state"].as_str()), (403, Some("not_charged")), "{b}");
+    // Charged after all, and recorded `not_charged`: a refusal read before the charge showed up.
+    *f.handle.pays().unwrap().crash.lock().unwrap() = Some(PayCrash::AfterCharge);
+    let (s, _) = f.post(req(&hour_invoice(10_000), "late")).await;
+    assert_eq!(s, 500);
+    let late = PayStore::open(PayStore::path_in(f.dir.path()))?.by_ref("late").unwrap().pay_id;
+    f.edit_on_disk(late, |r| {
+        r.state = PayState::NotCharged;
+        // Long ago: no time window releases it.
+        r.updated_at_ms = 0;
+        r.created_at_ms = 0;
+    });
+    f.restart(cfg());
+    assert_eq!(f.sales_for("late"), 1);
+
+    let backend = |till: Option<TillHandle>| TillBackend {
+        wallet: f.wallet.clone(),
+        topups: None,
+        pays: f.handle.pays(),
+        dir: f.dir.path().to_owned(),
+        till,
+    };
+    let with = backend(Some(f.handle.clone())).snapshot().await?;
+    assert_eq!(with.obligations.pays_msat, PRICE, "only the late charge, whose sale exists, counts");
+    let without = backend(None).snapshot().await?;
+    assert_eq!(without.obligations.pays_msat, 2 * PRICE, "without the till's records both count");
+    // Each claim carries its fee bound.
+    assert!(without.obligations.fees_msat >= with.obligations.fees_msat);
+    Ok(())
+}
+
+/// The wallet's admission guard, shared by a pay (its admission, its charge as an actor job, its
+/// funding) and taken exclusive by a payout, never deadlocks:
+///
+/// 1. a payout holding the guard holds up a pay's admission (nothing is charged meanwhile), and
+///    the pay goes on once it lets go;
+/// 2. a payout that asks while a pay's funding holds the guard shared waits for it, and the actor's
+///    next job (a second pay's charge) waits behind the payout, not forever: every one finishes.
+///
+/// The guard is fair: once a payout waits, new shared holders queue behind it. No holder waits for
+/// anything that waits for the guard: an actor job never waits for another job, a pay's funding
+/// waits only for the wallet, and a payout under the guard waits only for the wallet. So every
+/// wait ends when the holder ahead of it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pay_its_charge_and_a_payout_share_the_wallets_admission_guard_without_deadlock() -> anyhow::Result<()> {
+    let mut f = fx_with(cfg(), None).await?;
+    // The pays share the wallet's guard, as `Pays::for_wallet` makes them.
+    let store = PayStore::open(PayStore::path_in(f.dir.path()))?;
+    f.handle = f.handle.clone().with_pays(Pays::new_guarded(store, f.ln.clone(), cfg(), Currency::Regtest, f.wallet.spend.clone()));
+    let guard = f.wallet.spend.clone();
+
+    // 1.
+    let held = guard.exclusive().await;
+    let h = f.handle.clone();
+    let body = req(&hour_invoice(10_000), "held");
+    let signed = f.signs.get();
+    let (s, b, waited) = with_actor(&mut f.actor, async move {
+        let pay = tokio::spawn(async move { call(&h, "POST", "/v1/pay", body).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let waiting = !pay.is_finished();
+        drop(held);
+        let (s, b) = tokio::time::timeout(Duration::from_secs(30), pay).await.expect("the pay finishes").unwrap();
+        (s, b, waiting)
+    })
+    .await;
+    assert!(waited, "the pay waited while a payout held the guard");
+    assert_eq!((s, b["state"].as_str()), (200, Some("paid")), "{b}");
+    assert!(f.signs.get() > signed);
+
+    // 2.
+    f.ln.delay(Duration::from_millis(1_500));
+    let (h1, h2) = (f.handle.clone(), f.handle.clone());
+    let (b1, b2) = (req(&hour_invoice(10_000), "first"), req(&hour_invoice(10_000), "second"));
+    let ln = f.ln.clone();
+    let calls = ln.total_calls();
+    let ((s1, r1), payout_waited, (s2, r2)) = with_actor(&mut f.actor, async move {
+        let first = tokio::spawn(async move { call(&h1, "POST", "/v1/pay", b1).await });
+        // Until the first pay's funding has started: it holds the guard shared for its payment.
+        while ln.total_calls() == calls {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let g = guard.clone();
+        let payout = tokio::spawn(async move {
+            let t = tokio::time::Instant::now();
+            let x = tokio::time::timeout(Duration::from_secs(20), g.exclusive()).await.expect("the payout gets the guard");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(x);
+            t.elapsed()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // While the payout waits: a second pay, whose admission and charge queue behind it.
+        let second = tokio::spawn(async move { call(&h2, "POST", "/v1/pay", b2).await });
+        let all = async { (first.await.unwrap(), payout.await.unwrap(), second.await.unwrap()) };
+        tokio::time::timeout(Duration::from_secs(60), all).await.expect("no deadlock")
+    })
+    .await;
+    assert_eq!((s1, r1["state"].as_str()), (200, Some("paid")), "{r1}");
+    assert_eq!((s2, r2["state"].as_str()), (200, Some("paid")), "{r2}");
+    assert!(payout_waited >= Duration::from_millis(500), "the payout waited for the funding in flight: {payout_waited:?}");
+    Ok(())
+}

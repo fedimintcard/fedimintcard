@@ -157,12 +157,12 @@ registry's 404 by holding the slots, with nothing released until this step.
 
 Slots 0 to 23 of a 32-slot card take loads and online change; slots 24 to 31 take only the change
 of offline sales (`OFFLINE-PROTOCOL.md` § 8). Release order: **the registry, then the till, then
-the Setup app, then the POS apps**, each with the owner's OK.
+the Setup app, then the POS apps**, each with the owner's OK. Keep a 3.0 till available to empty any older cards that still hold funds.
 
-- [ ] **Registry.** All suites green on the commit (step 0). Staging first (`npx wrangler deploy
-      --env staging`, then a balance tap through the staging till), then `cd registry && npx
-      wrangler deploy`. No migration. Check: `GET /cards/<id>/slots` on a live 32-slot card lists
-      no slot from 24 up.
+- [ ] **Registry.** Verify the release commit on a test installation first. The production
+      operator deploys the 4.0 registry and verifies the service. On first use the registry
+      applies schema v14 and adds the nullable `notes.reg_sig` column. Check that
+      `GET /cards/<id>/slots` on a 32-slot card lists no slot at or above 24.
 - [ ] **The change-slot check, before the till goes out:** `GET /registry/change-slot-check` with
       an operator session. It lists, for the operator's cards, the live or pending notes on slots
       24 to 31 (or under their keys) and the open or expired holder loads that name those slots.
@@ -170,7 +170,18 @@ the Setup app, then the POS apps**, each with the owner's OK.
       with the holder's PIN. A listed holder load that is finished later logs
       `ALERT load_in_change_slot`. Keep the list with the release notes. From here on, watch the
       registry's log (`npx wrangler tail`) for `ALERT load_in_change_slot` and `ALERT change_used`.
-- [ ] **Till.** zion's package from the commit, as step 4. Check: a balance tap on a 32-slot card
+      To run the read-only check, the operator enters their registry's HTTPS origin and uses
+      their current operator session token in a Bash terminal.
+
+      ```bash
+      read -rp 'Registry HTTPS origin: ' registry_origin
+      read -rsp 'Operator session token: ' operator_session; echo
+      printf 'Authorization: Bearer %s\n' "$operator_session" |
+        curl --proto '=https' --fail --silent --show-error -H @- "${registry_origin%/}/registry/change-slot-check"
+      unset operator_session
+      ```
+
+- [ ] **Till.** Install the Card 4.0 package from the verified release, as in step 4. Check: a balance tap on a 32-slot card
       keys slots 24 and 25 (the card's state in the registry lists them keyed); a top-up and an
       online charge's change land below 24.
 - [ ] **Setup app**, both platforms, as step 5.
@@ -180,7 +191,7 @@ the Setup app, then the POS apps**, each with the owner's OK.
 - A POS app from this step refuses an offline sale that needs change on a card whose slots 24 to
   31 are not keyed yet ("No room for change offline", with a price to try). Before a day of
   offline sales, one online tap of each card at the new till keys them.
-- Rollback: the registry, `npx wrangler rollback <previous version id>` (no schema change); the
+- Rollback: the registry operator can return to the previous code version. The v14 column remains in the database. For the
   till, the previous `.s9pk` with an empty offline queue, as step 4.
 
 ## Afterwards

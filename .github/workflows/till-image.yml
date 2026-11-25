@@ -1,0 +1,127 @@
+name: Release till image
+on:
+  push:
+    tags: ['till-v*']
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full 40-character commit SHA to publish from main
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: till-image-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/fedimintcard/till
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    if: github.repository == 'fedimintcard/fedimintcard' && (github.event_name == 'push' || github.ref == 'refs/heads/main')
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Resolve approved source
+        id: source
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main && "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ && "$RELEASE_SHA" == "$GITHUB_SHA" ]] || exit 1
+            revision="$RELEASE_SHA"
+            tag="sha-$revision"
+          else
+            [[ "$GITHUB_REF_NAME" =~ ^till-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+            revision="$(git rev-parse 'HEAD^{commit}')"
+            tag="${GITHUB_REF_NAME#till-v}"
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+  build:
+    needs: source
+    if: github.repository == 'fedimintcard/fedimintcard'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build native image
+        env:
+          REVISION: ${{ needs.source.outputs.revision }}
+        run: docker buildx build --label "org.opencontainers.image.revision=$REVISION" --platform "linux/${{ matrix.arch }}" --provenance=false --load -t "$IMAGE:build-$GITHUB_RUN_ID-${{ matrix.arch }}-$GITHUB_RUN_ATTEMPT" .
+      - name: Exercise the release binary
+        run: scripts/smoke-till-image.sh "$IMAGE:build-$GITHUB_RUN_ID-${{ matrix.arch }}-$GITHUB_RUN_ATTEMPT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload tested architecture and capture digest
+        run: |
+          ref="$IMAGE:build-$GITHUB_RUN_ID-${{ matrix.arch }}-$GITHUB_RUN_ATTEMPT"
+          docker push "$ref"
+          docker image inspect "$ref" --format '{{index .RepoDigests 0}}' > "digest-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest-${{ matrix.arch }}
+          overwrite: true
+  publish:
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'digest-*', merge-multiple: true }
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested multi-architecture index
+        env:
+          VERSION: ${{ needs.source.outputs.tag }}
+          REVISION: ${{ needs.source.outputs.revision }}
+        run: |
+          for arch in amd64 arm64; do
+            grep -Eq '^ghcr\.io/fedimintcard/till@sha256:[a-f0-9]{64}$' "digest-$arch" || exit 1
+          done
+          reference="$IMAGE:$VERSION"
+          if docker buildx imagetools inspect "$reference" --raw > existing.json 2>lookup-error; then
+            for arch in amd64 arm64; do
+              digest="$(cut -d@ -f2 "digest-$arch")"
+              jq -e --arg digest "$digest" --arg arch "$arch" 'any(.manifests[]; .digest == $digest and .platform.os == "linux" and .platform.architecture == $arch)' existing.json >/dev/null || exit 1
+            done
+          elif grep -Fq "$reference: not found" lookup-error || grep -Eiq '(^|: )manifest[_ ]unknown(:|$)' lookup-error; then
+            docker buildx imagetools create \
+              --annotation 'index:org.opencontainers.image.title=Fedimint Card 4.0 Till' \
+              --annotation 'index:org.opencontainers.image.description=Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry.' \
+              --annotation 'index:org.opencontainers.image.source=https://github.com/fedimintcard/fedimintcard' \
+              --annotation "index:org.opencontainers.image.revision=$REVISION" \
+              -t "$reference" "$(cat digest-amd64)" "$(cat digest-arm64)"
+          else
+            cat lookup-error >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$reference" >> "$GITHUB_STEP_SUMMARY"

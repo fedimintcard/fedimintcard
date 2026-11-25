@@ -1,0 +1,17 @@
+**
+!LICENSE
+!NOTICE
+!host/Cargo.toml
+!host/Cargo.lock
+!host/rust-toolchain.toml
+!host/card/Cargo.toml
+!host/card/src/**
+# Cargo reads every workspace manifest, including this test-only member.
+!host/old-card-pin/Cargo.toml
+!host/old-card-pin/src/**
+!host/pos-core/Cargo.toml
+!host/pos-core/src/**
+!host/sidecar/Cargo.toml
+!host/sidecar/src/**
+!host/fed-tests/Cargo.toml
+!host/fed-tests/src/**

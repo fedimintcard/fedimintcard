@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod cards;
 pub mod claim;
 pub mod clock;
@@ -7,6 +8,7 @@ pub mod link;
 pub mod offline;
 pub mod ops;
 pub mod pay;
+pub mod payout;
 pub mod pool;
 pub mod pos;
 pub mod relay;

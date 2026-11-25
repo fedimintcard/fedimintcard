@@ -556,6 +556,9 @@ pub struct Pays {
     driving: Mutex<HashSet<u64>>,
     #[doc(hidden)]
     pub crash: Mutex<Option<PayCrash>>,
+    /// The wallet's admission guard (`crate::wallet::SpendGuard`): the wallet's own for
+    /// [`Self::for_wallet`], a fresh one for [`Self::new`].
+    pub spend: crate::wallet::SpendGuard,
 }
 
 /// One pay being driven; dropping it lets another driver take the pay.
@@ -587,6 +590,17 @@ impl Drop for Tap {
 
 impl Pays {
     pub fn new(store: PayStore, ln: Arc<dyn PayLightning>, cfg: PayConfig, currency: Currency) -> Arc<Self> {
+        Self::new_guarded(store, ln, cfg, currency, crate::wallet::SpendGuard::default())
+    }
+
+    /// [`Self::new`] sharing the wallet's admission guard `spend`.
+    pub fn new_guarded(
+        store: PayStore,
+        ln: Arc<dyn PayLightning>,
+        cfg: PayConfig,
+        currency: Currency,
+        spend: crate::wallet::SpendGuard,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(store),
             ln,
@@ -595,6 +609,7 @@ impl Pays {
             admit: tokio::sync::Mutex::new(()),
             driving: Mutex::new(HashSet::new()),
             crash: Mutex::new(None),
+            spend,
         })
     }
 
@@ -603,7 +618,7 @@ impl Pays {
     pub async fn for_wallet(dir: &Path, wallet: &Wallet, cfg: PayConfig) -> Result<Option<Arc<Self>>> {
         let Some(currency) = wallet.invoice_currency().await else { return Ok(None) };
         let store = PayStore::open(PayStore::path_in(dir))?;
-        Ok(Some(Self::new(store, Arc::new(WalletPayer { wallet: wallet.clone() }), cfg, currency)))
+        Ok(Some(Self::new_guarded(store, Arc::new(WalletPayer { wallet: wallet.clone() }), cfg, currency, wallet.spend.clone())))
     }
 
     pub fn get(&self, id: u64) -> Option<PayRec> {
@@ -666,6 +681,26 @@ fn charge_of(h: &TillHandle, rec: &PayRec) -> Charge {
         };
     }
     if h.has_pending_ref(&cref) { Charge::Pending } else { Charge::None }
+}
+
+/// Affirmative evidence that a `not_charged` pay's card never paid the till: no charge job for its
+/// ref is in flight, no unresolved charge in the card state carries it, and no sale for its price
+/// records it (a sale for another price is a `/v1/charge` that took the ref: its money is that
+/// sale's). Read in that order, and after the wallet's balance: a charge that paid the wallet
+/// before the balance was read is in flight (until its sale and the card state are written), or
+/// unresolved, or sold by then. A charge that starts after the read pays the wallet after it too.
+pub(crate) fn never_charged(h: &TillHandle, rec: &PayRec) -> bool {
+    if rec.state != PayState::NotCharged {
+        return false;
+    }
+    let cref = charge_ref(&rec.client_ref);
+    if h.inflight_ref().as_deref() == Some(cref.as_str()) || h.has_pending_ref(&cref) {
+        return false;
+    }
+    match h.sales().lock().unwrap().find_ref(&cref) {
+        Some(s) => s.price_msat != rec.price_msat,
+        None => true,
+    }
 }
 
 /// The card the sale of `rec`'s charge recorded, if it did.
@@ -872,6 +907,9 @@ fn charged(h: &TillHandle, pays: &Pays, mut rec: PayRec, r: Reply) -> Option<Rep
 /// the wallet what it already did with the invoice, so a payment a crash cut off is followed, not
 /// started again.
 async fn pay_step(pays: &Pays, mut rec: PayRec, wait: Duration) -> Reply {
+    // The wallet's debit and its record, under the admission guard: a payout's final snapshot never
+    // falls between them. Nothing below acquires it again.
+    let _debit = pays.spend.debit().await;
     match pays.ln.status(rec.bolt11.clone(), STATUS_WAIT.min(wait)).await {
         Ok(Some(o)) => return apply(pays, rec, o),
         Ok(None) => {}
@@ -1084,6 +1122,10 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
     };
 
     let admit = pays.admit.lock().await;
+    // A new `charging` record is a liability the card's charge then pays into the wallet: it is
+    // recorded under the wallet's admission guard, so a payout's final snapshot sees it before
+    // the money arrives (`crate::wallet::SpendGuard`). Taken after `admit`, released with it.
+    let liability = pays.spend.debit().await;
     let mut existing = pays.store.lock().unwrap().by_ref(&client_ref).cloned();
     // A pay whose card was refused, or whose charge a crash cut off: the sales and the card state
     // say whether its charge exists after all (an undecided charge that resolved later). Then it is
@@ -1210,6 +1252,7 @@ async fn pay_on(h: &TillHandle, mut tap: Tap, body: Bytes) -> Reply {
         let rec = pays.get(id);
         return rec.map_or_else(unknown_pay, |r| undecided(&r, "an earlier attempt with this client_ref is in flight"));
     };
+    drop(liability);
     drop(admit);
     // Its own task: a client that goes away mid-pay cannot stop it between the charge and the
     // payment.
