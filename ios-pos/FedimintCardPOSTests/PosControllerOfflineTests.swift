@@ -120,6 +120,43 @@ final class PosControllerOfflineTests: XCTestCase {
 
     private let heldAbandon = "The card already signed part of this payment. Its next tap on this phone still finishes it."
 
+    func testChargeRefusalsReachTheNFCSheetAndPaymentScreen() async {
+        let cases: [(Int, String, String, ErrorKind, String)] = [
+            (502, "ops_refused", "ops refused (409): the card belongs to a different federation or mint", .wrongFederation, "Different federation or mint"),
+            (409, "wrong_federation", "", .wrongFederation, "Different federation or mint"),
+            (403, "offline_note_invalid", "note failed verification", .offlineNoteInvalid, "Couldn’t verify card notes"),
+            (502, "ops_refused", "ops refused (409): unrelated refusal", .opsRefused, "Payment didn't go through"),
+        ]
+        for (status, code, detail, kind, sheet) in cases {
+            let r = ControllerRig()
+            await r.open()
+            await r.poll()
+            r.till.answer("/v1/charge", status, #"{"ok":false,"error":"\#(code)","detail":"\#(detail)"}"#)
+            r.ring(5)
+            r.pos.send(.cardPresent)
+            await r.until("charge refusal") { if case .error = r.pos.state { return true }; return false }
+            guard case .error(let info) = r.pos.state else { return XCTFail() }
+            XCTAssertEqual(info.kind, kind)
+            XCTAssertNil(info.unresolvedRef)
+            XCTAssertEqual(r.reader.log, ["begin", "error: " + sheet])
+            r.pos.stop()
+        }
+    }
+
+    func testFederationMismatchReachesTheNFCSheetAndTheBalanceScreen() async {
+        let r = ControllerRig()
+        await r.open()
+        r.till.answer("/v1/card/balance", 502, #"{"ok":false,"error":"ops_refused","detail":"ops refused (409): the card belongs to a different federation or mint"}"#)
+        r.pos.send(.cardBalanceOpened)
+        r.pos.send(.cardPresent)
+        await r.until("the balance refusal") {
+            if case .balanceFailed(.wrongFederation, _) = r.pos.state { return true }
+            return false
+        }
+        XCTAssertEqual(r.reader.log, ["begin", "error: Different federation or mint"])
+        r.pos.stop()
+    }
+
     /// A balance read through the controller, the till answering `body`: what the NFC sheet was
     /// told, from its opening to its last word.
     private func sheetAfterBalanceRead(_ body: String) async -> [String] {

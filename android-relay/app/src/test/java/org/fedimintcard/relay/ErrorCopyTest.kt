@@ -104,7 +104,6 @@ class ErrorCopyTest {
             ErrorKind.OFFLINE_NOT_READY to "No offline kit yet. Reach the till once while online.",
             ErrorKind.OFFLINE_KIT_EXPIRED to "The offline kit has expired. Reach the till to renew it.",
             ErrorKind.OFFLINE_CAP_REACHED to "Offline limit reached. Reach the till so waiting payments can sync.",
-            ErrorKind.OFFLINE_NOTE_INVALID to "This card can't be checked without the till. It pays online only.",
         )
         for ((k, detail) in cases) assertEquals("Till service unreachable" to detail, errorCopy(k, "core detail"))
         assertEquals(

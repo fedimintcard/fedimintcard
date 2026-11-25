@@ -141,6 +141,50 @@ class TopUpFlowTest {
         assertEquals("at most 100,000 sats", topUpErrorCopy(e.problem, e.paid, e.detail).second)
     }
 
+    @Test fun topUpCreateDescribesTheFederationWithoutClaimingPayment() {
+        val f = shown()
+        f.dispatch(PosEvent.TopUpPressed)
+        f.topUpPad.press(5)
+        val effect = f.dispatch(PosEvent.CreateInvoicePressed).single() as PosEffect.CreateTopUp
+        f.dispatch(PosEvent.TopUpCreated(effect.createId, parseTopUp(409, """{"ok":false,"error":"wrong_federation"}""")))
+        val s = f.state as PosState.TopUpFailed
+        assertFalse(s.paid)
+        assertNull(s.topUp)
+        assertEquals("Different federation or mint" to "Use a till connected to this card's federation and mint.", topUpErrorCopy(s.problem, s.paid, s.detail))
+    }
+
+    @Test fun wrongFederationOnPaidLoadKeepsTheSameTopUpOnThisTill() {
+        val twoFeds = "card a0b0c0d0 belongs to federation ${"a".repeat(64)}, and this wallet is in ${"b".repeat(64)}"
+        val mint = "the registry mint version differs from this wallet"
+        val ops = "ops refused (409): the card belongs to a different federation or mint"
+        for ((code, detail, status) in listOf(
+            Triple("wrong_federation", "", 409), Triple("ops_refused", ops, 502),
+            Triple("internal", twoFeds, 500), Triple("internal", mint, 500),
+        )) {
+            val f = invoiced()
+            f.dispatch(PosEvent.TopUpPolled("t1", st("paid")))
+            val load = f.dispatch(PosEvent.CardPresent).single() as PosEffect.LoadTopUp
+            val result = parseTopUpStatus(status, """{"ok":false,"error":"$code","detail":"$detail"}""", paidLoad = true)
+            f.dispatch(PosEvent.TopUpLoadDone(load.loadId, result))
+            val failed = f.state as PosState.TopUpFailed
+            assertTrue(failed.paid)
+            assertEquals("Different federation or mint" to "This top-up is paid and waiting at this till. Tap a card set up for this till's federation and mint.",
+                topUpErrorCopy(failed.problem, failed.paid, failed.detail))
+            val retry = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.LoadTopUp
+            assertEquals(load.topupId, retry.topupId)
+        }
+        fun classify(code: String, detail: String, status: Int, paidLoad: Boolean) = topUpProblem(
+            parseTopUpStatus(status, """{"ok":false,"error":"$code","detail":"$detail"}""", paidLoad)
+        )
+        val sameFed = twoFeds.replace("b".repeat(64), "a".repeat(64))
+        for (detail in listOf("$twoFeds elsewhere", twoFeds.dropLast(1), sameFed, "different federation", "$mint later")) {
+            assertEquals(TopUpProblem.OTHER, classify("internal", detail, 500, true))
+        }
+        assertEquals(TopUpProblem.OTHER, classify("internal", twoFeds, 500, false))
+        assertEquals(TopUpProblem.OTHER, classify("internal", mint, 409, true))
+        assertEquals(TopUpProblem.CARD_SERVICE, classify("ops_unreachable", mint, 502, true))
+    }
+
     @Test fun cardFullStaysPaidAndTapsAgain() {
         val f = invoiced()
         f.dispatch(PosEvent.TopUpPolled("t1", st("paid")))

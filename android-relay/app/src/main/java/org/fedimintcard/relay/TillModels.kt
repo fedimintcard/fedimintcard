@@ -106,6 +106,7 @@ enum class ChargeErrorCode(val wire: String) {
     UNKNOWN_CARD("unknown_card"),
     OPS_UNREACHABLE("ops_unreachable"),
     OPS_REFUSED("ops_refused"),
+    WRONG_FEDERATION("wrong_federation"),
     /** The till is on a registry and has no token yet; nothing ran (docs/TILL-API.md). */
     OPS_NOT_CONNECTED("ops_not_connected"),
     /** No bearer the till takes; nothing ran (docs/TILL-API.md). */
@@ -136,6 +137,11 @@ enum class ChargeErrorCode(val wire: String) {
     UNKNOWN("");
 
     companion object {
+        /** Till :11 reports the card's explicit federation or mint mismatch inside an ops refusal. */
+        fun fromTill(code: String?, detail: String): ChargeErrorCode =
+            if (code == "ops_refused" && detail == "ops refused (409): the card belongs to a different federation or mint") WRONG_FEDERATION
+            else fromWire(code)
+
         /** `card_link_gone` (the link closed before the job ran; nothing moved) reads as `no_card`. */
         fun fromWire(s: String?): ChargeErrorCode =
             if (s == "card_link_gone") NO_CARD else values().firstOrNull { it.wire.isNotEmpty() && it.wire == s } ?: UNKNOWN

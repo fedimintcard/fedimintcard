@@ -365,6 +365,38 @@ final class TopUpClientTests: XCTestCase {
         let notPaid = await p("not_paid"); XCTAssertEqual(notPaid, .other)
     }
 
+    func testMatchingFederationForAnUnpaidAndAPaidTopUp() async {
+        let a = String(repeating: "a", count: 64), b = String(repeating: "b", count: 64)
+        let mint = "the registry mint version differs from this wallet"
+        let different = "card 1234abcd belongs to federation \(a), and this wallet is in \(b)"
+        let cases: [(Int, String, String, TopUpProblem)] = [
+            (409, "wrong_federation", "", .wrongFederation),
+            (500, "internal", mint, .wrongFederation),
+            (500, "internal", different, .wrongFederation),
+            (500, "internal", mint + " elsewhere", .other),
+            (500, "internal", different + "!", .other),
+            (500, "internal", different.replacingOccurrences(of: b, with: a), .other),
+            (503, "internal", mint, .other),
+            (500, "ops_unreachable", mint, .cardService),
+        ]
+        for (status, code, detail, expected) in cases {
+            let body = #"{"ok":false,"error":"\#(code)","detail":"\#(detail)"}"#
+            let (c, _) = client(status, body)
+            let got = await c.loadTopUp("t1", cardLink: nil)
+            XCTAssertEqual(topUpProblem(got), expected)
+            if code == "internal" {
+                XCTAssertEqual(topUpProblem(TillParse.topUpStatus(status: status, body: Data(body.utf8))), .other)
+            }
+        }
+        let (c, _) = client(409, #"{"ok":false,"error":"wrong_federation"}"#)
+        let create = await c.createTopUp(amountMsat: 5000, clientRef: "c", shortId: "1234abcd")
+        XCTAssertEqual(topUpProblem(create), .wrongFederation)
+        XCTAssertEqual(topUpErrorCopy(.wrongFederation, paid: false, detail: "").1,
+                       "Use a till connected to this card's federation and mint.")
+        XCTAssertEqual(topUpErrorCopy(.wrongFederation, paid: true, detail: "").1,
+                       "This top-up is paid and waiting at this till. Tap a card set up for this till's federation and mint.")
+    }
+
     func testWaitingTopUpsParsesAndAsksForTheCard() async throws {
         let (c, t) = client(200, #"{"ok":true,"topups":[{"topup_id":"w1","amount_msat":100352,"for_card":null,"created_at_ms":7},{"topup_id":"w2","amount_msat":65536,"for_card":"6f94b19b","created_at_ms":9}]}"#)
         let r = await c.waitingTopUps(shortId: "6f94b19b")

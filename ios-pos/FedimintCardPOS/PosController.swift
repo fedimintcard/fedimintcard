@@ -251,6 +251,7 @@ final class PosController: ObservableObject {
                 guard let self else { return }
                 let r = await self.client.loadTopUp(tid, cardLink: linkId)
                 if case .ok(let st) = r, st.state == "loaded" { self.endCardJob(message: "Loaded \(formatSats(st.amountMsat)) sats", ok: true) }
+                else if topUpProblem(r) == .wrongFederation { self.endCardJob(message: balanceErrorCopy(.wrongFederation).0, ok: false) }
                 else { self.endCardJob(message: "Not loaded", ok: false) }
                 self.send(.topUpLoadDone(loadId: lid, result: r))
             }
@@ -259,11 +260,15 @@ final class PosController: ObservableObject {
             Task { [weak self] in
                 guard let self else { return }
                 let r = await self.client.cardBalance(cardLink: linkId)
-                if case .read(let b) = r {
+                switch r {
+                case .read(let b):
                     let onHold = onHoldText(strandedMsat: b.strandedMsat, untilMs: b.strandedUntilMs, nowMs: Self.clockMs(), timeZone: .current)
                     self.endCardJob(message: balanceSpoken(liveMsat: b.liveMsat, onHold: onHold), ok: true)
+                case .refused where balanceProblem(r) == .wrongFederation:
+                    self.endCardJob(message: balanceErrorCopy(.wrongFederation).0, ok: false)
+                default:
+                    self.endCardJob(message: "Couldn't read the card", ok: false)
                 }
-                else { self.endCardJob(message: "Couldn't read the card", ok: false) }
                 self.send(.balanceDone(readId: rid, result: r))
             }
         }
@@ -274,6 +279,8 @@ final class PosController: ObservableObject {
         switch r {
         case .success(let rc): endCardJob(message: receiptHeadline(rc), ok: true)
         case .declined(let code, _, _, _, _, _) where code == .wrongPin: endCardJob(message: "Wrong PIN", ok: false)
+        case .declined(let code, _, _, _, _, _) where code == .wrongFederation || code == .offlineNoteInvalid:
+            endCardJob(message: errorCopy(ErrorKind.from(code), "").0, ok: false)
         default: endCardJob(message: "Payment didn't go through", ok: false)
         }
     }

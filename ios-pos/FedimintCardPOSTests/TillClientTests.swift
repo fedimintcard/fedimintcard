@@ -207,6 +207,21 @@ final class ErrorMappingTests: XCTestCase {
                        .declined(code: .recovering, detail: "d", httpStatus: 503))
     }
 
+    func testBalanceDistinguishesFederationMismatchFromRegistryFailure() {
+        func result(_ status: Int, _ code: String, _ detail: String) -> BalanceProblem {
+            let body = Data(#"{"ok":false,"error":"\#(code)","detail":"\#(detail)"}"#.utf8)
+            return balanceProblem(TillParse.cardBalance(status: status, body: body))
+        }
+        let deployed = "ops refused (409): the card belongs to a different federation or mint"
+        XCTAssertEqual(result(502, "ops_refused", deployed), .wrongFederation)
+        XCTAssertEqual(result(409, "wrong_federation", ""), .wrongFederation)
+        XCTAssertEqual(result(502, "ops_refused", "ops refused (403): forbidden"), .cardService)
+        XCTAssertEqual(result(502, "ops_refused", deployed + " elsewhere"), .cardService)
+        XCTAssertEqual(result(502, "ops_unreachable", deployed), .cardService)
+        XCTAssertEqual(balanceErrorCopy(.wrongFederation).0, "Different federation or mint")
+        XCTAssertEqual(balanceErrorCopy(.wrongFederation).1, "Use a till connected to this card's federation and mint.")
+    }
+
     /// Every code docs/TILL-API.md gives `POST /v1/charge` (its table, and `card_link_gone`,
     /// `unauthorized` and `forbidden` above it) is one the app knows. An `error` the app does not
     /// know leaves the sale unresolved, so a documented refusal missing from `ChargeErrorCode` would

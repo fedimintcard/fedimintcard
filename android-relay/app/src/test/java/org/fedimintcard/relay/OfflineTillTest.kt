@@ -150,6 +150,24 @@ class OfflineTillTest {
         assertEquals(listOf(Note(1, 3_000)), r.receipt.change)
     }
 
+    @Test fun aCoreNoteVerificationRefusalReachesTheSaleScreenAsAnOfflineCheck() {
+        withKit()
+        core.onCharge = { CoreCharge.Refused("offline_note_invalid", "unverified note") }
+        val flow = PosFlow { "offline-check" }
+        flow.pad.press(5)
+        flow.dispatch(PosEvent.CardPresent)
+        flow.dispatch(PosEvent.ChargePressed)
+        "1234".forEach { flow.pinPad.press(it - '0') }
+        val sale = flow.dispatch(PosEvent.PinConfirmed).single() as PosEffect.StartCharge
+        val result = charge(sale.clientRef, sale.pin, linkDown)
+        assertTrue(declined(result).local)
+        flow.dispatch(PosEvent.ChargeDone(sale.chargeId, result))
+        val error = flow.state as PosState.Error
+        assertEquals("Couldn’t verify card notes" to "Connect to the till to check this card’s federation and mint.", errorCopy(error.kind, error.detail))
+        assertNull(error.unresolvedRef)
+        assertEquals(listOf(sale.clientRef), core.charged)
+    }
+
     @Test fun aSaleOncePostedNeverGoesToThePhone() {
         withKit()
         assertEquals(ChargeResult.Failed(TillError.Timeout), charge("r1") { sent -> sent(); ChargeResult.Failed(TillError.Timeout) })

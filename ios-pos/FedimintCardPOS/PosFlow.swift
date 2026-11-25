@@ -3,7 +3,7 @@ import Foundation
 enum ErrorKind: Equatable, CaseIterable {
     case badRequest, busy, noCard, relayUnreachable, cardError, insufficient, notesHeld, noExactPlan
     case declined, undecided, recovering, conflict, pinRequired, wrongPin, pinWait, oldCard, signCheckFailed, cardChanged
-    case unknownCard, opsUnreachable, opsRefused, cardLinkGone, unauthorized, `internal`, unknown
+    case unknownCard, wrongFederation, opsUnreachable, opsRefused, cardLinkGone, unauthorized, `internal`, unknown
     /// Offline, the price needs change and the card has no slot for it (not a full card).
     case offlineNoChangeRoom
     /// The phone could not reach the till (nothing was sent).
@@ -51,6 +51,7 @@ enum ErrorKind: Equatable, CaseIterable {
         case .unknownCard: return .unknownCard
         case .opsUnreachable: return .opsUnreachable
         case .opsRefused: return .opsRefused
+        case .wrongFederation: return .wrongFederation
         case .opsNotConnected: return .unknown // the till's own words, as before it was listed
         case .offlineNoChangeRoom: return .offlineNoChangeRoom
         case .cardLinkGone: return .cardLinkGone
@@ -99,7 +100,7 @@ enum ErrorKind: Equatable, CaseIterable {
     /// Kinds whose copy speaks of this phone's own kit and queue. The till answers some of their
     /// codes for its own offline path; from the till they read as before (`unknown`, its words).
     var phoneOnly: Bool {
-        [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlineNoteInvalid, .offlinePoolExhausted, .heldOnPhone].contains(self)
+        [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlinePoolExhausted, .heldOnPhone].contains(self)
     }
 }
 
@@ -116,7 +117,7 @@ struct PosErrorInfo: Equatable {
 }
 
 /// Why a balance read failed, in the terms the holder's screen needs.
-enum BalanceProblem: Equatable { case cardMoved, notOurCard, tillUnreachable, relayUnreachable, busy, cardService, timeout, notPaired, other }
+enum BalanceProblem: Equatable { case cardMoved, notOurCard, wrongFederation, tillUnreachable, relayUnreachable, busy, cardService, timeout, notPaired, other }
 
 func balanceProblem(_ r: BalanceResult) -> BalanceProblem {
     switch r {
@@ -132,6 +133,7 @@ func balanceProblem(_ r: BalanceResult) -> BalanceProblem {
         switch code {
         case .noCard, .cardChanged, .cardLinkGone: return .cardMoved
         case .unknownCard: return .notOurCard
+        case .wrongFederation: return .wrongFederation
         // A key that does not match, or an applet that is not there, is a card this till does not
         // know; anything else from the card mid-read is the card leaving the field.
         case .cardError:

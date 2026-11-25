@@ -130,6 +130,47 @@ class PosFlowTest {
         assertEquals(fx.clientRef, f.unresolvedRef)
         f.dispatch(PosEvent.BackPressed); assertEquals(err, f.state)
     }
+    @Test fun chargeShowsOnlyExplicitFederationMismatchAndKeepsAnEarlierSaleUnresolved() {
+        val legacy = "ops refused (409): the card belongs to a different federation or mint"
+        fun reply(code: String, detail: String, status: Int) = parseCharge(
+            status, """{"ok":false,"error":"$code","detail":"$detail"}"""
+        )
+        for (r in listOf(reply("ops_refused", legacy, 502), reply("wrong_federation", "", 409))) {
+            val fresh = unresolved(r).first.state as PosState.Error
+            assertEquals(ErrorKind.WRONG_FEDERATION, fresh.kind)
+            assertEquals("Different federation or mint" to "Use a till connected to this card's federation and mint.", errorCopy(fresh.kind, fresh.detail))
+            assertNull(fresh.unresolvedRef)
+
+            val (f, first) = unresolved(ChargeResult.Failed(TillError.Timeout))
+            val again = f.retry().single() as PosEffect.StartCharge
+            f.dispatch(PosEvent.ChargeDone(again.chargeId, r))
+            val pending = f.state as PosState.Error
+            assertEquals(first.clientRef, pending.unresolvedRef)
+            assertTrue(errorCopy(pending.kind, pending.detail, unresolved = true).second.contains("Check Sales on this till"))
+        }
+        for ((r, expected) in listOf(
+            reply("ops_refused", "$legacy elsewhere", 502) to ErrorKind.OPS_REFUSED,
+            reply("ops_refused", "ops refused (403): forbidden", 502) to ErrorKind.OPS_REFUSED,
+            reply("ops_unreachable", legacy, 502) to ErrorKind.OPS_UNREACHABLE,
+            reply("internal", legacy, 500) to ErrorKind.TIMEOUT_UNKNOWN,
+        )) assertEquals(expected, (unresolved(r).first.state as PosState.Error).kind)
+        val held = (reply("wrong_federation", "", 409) as ChargeResult.Declined).copy(held = true, local = true)
+        assertEquals(ErrorKind.HELD_ON_PHONE, (unresolved(held).first.state as PosState.Error).kind)
+    }
+
+    @Test fun offlineNoteVerificationFailureAsksForAnOnlineCheckWithoutClaimingMismatch() {
+        for (r in listOf(local(ChargeErrorCode.OFFLINE_NOTE_INVALID), declined(ChargeErrorCode.OFFLINE_NOTE_INVALID))) {
+            val s = unresolved(r).first.state as PosState.Error
+            assertEquals("Couldn’t verify card notes" to "Connect to the till to check this card’s federation and mint.", errorCopy(s.kind, s.detail))
+            assertNull(s.unresolvedRef)
+        }
+        for (code in listOf(ChargeErrorCode.INSUFFICIENT, ChargeErrorCode.CARD_NOT_GENUINE)) {
+            val s = unresolved(local(code)).first.state as PosState.Error
+            assertEquals(ErrorKind.from(code), s.kind)
+            assertNotEquals("Couldn’t verify card notes", errorCopy(s.kind, s.detail).first)
+        }
+    }
+
     @Test fun interruptedIsOutcomeUnknown() {
         val (f, _) = unresolved(ChargeResult.Failed(TillError.Interrupted))
         assertEquals(ErrorKind.TIMEOUT_UNKNOWN, (f.state as PosState.Error).kind)
@@ -439,7 +480,7 @@ class PosFlowTest {
 
     @Test fun phoneOnlyCodesFromTheTillReadAsBefore() {
         for (c in listOf(ChargeErrorCode.OFFLINE_NOT_READY, ChargeErrorCode.OFFLINE_KIT_EXPIRED, ChargeErrorCode.OFFLINE_CAP_REACHED,
-            ChargeErrorCode.OFFLINE_NOTE_INVALID, ChargeErrorCode.OFFLINE_POOL_EXHAUSTED, ChargeErrorCode.OFFLINE_UNSUPPORTED_CARD)) {
+            ChargeErrorCode.OFFLINE_POOL_EXHAUSTED, ChargeErrorCode.OFFLINE_UNSUPPORTED_CARD)) {
             val (f, _) = unresolved(declined(c))
             assertEquals(c.name, ErrorKind.UNKNOWN, (f.state as PosState.Error).kind)
         }

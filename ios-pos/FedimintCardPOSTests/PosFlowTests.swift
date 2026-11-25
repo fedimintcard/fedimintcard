@@ -307,6 +307,21 @@ final class PosFlowTests: XCTestCase {
 
     /// Nor does `forbidden` settle an unresolved sale: it comes before the till looks at the earlier
     /// attempt with the same `client_ref`, so it proves nothing about it.
+    func testFederationRefusalOnARetryKeepsTheOriginalUnresolvedReference() {
+        let f = flow()
+        let (id, ref, _) = chargeToSigning(f)
+        f.dispatch(.chargeDone(chargeId: id, result: .failed(.timeout)))
+        f.dispatch(.retryPressed)
+        let (retry, retryRef, _) = chargeToSigning(f)
+        XCTAssertEqual(retryRef, ref)
+        f.dispatch(.chargeDone(chargeId: retry, result: declined(.wrongFederation)))
+        guard case .error(let info) = f.state else { return XCTFail() }
+        XCTAssertEqual(info.kind, .wrongFederation)
+        XCTAssertEqual(info.unresolvedRef, ref)
+        XCTAssertEqual(errorCopy(info.kind, "", unresolved: true).1,
+                       "Use a till connected to this card's federation and mint. Check Sales on this till before trying again.")
+    }
+
     func testAForbiddenRetryLeavesAnUnresolvedSaleUnresolved() {
         let f = flow()
         let (id, ref, _) = chargeToSigning(f)
@@ -407,7 +422,7 @@ final class OfflineCopyTests: XCTestCase {
     func testEveryNewKindHasItsTitle() {
         let titles: [(ErrorKind, String)] = [
             (.offlineNoKit, "Till service unreachable"), (.offlineKitExpired, "Till service unreachable"),
-            (.offlineCapReached, "Till service unreachable"), (.offlineNoteInvalid, "Till service unreachable"),
+            (.offlineCapReached, "Till service unreachable"), (.offlineNoteInvalid, "Couldn’t verify card notes"),
             (.offlinePoolExhausted, "Amount not available offline"), (.offlineUnsupportedCard, "This card pays online only"),
             (.cardNotGenuine, "Card declined"), (.cardLimit, "Card limit reached"), (.heldOnPhone, "Payment not finished"),
         ]
@@ -416,7 +431,7 @@ final class OfflineCopyTests: XCTestCase {
             XCTAssertEqual(t, title, "\(k)")
             XCTAssertFalse(d.isEmpty, "\(k)")
         }
-        XCTAssertEqual(errorCopy(.offlineNoteInvalid, "").1, "This card can't be checked without the till. It pays online only.")
+        XCTAssertEqual(errorCopy(.offlineNoteInvalid, "").1, "Connect to the till to check this card’s federation and mint.")
         XCTAssertEqual(errorCopy(.offlineUnsupportedCard, "").1, "It can't be taken without the till.")
         XCTAssertEqual(errorCopy(.cardNotGenuine, "").1, "This isn't a genuine Fedimint Card.")
         XCTAssertEqual(errorCopy(.cardLimit, "").1, "This card has reached its daily limit.")
@@ -450,7 +465,9 @@ final class OfflineCopyTests: XCTestCase {
                                 .offlineUnsupportedCard, .cardNotGenuine, .cardLimit, .heldOnPhone]
         for k in new { XCTAssertFalse(k.definitive, "\(k) proves nothing about an earlier attempt") }
         for k: ErrorKind in [.offlineUnsupportedCard, .cardNotGenuine, .cardLimit] { XCTAssertFalse(k.retryable, "\(k)") }
-        for k: ErrorKind in [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlineNoteInvalid, .offlinePoolExhausted, .heldOnPhone] {
+        XCTAssertTrue(ErrorKind.offlineNoteInvalid.retryable)
+        XCTAssertFalse(ErrorKind.offlineNoteInvalid.phoneOnly)
+        for k: ErrorKind in [.offlineNoKit, .offlineKitExpired, .offlineCapReached, .offlinePoolExhausted, .heldOnPhone] {
             XCTAssertTrue(k.retryable, "\(k)")
             XCTAssertTrue(k.phoneOnly, "\(k)")
         }

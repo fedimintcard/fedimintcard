@@ -48,7 +48,7 @@ enum class TopUpProblem {
     CARD_FULL,
     /** The card has no free slot, found before any invoice was made: nothing was paid. */
     NO_ROOM,
-    CARD_MOVED, NOT_OUR_CARD, TILL_UNREACHABLE, TIMEOUT, CARD_SERVICE, BAD_AMOUNT, BUSY,
+    CARD_MOVED, NOT_OUR_CARD, WRONG_FEDERATION, TILL_UNREACHABLE, TIMEOUT, CARD_SERVICE, BAD_AMOUNT, BUSY,
     /** Paid, and the card step was cancelled: the top-up waits in the till until a tap loads it. */
     NOT_LOADED,
     /** The till gave up on this top-up (`state: failed`); any eCash received stays in the till. */
@@ -71,6 +71,7 @@ fun topUpProblem(r: TopUpReply<*>): TopUpProblem = when (r) {
         "card_error" ->
             if (Regex("different card|6a82|6e00|6d00", RegexOption.IGNORE_CASE).containsMatchIn(r.detail)) TopUpProblem.NOT_OUR_CARD
             else TopUpProblem.CARD_MOVED
+        "wrong_federation" -> TopUpProblem.WRONG_FEDERATION
         "unknown_card" -> TopUpProblem.NOT_OUR_CARD
         "ops_not_connected", "ops_unreachable", "ops_refused" -> TopUpProblem.CARD_SERVICE
         "bad_amount" -> TopUpProblem.BAD_AMOUNT
@@ -89,6 +90,9 @@ fun topUpErrorCopy(p: TopUpProblem, paid: Boolean, detail: String): Pair<String,
         TopUpProblem.CARD_FULL -> "This card is full" to "Spend from it, then tap again.$waiting"
         TopUpProblem.NO_ROOM -> "This card is full" to "Spend from it first, then top up."
         TopUpProblem.CARD_MOVED -> "The card moved away" to "Hold the card still until it's loaded.$waiting"
+        TopUpProblem.WRONG_FEDERATION -> if (paid) {
+            wrongFederationCopy.first to "This top-up is paid and waiting at this till. Tap a card set up for this till's federation and mint."
+        } else wrongFederationCopy
         TopUpProblem.NOT_OUR_CARD -> "Not a card for this till" to "Try the holder's card.$waiting"
         TopUpProblem.TILL_UNREACHABLE -> "Can't reach the till" to "Check that the till is running, then try again.$waiting"
         TopUpProblem.TIMEOUT -> "The till took too long" to "Try again: the same top-up is never loaded twice.$waiting"

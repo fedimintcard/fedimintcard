@@ -96,6 +96,7 @@ enum ChargeErrorCode: String, CaseIterable {
     case unknownCard = "unknown_card"
     case opsUnreachable = "ops_unreachable"
     case opsRefused = "ops_refused"
+    case wrongFederation = "wrong_federation"
     /// The till is on a registry and has no token yet; nothing ran (docs/TILL-API.md).
     case opsNotConnected = "ops_not_connected"
     /// Offline, the price needs change and the card has no slot for it; `suggested_msat` may say what it can pay.
@@ -125,7 +126,11 @@ enum ChargeErrorCode: String, CaseIterable {
     case cardLimit = "card_limit"
     case unknown = ""
 
-    static func fromWire(_ s: String?) -> ChargeErrorCode {
+    static func fromWire(_ s: String?, detail: String? = nil) -> ChargeErrorCode {
+        // The Card 4.0 till :11 wraps this refusal in its registry error.
+        if s == "ops_refused", detail == "ops refused (409): the card belongs to a different federation or mint" {
+            return .wrongFederation
+        }
         guard let s, !s.isEmpty else { return .unknown }
         return ChargeErrorCode(rawValue: s) ?? .unknown
     }

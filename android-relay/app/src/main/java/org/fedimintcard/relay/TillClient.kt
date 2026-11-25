@@ -154,7 +154,7 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
     fun loadTopUp(topupId: String, link: String? = null): TopUpReply<TopUpStatus> =
         when (val r = call("POST", "/v1/topup/" + encode(topupId) + "/load", "{}", CHARGE_READ_MS, link)) {
             is TillResult.Err -> TopUpReply.Failed(r.error)
-            is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body)
+            is TillResult.Ok -> parseTopUpStatus(r.value.status, r.value.body, paidLoad = true)
         }
 
     /**
@@ -279,9 +279,10 @@ internal fun parseCharge(httpStatus: Int, body: String): ChargeResult = try {
     val o = JSONObject(body)
     if (!o.has("ok")) throw JSONException("missing ok")
     if (!o.getBoolean("ok")) {
+        val detail = if (o.isNull("detail")) "" else o.optString("detail", "")
         ChargeResult.Declined(
-            ChargeErrorCode.fromWire(o.optString("error", "")),
-            if (o.isNull("detail")) "" else o.optString("detail", ""),
+            ChargeErrorCode.fromTill(o.optString("error", ""), detail),
+            detail,
             httpStatus,
             if (o.isNull("suggested_msat")) null else o.optLong("suggested_msat", 0L).takeIf { it > 0 },
             wrongTries = if (o.has("wrong_tries") && !o.isNull("wrong_tries")) o.optInt("wrong_tries") else null,
@@ -340,7 +341,8 @@ internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = tr
     if (!o.optBoolean("ok", false)) {
         // A card error or a missing card is a normal answer from this route, not a parse failure.
         val code = if (o.isNull("error")) null else o.optString("error")
-        BalanceResult.Refused(ChargeErrorCode.fromWire(code), if (o.isNull("detail")) code ?: "card unreadable" else o.optString("detail"))
+        val detail = if (o.isNull("detail")) code ?: "card unreadable" else o.optString("detail")
+        BalanceResult.Refused(ChargeErrorCode.fromTill(code, detail), detail)
     } else {
         val a = o.optJSONArray("notes")
         val rows = if (a == null) emptyList() else (0 until a.length()).map {
@@ -362,9 +364,22 @@ internal fun parseCardBalance(httpStatus: Int, body: String): BalanceResult = tr
     BalanceResult.Failed(TillError.BadResponse(e.message ?: "bad json"))
 }
 
-private fun refused(httpStatus: Int, o: JSONObject): TopUpReply.Refused {
+// Till :11's paid load names both federation IDs and the card short ID in this form.
+private val paidLoadFederationMismatch = Regex("card [0-9a-f]{8} belongs to federation ([0-9a-f]{64}), and this wallet is in ([0-9a-f]{64})")
+
+private fun wrongPaidLoadScope(detail: String): Boolean {
+    if (detail == "the registry mint version differs from this wallet") return true
+    val match = paidLoadFederationMismatch.matchEntire(detail) ?: return false
+    return match.groupValues[1] != match.groupValues[2]
+}
+
+private fun refused(httpStatus: Int, o: JSONObject, paidLoad: Boolean = false): TopUpReply.Refused {
     val code = if (o.isNull("error")) "" else o.optString("error", "")
-    return TopUpReply.Refused(code, if (o.isNull("detail")) "" else o.optString("detail", ""), httpStatus)
+    val detail = if (o.isNull("detail")) "" else o.optString("detail", "")
+    if (ChargeErrorCode.fromTill(code, detail) == ChargeErrorCode.WRONG_FEDERATION ||
+        (paidLoad && httpStatus == 500 && code == "internal" && wrongPaidLoadScope(detail))
+    ) return TopUpReply.Refused(ChargeErrorCode.WRONG_FEDERATION.wire, "", httpStatus)
+    return TopUpReply.Refused(code, detail, httpStatus)
 }
 
 /** `POST /v1/topup`: `{topup_id, amount_msat, invoice, expires_at_ms, state}`, or `{ok:false,…}`. */
@@ -396,9 +411,9 @@ internal fun parseWaitingTopUps(httpStatus: Int, body: String): List<WaitingTopU
 }
 
 /** `GET /v1/topup/{id}` and `POST …/load`: `{topup_id, amount_msat, state, load_txid?, detail?}`. */
-internal fun parseTopUpStatus(httpStatus: Int, body: String): TopUpReply<TopUpStatus> = try {
+internal fun parseTopUpStatus(httpStatus: Int, body: String, paidLoad: Boolean = false): TopUpReply<TopUpStatus> = try {
     val o = JSONObject(body)
-    if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o)
+    if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o, paidLoad)
     else TopUpReply.Ok(
         TopUpStatus(
             o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("state"),
