@@ -160,6 +160,64 @@ async fn saved_wallet_refreshes_an_incomplete_api_cache_even_with_the_current_ma
     .await?
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn funded_mint_v1_wallet_with_a_historical_walletv2_config_reopens_and_spends() -> Result<()> {
+    use fedimint_client::db::ClientConfigKey;
+    use fedimint_core::db::IDatabaseTransactionOpsCoreTyped as _;
+    use fedimint_core::encoding::{DynRawFallback, Encodable};
+    use fedimint_walletv2_client::common::{KIND, config::WalletClientConfig};
+
+    let fixtures = Fixtures::new_primary(fedimint_mint_client::MintClientInit, fedimint_mint_server::MintInit)
+        .with_server_only_module(fedimint_walletv2_server::WalletInit)
+        .with_server_only_module(fedimint_lnv2_server::LightningInit)
+        .with_server_only_module(fedimint_meta_server::MetaInit);
+    let fed = federation(fixtures).await?;
+    let dir = tempfile::tempdir()?;
+    tokio::time::timeout(STEP * 2, async {
+        let wallet = Wallet::join(dir.path(), &fed.invite_code().to_string()).await?;
+        let funder = funded_client(&fed).await?;
+        let mint = funder.get_first_module::<fedimint_mint_client::MintClientModule>()?;
+        let notes = mint.send_oob_notes(Amount::from_msats(TEST_MSAT), ()).await?;
+        wallet.import(&notes.to_string()).await?;
+        wait_balance(&wallet, TEST_MSAT).await?;
+        let original = OriginalWallet::read(dir.path())?;
+        let mut config = wallet.client.config().await;
+        let (&id, module) = config.modules.iter_mut().find(|(_, m)| m.is_kind(&KIND)).context("fixture has no walletv2")?;
+        let current = module.cast::<WalletClientConfig>()?;
+        // The stock walletv2 client config before upstream fd67cf649 consisted of these four
+        // consensus fields in this order. Keep this wire fixture dependent only on test keys.
+        let mut historical = Vec::new();
+        current.bitcoin_pks.consensus_encode(&mut historical)?;
+        current.dust_limit.consensus_encode(&mut historical)?;
+        current.fee_consensus.consensus_encode(&mut historical)?;
+        current.network.consensus_encode(&mut historical)?;
+        module.config = DynRawFallback::Raw { module_instance_id: id, raw: historical };
+        let original_consensus = config.consensus_encode_to_vec();
+
+        let db = wallet.client.db().clone();
+        close(wallet).await?;
+        let mut tx = db.begin_transaction().await;
+        tx.insert_entry(&ClientConfigKey, &config).await;
+        tx.commit_tx_result().await?;
+        drop(db);
+
+        let reopened = Wallet::open(dir.path()).await?;
+        ensure!(reopened.federation_id() == fed.id() && reopened.balance_msat().await? == TEST_MSAT);
+        ensure!(reopened.client.config().await.consensus_encode_to_vec() == original_consensus);
+        ensure!(reopened.client.get_first_module::<WalletClientModule>().is_err());
+        ensure!(reopened.lightning_v2()?.list_gateways(None).await?.is_empty());
+        ensure!(reopened.client.get_first_module::<MetaClientModule>()?.get_consensus_value_rev(MetaKey(73)).await?.is_none());
+        let (exported, amount) = reopened.export(TEST_MSAT, false, false).await?;
+        ensure!(amount.msats == TEST_MSAT);
+        let recipient = Wallet::from_client(fed.new_client().await).await?;
+        ensure!(recipient.import(&exported.to_string()).await?.face == amount);
+        wait_balance(&recipient, TEST_MSAT).await?;
+        close(reopened).await?;
+        original.verify(dir.path())
+    })
+    .await?
+}
+
 /// Snapshot identity and original wallet files without emitting any wallet material on failure.
 struct OriginalWallet {
     mnemonic: Vec<u8>,

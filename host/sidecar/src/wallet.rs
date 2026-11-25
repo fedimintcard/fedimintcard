@@ -23,7 +23,8 @@ use fedimint_core::config::FederationId;
 use fedimint_core::core::{ModuleInstanceId, OperationId};
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
-use fedimint_core::module::CoreConsensusVersion;
+use fedimint_core::module::registry::ModuleDecoderRegistry;
+use fedimint_core::module::{CommonModuleInit, CoreConsensusVersion};
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_ln_client::{InternalPayState, LnPayState, PayBolt11InvoiceError};
 use fedimint_ln_common::config::FeeToAmount as _;
@@ -153,12 +154,38 @@ async fn gateway_from_any_peer(api: &fedimint_api_client::api::DynModuleApi) -> 
     all.into_iter().next().map(|a| a.info)
 }
 
-/// Whether the till registers the lnv2 client for `cfg`: only when the federation has lnv2 and
-/// no ln module, so a till on a federation with ln (Island Bitcoin Community: its lnv2 is older
-/// than this client speaks) builds exactly the client it built before.
-fn wants_lnv2(cfg: &ClientConfig) -> bool {
-    let has = |kind: &fedimint_core::core::ModuleKind| cfg.modules.values().any(|m| m.kind() == kind);
-    !has(&fedimint_ln_common::KIND) && has(&fedimint_lnv2_client::common::KIND)
+#[derive(Clone, Copy)]
+struct FederationModules {
+    lnv2: bool,
+    meta: bool,
+    walletv2: bool,
+}
+
+impl FederationModules {
+    fn for_config(cfg: &ClientConfig, mint: MintVersion) -> Self {
+        // Prefer the original Lightning module on mixed federations.
+        let has_ln = cfg.modules.values().any(|m| m.is_kind(&fedimint_ln_common::KIND));
+        Self {
+            lnv2: !has_ln && Self::register::<fedimint_lnv2_client::common::LightningCommonInit>(cfg, mint),
+            meta: Self::register::<fedimint_meta_client::common::MetaCommonInit>(cfg, mint),
+            walletv2: Self::register::<fedimint_walletv2_client::common::WalletCommonInit>(cfg, mint),
+        }
+    }
+
+    fn register<M: CommonModuleInit>(cfg: &ClientConfig, mint: MintVersion) -> bool {
+        let mut advertised = cfg.modules.iter().filter(|(_, module)| module.is_kind(&M::KIND)).peekable();
+        if advertised.peek().is_none() {
+            return false;
+        }
+        // SDK decoders apply to every instance of a kind. For a v1 wallet, enable an
+        // optional client when it can read all instances. V2 wallets use SDK negotiation.
+        mint == MintVersion::V2
+            || advertised.all(|(&id, module)| {
+                let decoders: ModuleDecoderRegistry = [(id, M::KIND, M::decoder())].into_iter().collect();
+                module.version.major == M::CONSENSUS_VERSION.major
+                    && module.clone().redecode_raw(&decoders).is_ok_and(|cfg| cfg.cast::<M::ClientConfig>().is_ok())
+            })
+    }
 }
 
 /// The wallet's admission guard: every clone of a [`Wallet`] shares one.
@@ -355,12 +382,12 @@ impl Wallet {
             .await
             .context("downloading federation config from the invite code")?;
         let (mint, _) = mint::bitcoin_mint(preview.config())?;
-        let lnv2 = wants_lnv2(preview.config());
-        if mint == MintVersion::V2 || lnv2 {
+        let modules = FederationModules::for_config(preview.config(), mint);
+        if mint == MintVersion::V2 || modules.lnv2 || modules.meta || modules.walletv2 {
             preview = Client::builder()
                 .await
                 .with_module_for_join()
-                .with_federation_modules(mint, lnv2)
+                .with_federation_modules(mint, modules)
                 .preview(endpoints, &invite_code)
                 .await
                 .context("downloading federation config from the invite code")?;
@@ -403,7 +430,7 @@ impl Wallet {
         let db = open_db(data_dir).await?;
         let cfg = Client::get_config_from_db(&db).await.context("wallet database has no federation config")?;
         let (mint, mint_id) = mint::bitcoin_mint(&cfg)?;
-        let lnv2 = wants_lnv2(&cfg);
+        let modules = FederationModules::for_config(&cfg, mint);
         // A wallet that joined before the ln module was registered has a cached API version set
         // without it, and the client skips any module missing from that set. Drop the cache once
         // (marker file) so the client fetches the versions afresh, ln included, as it does at join.
@@ -411,12 +438,8 @@ impl Wallet {
         let marker = data_dir.join(LN_VERSIONS_MARKER);
         let marker_v2 = data_dir.join(LNV2_VERSIONS_MARKER);
         let current_modules = data_dir.join(CARD40_MODULES_MARKER);
-        let uses_new_modules = mint == MintVersion::V2
-            || cfg
-                .modules
-                .values()
-                .any(|m| m.is_kind(&fedimint_meta_client::common::KIND) || m.is_kind(&fedimint_walletv2_client::common::KIND));
-        let refetch = !marker.exists() || (lnv2 && !marker_v2.exists()) || (uses_new_modules && !current_modules.exists());
+        let uses_new_modules = mint == MintVersion::V2 || modules.meta || modules.walletv2;
+        let refetch = !marker.exists() || (modules.lnv2 && !marker_v2.exists()) || (uses_new_modules && !current_modules.exists());
         {
             use fedimint_client::db::CachedApiVersionSetKey;
             use fedimint_core::db::IDatabaseTransactionOpsCoreTyped as _;
@@ -428,12 +451,12 @@ impl Wallet {
                 dbtx.commit_tx_result().await.context("clearing the cached API versions")?;
             }
         }
-        let builder = Client::builder().await.with_module_for_join().with_federation_modules(mint, lnv2);
+        let builder = Client::builder().await.with_module_for_join().with_federation_modules(mint, modules);
         let client = builder.open(connectors().await, db, root_secret(&mnemonic)).await.context("opening the client database")?;
         if !marker.exists() {
             let _ = std::fs::write(&marker, b"ln module registered; API versions refetched once\n");
         }
-        if lnv2 && !marker_v2.exists() {
+        if modules.lnv2 && !marker_v2.exists() {
             let _ = std::fs::write(&marker_v2, b"lnv2 module registered; API versions refetched once\n");
         }
         let mut w = Self::from_client(Arc::new(client)).await?;
@@ -463,7 +486,7 @@ impl Wallet {
         Ok(self.client.get_first_module::<fedimint_ln_client::LightningClientModule>()?)
     }
 
-    /// The federation's lnv2 module, registered only where there is no ln module (`wants_lnv2`).
+    /// The federation's lnv2 module, registered only where there is no ln module.
     pub fn lightning_v2(&self) -> Result<fedimint_client::module::ClientModuleInstance<'_, fedimint_lnv2_client::LightningClientModule>> {
         Ok(self.client.get_first_module::<fedimint_lnv2_client::LightningClientModule>()?)
     }
@@ -810,28 +833,32 @@ fn refuse_fee_or_balance(fee_msat: u64, max_fee_msat: Option<u64>, amount_msat: 
     }
 }
 
-/// `Client::builder` with the mint and ln modules registered, and lnv2 where `wants_lnv2`.
+/// Register the original mint and Lightning modules, then the modules selected for this federation.
 trait BuilderExt {
     fn with_module_for_join(self) -> fedimint_client::ClientBuilder;
-    fn with_federation_modules(self, mint: MintVersion, lnv2: bool) -> fedimint_client::ClientBuilder;
+    fn with_federation_modules(self, mint: MintVersion, modules: FederationModules) -> fedimint_client::ClientBuilder;
 }
 impl BuilderExt for fedimint_client::ClientBuilder {
     fn with_module_for_join(mut self) -> fedimint_client::ClientBuilder {
         self.with_module(MintClientInit);
         self.with_module(fedimint_ln_client::LightningClientInit::default());
-        self.with_module(fedimint_meta_client::MetaClientInit);
-        self.with_module(fedimint_walletv2_client::WalletClientInit);
-        let source: fedimint_meta_client::MetaModuleMetaSourceWithFallback = Default::default();
-        self.with_meta_service(fedimint_client::meta::MetaService::new(source));
         self
     }
 
-    fn with_federation_modules(mut self, mint: MintVersion, lnv2: bool) -> fedimint_client::ClientBuilder {
+    fn with_federation_modules(mut self, mint: MintVersion, modules: FederationModules) -> fedimint_client::ClientBuilder {
         if mint == MintVersion::V2 {
             self.with_module(fedimint_mintv2_client::MintClientInit);
         }
-        if lnv2 {
+        if modules.lnv2 {
             self.with_module(fedimint_lnv2_client::LightningClientInit::default());
+        }
+        if modules.meta {
+            self.with_module(fedimint_meta_client::MetaClientInit);
+            let source: fedimint_meta_client::MetaModuleMetaSourceWithFallback = Default::default();
+            self.with_meta_service(fedimint_client::meta::MetaService::new(source));
+        }
+        if modules.walletv2 {
+            self.with_module(fedimint_walletv2_client::WalletClientInit);
         }
         self
     }
@@ -884,6 +911,47 @@ fn read_mnemonic(data_dir: &Path) -> Result<Mnemonic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_modules_preflight_every_instance_for_v1() {
+        use fedimint_core::config::{ClientModuleConfig, GlobalClientConfig};
+        use fedimint_core::encoding::DynRawFallback;
+        use fedimint_lnv2_client::common::LightningCommonInit;
+        use fedimint_meta_client::common::{MetaCommonInit, config::MetaClientConfig};
+
+        let mut config = ClientConfig {
+            global: GlobalClientConfig {
+                api_endpoints: Default::default(),
+                broadcast_public_keys: None,
+                consensus_version: CoreConsensusVersion::new(2, 1),
+                meta: Default::default(),
+            },
+            modules: [(4, ClientModuleConfig::from_typed(4, MetaCommonInit::KIND, MetaCommonInit::CONSENSUS_VERSION, MetaClientConfig))]
+                .into_iter()
+                .collect(),
+        };
+        assert!(FederationModules::for_config(&config, MintVersion::V1).meta);
+        config.modules.insert(
+            5,
+            ClientModuleConfig {
+                kind: MetaCommonInit::KIND,
+                version: MetaCommonInit::CONSENSUS_VERSION,
+                config: DynRawFallback::Raw { module_instance_id: 5, raw: vec![1] },
+            },
+        );
+        config.modules.insert(
+            6,
+            ClientModuleConfig {
+                kind: LightningCommonInit::KIND,
+                version: LightningCommonInit::CONSENSUS_VERSION,
+                config: DynRawFallback::Raw { module_instance_id: 6, raw: vec![] },
+            },
+        );
+        let modules = FederationModules::for_config(&config, MintVersion::V1);
+        assert!(!modules.meta && !modules.lnv2);
+        let strict = FederationModules::for_config(&config, MintVersion::V2);
+        assert!(strict.meta && strict.lnv2);
+    }
 
     #[test]
     fn bolt11_parsing_refuses_garbage_and_amountless_invoices() {
