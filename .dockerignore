@@ -3,6 +3,7 @@
 !NOTICE
 !host/Cargo.toml
 !host/Cargo.lock
+!host/vendor/fedimint-mintv2-common/**
 !host/rust-toolchain.toml
 !host/card/Cargo.toml
 !host/card/src/**

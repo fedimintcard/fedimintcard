@@ -179,6 +179,7 @@ impl Store {
         let keys = kit.decode(&self.phone_id)?;
         let now = now_ms().max(kit.issued_at_ms).max(self.q().file.high_water_ms);
         let env = Env {
+            mint_version: kit.mint_version,
             mint_id: kit.mint_instance_id,
             tbs_pks: &keys.tbs_pks,
             fee: &keys.fee,

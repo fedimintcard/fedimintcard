@@ -124,8 +124,18 @@ pub struct PendingTx {
     pub change: Vec<(u8, u64)>,
 }
 
+/// Cross-file journal for the interval between the Fedimint operation commit and the card file's txid save.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueSubmission {
+    pub operation: fedimint_core::core::OperationId,
+    pub client_ref: Option<String>,
+    pub notes: Vec<LoadNote>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CardState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_submission: Option<IssueSubmission>,
     #[serde(default)]
     pub version: u32,
     #[serde(default)]

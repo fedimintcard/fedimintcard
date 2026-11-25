@@ -1,5 +1,5 @@
 /**
- * Fedimint's mint v1 note check, ported from `fedimint-tbs` and `fedimint-mint-common` at
+ * Fedimint's mint note checks, ported from `fedimint-tbs` and `fedimint-mint-common` at
  * v0.13.0-beta.1, so ops can refuse a note whose signature the federation did not make
  * (OPS-PLAN § 6, "how ops trusts a load").
  *
@@ -17,9 +17,11 @@
  *   how `Fp::from_u768` weighs the two halves of the 96 bytes.
  *
  * `test/tbs-vectors.json` holds vectors the Rust code produced (`host/sidecar/tests/tbs_vectors.rs`);
- * the registry tests check this port against them.
+ * the registry tests check both mint versions against them. Mint v2 uses the same group mapping
+ * with a SHA-256 seed and its own domain tag.
  */
 import {bls12_381} from '@noble/curves/bls12-381.js';
+import {sha256} from '@noble/hashes/sha2.js';
 import {sha3_256} from '@noble/hashes/sha3.js';
 
 const Fp = bls12_381.fields.Fp;
@@ -29,6 +31,8 @@ const G2 = bls12_381.G2.Point;
 type G1Point = InstanceType<typeof G1>;
 type G2Point = InstanceType<typeof G2>;
 
+export type MintVersion = 'v1' | 'v2';
+const V2_HASH_TAG = new TextEncoder().encode('FEDIMINT_TBS_BLS12_381_MESSAGE');
 const HASH_TAG = new TextEncoder().encode('TBS_BLS12-381_');
 /** (p + 1) / 4: p = 3 (mod 4), so this power is a square root when one exists (`Fp::sqrt`). */
 const SQRT_EXP = (P + 1n) / 4n;
@@ -169,8 +173,10 @@ function g1Random(rng: ChaChaRng): G1Point {
 }
 
 /** `tbs::Message::from_bytes`: the G1 point a note's nonce is signed as. */
-export function messageOf(bytes: Uint8Array): G1Point {
-  const seed = sha3_256(new Uint8Array([...HASH_TAG, ...bytes]));
+export function messageOf(bytes: Uint8Array, version: MintVersion = 'v1'): G1Point {
+  const seed = version === 'v2'
+    ? sha256(new Uint8Array([...V2_HASH_TAG, ...bytes]))
+    : sha3_256(new Uint8Array([...HASH_TAG, ...bytes]));
   return g1Random(new ChaChaRng(seed));
 }
 
@@ -219,7 +225,7 @@ export interface NoteCheck {
  * prod e(r_i H_i, pk_i) * e(-sum r_i sig_i, G2) == 1, one Miller loop per note and one final
  * exponentiation. Random weights keep one note's error from cancelling another's.
  */
-export function verifyNotes(notes: readonly NoteCheck[]): boolean {
+export function verifyNotes(notes: readonly NoteCheck[], version: MintVersion = 'v1'): boolean {
   if (notes.length === 0) {
     return true;
   }
@@ -232,7 +238,7 @@ export function verifyNotes(notes: readonly NoteCheck[]): boolean {
       return false;
     }
     const r = weights[i]! | 1n;
-    pairs.push({g1: messageOf(fromHex(n.nonce)).multiply(r), g2: n.pk});
+    pairs.push({g1: messageOf(fromHex(n.nonce), version).multiply(r), g2: n.pk});
     sigSum = sigSum.add(sig.multiply(r));
   }
   pairs.push({g1: sigSum.negate(), g2: G2.BASE});

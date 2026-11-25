@@ -38,11 +38,12 @@ RUN --mount=type=cache,id=till-registry,target=/usr/local/cargo/registry,sharing
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 LABEL org.opencontainers.image.source="https://github.com/fedimintcard/fedimintcard" \
       org.opencontainers.image.title="Fedimint Card 4.0 Till" \
-      org.opencontainers.image.description="Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry."
+      org.opencontainers.image.description="Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry with support for the federation’s Bitcoin mint (v1 or v2)."
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/* && install -d -m 0700 -o 1000 -g 1000 /data
 COPY --from=build /out/card-sidecar /usr/local/bin/card-sidecar
 COPY LICENSE NOTICE /usr/share/doc/fedimintcard/
+COPY host/vendor/fedimint-mintv2-common/LICENSE /usr/share/doc/fedimintcard/fedimint-mintv2-common.LICENSE
 RUN card-sidecar till admin --help >/dev/null
 ENV CARD_DATA_DIR=/data TILL_ADMIN_LISTEN=0.0.0.0:9878 TILL_LISTEN=0.0.0.0:9877 TILL_REQUIRE_POS_TOKEN=true
 USER 1000:1000

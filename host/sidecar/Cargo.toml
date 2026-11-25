@@ -1,6 +1,6 @@
 [package]
 name = "fedimint-card-sidecar"
-description = "Card wallet CLI: holds Fedimint mint v1 notes on a JavaCard's spend keys"
+description = "Card wallet CLI: holds Fedimint eCash notes on a JavaCard's spend keys"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -35,6 +35,10 @@ fedimint-ln-client = { workspace = true }
 fedimint-ln-common = { workspace = true }
 fedimint-lnv2-client = { workspace = true }
 fedimint-mint-common = { workspace = true }
+fedimint-mintv2-common = { workspace = true }
+fedimint-mintv2-client = { workspace = true }
+fedimint-meta-client = { workspace = true }
+fedimint-walletv2-client = { workspace = true }
 fedimint-rocksdb = { workspace = true }
 futures = "0.3"
 lightning-invoice = "0.34.1"
@@ -51,6 +55,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [dev-dependencies]
+fedimint-card-fed-tests = { path = "../fed-tests" }
 # The P1 00 PIN of cards older than 4.0, for tests only: never a [dependencies] entry.
 fedimint-card-old-card-pin = { path = "../old-card-pin" }
 # The lnv2 test gateway (tests/wallet_pay.rs) implements a fedimint trait declared with async-trait.
@@ -59,6 +64,7 @@ fedimint-card-host-card = { path = "../card", features = ["softkit"] }
 fedimint-dummy-client = { workspace = true }
 fedimint-dummy-server = { workspace = true }
 fedimint-mint-server = { workspace = true }
+fedimint-mintv2-server = { workspace = true }
 fedimint-ln-server = { workspace = true }
 fedimint-lnv2-server = { workspace = true }
 fedimint-testing = { workspace = true }

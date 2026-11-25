@@ -747,7 +747,7 @@ impl Engine<'_> {
         })?;
         // The quote is exact for the inventory now; notes credited meanwhile can change the
         // layout, so the larger of it and the bound of one mint transaction is held back.
-        let quote = quote.max(fees::mint_fee_bound(&funds.schedules.mint, funds.balance_msat, 0));
+        let quote = quote.max(fees::mint_fee_bound(&funds.schedules, funds.balance_msat, 0));
         if amount_msat.saturating_add(quote) > funds.spendable_msat {
             let avail = funds.spendable_msat.saturating_sub(quote) / min * min / 1000;
             let mut r = Reply::fail(409, "insufficient_available", format!("{avail} sat can be paid out as eCash now"));

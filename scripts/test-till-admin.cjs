@@ -24,6 +24,7 @@ const qr = { text: 'disposable-example', qr_svg: '<svg xmlns="http://www.w3.org/
     page.on('pageerror', (e) => errors.push(e.message));
     const amounts = [], pairingPayloads = [], manualPayments = [], settingsPatches = [], unconfirmedRequests = [];
     let version = 1700000000000;
+    let joinRequests = 0, statusAfterJoin = 0;
     let joined = false, destination = null, proposed = null, records = [], interrupted = true;
     let posUrl = 'https://merchant-pos.test', available = true, blocked = null, lightningBlocked = null;
     await context.route('**/*', async (route) => {
@@ -34,11 +35,23 @@ const qr = { text: 'disposable-example', qr_svg: '<svg xmlns="http://www.w3.org/
       const send = (json, status = 200) => route.fulfill({ status, json });
       if (req.headers().authorization !== 'Bearer test-only-review') return send({ error: 'unauthorized' }, 401);
       const d = req.postDataJSON();
-      if (p === '/admin/status') return send({
-        joined, connected: false, starting: false, pos_url: posUrl, wallet_balance_msat: 100000000,
-        federation_id: 'abcdef0123456789'.repeat(4), federation_reachable: true,
-      });
-      if (p === '/admin/join') { joined = true; return send({ ok: true }); }
+      if (p === '/admin/status') {
+        if (joinRequests && !joined) {
+          statusAfterJoin++;
+          if (statusAfterJoin === 1) return send({ joined: false, starting: true, joining: true });
+          if (statusAfterJoin === 2) return route.abort('connectionreset');
+          if (statusAfterJoin === 3) return send({ joined: false, starting: true, retrying_mint: true });
+          joined = true;
+        }
+        return send({
+          joined, connected: false, starting: false, pos_url: posUrl, wallet_balance_msat: 100000000,
+          federation_id: 'abcdef0123456789'.repeat(4), federation_reachable: true,
+        });
+      }
+      if (p === '/admin/join') {
+        joinRequests++;
+        return send({ ok: false, error: 'setup_changed', detail: 'Refresh to see federation setup.' }, 409);
+      }
       if (p === '/admin/payout') return send({
         settings, destination, pending_destination: proposed, recent: records, blocked,
         funds: available ? { before_withdrawal_fees_sat: 90000, available_sat: 89500, obligations_sat: 0, reserve_sat: 10000, lightning_blocked: lightningBlocked } : null,
@@ -115,7 +128,16 @@ const qr = { text: 'disposable-example', qr_svg: '<svg xmlns="http://www.w3.org/
     await page.getByLabel('Till admin password').fill('test-only-review'); await submit('auth');
     await see('This till receives sales in this federation. Use Card 4.0 cards and a 4.0 registry.');
     await page.getByLabel('Federation invite').fill('local-test-invite'); await submit('join'); await click('agree');
-    await see('100,000 sats'); await byId('sales').getByText('Sale 1', { exact: false }).waitFor();
+    await see('Joining federation…');
+    assert.equal(await byId('setup').isVisible(), false);
+    await see('Reconnecting to till…');
+    assert.equal(await byId('setup').isVisible(), false);
+    await see('Waiting for the federation’s Bitcoin mint. Retrying automatically…');
+    assert.equal(await byId('setup').isVisible(), false);
+    await click('refresh');
+    await see('100,000 sats');
+    assert.equal(joinRequests, 1);
+    await byId('sales').getByText('Sale 1', { exact: false }).waitFor();
     assert.equal(await tab('Overview').getAttribute('aria-selected'), 'true');
     assert.equal(await byId('withdraw').isVisible(), false);
     await tab('Overview').focus(); await page.keyboard.press('ArrowRight');
@@ -179,7 +201,7 @@ const qr = { text: 'disposable-example', qr_svg: '<svg xmlns="http://www.w3.org/
     await click('recoverWithdrawal'); await click('agree'); await see('The till refused this amount.');
     assert.ok(await byId('withdraw').isVisible());
     assert.equal(unconfirmedRequests.length, 2); assert.equal(unconfirmedRequests[0], unconfirmedRequests[1]);
-    await withdraw('1000'); await see('Failed to fetch');
+    await withdraw('1000'); await see('Lost contact with the till. Check the connection and the status of your request.');
     await click('recoverWithdrawal'); await click('agree');
     await page.locator('dialog[open] textarea').waitFor();
     assert.equal(await byId('code').inputValue(), 'disposable-test-note');
@@ -225,7 +247,7 @@ const qr = { text: 'disposable-example', qr_svg: '<svg xmlns="http://www.w3.org/
 
     // Refresh and sign in again to view the same receipt in this tab.
     await refresh();
-    await withdraw('2400'); await see('Failed to fetch');
+    await withdraw('2400'); await see('Lost contact with the till. Check the connection and the status of your request.');
     assert.ok(await byId('withdrawalRecovery').isVisible());
     assert.ok(await byId('withdraw').isHidden());
     const requestId = manualPayments.at(-1).request_id;

@@ -17,7 +17,9 @@
 //!   the spend and the fees, so `inputs + change ≤ 2B − spend`. A note credited during the funding
 //!   adds its whole value to the balance and at most `2 × ppm / 1e6` of it (0.2 %) to the fees:
 //!   it pays for itself.
-//! - **Dust.** The change layout (`represent_amount`) leaves less than `fee(1 msat) = base`.
+//! - **Dust.** Both clients return change down to their smallest change tier. The remainder
+//!   is strictly below that tier plus the fee to issue it. Mint v1 uses 1 msat and v2 uses its
+//!   smallest SDK client denomination.
 //! - **Module.** ln (v1) charges a fixed `contract_output` on the outgoing contract; lnv2 charges
 //!   `base + floor(ppm × contract / 1e6)`. The contract is the invoice plus the gateway's fee,
 //!   which the wallet refuses above the payout's cap.
@@ -104,6 +106,8 @@ impl LnSchedule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedules {
     pub mint: Linear,
+    /// Smallest change output made by this mint client, in msat.
+    pub min_change_msat: u64,
     /// `None` without a Lightning module, or with one whose fees cannot be bounded.
     pub ln: Option<LnSchedule>,
     /// Why the Lightning module's fees cannot be bounded, when it has some.
@@ -113,7 +117,12 @@ pub struct Schedules {
 impl Schedules {
     /// Fees off everywhere (tests, federations with zero fees).
     pub fn zero() -> Self {
-        Self { mint: Linear::ZERO, ln: Some(LnSchedule::V1 { contract_input_msat: 0, contract_output_msat: 0 }), ln_problem: None }
+        Self {
+            mint: Linear::ZERO,
+            min_change_msat: 1,
+            ln: Some(LnSchedule::V1 { contract_input_msat: 0, contract_output_msat: 0 }),
+            ln_problem: None,
+        }
     }
 
     fn ln(&self) -> Result<LnSchedule, String> {
@@ -123,20 +132,18 @@ impl Schedules {
 
 /// An upper bound on the mint fees (inputs, change outputs, dust) of one transaction from a wallet
 /// holding `balance_msat` whose explicit non-mint outputs are worth `spend_msat`.
-pub fn mint_fee_bound(mint: &Linear, balance_msat: u64, spend_msat: u64) -> u64 {
+pub fn mint_fee_bound(s: &Schedules, balance_msat: u64, spend_msat: u64) -> u64 {
+    let mint = s.mint;
+    let dust = s.min_change_msat.saturating_sub(1).saturating_add(mint.fee(s.min_change_msat));
     let value = (2 * balance_msat as u128).saturating_sub(spend_msat as u128);
-    mint.base_msat
-        .saturating_mul(max_items())
-        .saturating_add(mint.proportional_ceil(value))
-        // Dust: less than `fee(1 msat)`, which is the base.
-        .saturating_add(mint.base_msat)
+    mint.base_msat.saturating_mul(max_items()).saturating_add(mint.proportional_ceil(value)).saturating_add(dust)
 }
 
 /// An upper bound on the federation's fees for funding an outgoing contract worth `contract_msat`:
 /// the mint's and the Lightning module's. `Err` without a Lightning module.
 pub fn ln_send_fee_bound(s: &Schedules, balance_msat: u64, contract_msat: u64) -> Result<u64, String> {
     let ln = s.ln()?;
-    Ok(mint_fee_bound(&s.mint, balance_msat, contract_msat).saturating_add(ln.output_fee(contract_msat)))
+    Ok(mint_fee_bound(s, balance_msat, contract_msat).saturating_add(ln.output_fee(contract_msat)))
 }
 
 /// [`ln_send_fee_bound`] for every contract amount in `lo..=hi`: the bound is affine in the
@@ -158,7 +165,7 @@ pub fn obligation_fee_bound(s: &Schedules, balance_msat: u64, amount_msat: u64) 
         return Err(p.clone());
     }
     let ln = s.ln.map_or(0, |l| l.output_fee(amount_msat).saturating_add(l.input_fee(amount_msat)));
-    Ok(mint_fee_bound(&s.mint, balance_msat, 0).saturating_mul(2).saturating_add(ln))
+    Ok(mint_fee_bound(s, balance_msat, 0).saturating_mul(2).saturating_add(ln))
 }
 
 #[cfg(test)]
@@ -208,7 +215,7 @@ mod tests {
         for fc in &schedules {
             let mint = mint_of(fc);
             for ln in lns {
-                let s = Schedules { mint, ln: Some(ln), ln_problem: None };
+                let s = Schedules { mint, min_change_msat: 1, ln: Some(ln), ln_problem: None };
                 for (balance, contract) in [(10_000_000u64, 1_000_000u64), (100_000_000, 99_000_000), (1 << 40, 1 << 20), (5_000, 1_000)] {
                     let bound = ln_send_fee_bound(&s, balance, contract).unwrap();
                     // Worst layout: the most items the transaction holds, spending the whole
@@ -229,10 +236,22 @@ mod tests {
     }
 
     #[test]
+    fn the_v2_bound_covers_the_smallest_change_output_and_its_fee() {
+        let tier = fedimint_mintv2_common::config::client_denominations().next().unwrap().amount().msats;
+        let mut s = Schedules { min_change_msat: tier, ..Schedules::zero() };
+        assert_eq!(tier, 512);
+        // A 1024-msat input funding a 513-msat contract leaves no issuable change.
+        assert_eq!(ln_send_fee_bound(&s, 1024, 513).unwrap(), 511);
+        assert_eq!(obligation_fee_bound(&s, 1024, 513).unwrap(), 2 * 511);
+        s.mint = Linear { base_msat: 10, ppm: 0 };
+        assert_eq!(mint_fee_bound(&s, 2048, 1), 10 * max_items() + 521);
+    }
+
+    #[test]
     fn typical_schedules_hold_back_little() {
         // 100 msat per item, no proportional part: about 104 sat, whatever the amount.
         let v1 = LnSchedule::V1 { contract_input_msat: 0, contract_output_msat: 0 };
-        let s = Schedules { mint: Linear { base_msat: 100, ppm: 0 }, ln: Some(v1), ln_problem: None };
+        let s = Schedules { mint: Linear { base_msat: 100, ppm: 0 }, min_change_msat: 1, ln: Some(v1), ln_problem: None };
         assert_eq!(ln_send_fee_bound(&s, 1 << 40, 1 << 30).unwrap(), 100 * 1_041 + 100);
         assert_eq!(obligation_fee_bound(&s, 1 << 40, 5_000).unwrap(), 2 * (100 * 1_041 + 100));
         // Fees off: nothing.
@@ -241,8 +260,8 @@ mod tests {
         assert_eq!(obligation_fee_bound(&off, 1 << 40, 5_000).unwrap(), 0);
         // No Lightning module: no Lightning funding. One whose fees cannot be bounded: refused
         // with its reason, and what its obligations will cost is unknown.
-        assert!(ln_send_fee_bound(&Schedules { mint: Linear::ZERO, ln: None, ln_problem: None }, 1, 1).is_err());
-        let bad = Schedules { mint: Linear::ZERO, ln: None, ln_problem: Some("stepped lnv2 fees".into()) };
+        assert!(ln_send_fee_bound(&Schedules { mint: Linear::ZERO, min_change_msat: 1, ln: None, ln_problem: None }, 1, 1).is_err());
+        let bad = Schedules { mint: Linear::ZERO, min_change_msat: 1, ln: None, ln_problem: Some("stepped lnv2 fees".into()) };
         assert_eq!(ln_send_fee_bound(&bad, 1, 1).unwrap_err(), "stepped lnv2 fees");
         assert!(obligation_fee_bound(&bad, 1, 1).is_err());
         assert_eq!(obligation_fee_bound(&bad, 1, 0).unwrap(), 0);
@@ -251,6 +270,7 @@ mod tests {
     #[test]
     fn the_bound_over_a_range_is_its_largest_end() {
         let s = Schedules {
+            min_change_msat: 1,
             mint: Linear { base_msat: 100, ppm: 1_000 },
             ln: Some(LnSchedule::V2(Linear { base_msat: 1_000, ppm: 1_000 })),
             ln_problem: None,

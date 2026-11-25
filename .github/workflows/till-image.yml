@@ -139,7 +139,7 @@ jobs:
           jq --arg mt "$media_type" --arg revision "$REVISION" '
             .mediaType = $mt | .annotations = {
               "org.opencontainers.image.title": "Fedimint Card 4.0 Till",
-              "org.opencontainers.image.description": "Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry.",
+              "org.opencontainers.image.description": "Merchant till for Fedimint Card 4.x cards only. Requires a Card 4.0 registry with support for the federation’s Bitcoin mint (v1 or v2).",
               "org.opencontainers.image.source": "https://github.com/fedimintcard/fedimintcard",
               "org.opencontainers.image.revision": $revision
             }

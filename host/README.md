@@ -11,7 +11,7 @@ Rust side of the spike: a `Card` transport and federation tests that spend a not
 
 ## Pin
 
-Fedimint **`v0.13.0`**, commit `264ebf22b698c158055bcdd80d5b586fdb48d1fc`. The till uses mint v1 through `fedimint-mint-client` and `fedimint-mint-common`; the phone core reads mint v1's types from `fedimint-mint-common` alone and links no fedimint client crate (`pos-core/Cargo.toml`, `scripts/pos-core-mobile.sh check`); `fed-tests` runs module `mintv2`.
+Fedimint **`v0.13.0`**, commit `264ebf22b698c158055bcdd80d5b586fdb48d1fc`. The till supports Bitcoin mint v1 and mint v2. The phone core uses both modules’ common types for offline payments. The host workspace uses the copy of `fedimint-mintv2-common` in `vendor/` for the supported Bitcoin fee schedules. The wallet registers the federation’s metadata and wallet v2 modules when available.
 `Cargo.lock` was seeded from fedimint's own lock file at `v0.13.0-beta.1` (git dependencies ignore it) and moved to `v0.13.0` with `cargo update -p fedimint-core`, then `cargo update -p bdk_electrum`: the fedimint packages and what their new requirements force changed, the rest stayed locked. The second command is needed because `fedimint-ldk-node` 0.7.1, which only the tests link, accepts `bdk_electrum` 0.23.0 but does not build with it (0.23.0 brings an older `electrum-client` than the 0.24 it uses); 0.23.2 is the version fedimint's own lock holds.
 `rust-toolchain.toml` pins Rust 1.91.1: the dependency tree (`n0-*`, `netwatch`, `portmapper`) needs rustc 1.91, and 1.90 fails to resolve.
 

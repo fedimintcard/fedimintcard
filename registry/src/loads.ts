@@ -139,6 +139,7 @@ export function freeSlots(sql: Sql, shortId: string) {
   return {
     version: versionOf(sql, shortId),
     federation_id: fed.federation_id,
+    ...(fed.mint_version === 'v2' ? {mint_version: 'v2'} : {}),
     slot_count: count,
     free,
     // Only slots a holder may load into once a till keys them; `/cards/:id/state` lists every

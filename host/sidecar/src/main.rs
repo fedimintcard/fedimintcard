@@ -407,6 +407,14 @@ async fn main() -> Result<()> {
         }
         Cmd::Ln(LnCmd::Gateways) => {
             let w = Wallet::open(&cli.data_dir).await?;
+            if w.lightning().is_err() {
+                let gateways = w.lightning_v2()?.list_gateways(None).await?;
+                println!("{} gateway(s)", gateways.len());
+                for gateway in gateways {
+                    println!("{gateway}");
+                }
+                return Ok(());
+            }
             let ln = w.lightning()?;
             ln.update_gateway_cache().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let gws = ln.list_gateways().await;
@@ -421,6 +429,16 @@ async fn main() -> Result<()> {
         Cmd::Ln(LnCmd::Receive { amount_msat, gateway }) => {
             use futures::StreamExt as _;
             let w = Wallet::open(&cli.data_dir).await?;
+            if w.lightning().is_err() {
+                use fedimint_card_sidecar::topup::{INVOICE_EXPIRY_SECS, TopupLightning, WalletLightning, now_ms};
+                let receiver = WalletLightning { wallet: w.clone() };
+                let (op, invoice) = receiver.invoice_v2(*amount_msat, INVOICE_EXPIRY_SECS, gateway.as_deref()).await?;
+                println!("{invoice}");
+                let outcome = receiver.wait(op, now_ms() + INVOICE_EXPIRY_SECS * 1000).await?;
+                eprintln!("{outcome:?}");
+                println!("wallet balance now {} msat", w.balance_msat().await?);
+                return Ok(());
+            }
             let ln = w.lightning()?;
             ln.update_gateway_cache().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let want = match gateway {
@@ -468,7 +486,7 @@ async fn main() -> Result<()> {
             let cfg = w.client.config().await;
             println!(
                 "name: {}; guardians: {}; core consensus: {}.{}",
-                cfg.global.meta.get("federation_name").map_or("?", String::as_str),
+                w.federation_name().await.as_deref().unwrap_or("?"),
                 cfg.global.api_endpoints.len(),
                 cfg.global.consensus_version.major,
                 cfg.global.consensus_version.minor
@@ -510,13 +528,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Ecash(Ecash::Export { amount_msat, qr: want_qr, round_up, include_invite }) => {
             let w = Wallet::open(&cli.data_dir).await?;
-            let (notes, face) = w.export(*amount_msat, *round_up, *include_invite).await?;
+            let (notes, face) = w.export_ecash(*amount_msat, *round_up, *include_invite).await?;
             // The log comes before the screen: this string is the only copy of the value.
             StateStore::open(state_path(&cli.data_dir))?.append_cashout_log(&notes.to_string())?;
             println!("{notes}");
             eprintln!("exported {}", sats(face.msats));
             if *want_qr {
-                qr(&notes.to_string())?;
+                qr(&notes)?;
             }
         }
         Cmd::Till(TillCmd::Serve(args)) => serve_till(&cli.data_dir, args, None).await?,

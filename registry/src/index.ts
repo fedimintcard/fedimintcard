@@ -291,12 +291,15 @@ export class Registry {
       return this.cardRoute(request, caller, card[1]!, card[2] ?? '', now);
     }
 
-    if (path === '/federations' && method === 'POST') {
+    if ((path === '/federations' || path === '/federations/mintv2') && method === 'POST') {
       if (caller.kind !== 'till') return fail(403, 'only a till reports a federation name');
       const body = await objectBody(request);
       if (!body) return fail(400, 'expected {federation_id, name}');
-      putFederationName(sql, caller.till.operator_id, body, now);
-      return json(200, {ok: true});
+      const version = path === '/federations/mintv2' ? 'v2' : 'v1';
+      if (body.mint_version !== undefined && body.mint_version !== version) return fail(400, 'wrong mint version for this endpoint');
+      if (version === 'v2' && !body.tbs_pks) return fail(400, 'mint v2 tier keys are required');
+      storage.transactionSync(() => putFederationName(sql, caller.till.operator_id, body, now, version));
+      return json(200, version === 'v2' ? {ok: true, mint_version: version, federation_id: body.federation_id} : {ok: true});
     }
 
     if (caller.kind !== 'operator') {

@@ -97,7 +97,12 @@ fn mode(path: &std::path::Path) -> u32 {
 }
 
 fn report() -> FederationReport {
-    FederationReport { federation_id: "f".repeat(64), name: Some("Test".into()), tbs_pks: Default::default() }
+    FederationReport {
+        mint_version: Default::default(),
+        federation_id: "f".repeat(64),
+        name: Some("Test".into()),
+        tbs_pks: Default::default(),
+    }
 }
 
 // ------------------------------------------------------------------ the claim file and the poll

@@ -7,28 +7,31 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use crate::mint::MintFee;
 use anyhow::{Context, Result, bail, ensure};
 use fedimint_card_host_card::v3::{HEADER_LEN, header_has_work};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::Decodable;
 use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::{Amount, Tiered};
-use fedimint_mint_common::config::FeeConsensus;
 use serde::{Deserialize, Serialize};
 use tbs::{AggregatePublicKey, BlindedMessage};
 
-use crate::charge::{PoolEntry, mint_decoders};
+use crate::charge::PoolEntry;
+use crate::mint::MintVersion;
 use crate::plan::FeeHeadroom;
 use crate::queue::{OfflineConfig, OfflineError};
 
 /// The kit's format.
-pub const KIT_VERSION: u32 = 1;
+pub const KIT_VERSION: u32 = 2;
 /// Most bytes a kit may take as JSON: the till lowers the pool's depth to stay under it.
 pub const KIT_MAX_BYTES: usize = 128 * 1024;
 
 /// An offline kit, as the till answers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Kit {
+    #[serde(default, skip_serializing_if = "MintVersion::is_v1")]
+    pub mint_version: MintVersion,
     pub version: u32,
     /// 16 random bytes, hex.
     pub kit_id: String,
@@ -70,7 +73,7 @@ pub struct PoolTier {
 /// A kit decoded and checked: what a charge works with.
 pub struct KitKeys {
     pub tbs_pks: Tiered<AggregatePublicKey>,
-    pub fee: FeeConsensus,
+    pub fee: MintFee,
     pub decoders: ModuleDecoderRegistry,
     pub header: Option<[u8; HEADER_LEN]>,
     pub pool: Vec<PoolEntry>,
@@ -107,6 +110,10 @@ impl Kit {
     }
 
     fn check(&self, phone_id: &str) -> Result<KitKeys> {
+        ensure!(
+            (self.version == 1 && self.mint_version == MintVersion::V1) || (self.version == 2 && self.mint_version == MintVersion::V2),
+            "unsupported offline kit format for this mint"
+        );
         ensure!(self.phone_id == phone_id, "it was issued to phone {}, not {phone_id}", self.phone_id);
         ensure!(self.issued_at_ms < self.expires_at_ms, "it expires before it was issued");
         ensure!(self.cap_msat > 0 && self.cap_count > 0, "its caps are zero");
@@ -119,7 +126,7 @@ impl Kit {
         }
         ensure!(!tiers.is_empty(), "it has no note keys");
         let tbs_pks: Tiered<AggregatePublicKey> = tiers.into_iter().collect();
-        let fee = FeeConsensus::consensus_decode_hex(&self.fee_consensus, &reg).map_err(|e| anyhow::anyhow!("its fee schedule: {e}"))?;
+        let fee = MintFee::from_hex(self.mint_version, &self.fee_consensus).context("its fee schedule")?;
         let cert_key = hex::decode(&self.cert_key).context("its certificate key is not hex")?;
         ensure!(cert_key.len() == 65 && cert_key[0] == 0x04, "its certificate key is not an uncompressed P-256 point");
         let header = match &self.block_header {
@@ -151,7 +158,7 @@ impl Kit {
         Ok(KitKeys {
             tbs_pks,
             fee,
-            decoders: mint_decoders(self.mint_instance_id),
+            decoders: self.mint_version.decoders(self.mint_instance_id),
             header,
             pool,
             cfg: OfflineConfig { cap_msat: self.cap_msat, cap_count: self.cap_count, fee_headroom: self.fee_headroom },

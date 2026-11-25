@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use fedimint_card_host_card::softkit::{SoftMint, SoftTransport, ready_for_pin};
 use fedimint_card_host_card::{Card, Certificate, SlotState, SoftCard, TEST_PIN, Transport};
-use fedimint_card_pos_core::kit::{KIT_VERSION, Kit, PoolTier};
+use fedimint_card_pos_core::kit::{Kit, PoolTier};
 use fedimint_card_pos_core::plan::{self, FeeHeadroom};
 use fedimint_core::encoding::Encodable;
 use fedimint_mint_common::config::FeeConsensus;
@@ -91,7 +91,8 @@ impl Fx {
             t <<= 1;
         }
         Kit {
-            version: KIT_VERSION,
+            version: 1,
+            mint_version: Default::default(),
             kit_id: hex::encode(rand::random::<[u8; 16]>()),
             phone_id: phone_id.to_owned(),
             federation_id: "00".repeat(32),

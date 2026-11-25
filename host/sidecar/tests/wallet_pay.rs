@@ -27,7 +27,7 @@ use fedimint_core::Amount;
 use fedimint_core::OutPoint;
 use fedimint_core::bitcoin::hashes::{Hash as _, sha256};
 use fedimint_core::config::FederationId;
-use fedimint_core::core::{ModuleInstanceId, OperationId};
+use fedimint_core::core::{IntoDynInstance as _, ModuleInstanceId, OperationId};
 use fedimint_core::module::{ApiAuth, ApiRequestErased};
 use fedimint_core::secp256k1::rand::rngs::OsRng;
 use fedimint_core::secp256k1::schnorr::Signature;
@@ -68,12 +68,13 @@ fn gateway_fee_msat() -> u64 {
 #[derive(Debug)]
 struct TestGateway {
     keypair: Keypair,
+    incoming: Mutex<Option<IncomingContract>>,
 }
 
 impl TestGateway {
     fn new() -> Self {
         let keypair = SecretKey::from_slice(&[1; 32]).expect("valid key").keypair(SECP256K1);
-        Self { keypair }
+        Self { keypair, incoming: Mutex::default() }
     }
 }
 
@@ -89,7 +90,7 @@ impl GatewayConnection for TestGateway {
             expiration_delta_default: 500,
             expiration_delta_minimum: 144,
             receive_fee: PaymentFee::TRANSACTION_FEE_DEFAULT,
-            receive_enabled: false,
+            receive_enabled: true,
         }))
     }
 
@@ -97,12 +98,26 @@ impl GatewayConnection for TestGateway {
         &self,
         _gateway_api: SafeUrl,
         _federation_id: FederationId,
-        _contract: IncomingContract,
-        _amount: Amount,
+        contract: IncomingContract,
+        amount: Amount,
         _description: Bolt11InvoiceDescription,
-        _expiry_secs: u32,
+        expiry_secs: u32,
     ) -> Result<Bolt11Invoice, ServerError> {
-        Err(ServerError::InvalidRequest("the test gateway does not receive".into()))
+        let fedimint_lnv2_client::common::contracts::PaymentImage::Hash(hash) = contract.commitment.payment_image else {
+            return Err(ServerError::InvalidRequest("expected BOLT11 hash".into()));
+        };
+        let invoice = InvoiceBuilder::new(Currency::Regtest)
+            .description(String::new())
+            .payment_hash(hash)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(0)
+            .payment_secret(PaymentSecret([0; 32]))
+            .amount_milli_satoshis(amount.msats)
+            .expiry_time(Duration::from_secs(expiry_secs.into()))
+            .build_signed(|m| SECP256K1.sign_ecdsa_recoverable(m, &self.keypair.secret_key()))
+            .expect("valid test invoice");
+        *self.incoming.lock().unwrap() = Some(contract);
+        Ok(invoice)
     }
 
     async fn send_payment(
@@ -176,10 +191,41 @@ async fn close(w: Wallet) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn advertised_mint_without_a_runtime_module_is_retryable() -> anyhow::Result<()> {
+    let fed = build(Fixtures::new_primary(DummyClientInit, DummyInit).with_server_only_module(fedimint_mintv2_server::MintInit)).await?;
+    let result = Wallet::from_client(fed.new_client().await).await;
+    let error = result.err().expect("this client did not initialize the advertised Bitcoin mint");
+    assert!(error.is::<fedimint_card_sidecar::wallet::MintUnavailable>(), "{error:#}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lnv2_pays_refuses_fails_for_certain_and_leaves_the_unanswered_open() -> anyhow::Result<()> {
-    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit).with_module(
+    exercise_lnv2(Fixtures::new_primary(MintClientInit, MintInit), false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mintv2_and_lnv2_pay_receive_replay_and_refund() -> anyhow::Result<()> {
+    exercise_lnv2(Fixtures::new_primary(fedimint_mintv2_client::MintClientInit, fedimint_mintv2_server::MintInit), true).await
+}
+
+/// The Lightning payment can finish before its transaction's ordinary mint change
+/// is issued. Balance assertions take their snapshots after both have settled.
+async fn await_lnv2_change(w: &Wallet, operation_id: &str) -> anyhow::Result<()> {
+    let op = OperationId(hex::decode(operation_id)?.try_into().expect("wallet operation id is 32 bytes"));
+    let entry = w.client.operation_log().get_operation(op).await.expect("wallet knows the payment");
+    let fedimint_lnv2_client::LightningOperationMeta::Send(meta) = entry.try_meta()? else {
+        anyhow::bail!("expected a send operation");
+    };
+    w.client.await_primary_bitcoin_module_outputs(op, meta.change_outpoint_range.into_iter().collect()).await?;
+    Ok(())
+}
+
+async fn exercise_lnv2(fixtures: Fixtures, receive_invoice: bool) -> anyhow::Result<()> {
+    let gateway = Arc::new(TestGateway::new());
+    let fixtures = fixtures.with_module(DummyClientInit, DummyInit).with_module(
         fedimint_lnv2_client::LightningClientInit {
-            gateway_conn: Some(Arc::new(TestGateway::new())),
+            gateway_conn: Some(gateway.clone()),
             custom_meta_fn: Arc::new(|| serde_json::Value::Null),
         },
         fedimint_lnv2_server::LightningInit,
@@ -192,6 +238,35 @@ async fn lnv2_pays_refuses_fails_for_certain_and_leaves_the_unanswered_open() ->
     let w = Wallet::from_client(client).await?;
     assert!(w.lightning().is_err() && w.lightning_v2().is_ok());
 
+    if receive_invoice {
+        use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, WalletLightning};
+        use fedimint_client::transaction::{ClientOutput, ClientOutputBundle};
+        use fedimint_core::module::Amounts;
+        use fedimint_lnv2_client::common::{LightningOutput, LightningOutputV0};
+        let receiver = Wallet::from_client(fed.new_client().await).await?;
+        let topup = WalletLightning { wallet: receiver.clone() };
+        let (op, invoice) = topup.invoice(INVOICE_MSAT, 3600).await?;
+        assert_eq!(invoice.parse::<Bolt11Invoice>()?.amount_milli_satoshis(), Some(INVOICE_MSAT));
+        let contract = gateway.incoming.lock().unwrap().take().expect("invoice registered");
+        assert_eq!(contract.commitment.amount.msats, INVOICE_MSAT - gateway_fee_msat());
+        let before = receiver.balance_msat().await?;
+        let outputs = ClientOutputBundle::new_no_sm(vec![ClientOutput {
+            amounts: Amounts::new_bitcoin(contract.commitment.amount),
+            output: LightningOutput::V0(LightningOutputV0::Incoming(contract)),
+        }])
+        .into_dyn(lnv2);
+        let funded = OperationId::new_random();
+        let change = w
+            .client
+            .finalize_and_submit_transaction(funded, "gateway receive", |_| (), TransactionBuilder::new().with_outputs(outputs))
+            .await?;
+        w.client.await_primary_bitcoin_module_outputs(funded, change.into_iter().collect()).await?;
+        assert!(matches!(tokio::time::timeout(WAIT, topup.wait(op.clone(), u64::MAX)).await??, LnOutcome::Paid));
+        assert_eq!(receiver.ln_receive_settled(&op, WAIT).await?, Some(true));
+        let credited = receiver.balance_msat().await? - before;
+        assert!(credited > INVOICE_MSAT / 2 && credited <= INVOICE_MSAT - gateway_fee_msat());
+    }
+
     // Paid: the preimage and the fee its contract was funded with.
     let payable = invoice(PAYABLE).to_string();
     let before = w.balance_msat().await?;
@@ -199,6 +274,7 @@ async fn lnv2_pays_refuses_fails_for_certain_and_leaves_the_unanswered_open() ->
     let WalletPay::Paid { preimage, fee_msat, operation_id } = &paid else { panic!("{paid:?}") };
     assert_eq!(*preimage, hex::encode(PREIMAGE));
     assert_eq!(*fee_msat, gateway_fee_msat());
+    await_lnv2_change(&w, operation_id).await?;
     let after = w.balance_msat().await?;
     assert!(before - after >= INVOICE_MSAT + gateway_fee_msat(), "{before} -> {after}");
     // Resolved from the client's record, found by the invoice, and paid again: the same payment.
@@ -221,8 +297,9 @@ async fn lnv2_pays_refuses_fails_for_certain_and_leaves_the_unanswered_open() ->
     let unpayable = invoice(UNPAYABLE).to_string();
     let out = w.pay_invoice(&unpayable, gateway_fee_msat(), WAIT).await?;
     let WalletPay::Failed { operation_id: Some(op), insufficient_funds: false, .. } = &out else { panic!("{out:?}") };
+    await_lnv2_change(&w, op).await?;
     let refunded = w.balance_msat().await?;
-    assert!(after - refunded < INVOICE_MSAT, "{after} -> {refunded}: the refund came back");
+    assert!(refunded <= after && after - refunded < INVOICE_MSAT, "{after} -> {refunded}: the refund came back");
     assert_eq!(w.resolve_pay(op, WAIT).await?, out);
     assert_eq!(w.pay_status(&unpayable, WAIT).await?, Some(out.clone()));
 

@@ -259,3 +259,5 @@ pub async fn wait_for_balance(env: &Env, at_least: fedimint_core::Amount) -> Res
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+pub mod ten_msat_mint;

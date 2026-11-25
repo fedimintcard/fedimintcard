@@ -193,14 +193,38 @@ pub trait TopupLightning: Send + Sync {
     fn wait(&self, operation_id: String, expires_at_ms: u64) -> BoxFuture<'static, Result<LnOutcome>>;
 }
 
-/// The federation's `ln` module through the till's wallet.
+/// The federation's Lightning module through the till's wallet.
 pub struct WalletLightning {
     pub wallet: Wallet,
+}
+
+impl WalletLightning {
+    pub async fn invoice_v2(&self, amount_msat: u64, expiry_secs: u64, gateway: Option<&str>) -> Result<(String, String)> {
+        use fedimint_lnv2_client::common::Bolt11InvoiceDescription;
+        let ln = self.wallet.lightning_v2()?;
+        let gateway = match gateway {
+            Some(url) => Some(ln.list_gateways(None).await?.into_iter().find(|g| g.as_str() == url).context("unknown Lightning gateway")?),
+            None => None,
+        };
+        let (invoice, op) = ln
+            .receive(
+                fedimint_core::Amount::from_msats(amount_msat),
+                expiry_secs.try_into()?,
+                Bolt11InvoiceDescription::Direct("fedimintcard top-up".into()),
+                gateway,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok((hex::encode(op.0), invoice.to_string()))
+    }
 }
 
 impl TopupLightning for WalletLightning {
     fn invoice(&self, amount_msat: u64, expiry_secs: u64) -> BoxFuture<'_, Result<(String, String)>> {
         Box::pin(async move {
+            if self.wallet.lightning().is_err() {
+                return self.invoice_v2(amount_msat, expiry_secs, None).await;
+            }
             let ln = self.wallet.lightning()?;
             ln.update_gateway_cache().await.map_err(|e| anyhow!("reading the federation's gateways: {e:?}"))?;
             let gw = ln.select_available_gateway(None, None).await.map_err(|e| anyhow!("no Lightning gateway answers: {e:?}"))?;
@@ -222,6 +246,16 @@ impl TopupLightning for WalletLightning {
             let op = fedimint_core::core::OperationId(
                 hex::decode(&operation_id).ok().and_then(|b| b.try_into().ok()).context("bad operation id")?,
             );
+            let entry = wallet.client.operation_log().get_operation(op).await.context("unknown Lightning receive operation")?;
+            if entry.operation_module_kind() == fedimint_lnv2_client::common::KIND.as_str() {
+                use fedimint_lnv2_client::FinalReceiveOperationState;
+                return Ok(match wallet.lightning_v2()?.await_final_receive_operation_state(op).await? {
+                    FinalReceiveOperationState::Claimed => LnOutcome::Paid,
+                    FinalReceiveOperationState::Expired => LnOutcome::Expired,
+                    FinalReceiveOperationState::Failure => LnOutcome::Failed("Lightning payment claim failed".into()),
+                    FinalReceiveOperationState::Uneconomical => LnOutcome::Failed("Lightning payment was uneconomical to claim".into()),
+                });
+            }
             let ln = wallet.lightning()?;
             let mut updates = ln.subscribe_ln_receive(op).await?.into_stream();
             let mut funded = false;

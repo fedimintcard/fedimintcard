@@ -56,6 +56,20 @@ pub const MAX_INPUTS: usize = 3;
 
 /// The note tiers the till's outputs may use: bit `i` set when a note of 2^`i` msat is there.
 pub type Tiers = u64;
+/// The normal wallet denomination and the smallest card output its mint can redeem.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputFloors {
+    pub preferred: u64,
+    pub minimum: u64,
+}
+
+/// Original mint v1 planning may use a 1 msat output as a last resort.
+impl From<u64> for OutputFloors {
+    fn from(preferred: u64) -> Self {
+        Self { preferred, minimum: 1 }
+    }
+}
+
 /// Every tier: a till's own outputs.
 pub const ALL_TIERS: Tiers = u64::MAX;
 
@@ -304,18 +318,19 @@ fn dfs(
 /// `note_amount - fee(note_amount)`, using only tiers of at least `min_denom` when that can be
 /// balanced exactly and otherwise (second element `true`) allowing smaller ones.
 /// `None` if the note cannot even pay its own fee.
-pub fn cashout(note_amount: u64, fee: FeeFn, min_denom: u64) -> Option<(Vec<u64>, bool)> {
+pub fn cashout(note_amount: u64, fee: FeeFn, limits: impl Into<OutputFloors>) -> Option<(Vec<u64>, bool)> {
+    let limits = limits.into();
     let target = note_amount.checked_sub(fee(note_amount))?;
     if target == 0 {
         return None;
     }
     for last_resort in [false, true] {
         let mut best: Option<(Vec<u64>, bool)> = None;
-        for floor in floors(min_denom, last_resort) {
+        for floor in floors(limits, last_resort) {
             if let Some(v) = min_notes(target, MAX_CASHOUT_NOTES, fee, floor) {
                 // Fewer notes means fewer fees for everyone who touches them afterwards.
                 if best.as_ref().is_none_or(|(b, _)| v.len() < b.len()) {
-                    best = Some((v, floor < min_denom));
+                    best = Some((v, floor < limits.preferred));
                 }
             }
         }
@@ -328,17 +343,19 @@ pub fn cashout(note_amount: u64, fee: FeeFn, min_denom: u64) -> Option<(Vec<u64>
 
 /// Floors to try, highest first: `min_denom`, halving down to 4 msat (every multiple-of-4 fee
 /// schedule balances there). With `last_resort`, only 1 msat.
-fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
+fn floors(limits: OutputFloors, last_resort: bool) -> Vec<u64> {
     if last_resort {
-        return vec![1];
+        return if limits.minimum <= 1 { vec![1] } else { vec![] };
     }
     let mut v = vec![];
-    let mut f = min_denom.max(1);
-    while f > 4 {
+    let mut f = limits.preferred.max(1);
+    while f > 4 && f >= limits.minimum {
         v.push(f);
         f /= 2;
     }
-    v.push(f);
+    if f >= limits.minimum {
+        v.push(f);
+    }
     v
 }
 
@@ -351,13 +368,20 @@ fn floors(min_denom: u64, last_resort: bool) -> Vec<u64> {
 /// Objective, in order: leave [`ROOM_AFTER_CHARGE`] free slots if any plan can (else get as close
 /// as possible), fewest change notes, fewest output notes, fewest inputs (each costs one card
 /// signature, about a second on silicon; at most [`MAX_INPUTS`]), smallest overpay.
-pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64) -> Result<Plan, PlanError> {
-    solve_in(notes, price, free_slots, fee, min_denom, ALL_TIERS)
+pub fn solve(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, floors: impl Into<OutputFloors>) -> Result<Plan, PlanError> {
+    solve_in(notes, price, free_slots, fee, floors, ALL_TIERS)
 }
 
 /// [`solve`] with the till's notes in `tiers` only (the change may use any tier).
-pub fn solve_in(notes: &[u64], price: u64, free_slots: usize, fee: FeeFn, min_denom: u64, tiers: Tiers) -> Result<Plan, PlanError> {
-    solve_surplus(notes, price, free_slots, fee, min_denom, 0, 0, tiers)
+pub fn solve_in(
+    notes: &[u64],
+    price: u64,
+    free_slots: usize,
+    fee: FeeFn,
+    floors: impl Into<OutputFloors>,
+    tiers: Tiers,
+) -> Result<Plan, PlanError> {
+    solve_surplus(notes, price, free_slots, fee, floors.into(), 0, 0, tiers)
 }
 
 /// [`solve_in`] for a transaction whose inputs pay exactly `surplus` msat more than its outputs and
@@ -369,7 +393,7 @@ fn solve_surplus(
     price: u64,
     free_slots: usize,
     fee: FeeFn,
-    min_denom: u64,
+    limits: OutputFloors,
     surplus: u64,
     min_overpay: u64,
     tiers: Tiers,
@@ -380,17 +404,17 @@ fn solve_surplus(
     let mut best: Option<Plan> = None;
     let mut first_err = None;
     let mut tried = Vec::new();
-    for floor in floors(min_denom, false).into_iter().chain(floors(min_denom, true)) {
+    for floor in floors(limits, false).into_iter().chain(floors(limits, true)) {
         if tried.contains(&floor) {
-            continue; // `min_denom == 1`: the last-resort floor is the one already searched
+            continue; // The 1 msat preferred floor already included the last resort.
         }
         tried.push(floor);
-        if floor == 1 && min_denom > 1 && best.is_some() {
+        if floor == 1 && limits.preferred > 1 && best.is_some() {
             break; // 1 msat notes only when nothing larger balances
         }
         match solve_with(notes, price, free_slots, fee, floor, surplus, min_overpay, tiers) {
             Ok(mut p) => {
-                p.dust = floor < min_denom;
+                p.dust = floor < limits.preferred;
                 let key = |p: &Plan| {
                     (
                         room_short(free_slots, p.inputs.len(), p.change.len()),
@@ -719,10 +743,10 @@ pub fn solve_with_margin(
     price: u64,
     free_slots: usize,
     fee: FeeFn,
-    min_denom: u64,
+    floors: impl Into<OutputFloors>,
     headroom: FeeHeadroom,
 ) -> Result<Plan, PlanError> {
-    solve_with_margin_in(notes, price, free_slots, fee, min_denom, headroom, ALL_TIERS)
+    solve_with_margin_in(notes, price, free_slots, fee, floors, headroom, ALL_TIERS)
 }
 
 /// [`solve_with_margin`] with the till's notes in `tiers` only.
@@ -731,11 +755,12 @@ pub fn solve_with_margin_in(
     price: u64,
     free_slots: usize,
     fee: FeeFn,
-    min_denom: u64,
+    floors: impl Into<OutputFloors>,
     headroom: FeeHeadroom,
     tiers: Tiers,
 ) -> Result<Plan, PlanError> {
-    let exact = solve_in(notes, price, free_slots, fee, min_denom, tiers)?;
+    let floors = floors.into();
+    let exact = solve_in(notes, price, free_slots, fee, floors, tiers)?;
     if headroom.is_off() {
         return Ok(exact);
     }
@@ -751,7 +776,7 @@ pub fn solve_with_margin_in(
         if margin == 0 {
             break;
         }
-        let Ok(p) = solve_surplus(notes, price, free_slots, fee, min_denom, margin, min_overpay, tiers) else { break };
+        let Ok(p) = solve_surplus(notes, price, free_slots, fee, floors, margin, min_overpay, tiers) else { break };
         if rank(&p) > rank(&exact) || p.inputs.len() > exact.inputs.len() {
             break;
         }
@@ -859,10 +884,10 @@ pub fn exact_prices_near(
     price: u64,
     free_slots: usize,
     fee: FeeFn,
-    min_denom: u64,
+    floors: impl Into<OutputFloors>,
     step: u64,
 ) -> (Option<u64>, Option<u64>) {
-    exact_prices_near_in(notes, price, free_slots, fee, min_denom, step, ALL_TIERS)
+    exact_prices_near_in(notes, price, free_slots, fee, floors, step, ALL_TIERS)
 }
 
 /// [`exact_prices_near`] with the till's notes in `tiers` only. A candidate whose till side cannot
@@ -873,10 +898,11 @@ pub fn exact_prices_near_in(
     price: u64,
     free_slots: usize,
     fee: FeeFn,
-    min_denom: u64,
+    floors: impl Into<OutputFloors>,
     step: u64,
     tiers: Tiers,
 ) -> (Option<u64>, Option<u64>) {
+    let floors = floors.into();
     let step = step.max(1);
     let n = notes.len().min(MAX_CARD_NOTES);
     let net = |a: u64| a.saturating_sub(fee(a));
@@ -931,7 +957,7 @@ pub fn exact_prices_near_in(
             up = t;
         }
     }
-    let pays = |p: u64| solve_in(notes, p, free_slots, fee, min_denom, tiers).is_ok();
+    let pays = |p: u64| solve_in(notes, p, free_slots, fee, floors, tiers).is_ok();
     let mut below = None;
     let mut above: Option<u64> = None;
     for mut list in [cands, scan] {
@@ -1164,6 +1190,26 @@ mod tests {
         assert!(p.till.iter().chain(&p.change).all(|a| *a >= 512), "{p:?}");
         assert_eq!(p.overpay, 352);
         assert!(p.balances(&[1 << 20], &zero));
+    }
+
+    #[test]
+    fn mint_v2_outputs_clear_the_base_fee_for_sale_offline_and_cashout() {
+        // With a 10 msat fee, 8 msat and smaller inputs cannot be reissued.
+        let fee = |_: u64| 10;
+        let limits = OutputFloors { preferred: 512, minimum: 16 };
+        let notes = [65_536];
+        for p in [
+            solve(&notes, 20_000, 16, &fee, limits).unwrap(),
+            solve_with_margin(&notes, 20_000, 16, &fee, limits, FeeHeadroom::DEFAULT).unwrap(),
+        ] {
+            assert!(p.balances(&notes, &fee));
+            assert!(p.till.iter().chain(&p.change).all(|&amount| amount > 10));
+        }
+        let (out, _) = cashout(notes[0], &fee, limits).unwrap();
+        assert!(out.iter().all(|&amount| amount > 10));
+        assert_eq!(notes[0], out.iter().sum::<u64>() + fee(notes[0]) + fee_sum(&out, &fee));
+        assert!(cashout(32, &fee, limits).is_none());
+        assert!(solve_in(&notes, 1, 16, &fee, limits, 1 | 2 | 4 | 8).is_err());
     }
 
     #[test]

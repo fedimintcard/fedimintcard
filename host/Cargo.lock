@@ -1768,7 +1768,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.104",
 ]
 
 [[package]]
@@ -2414,20 +2414,34 @@ name = "fedimint-card-fed-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "erased-serde",
  "fedimint-api-client",
  "fedimint-card-host-card",
  "fedimint-card-old-card-pin",
+ "fedimint-card-sidecar",
  "fedimint-client",
  "fedimint-core",
  "fedimint-dummy-client",
  "fedimint-dummy-common",
  "fedimint-dummy-server",
+ "fedimint-lnv2-client",
+ "fedimint-lnv2-server",
+ "fedimint-meta-client",
+ "fedimint-meta-server",
+ "fedimint-mint-client",
+ "fedimint-mint-server",
  "fedimint-mintv2-client",
  "fedimint-mintv2-common",
  "fedimint-mintv2-server",
+ "fedimint-server-core",
  "fedimint-tbs",
  "fedimint-testing",
+ "fedimint-walletv2-client",
+ "fedimint-walletv2-server",
+ "reqwest 0.12.28",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2466,6 +2480,7 @@ dependencies = [
  "fedimint-card-host-card",
  "fedimint-core",
  "fedimint-mint-common",
+ "fedimint-mintv2-common",
  "fedimint-tbs",
  "fs4",
  "hex",
@@ -2488,6 +2503,7 @@ dependencies = [
  "clap",
  "fedimint-api-client",
  "fedimint-bip39",
+ "fedimint-card-fed-tests",
  "fedimint-card-host-card",
  "fedimint-card-old-card-pin",
  "fedimint-card-pos-core",
@@ -2501,12 +2517,17 @@ dependencies = [
  "fedimint-ln-server",
  "fedimint-lnv2-client",
  "fedimint-lnv2-server",
+ "fedimint-meta-client",
  "fedimint-mint-client",
  "fedimint-mint-common",
  "fedimint-mint-server",
+ "fedimint-mintv2-client",
+ "fedimint-mintv2-common",
+ "fedimint-mintv2-server",
  "fedimint-rocksdb",
  "fedimint-tbs",
  "fedimint-testing",
+ "fedimint-walletv2-client",
  "futures",
  "hex",
  "lightning-invoice",
@@ -3270,6 +3291,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-meta-client"
+version = "0.13.0"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
+dependencies = [
+ "async-trait",
+ "erased-serde",
+ "fedimint-api-client",
+ "fedimint-client-module",
+ "fedimint-core",
+ "fedimint-logging",
+ "fedimint-meta-common",
+ "futures",
+ "serde",
+ "serde_json",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-meta-common"
+version = "0.13.0"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
+dependencies = [
+ "fedimint-core",
+ "fedimint-logging",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-meta-server"
+version = "0.13.0"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-logging",
+ "fedimint-meta-common",
+ "fedimint-server-core",
+ "futures",
+ "rand 0.8.8",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
+ "tracing",
+]
+
+[[package]]
 name = "fedimint-metrics"
 version = "0.13.0"
 source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
@@ -3397,7 +3473,6 @@ dependencies = [
 [[package]]
 name = "fedimint-mintv2-common"
 version = "0.13.0"
-source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
 dependencies = [
  "bitcoin_hashes",
  "fedimint-core",
@@ -3794,6 +3869,30 @@ dependencies = [
  "secp256k1",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fedimint-walletv2-server"
+version = "0.13.0"
+source = "git+https://github.com/fedimint/fedimint?tag=v0.13.0#264ebf22b698c158055bcdd80d5b586fdb48d1fc"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitcoin",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-logging",
+ "fedimint-metrics",
+ "fedimint-server-core",
+ "fedimint-walletv2-common",
+ "futures",
+ "miniscript",
+ "rand 0.8.8",
+ "secp256k1",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.28.0",
+ "tracing",
 ]
 
 [[package]]

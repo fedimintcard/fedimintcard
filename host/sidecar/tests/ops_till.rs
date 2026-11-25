@@ -12,6 +12,9 @@
 //! OPS_TEST_URL=http://127.0.0.1:8799 cargo test -p fedimint-card-sidecar --test ops_till
 //! ```
 //!
+//! Set `CARD_TEST_MINT=v2` to run these cases with a Bitcoin mint v2 federation at 10 msat per item.
+//! The default is a mint v1 federation.
+//!
 //! O4 adds the holder's side: a card loaded by the reference loader (`holder.rs`) from a wallet of
 //! its own, then charged at a till; and a load whose signatures are forged, refused by ops.
 //!
@@ -209,7 +212,12 @@ async fn federation() -> anyhow::Result<FederationTest> {
         std::env::var_os("FM_TEST_USE_REAL_DAEMONS").is_none(),
         "FM_TEST_USE_REAL_DAEMONS is set: these tests need the in-process fake bitcoin backend"
     );
-    let fixtures = Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fixtures = match std::env::var("CARD_TEST_MINT").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("v1") => Fixtures::new_primary(MintClientInit, MintInit),
+        Ok("v2") => Fixtures::new_primary(fedimint_mintv2_client::MintClientInit, fedimint_card_fed_tests::ten_msat_mint::TenMsatMint),
+        _ => anyhow::bail!("CARD_TEST_MINT must be v1 or v2"),
+    }
+    .with_module(DummyClientInit, DummyInit);
     Ok(tokio::time::timeout(Duration::from_secs(60), fixtures.new_fed_builder(0).build()).await?)
 }
 
@@ -660,7 +668,7 @@ async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -
     let err = till.ops.client.slot_keys(&short_id, &[(8, other)]).await.expect_err("slot 8 has a key");
     assert!(matches!(err, fedimint_card_sidecar::ops::OpsError::Changed(_)), "{err}");
 
-    // A holder load through the till: twelve notes, KEY_AHEAD free, so 9 short plus KEY_AHEAD.
+    // A holder load through the till uses only the slots available for loads.
     let before = unkeyed(&reg.state(&short_id).await?);
     let free = reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?;
     let free_n = free["free"].as_array().unwrap().len();
@@ -668,17 +676,21 @@ async fn a_split_keyed_card_is_keyed_by_the_till_at_the_taps_that_need_slots() -
     let r = load.load(&mut Shared(card.clone()), &[(1 << 24) - (1 << 12)]).await?;
     assert_eq!(r.notes.len(), 12);
     let s = reg.state(&short_id).await?;
-    let n = 12 - free_n + KEY_AHEAD;
+    let available = free["unkeyed_slots"].as_array().unwrap().len();
+    let n = (12 - free_n + KEY_AHEAD).min(available);
     assert_eq!(unkeyed(&s), before[n..].to_vec(), "{s}");
 
-    // The till's own load (a top-up from its wallet) keys the same way.
-    let free_n =
-        reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?["free"].as_array().unwrap().len();
-    let before = unkeyed(&s);
+    // A second split-keyed card has room for the till's own load on either mint.
+    let card = Rc::new(RefCell::new(SoftCard::v4()));
+    let short_id = reg.provision_split(&card).await?;
+    let free = reg.http.get(format!("{}/cards/{short_id}/slots", reg.url)).send().await?.json::<Value>().await?;
+    let free_n = free["free"].as_array().unwrap().len();
+    let before = unkeyed(&reg.state(&short_id).await?);
     let notes = free_n + 2;
     let amounts: Vec<u64> = (0..notes as u32).map(|i| 1u64 << (12 + i)).collect();
     till.load(&card, &[amounts.iter().sum()]).await?;
     let s = reg.state(&short_id).await?;
-    assert_eq!(unkeyed(&s), before[(2 + KEY_AHEAD).min(before.len())..].to_vec(), "{s}");
+    let want = before.into_iter().skip(2 + KEY_AHEAD).filter(|s| !spares.contains(s)).collect::<Vec<_>>();
+    assert_eq!(unkeyed(&s), want, "{s}");
     Ok(())
 }

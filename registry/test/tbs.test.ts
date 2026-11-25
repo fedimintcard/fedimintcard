@@ -30,6 +30,16 @@ describe('Note::verify', () => {
     }
   });
 
+  it('verifies mint v2 signatures using the Rust nonce hash and keeps both schemes distinct', () => {
+    for (const n of vectors.notes) {
+      const pk = parsePublicKey(n.pk)!;
+      expect(toHex(messageOf(fromHex(n.nonce), 'v2').toBytes())).toBe(n.v2_message);
+      expect(verifyNotes([{nonce: n.nonce, signature: n.v2_signature, pk}], 'v2')).toBe(true);
+      expect(verifyNotes([{nonce: n.nonce, signature: n.signature, pk}], 'v2')).toBe(false);
+      expect(verifyNote(n.nonce, n.v2_signature, pk)).toBe(false);
+    }
+  });
+
   it('refuses the wrong tier, another nonce, a flipped bit and a non-point', () => {
     const [a, b] = vectors.notes;
     expect(verifyNote(a!.nonce, a!.signature, parsePublicKey(a!.other_tier_pk)!)).toBe(false);

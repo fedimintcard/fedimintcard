@@ -44,7 +44,7 @@ use tbs::BlindingKey;
 use crate::glue::{card_outputs, nonce_for, on_card};
 use crate::ops::{OpsClient, OpsError, RemoteSlot, short_id_of};
 use crate::plan;
-use crate::shares::{self, FETCH_TIMEOUT, blind};
+use crate::shares::{self, FETCH_TIMEOUT};
 use crate::state::{LoadNote, write_private_json};
 use crate::wallet::Wallet;
 
@@ -240,6 +240,7 @@ impl<'w> Loader<'w> {
         let short_id = short_id_of(&slot0);
         let mut free = self.ops.free_slots(&short_id).await.context("asking ops for the card's free slots")?;
         let ours = self.wallet.federation_id().to_string();
+        ensure!(free.mint_version == self.wallet.mint_version, "the registry mint version differs from this wallet");
         ensure!(free.federation_id == ours, "card {short_id} belongs to federation {}, and this wallet is in {ours}", free.federation_id);
         if let Some(keyer) = &self.keyer {
             let n = crate::ops::slots_to_key(notes.len(), free.free.len(), free.unkeyed_slots.len());
@@ -280,7 +281,7 @@ impl<'w> Loader<'w> {
         let client = &self.wallet.client;
         let op = OperationId::new_random();
         let mut dbtx = client.db().begin_transaction().await;
-        let bundle = card_outputs(self.wallet, outs.iter().map(|o| (o.amount, blind(o.nonce, o.key))));
+        let bundle = card_outputs(self.wallet, outs.iter().map(|o| (o.amount, self.wallet.mint_version.blind(o.nonce, o.key))))?;
         let range = client
             .finalize_and_submit_transaction_dbtx(
                 &mut dbtx.to_ref_nc(),

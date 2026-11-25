@@ -946,6 +946,22 @@ describe('O4: mint keys, and every live note verified', () => {
     expect(((await (await get('/registry/federations', token)).json()) as {federations: unknown[]}).federations).toEqual([]);
   });
 
+  it('records each federation’s mint scheme with its keys and preserves it on replay', async () => {
+    const token = await signIn();
+    const till = await newTill(token);
+    const report = {federation_id: 'c'.repeat(64), tbs_pks: TBS_PKS, mint_version: 'v2'};
+    const v2 = '/federations/mintv2';
+    expect((await post(v2, token, report)).status).toBe(403);
+    expect((await post('/federations', till.token, report)).status).toBe(400);
+    expect((await post(v2, till.token, {...report, federation_id: FED, name: 'invalid update'})).status).toBe(409);
+    expect(await (await get('/registry/federations', token)).json()).toMatchObject({federations: []});
+    const registered = await post(v2, till.token, report);
+    expect(registered.status).toBe(200);
+    expect(await registered.json()).toEqual({ok: true, mint_version: 'v2', federation_id: report.federation_id});
+    expect((await post(v2, till.token, report)).status).toBe(200);
+    expect((await post('/federations', till.token, {...report, mint_version: 'v1'})).status).toBe(409);
+  });
+
   it('refuses a till’s outcome whose change signature the federation did not make, and changes nothing', async () => {
     const token = await signIn();
     const till = await newTill(token);
@@ -1020,6 +1036,30 @@ describe('O4: holder loading', () => {
     expect(body.federation_id).toBe(FED);
     expect((body.free as {slot: number}[]).map(f => f.slot)).toEqual([0, 1, 3, 4, 5, 6, 7]);
     expect(JSON.stringify(body)).not.toMatch(/amount|signature|notes|2048000/);
+  });
+
+  it('certifies a mint v2 holder note only after its v2 signature verifies', async () => {
+    const token = await signIn();
+    const till = await (await post('/tills', token, {name: 'v2 till'})).json() as {token: string};
+    const amount = 1024;
+    const pk = toHex(bls12_381.G2.Point.BASE.multiply(tierSecret(amount)).toBytes());
+    expect((await post('/federations/mintv2', till.token, {federation_id: FED, tbs_pks: {[amount]: pk}})).status).toBe(200);
+    const shortId = '1a2b3c4d';
+    expect((await post('/registry/cards', token, card({short_id: shortId, batch_id: await newBatch(token)}))).status).toBe(200);
+    expect(await slotsOf(shortId)).toMatchObject({mint_version: 'v2'});
+    expect(await state(till.token, shortId)).toMatchObject({federation_id: FED, mint_version: 'v2'});
+    const notes: [number, number][] = [[1, amount]];
+    expect((await post(`/cards/${shortId}/load`, null, load(shortId, 0, notes))).status).toBe(200);
+    const outcome = signed(shortId, notes);
+    const path = `/cards/${shortId}/load/outcome`;
+    expect((await post(path, null, outcome)).status).toBe(422);
+    expect((await state(till.token, shortId)).notes[0]?.status).toBe('pending');
+    const note = outcome.notes[0]!;
+    note.signature = toHex(messageOf(fromHex(note.nonce), 'v2').multiply(tierSecret(amount)).toBytes());
+    const accepted = await post(path, null, outcome);
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toMatchObject({notes: [{nonce: note.nonce, reg_sig: expect.stringMatching(/^30[0-9a-f]+$/)}]});
+    expect((await state(till.token, shortId)).notes[0]?.status).toBe('live');
   });
 
   it('answers 404 for an unknown card, and 400 for a malformed short id', async () => {

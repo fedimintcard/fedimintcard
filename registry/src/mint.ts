@@ -10,7 +10,7 @@
  * its batch's federation, under its operator.
  */
 import {BadRequest, Conflict, isHex, Unprocessable} from './http';
-import {parsePublicKey, verifyNotes, type NoteCheck} from './tbs';
+import {parsePublicKey, verifyNotes, type NoteCheck, type MintVersion} from './tbs';
 
 type Sql = SqlStorage;
 
@@ -51,13 +51,14 @@ export function putMintKeys(
   federationId: string,
   raw: unknown,
   now: number,
+  version: MintVersion = 'v1',
 ): boolean {
   const tiers = parseTiers(raw);
   const prior = sql
-    .exec('SELECT tbs_pks FROM federation_keys WHERE operator_id = ? AND federation_id = ?', operatorId, federationId)
-    .toArray()[0] as {tbs_pks: string} | undefined;
+    .exec('SELECT tbs_pks, mint_version FROM federation_keys WHERE operator_id = ? AND federation_id = ?', operatorId, federationId)
+    .toArray()[0] as {tbs_pks: string; mint_version: MintVersion} | undefined;
   if (prior) {
-    if (prior.tbs_pks === tiers) {
+    if (prior.tbs_pks === tiers && prior.mint_version === version) {
       return false;
     }
     throw new Conflict(`federation ${federationId} already has other mint keys on record`);
@@ -68,45 +69,47 @@ export function putMintKeys(
     }
   }
   sql.exec(
-    'INSERT INTO federation_keys (operator_id, federation_id, tbs_pks, updated_at) VALUES (?, ?, ?, ?)',
+    'INSERT INTO federation_keys (operator_id, federation_id, tbs_pks, updated_at, mint_version) VALUES (?, ?, ?, ?, ?)',
     operatorId,
     federationId,
     tiers,
     now,
+    version,
   );
   return true;
 }
 
 /** The card's federation and operator, through its batch; null for no such card. */
-export function cardFederation(sql: Sql, shortId: string): {operator_id: number; federation_id: string} | null {
+export function cardFederation(sql: Sql, shortId: string): {operator_id: number; federation_id: string; mint_version: MintVersion | null} | null {
   const row = sql
     .exec(
-      'SELECT b.operator_id, b.federation_id FROM cards c JOIN batches b ON b.batch_id = c.batch_id WHERE c.short_id = ?',
+      `SELECT b.operator_id, b.federation_id, k.mint_version FROM cards c JOIN batches b ON b.batch_id = c.batch_id
+       LEFT JOIN federation_keys k ON k.operator_id = b.operator_id AND k.federation_id = b.federation_id WHERE c.short_id = ?`,
       shortId,
     )
-    .toArray()[0] as {operator_id: number; federation_id: string} | undefined;
-  return row ? {operator_id: Number(row.operator_id), federation_id: String(row.federation_id)} : null;
+    .toArray()[0] as {operator_id: number; federation_id: string; mint_version: MintVersion | null} | undefined;
+  return row ?? null;
 }
 
 /** The tier keys of the card's federation; an Unprocessable when no till has reported them. */
-export function mintKeysFor(sql: Sql, shortId: string): Map<string, string> {
+export function mintKeysFor(sql: Sql, shortId: string): {tiers: Map<string, string>; version: MintVersion} {
   const fed = cardFederation(sql, shortId);
   const row = fed
     ? (sql
-        .exec('SELECT tbs_pks FROM federation_keys WHERE operator_id = ? AND federation_id = ?', fed.operator_id, fed.federation_id)
-        .toArray()[0] as {tbs_pks: string} | undefined)
+        .exec('SELECT tbs_pks, mint_version FROM federation_keys WHERE operator_id = ? AND federation_id = ?', fed.operator_id, fed.federation_id)
+        .toArray()[0] as {tbs_pks: string; mint_version: MintVersion} | undefined)
     : undefined;
   if (!row) {
     throw new Unprocessable(
       `the mint keys of card ${shortId}'s federation are not on record yet; a till of its operator reports them at startup`,
     );
   }
-  return new Map(Object.entries(JSON.parse(row.tbs_pks) as Record<string, string>));
+  return {tiers: new Map(Object.entries(JSON.parse(row.tbs_pks) as Record<string, string>)), version: row.mint_version};
 }
 
 /** Whether the card's federation has a note tier of `amountMsat`. */
-export function isTier(keys: Map<string, string>, amountMsat: number): boolean {
-  return keys.has(String(amountMsat));
+export function isTier(keys: ReturnType<typeof mintKeysFor>, amountMsat: number): boolean {
+  return keys.tiers.has(String(amountMsat));
 }
 
 /**
@@ -123,14 +126,14 @@ export function checkNotes(
   }
   const keys = mintKeysFor(sql, shortId);
   const checks: NoteCheck[] = notes.map(n => {
-    const hex = keys.get(String(n.amount_msat));
+    const hex = keys.tiers.get(String(n.amount_msat));
     const pk = hex === undefined ? null : parsePublicKey(hex);
     if (!pk) {
       throw new Unprocessable(`${n.amount_msat} msat is not a note tier of card ${shortId}'s federation`);
     }
     return {nonce: n.nonce, signature: n.signature, pk};
   });
-  if (!verifyNotes(checks)) {
+  if (!verifyNotes(checks, keys.version)) {
     throw new Unprocessable('a note signature does not verify under the federation’s key for its amount; nothing was recorded');
   }
 }
