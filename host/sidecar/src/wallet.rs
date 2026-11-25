@@ -1,8 +1,8 @@
 //! The till's persistent Fedimint client, Bitcoin eCash, and Lightning operations.
 
 mod fee_inclusive;
-mod topup_costs;
 mod mint;
+mod topup_costs;
 pub use fedimint_card_pos_core::mint::MintVersion;
 pub use mint::{CardMintConfig, MintUnavailable, UnsupportedMint, encode_v2_ecash};
 
