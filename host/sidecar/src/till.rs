@@ -2169,8 +2169,18 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
         if had.for_card != for_card {
             return Reply::fail(409, "client_ref_conflict", "this top-up reference was used for a different card");
         }
-        if had.state == TopupState::Waiting && had.quote.is_some() && !supports_quote {
-            return topup_quote_version();
+        if had.state == TopupState::Waiting && had.quote.is_some() {
+            if !supports_quote {
+                return topup_quote_version();
+            }
+            if crate::topup::now_ms() >= had.expires_at_ms {
+                // Payment may already be in flight. Keep watching this receipt and its hold.
+                return Reply::fail(
+                    409,
+                    "topup_settlement_pending",
+                    "The payment window has closed. Check this top-up again for its outcome.",
+                );
+            }
         }
         return Reply::ok(had.to_json());
     }
@@ -2223,7 +2233,11 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
     if let Err(e) = quote.validate(amount) {
         return Reply::fail(503, "topup_quote_unavailable", format!("The invoice quote could not be verified: {e:#}"));
     }
+    let admission = h.wallet.spend.exclusive().await;
     let now = crate::topup::now_ms();
+    if now >= invoice.expires_at_ms {
+        return Reply::fail(503, "topup_quote_unavailable", "The payment window closed before the quote was ready. Request a fresh quote.");
+    }
     let rec = TopupRec {
         topup_id: crate::topup::new_id(),
         client_ref: req.client_ref,
@@ -2233,7 +2247,7 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
         invoice: invoice.invoice,
         operation_id: invoice.operation_id,
         created_at_ms: now,
-        expires_at_ms: now + crate::topup::INVOICE_EXPIRY_SECS * 1000,
+        expires_at_ms: invoice.expires_at_ms,
         state: TopupState::Waiting,
         load_txid: None,
         load_operation_id: None,
@@ -2242,7 +2256,6 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
         detail: None,
         for_card,
     };
-    let admission = h.wallet.spend.exclusive().await;
     if let Err(e) = t.store.lock().unwrap().insert(rec.clone()) {
         return error_reply(&e);
     }

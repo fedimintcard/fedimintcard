@@ -225,7 +225,7 @@ impl Wallet {
 impl WalletLightning {
     pub(crate) async fn fee_inclusive_invoice(&self, face_msat: u64, expiry_secs: u64) -> Result<TopupInvoice> {
         let pricing = self.wallet.card_topup_pricing(face_msat).await?;
-        let (quote, invoice, op) = if let Ok(ln) = self.wallet.lightning() {
+        let (quote, invoice, op, contract_expiry) = if let Ok(ln) = self.wallet.lightning() {
             // LN v1's incoming offer requires the entire advertised amount in
             // the contract. The gateway's outgoing routing fees do not apply.
             ln.update_gateway_cache().await.map_err(|e| anyhow!("reading the federation's gateways: {e:?}"))?;
@@ -240,7 +240,7 @@ impl WalletLightning {
                 .create_bolt11_invoice(Amount::from_msats(q.gross), desc, Some(expiry_secs), (), Some(gw))
                 .await
                 .map_err(|e| anyhow!("the gateway made no invoice: {e:?}"))?;
-            (q, invoice, op)
+            (q, invoice, op, None)
         } else {
             let ln = self.wallet.lightning_v2()?;
             let mut selected = None;
@@ -268,10 +268,18 @@ impl WalletLightning {
                     serde_json::Value::Null,
                 )
                 .await?;
-            (q, invoice, op)
+            let entry = self.wallet.client.operation_log().get_operation(op).await.context("missing Lightning receive operation")?;
+            let fedimint_lnv2_client::LightningOperationMeta::Receive(receive) = entry.try_meta()? else {
+                bail!("the Lightning operation is not an incoming invoice")
+            };
+            (q, invoice, op, Some(receive.contract.commitment.expiration_or_fee))
         };
         ensure!(invoice.amount_milli_satoshis() == Some(quote.gross), "the gateway returned an invoice for a different amount");
+        let signed_deadline = invoice.expires_at().context("the Lightning invoice expiry is out of range")?.as_secs();
+        let deadline = contract_expiry.map_or(signed_deadline, |contract| signed_deadline.min(contract));
+        let expires_at_ms = deadline.checked_mul(1000).context("the Lightning invoice expiry is out of range")?;
         Ok(TopupInvoice {
+            expires_at_ms,
             operation_id: hex::encode(op.0),
             invoice: invoice.to_string(),
             invoice_amount_msat: quote.gross,

@@ -88,6 +88,7 @@ async fn v1_topup(fee_bearing: bool) -> Result<()> {
     assert_eq!(q["amount_msat"], face);
     assert_eq!(gross, face + fee);
     assert_eq!(invoice.amount_milli_satoshis(), Some(gross));
+    assert_eq!(q["expires_at_ms"], invoice.expires_at().unwrap().as_secs() * 1000);
     assert_eq!(fee > 0, fee_bearing);
     // Use the same guard and offer-to-contract operation as an LN-v1 gateway.
     let (output, amount, _) =

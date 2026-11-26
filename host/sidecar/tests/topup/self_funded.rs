@@ -29,6 +29,7 @@ struct Gateway {
     federation_id: FederationId,
     contract: Mutex<Option<IncomingContract>>,
     invoices: AtomicUsize,
+    signed_lifetime_secs: AtomicU64,
 }
 
 async fn terms(State(g): State<Arc<Gateway>>, Json(fed): Json<FederationId>) -> Json<Option<RoutingInfo>> {
@@ -58,7 +59,7 @@ async fn invoice(State(g): State<Arc<Gateway>>, Json(req): Json<CreateBolt11Invo
         .min_final_cltv_expiry_delta(0)
         .payment_secret(PaymentSecret([0; 32]))
         .amount_milli_satoshis(req.amount.msats)
-        .expiry_time(Duration::from_secs(req.expiry_secs.into()))
+        .expiry_time(Duration::from_secs(g.signed_lifetime_secs.load(Ordering::SeqCst)))
         .build_signed(|m| SECP256K1.sign_ecdsa_recoverable(m, &g.key.secret_key()))
         .unwrap();
     assert!(g.contract.lock().unwrap().replace(req.contract).is_none());
@@ -159,6 +160,8 @@ async fn first_topup(mint: MintVersion, restart: bool, overlapping: bool) -> Res
         federation_id: fed.id(),
         contract: Mutex::new(None),
         invoices: AtomicUsize::new(0),
+        // Normal responses deliberately outlive the actual funding contract.
+        signed_lifetime_secs: AtomicU64::new(3600),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = SafeUrl::parse(&format!("http://{}", listener.local_addr()?))?;
@@ -195,6 +198,17 @@ async fn first_topup(mint: MintVersion, restart: bool, overlapping: bool) -> Res
     let (_, before) = call(addr, "GET", "/v1/status", None, None).await;
     assert_eq!(before["wallet_balance_msat"], 0);
     let request = json!({"fee_quote_version":1,"amount_msat":2_100_000,"short_id":short_id,"client_ref":"first"});
+    if restart {
+        // A late gateway response has already lost its entire signed payment window.
+        // Nothing from it becomes payable on the POS; the same reference can request fresh terms.
+        gateway.signed_lifetime_secs.store(0, Ordering::SeqCst);
+        let (code, rejected) = call(addr, "POST", CREATE, None, Some(request.clone())).await;
+        assert_eq!((code, rejected["error"].as_str()), (503, Some("topup_quote_unavailable")), "{rejected}");
+        assert!(rejected.get("invoice").is_none());
+        assert!(TopupStore::open(TopupStore::path_in(dir.path()))?.all().is_empty());
+        gateway.contract.lock().unwrap().take().unwrap();
+        gateway.signed_lifetime_secs.store(90, Ordering::SeqCst);
+    }
     let (code, quote) = call(addr, "POST", CREATE, None, Some(request.clone())).await;
     assert_eq!(code, 200, "{quote}");
     let face = quote["amount_msat"].as_u64().unwrap();
@@ -206,9 +220,16 @@ async fn first_topup(mint: MintVersion, restart: bool, overlapping: bool) -> Res
     assert_eq!(gross, face + fee);
     assert!(fee >= GATEWAY_FEE_MSAT);
     assert_eq!(quote["fee_quote_version"], 1);
-    assert_eq!(quote["invoice"].as_str().unwrap().parse::<Bolt11Invoice>()?.amount_milli_satoshis(), Some(gross));
+    let signed: Bolt11Invoice = quote["invoice"].as_str().unwrap().parse()?;
+    assert_eq!(signed.amount_milli_satoshis(), Some(gross));
     let id = quote["topup_id"].as_str().unwrap();
     let contract = gateway.contract.lock().unwrap().take().unwrap();
+    let signed_deadline = signed.expires_at().unwrap().as_secs();
+    let contract_deadline = contract.commitment.expiration_or_fee;
+    assert_eq!(signed_deadline < contract_deadline, restart);
+    let deadline_ms = 1000 * signed_deadline.min(contract_deadline);
+    assert_eq!(quote["expires_at_ms"], deadline_ms);
+    assert_eq!(TopupStore::open(TopupStore::path_in(dir.path()))?.get(id).unwrap().expires_at_ms, deadline_ms);
     let second = if overlapping {
         // Two independent customers can have payable invoices before either has paid.
         let request = json!({"fee_quote_version":1,"amount_msat":1_024_000,"short_id":short_id,"client_ref":"second"});
@@ -230,7 +251,8 @@ async fn first_topup(mint: MintVersion, restart: bool, overlapping: bool) -> Res
     let (s, replay) = call(addr, "POST", CREATE, None, Some(request)).await;
     assert_eq!(s, 200, "{replay}");
     assert_eq!(replay["invoice"], quote["invoice"]);
-    assert_eq!(gateway.invoices.load(Ordering::SeqCst), if overlapping { 2 } else { 1 });
+    assert_eq!(replay["expires_at_ms"], deadline_ms);
+    assert_eq!(gateway.invoices.load(Ordering::SeqCst), 1 + usize::from(restart) + usize::from(overlapping));
     let (link, phone) = open_link(addr, card.clone()).await;
     let load_url = format!("/v1/topup/{id}/load");
     let (s, load) = call(addr, "POST", &load_url, Some(&link), None).await;

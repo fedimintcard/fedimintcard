@@ -72,7 +72,8 @@ impl TopupLightning for FakeLn {
             let topup_fee_msat = 3_644;
             let invoice_amount_msat = face_msat + topup_fee_msat;
             let (operation_id, invoice) = self.invoice(invoice_amount_msat, expiry_secs).await?;
-            Ok(TopupInvoice { operation_id, invoice, invoice_amount_msat, topup_fee_msat, load_fee_bound_msat: 60 })
+            let expires_at_ms = fedimint_card_sidecar::topup::now_ms() + expiry_secs * 1000;
+            Ok(TopupInvoice { operation_id, invoice, invoice_amount_msat, expires_at_ms, topup_fee_msat, load_fee_bound_msat: 60 })
         })
     }
 
@@ -1053,6 +1054,29 @@ async fn a_legacy_paid_topup_keeps_its_original_invoice_and_an_accepted_load_can
             assert_eq!(loaded["load_txid"], "accepted-before-restart");
         }
         assert!(f.registry.loads.lock().unwrap().is_empty());
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_quote_replay_waits_for_its_original_payment() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    with_actor(actor, async move {
+        let request = json!({"amount_msat": 100_000, "client_ref": "closing-window"});
+        let (_, quote) = create_quote(f.addr, request.clone()).await;
+        let id = quote["topup_id"].as_str().unwrap();
+        f.topups.store.lock().unwrap().update(id, |r| r.expires_at_ms = 1).unwrap();
+        let (code, closed) = create_quote(f.addr, request.clone()).await;
+        assert_eq!((code, closed["error"].as_str()), (409, Some("topup_settlement_pending")));
+        assert!(closed.get("invoice").is_none());
+        assert_eq!(f.topups.get(id).unwrap().state, TopupState::Waiting);
+        f.ln.settle(&op_of(&f.topups, id), LnOutcome::Paid);
+        until_state(f.addr, id, "paid").await;
+        let (_, settled) = create_quote(f.addr, request).await;
+        assert_eq!(settled["topup_id"], id);
+        assert_eq!(settled["state"], "paid");
         assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
     })
     .await;

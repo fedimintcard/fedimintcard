@@ -112,6 +112,8 @@ impl RealizedTopupCosts {
 }
 
 pub struct TopupInvoice {
+    /// Earlier of the signed invoice expiry and its incoming contract's funding deadline.
+    pub expires_at_ms: u64,
     pub operation_id: String,
     pub invoice: String,
     pub invoice_amount_msat: u64,
