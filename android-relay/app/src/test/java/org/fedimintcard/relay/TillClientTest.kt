@@ -177,20 +177,51 @@ class TillClientTest {
         }
     }
 
+    // BOLT 11's signed 250,000-sat coffee invoice.
+    private val invoice = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh"
+    private val quoteBody = """{"ok":true,"topup_id":"t1","amount_msat":249900000,"invoice_amount_msat":250000000,"topup_fee_msat":100000,"fee_quote_version":1,"invoice":"$invoice","expires_at_ms":99,"state":"waiting"}"""
+
     @Test fun createTopUpOk() {
-        val f = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":100352,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
-        val r = TillClient({ "http://h:1" }, f, { "tok" }).createTopUp(100_000, "r1") as TopUpReply.Ok
-        assertEquals(TopUp("t1", 100_352, "lnbc1", 99, "waiting"), r.value)
-        assertEquals("POST", f.method); assertEquals("http://h:1/v1/topup", f.url)
-        assertTrue(f.body!!.contains("\"amount_msat\":100000")); assertTrue(f.body!!.contains("\"client_ref\":\"r1\""))
+        val f = HeaderFake(raw(200, quoteBody))
+        val r = TillClient({ "http://h:1" }, f, { "tok" }).createTopUp(249_900_000, "r1") as TopUpReply.Ok
+        assertEquals(TopUp("t1", 249_900_000, invoice, 99, "waiting", TopUpQuote(250_000_000, 100_000)), r.value)
+        assertEquals("POST", f.method); assertEquals("http://h:1/v1/topup/fee-inclusive", f.url)
+        assertTrue(f.body!!.contains("\"fee_quote_version\":1"))
+        assertTrue(f.body!!.contains("\"amount_msat\":249900000")); assertTrue(f.body!!.contains("\"client_ref\":\"r1\""))
         assertEquals("Bearer tok", f.headers["Authorization"])
     }
 
+    @Test fun unverifiedQuotesNeverReachThePaymentScreen() {
+        val malformed = listOf(
+            quoteBody.replace("\"fee_quote_version\":1,", ""),
+            quoteBody.replace("\"fee_quote_version\":1", "\"fee_quote_version\":2"),
+            quoteBody.replace("249900000", "249899999"),
+            quoteBody.replace("249900000", "249900000.5"),
+            quoteBody.replace("249900000", "9223372036854775808"),
+            quoteBody.replace("250000000", "249999999").replace("249900000", "249899999"),
+            quoteBody.replace(invoice, invoice.dropLast(1) + "q"),
+        )
+        for (body in malformed) assertEquals(TopUpProblem.UNVERIFIED_QUOTE, topUpProblem(parseTopUp(200, body)))
+        assertEquals(TopUpProblem.UNVERIFIED_QUOTE, topUpProblem(parseTopUp(405, "")))
+    }
+
+    @Test fun alreadyPaidLegacyReplayNeedsNoNewInvoice() {
+        val old = """{"ok":true,"topup_id":"old","state":"paid","amount_msat":100352}"""
+        assertEquals(TopUpReply.Ok(TopUp("old", 100_352, "", 0, "paid")), parseTopUp(200, old))
+    }
+
+    @Test fun zeroFeeQuoteStillVerifiesTheSignedTotal() {
+        val free = quoteBody.replace("249900000", "250000000")
+            .replace("\"topup_fee_msat\":100000", "\"topup_fee_msat\":0")
+        val t = (parseTopUp(200, free) as TopUpReply.Ok).value
+        assertEquals(TopUpQuote(t.amountMsat, 0), t.quote)
+    }
+
     @Test fun createTopUpSendsTheCard() {
-        val f = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
+        val f = HeaderFake(raw(200, quoteBody))
         TillClient({ "http://h:1" }, f, { "tok" }).createTopUp(100_000, "r1", "6f94b19b") as TopUpReply.Ok
         assertTrue(f.body!!.contains("\"short_id\":\"6f94b19b\""))
-        val g = HeaderFake(raw(200, """{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"""))
+        val g = HeaderFake(raw(200, quoteBody))
         TillClient({ "http://h:1" }, g, { "tok" }).createTopUp(100_000, "r1")
         assertFalse(g.body!!.contains("short_id"))
     }

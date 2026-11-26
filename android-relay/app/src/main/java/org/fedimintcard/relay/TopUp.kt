@@ -1,12 +1,16 @@
 package org.fedimintcard.relay
 
-/** A top-up the till made (`POST /v1/topup`, docs/TOPUP.md): the invoice is for [amountMsat]. */
+data class TopUpQuote(val invoiceAmountMsat: Long, val topupFeeMsat: Long)
+
+/** The face amount goes on the card. A payable invoice also requires verified fee terms. */
 data class TopUp(
     val topupId: String,
     val amountMsat: Long,
     val invoice: String,
     val expiresAtMs: Long,
     val state: String,
+    val quote: TopUpQuote? = null,
+    val loadTxid: String? = null,
 )
 
 /**
@@ -43,7 +47,7 @@ sealed class TopUpReply<out T> {
 /** Why a top-up step failed, in the terms the screen needs. */
 enum class TopUpProblem {
     /** Unpaid at expiry: nothing moved. */
-    EXPIRED,
+    EXPIRED, UNVERIFIED_QUOTE,
     /** The card has no room for the notes; the top-up stays paid. */
     CARD_FULL,
     /** The card has no free slot, found before any invoice was made: nothing was paid. */
@@ -65,6 +69,7 @@ fun topUpProblem(r: TopUpReply<*>): TopUpProblem = when (r) {
         is TillError.BadResponse -> TopUpProblem.OTHER
     }
     is TopUpReply.Refused -> when (r.error) {
+        "topup_quote_version", "invalid_topup_quote" -> TopUpProblem.UNVERIFIED_QUOTE
         "expired" -> TopUpProblem.EXPIRED
         "card_full" -> TopUpProblem.CARD_FULL
         "no_card", "card_link_gone", "card_changed", "card_lost" -> TopUpProblem.CARD_MOVED
@@ -85,6 +90,7 @@ fun topUpProblem(r: TopUpReply<*>): TopUpProblem = when (r) {
 fun topUpErrorCopy(p: TopUpProblem, paid: Boolean, detail: String): Pair<String, String> {
     val waiting = if (paid) " The top-up is paid and waiting." else ""
     return when (p) {
+        TopUpProblem.UNVERIFIED_QUOTE -> "Can't verify this top-up" to "The till must provide a matching invoice and fee breakdown. Check that the till and POS are up to date."
         TopUpProblem.EXPIRED -> "The invoice expired" to "Nothing was paid. Make a new invoice to try again."
         TopUpProblem.NOT_LOADED -> "Not loaded yet" to "The top-up is paid and waiting. Tap the card to load it; Done leaves the payment with the till."
         TopUpProblem.CARD_FULL -> "This card is full" to "Spend from it, then tap again.$waiting"
@@ -106,7 +112,8 @@ fun topUpErrorCopy(p: TopUpProblem, paid: Boolean, detail: String): Pair<String,
 
 /** `m:ss` left until [expiresAtMs]; 0:00 once past. */
 fun timeLeft(expiresAtMs: Long, nowMs: Long): String {
-    val s = ((expiresAtMs - nowMs).coerceAtLeast(0) + 999) / 1000
+    val remaining = (expiresAtMs.coerceAtLeast(0) - nowMs.coerceAtLeast(0)).coerceAtLeast(0)
+    val s = remaining / 1000 + if (remaining % 1000 == 0L) 0 else 1
     return "${s / 60}:${(s % 60).toString().padStart(2, '0')}"
 }
 

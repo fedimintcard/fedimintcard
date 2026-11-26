@@ -428,6 +428,7 @@ mod tests {
             "/v1/card/balance",
             "/v1/cards/issue",
             "/v1/topup",
+            "/v1/topup/fee-inclusive",
             "/v1/topup/ab/load",
             "/v1/offline/kit",
             "/v1/payments",

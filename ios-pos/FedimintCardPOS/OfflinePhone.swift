@@ -1,6 +1,11 @@
 import Foundation
 import FedimintCardPosCore
 
+/// Check the signed Lightning invoice with the same parser as the till.
+func verifiedInvoiceTotal(_ invoice: String, _ total: Int64) -> Bool {
+    (try? invoiceMatchesTotal(invoice: invoice, totalMsat: total)) == true
+}
+
 // The phone as an offline till (docs/POS-OFFLINE.md): the POS core (host/pos-core, UniFFI) takes
 // the card when the till cannot be reached, keeps what it took in its store, and sends it to the
 // till once the till answers. This is the only file that imports the core; the rest of the app,

@@ -30,16 +30,13 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow, ensure};
 
 use super::fees::{Schedules, obligation_fee_bound};
 use crate::pay::{PayRec, PayState, PayStore, Pays};
 use crate::topup::{TopupRec, TopupState, TopupStore, Topups};
 use crate::wallet::Wallet;
 
-/// The `topups.json` version this build reads (`topup::TOPUPS_VERSION`).
-const TOPUPS_VERSION: u32 = 1;
 /// How long one top-up's receive is followed for evidence.
 const RECEIVE_WAIT: Duration = Duration::from_millis(500);
 /// How long one snapshot spends looking for evidence in all.
@@ -66,6 +63,8 @@ impl Obligations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub balance_msat: u64,
+    /// Notes available to fund the next debit, after allowing for any unspendable v1 change.
+    pub debit_balance_msat: u64,
     pub obligations: Obligations,
     pub schedules: Schedules,
 }
@@ -73,7 +72,7 @@ pub struct Snapshot {
 /// One record's claim on the wallet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owed {
-    Topup { amount_msat: u64, release: Option<String> },
+    Topup { amount_msat: u64, load_fee_bound_msat: Option<u64>, release: Option<String> },
     Pay { amount_msat: u64, release: Option<Box<PayRec>> },
 }
 
@@ -86,7 +85,7 @@ pub fn topup_owed(t: &TopupRec) -> Option<Owed> {
         TopupState::Failed | TopupState::Expired => Some(t.operation_id.clone()),
         TopupState::Loaded => return None,
     };
-    Some(Owed::Topup { amount_msat: t.amount_msat, release })
+    Some(Owed::Topup { amount_msat: t.amount_msat, load_fee_bound_msat: t.quote.as_ref().map(|q| q.load_fee_bound_msat), release })
 }
 
 /// A pay's claim. `refunding` counts everything the card paid: its `refund_msat` already counts
@@ -102,26 +101,9 @@ pub fn pay_owed(p: &PayRec) -> Option<Owed> {
     (amount_msat > 0).then_some(Owed::Pay { amount_msat, release })
 }
 
-#[derive(Deserialize)]
-struct TopupsOnDisk {
-    version: u32,
-    topups: Vec<TopupRec>,
-}
-
-/// `topups.json` in `dir`; none when there is no file.
+/// Read and validate the same store as the service, including any fee-inclusive holds.
 pub fn topups_on_disk(dir: &Path) -> Result<Vec<TopupRec>> {
-    let path = TopupStore::path_in(dir);
-    match std::fs::read(&path) {
-        Ok(b) => {
-            let f: TopupsOnDisk = serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?;
-            if f.version > TOPUPS_VERSION {
-                bail!("{} has version {}, this build understands {TOPUPS_VERSION}", path.display(), f.version);
-            }
-            Ok(f.topups)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+    Ok(TopupStore::open(TopupStore::path_in(dir))?.all().to_vec())
 }
 
 /// `pays.json` in `dir`; none when there is no file.
@@ -152,8 +134,14 @@ pub fn total(owed: &[Owed], s: &Schedules, balance_msat: u64, released: &dyn Fn(
             continue;
         }
         let amount = match item {
-            Owed::Topup { amount_msat, .. } => {
+            Owed::Topup { amount_msat, load_fee_bound_msat, .. } => {
                 o.topups_msat = o.topups_msat.saturating_add(*amount_msat);
+                // A fee-inclusive invoice funds its own claim. Its proceeds must cover the face
+                // and the quoted load cost from the moment the invoice can be paid until loaded.
+                if let Some(fee) = load_fee_bound_msat {
+                    o.fees_msat = o.fees_msat.saturating_add(*fee);
+                    continue;
+                }
                 *amount_msat
             }
             Owed::Pay { amount_msat, .. } => {
@@ -183,6 +171,59 @@ async fn receive_canceled(w: &Wallet, operation_id: &str, deadline: tokio::time:
     }
 }
 
+/// A wallet debit outside the merchant payout engine. Card loads can spend the amount reserved
+/// for their own paid quote; all other debits must leave every such reservation in the wallet.
+pub enum TopupDebit<'a> {
+    Mint { amount_msat: u64, load_tag: Option<&'a str> },
+    Lightning { bolt11: &'a str, max_fee_msat: Option<u64> },
+}
+
+/// Called with exclusive access to wallet debits (the till actor, the spend guard, or the CLI's
+/// exclusive wallet DB). Fixed fee-inclusive commitments survive even when the service is stopped.
+pub async fn protect_fee_inclusive_topups(w: &Wallet, dir: &Path, debit: TopupDebit<'_>) -> Result<()> {
+    let rows = topups_on_disk(dir)?;
+    let committed: Vec<_> = rows.iter().filter(|r| r.quote.is_some() && r.state != TopupState::Loaded).collect();
+    if committed.is_empty() {
+        return Ok(());
+    }
+    if let TopupDebit::Mint { amount_msat, load_tag: Some(tag) } = &debit
+        && let Some(own) = committed.iter().find(|t| t.topup_id == *tag)
+    {
+        // This exact receipt was individually priced to cover its own complete load. Giving it
+        // access to that amount also lets it load while other holders' invoices are still unpaid.
+        ensure!(own.state == TopupState::Paid && own.amount_msat == *amount_msat, "the top-up does not authorize this card amount");
+        return Ok(());
+    }
+    let (balance, spendable_face) = w.mint_balances_msat().await?;
+    let deadline = tokio::time::Instant::now() + EVIDENCE_BUDGET;
+    let mut held = 0_u64;
+    for t in committed {
+        if matches!(t.state, TopupState::Expired | TopupState::Failed) && receive_canceled(w, &t.operation_id, deadline).await {
+            continue;
+        }
+        let fee = t.quote.as_ref().expect("fee-inclusive top-up").load_fee_bound_msat;
+        held = held.saturating_add(t.amount_msat).saturating_add(fee);
+    }
+    if held == 0 {
+        return Ok(());
+    }
+    let schedules = w.fee_schedules().await.map_err(anyhow::Error::msg)?;
+    let cost = match debit {
+        TopupDebit::Mint { amount_msat, .. } => amount_msat.checked_add(super::fees::mint_fee_bound(&schedules, balance, 0)),
+        TopupDebit::Lightning { bolt11, max_fee_msat } => {
+            let amount = crate::wallet::parse_bolt11(bolt11)?.amount_milli_satoshis().context("Lightning invoice has no amount")?;
+            let cap = max_fee_msat.context("a gateway fee cap is required while customer top-ups are outstanding")?;
+            let contract = amount.checked_add(cap).context("Lightning payment and fee cap overflow")?;
+            let fee = super::fees::ln_send_fee_bound_over(&schedules, balance, amount, contract).map_err(anyhow::Error::msg)?;
+            contract.checked_add(fee)
+        }
+    }
+    .context("debit exceeds the wallet amount range")?;
+    let available = spendable_face.saturating_sub(held).saturating_sub(w.uneconomical_change_bound_msat()?);
+    ensure!(available >= cost, "{held} msat is reserved for customer top-ups; the available balance cannot cover this debit and its fees");
+    Ok(())
+}
+
 /// The wallet's balance and what of it is owed: the claims read first, then the balance, then the
 /// evidence that releases a claim (`never_charged`, for a `not_charged` pay; `None` counts every
 /// one), then the fee bounds at that balance. `Err` when any of it cannot be read or bounded.
@@ -195,7 +236,7 @@ pub async fn snapshot(
 ) -> Result<Snapshot> {
     let schedules = w.fee_schedules().await.map_err(|e| anyhow!("{e}"))?;
     let owed = owed(dir, topups, pays)?;
-    let balance_msat = w.balance_msat().await?;
+    let (balance_msat, spendable_face) = w.mint_balances_msat().await?;
     let deadline = tokio::time::Instant::now() + EVIDENCE_BUDGET;
     let mut canceled = HashSet::new();
     for item in &owed {
@@ -211,7 +252,10 @@ pub async fn snapshot(
         _ => false,
     };
     let obligations = total(&owed, &schedules, balance_msat, &released)?;
-    Ok(Snapshot { balance_msat, obligations, schedules })
+    let protecting_quotes = owed.iter().any(|item| matches!(item, Owed::Topup { load_fee_bound_msat: Some(_), .. }) && !released(item));
+    let debit_balance_msat =
+        if protecting_quotes { spendable_face.saturating_sub(w.uneconomical_change_bound_msat()?) } else { balance_msat };
+    Ok(Snapshot { balance_msat, debit_balance_msat, obligations, schedules })
 }
 
 #[cfg(test)]
@@ -225,12 +269,15 @@ pub(crate) mod tests {
             client_ref: None,
             requested_msat: msat,
             amount_msat: msat,
+            quote: None,
             invoice: "lnbcrt1".into(),
             operation_id: hex::encode(rand::random::<[u8; 32]>()),
             created_at_ms: 0,
             expires_at_ms: 0,
             state,
             load_txid: None,
+            load_operation_id: None,
+            realized_costs: None,
             short_id: None,
             detail: None,
             for_card: None,
@@ -338,6 +385,32 @@ pub(crate) mod tests {
         let bad = Schedules { ln: None, ln_problem: Some("stepped".into()), ..s };
         assert!(total(&owed_of(&[topup(TopupState::Paid, 1)], &[]), &bad, 1, &none).is_err());
         assert_eq!(total(&[], &bad, 1, &none).unwrap(), Obligations::default());
+    }
+
+    #[test]
+    fn fee_inclusive_holds_survive_claim_and_restart_and_release_only_after_load_or_proven_cancellation() {
+        let quote =
+            crate::topup::TopupQuote { version: 1, invoice_amount_msat: 2_110_224, topup_fee_msat: 10_000, load_fee_bound_msat: 6_416 };
+        let dir = tempfile::tempdir().unwrap();
+        let path = TopupStore::path_in(dir.path());
+        let mut store = TopupStore::open(&path).unwrap();
+        let mut row = topup(TopupState::Waiting, 2_100_224);
+        row.quote = Some(quote);
+        let id = row.topup_id.clone();
+        store.insert(row).unwrap();
+        for state in [TopupState::Waiting, TopupState::Paid, TopupState::Failed, TopupState::Expired, TopupState::Loaded] {
+            store.update(&id, |r| r.state = state).unwrap();
+            let owed = owed(dir.path(), None, None).unwrap();
+            let guarded = total(&owed, &Schedules::zero(), 4_000_000, &none).unwrap();
+            assert_eq!(guarded.total(), if state == TopupState::Loaded { 0 } else { 2_106_640 });
+            let cleared = total(&owed, &Schedules::zero(), 4_000_000, &|o| matches!(o, Owed::Topup { release: Some(_), .. })).unwrap();
+            assert_eq!(cleared.total(), if matches!(state, TopupState::Paid | TopupState::Waiting) { 2_106_640 } else { 0 });
+        }
+        let mut corrupt = topup(TopupState::Paid, 1000);
+        corrupt.quote = Some(crate::topup::TopupQuote { version: 1, invoice_amount_msat: 1000, topup_fee_msat: 2, load_fee_bound_msat: 1 });
+        assert!(store.insert(corrupt.clone()).is_err());
+        std::fs::write(path, serde_json::to_vec(&serde_json::json!({"version":1,"topups":[corrupt]})).unwrap()).unwrap();
+        assert!(owed(dir.path(), None, None).is_err());
     }
 
     #[test]

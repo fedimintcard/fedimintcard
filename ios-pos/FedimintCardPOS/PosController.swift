@@ -185,8 +185,8 @@ final class PosController: ObservableObject {
         // After every charge (the till's or the phone's), sync what waits here.
         if case .receipt = now { syncWanted = true; pollNow() }
         if case .topUpLoaded = now { pollNow() }
-        if case .topUpInvoice(let t, _) = now {
-            if case .topUpInvoice(let b, _) = before, b.topupId == t.topupId {} else { watchInvoice(t) }
+        if case .topUpInvoice(let t, _, _) = now {
+            if case .topUpInvoice(let b, _, _) = before, b.topupId == t.topupId {} else { watchInvoice(t) }
         }
         // The waiting top-up arriving changes the state, not the read: the countdown keeps going.
         if case .balanceShown(let rid, _, _, _, _) = now {
@@ -408,12 +408,12 @@ final class PosController: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 sincePoll += 500_000_000
-                guard let self, case .topUpInvoice(let cur, _) = self.state, cur.topupId == t.topupId else { return }
+                guard let self, case .topUpInvoice(let cur, _, _) = self.state, cur.topupId == t.topupId else { return }
                 self.nowMs = Self.clockMs()
                 if sincePoll >= Self.invoicePollNanos {
                     sincePoll = 0
                     let r = await self.client.topUpStatus(t.topupId)
-                    guard case .topUpInvoice(let still, _) = self.state, still.topupId == t.topupId else { return }
+                    guard case .topUpInvoice(let still, _, _) = self.state, still.topupId == t.topupId else { return }
                     self.send(.topUpPolled(topupId: t.topupId, result: r))
                 }
             }

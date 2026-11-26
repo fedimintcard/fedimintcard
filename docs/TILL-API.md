@@ -454,25 +454,24 @@ for slots 0–7 only has slots with no key yet. `free_slots` lists keyed slots o
 `unkeyed_slots` are room as well: the till keys them at the tap that needs them (a load, or a
 charge's change). Room for a top-up is `free_slots.length + unkeyed_slots.length`.
 
-## POST /v1/topup, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load, GET /v1/topups/waiting
+## POST /v1/topup/fee-inclusive, GET /v1/topup/{topup_id}, POST /v1/topup/{topup_id}/load, GET /v1/topups/waiting
 
 Top-up by Lightning (`docs/TOPUP.md`): the till makes an invoice through the federation's gateway
-(its `ln` or `lnv2` module) and loads what it received onto the card as a holder load, recorded in ops.
+(its `ln` or `lnv2` module) and loads the agreed card credit once the receipt settles. The registry records the card load.
 On ops only (`503 ops_not_connected` otherwise); `503 lightning_unavailable` when the federation's
 Lightning module is unavailable.
 
-`POST /v1/topup` `{"amount_msat":N,"client_ref":"<1-64 bytes, optional>","short_id":"<8 hex, optional>"}`
+`POST /v1/topup/fee-inclusive` `{"fee_quote_version":1,"amount_msat":N,"client_ref":"<1-64 bytes, optional>","short_id":"<8 hex, optional>"}`
 rounds `N` to the nearest card amount (at most 3 notes) and answers the top-up. With `short_id`
 (from `/v1/card/balance`) the till reads that card's free slots from ops (keyed and unkeyed, slots 0 to 23 only), rounds
 to fit them, and refuses a card with none (`409 card_full`) before any invoice exists; the card is recorded as the
 top-up's `for_card`.
 
-`200 {"ok":true,"topup_id":"<16 hex>","amount_msat":N,"invoice":"lnbc…","expires_at_ms":T,"state":"waiting"}`
+`200 {"ok":true,"topup_id":"<16 hex>","fee_quote_version":1,"amount_msat":N,"topup_fee_msat":F,"invoice_amount_msat":T,"invoice":"lnbc…","expires_at_ms":E,"state":"waiting","fee_accounting":{…}}`
 
-The invoice is for exactly `amount_msat` and expires in 10 minutes. The same `client_ref` answers
-the same top-up (no second invoice); with another amount it is `409 client_ref_conflict`.
-`400 bad_amount` for a missing, zero or too large (over 100,000 sats) amount; `502 invoice_failed`
-when no gateway made an invoice.
+The invoice amount is the card credit plus the fixed top-up fee (`T = N + F`). An updated POS verifies that the signed Lightning invoice has this total and shows all three amounts before revealing the QR. An invoice expires after 10 minutes. A matching `client_ref`, amount and card return the original top-up. Reusing the reference for a different purchase returns `409 client_ref_conflict`. Previously issued top-ups keep their original terms.
+
+For a new invoice the legacy `POST /v1/topup` route and unsupported quote versions return `409 topup_quote_version`. Unverified funding or gateway terms return `503 topup_quote_unavailable`. A missing, zero or excessive requested amount (over 100,000 sats) returns `400 bad_amount`.
 
 `GET /v1/topup/{topup_id}` answers the same body with the current `state`: `waiting`, `paid`,
 `loaded` (with `load_txid`), `expired`, or `failed` (with `detail`). `404 unknown_topup`.

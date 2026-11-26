@@ -76,6 +76,8 @@ pub struct PendingLoad {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeptLoad {
     pub tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     pub short_id: String,
     pub txid: String,
     /// The federation took it: the notes are live on the card.
@@ -125,6 +127,7 @@ struct Journal {
 #[derive(Debug, Clone)]
 pub struct LoadReport {
     pub short_id: String,
+    pub operation_id: String,
     pub txid: String,
     /// `(slot, msat)` of each note now live on the card.
     pub notes: Vec<(u8, u64)>,
@@ -185,6 +188,11 @@ impl<'w> Loader<'w> {
     /// How the kept loads tagged `tag` ended, oldest first.
     pub fn kept(&self, tag: &str) -> Result<Vec<KeptLoad>> {
         Ok(self.read_journal()?.kept.into_iter().filter(|k| k.tag == tag).collect())
+    }
+
+    /// Drop a tagged completion after the caller has durably recorded its result.
+    pub(crate) fn acknowledge(&self, tag: &str) -> Result<()> {
+        self.update_whole(|j| j.kept.retain(|k| k.tag != tag))
     }
 
     fn read_journal(&self) -> Result<Journal> {
@@ -255,7 +263,17 @@ impl<'w> Loader<'w> {
         if free.free.len() < notes.len() {
             return Err(anyhow!(CardFull { short_id, free: free.free.len(), needed: notes.len(), unkeyed: free.unkeyed_slots.len() }));
         }
-        let need: u64 = notes.iter().sum::<u64>() + notes.iter().map(|a| 2 * self.wallet.fee(*a)).sum::<u64>();
+        let face = notes.iter().try_fold(0_u64, |total, n| total.checked_add(*n)).context("card load amount overflow")?;
+        crate::payout::funds::protect_fee_inclusive_topups(
+            self.wallet,
+            self.journal.parent().context("load journal has no directory")?,
+            crate::payout::funds::TopupDebit::Mint { amount_msat: face, load_tag: self.tag.as_deref() },
+        )
+        .await?;
+        let need = notes
+            .iter()
+            .try_fold(face, |total, a| total.checked_add(self.wallet.fee(*a).checked_mul(2)?))
+            .context("card load fee overflow")?;
         let bal = self.wallet.balance_msat().await?;
         ensure!(bal >= need, "wallet holds {bal} msat but the load needs about {need} msat including fees");
 
@@ -360,7 +378,7 @@ impl<'w> Loader<'w> {
                     tracing::warn!("load {}: the notes are live but not yet on the card: {e:#}", pending.txid);
                 }
                 let live = pending.notes.iter().map(|n| (n.slot, n.amount_msat)).collect();
-                Ok(LoadReport { short_id, txid: pending.txid, notes: live, resumed })
+                Ok(LoadReport { short_id, txid: pending.txid, operation_id: pending.operation_id, notes: live, resumed })
             }
             None => bail!("the federation did not take load {}; nothing moved", pending.txid),
         }
@@ -438,11 +456,14 @@ impl<'w> Loader<'w> {
         // Out of the journal, and, for a load to keep, how it ended, in one save.
         self.update_whole(|j| {
             j.loads.retain(|q| q.txid != p.txid);
-            if let (true, Some(tag)) = (p.keep, &p.tag)
+            // Older tills journaled the 16-hex top-up ID without the explicit keep flag.
+            if let Some(tag) = &p.tag
+                && (p.keep || (tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_hexdigit())))
                 && !j.kept.iter().any(|k| k.txid == p.txid)
             {
                 j.kept.push(KeptLoad {
                     tag: tag.clone(),
+                    operation_id: Some(p.operation_id.clone()),
                     short_id: p.short_id.clone(),
                     txid: p.txid.clone(),
                     accepted,

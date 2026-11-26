@@ -19,7 +19,7 @@ use fedimint_card_sidecar::ops::{Ops, OpsClient, OpsConfig, short_id_of};
 use fedimint_card_sidecar::sales::SalesStore;
 use fedimint_card_sidecar::state::StateStore;
 use fedimint_card_sidecar::till::{self, Conn, OpsState};
-use fedimint_card_sidecar::topup::{LnOutcome, TopupLightning, TopupState, TopupStore, Topups};
+use fedimint_card_sidecar::topup::{LnOutcome, TopupInvoice, TopupLightning, TopupState, TopupStore, Topups};
 use fedimint_card_sidecar::wallet::Wallet;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::TransactionBuilder;
@@ -45,6 +45,7 @@ struct FakeLn {
     senders: Mutex<HashMap<String, oneshot::Sender<LnOutcome>>>,
     receivers: Mutex<HashMap<String, oneshot::Receiver<LnOutcome>>>,
     invoices: AtomicUsize,
+    final_receipts: Mutex<HashMap<String, bool>>,
 }
 
 impl FakeLn {
@@ -55,6 +56,27 @@ impl FakeLn {
 }
 
 impl TopupLightning for FakeLn {
+    fn realized(&self, _: String, load_op: Option<String>) -> BoxFuture<'_, fedimint_card_sidecar::topup::RealizedTopupCosts> {
+        Box::pin(async move {
+            fedimint_card_sidecar::topup::RealizedTopupCosts {
+                gateway_msat: Some(2_097),
+                claim_msat: Some(1_487),
+                load_msat: load_op.as_ref().map(|_| 50),
+                unspendable_change_delta_msat: load_op.map(|_| 0),
+            }
+        })
+    }
+
+    fn fee_invoice(&self, face_msat: u64, expiry_secs: u64) -> BoxFuture<'_, anyhow::Result<TopupInvoice>> {
+        Box::pin(async move {
+            let topup_fee_msat = 3_644;
+            let invoice_amount_msat = face_msat + topup_fee_msat;
+            let (operation_id, invoice) = self.invoice(invoice_amount_msat, expiry_secs).await?;
+            let expires_at_ms = fedimint_card_sidecar::topup::now_ms() + expiry_secs * 1000;
+            Ok(TopupInvoice { operation_id, invoice, invoice_amount_msat, expires_at_ms, topup_fee_msat, load_fee_bound_msat: 60 })
+        })
+    }
+
     fn invoice(&self, amount_msat: u64, _expiry_secs: u64) -> BoxFuture<'_, anyhow::Result<(String, String)>> {
         Box::pin(async move {
             let op = format!("{:064x}", self.n.fetch_add(1, Ordering::SeqCst));
@@ -64,6 +86,10 @@ impl TopupLightning for FakeLn {
             self.invoices.fetch_add(1, Ordering::SeqCst);
             Ok((op, format!("lnbcrt{amount_msat}fake")))
         })
+    }
+
+    fn settled(&self, operation_id: String) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        Box::pin(async move { Ok(self.final_receipts.lock().unwrap().get(&operation_id).copied()) })
     }
 
     fn wait(&self, operation_id: String, _expires_at_ms: u64) -> BoxFuture<'static, anyhow::Result<LnOutcome>> {
@@ -84,6 +110,7 @@ impl TopupLightning for FakeLn {
 /// never-keyed slots (`unkeyed`, split keying), and every load, outcome and slot-keys post it was
 /// sent.
 struct FakeRegistry {
+    mint_version: fedimint_card_sidecar::wallet::MintVersion,
     federation_id: String,
     keys: Vec<String>,
     free: AtomicUsize,
@@ -106,6 +133,7 @@ struct FakeRegistry {
 impl FakeRegistry {
     fn new(federation_id: String, keys: Vec<String>, free: usize) -> Self {
         Self {
+            mint_version: fedimint_card_sidecar::wallet::MintVersion::V1,
             federation_id,
             keys,
             free: AtomicUsize::new(free),
@@ -134,7 +162,9 @@ async fn slots(State(r): State<Arc<FakeRegistry>>, Path(_id): Path<String>) -> J
         (1..r.keys.len() as u64).filter(|s| !used.contains(s)).take(n).map(|s| json!({"slot": s, "pubkey": r.keys[s as usize]})).collect();
     free.extend(r.keyed.lock().unwrap().iter().filter(|(s, _)| !used.contains(&(*s as u64))).map(|(s, k)| json!({"slot": s, "pubkey": k})));
     let unkeyed = r.unkeyed.lock().unwrap().clone();
-    Json(json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "free": free, "unkeyed_slots": unkeyed}))
+    Json(
+        json!({"version": r.version.load(Ordering::SeqCst), "federation_id": r.federation_id, "mint_version": r.mint_version, "free": free, "unkeyed_slots": unkeyed}),
+    )
 }
 
 async fn slot_keys(
@@ -316,6 +346,11 @@ async fn with_actor<T: Send + 'static>(
     }
 }
 
+async fn create_quote(addr: SocketAddr, mut body: Value) -> (u16, Value) {
+    body["fee_quote_version"] = json!(1);
+    call(addr, "POST", "/v1/topup/fee-inclusive", None, Some(body)).await
+}
+
 async fn call(addr: SocketAddr, method: &str, path: &str, link: Option<&str>, body: Option<Value>) -> (u16, Value) {
     let http = reqwest::Client::new();
     let mut req = match method {
@@ -413,20 +448,23 @@ async fn a_paid_top_up_loads_the_card_once() -> anyhow::Result<()> {
         (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone(), f.short_id.clone());
     with_actor(actor, async move {
         // 100 sats rounds to the nearest card amount, 100.352 sats in three notes.
-        let (s, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "client_ref": "t1"}))).await;
+        let (s, created) = create_quote(addr, json!({"amount_msat": 100_000, "client_ref": "t1"})).await;
         assert_eq!(s, 200, "{created}");
         assert_eq!(created["amount_msat"], 100_352);
         assert_eq!(created["state"], "waiting");
-        assert_eq!(created["invoice"], "lnbcrt100352fake");
+        assert_eq!(created["invoice"], "lnbcrt103996fake");
+        assert_eq!(created["fee_quote_version"], 1);
+        assert_eq!(created["invoice_amount_msat"], 103_996);
+        assert_eq!(created["topup_fee_msat"], 3_644);
         assert!(created["expires_at_ms"].as_u64().unwrap() > 0);
         assert!(created.get("operation_id").is_none(), "{created}");
         let id = created["topup_id"].as_str().unwrap().to_owned();
 
         // The same client_ref answers the same top-up, with no second invoice; another amount is a conflict.
-        let (s, again) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "client_ref": "t1"}))).await;
+        let (s, again) = create_quote(addr, json!({"amount_msat": 100_000, "client_ref": "t1"})).await;
         assert_eq!((s, again["topup_id"].as_str()), (200, Some(id.as_str())), "{again}");
         assert_eq!(ln.invoices.load(Ordering::SeqCst), 1);
-        let (s, conflict) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 50_000, "client_ref": "t1"}))).await;
+        let (s, conflict) = create_quote(addr, json!({"amount_msat": 50_000, "client_ref": "t1"})).await;
         assert_eq!((s, conflict["error"].as_str()), (409, Some("client_ref_conflict")), "{conflict}");
 
         // Unpaid: no load, and the card is not touched.
@@ -441,6 +479,12 @@ async fn a_paid_top_up_loads_the_card_once() -> anyhow::Result<()> {
         assert_eq!(s, 200, "{loaded}");
         assert_eq!(loaded["state"], "loaded");
         assert_eq!(loaded["amount_msat"], 100_352);
+        assert_eq!(loaded["fee_accounting"]["status"], "reconciled");
+        assert_eq!(loaded["fee_accounting"]["gateway_msat"], 2097);
+        assert_eq!(loaded["fee_accounting"]["claim_msat"], 1487);
+        assert_eq!(loaded["fee_accounting"]["load_msat"], 50);
+        assert_eq!(loaded["fee_accounting"]["retained_nominal_msat"], 10);
+        assert_eq!(loaded["fee_accounting"]["retained_spendable_msat"], 10);
         let txid = loaded["load_txid"].as_str().unwrap().to_owned();
         tokio::time::timeout(Duration::from_secs(5), phone).await.expect("the till closes the link").unwrap();
 
@@ -476,7 +520,7 @@ async fn a_card_older_than_4_0_takes_no_top_up_and_the_top_up_stays_paid() -> an
     let (f, actor) = start(Setup::OnOps).await?;
     let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
     with_actor(actor, async move {
-        let (s, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (s, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         assert_eq!(s, 200, "{created}");
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
@@ -515,7 +559,7 @@ async fn a_full_card_keeps_the_top_up_paid_until_it_has_room() -> anyhow::Result
     let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
     with_actor(actor, async move {
         registry.free.store(2, Ordering::SeqCst);
-        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (_, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
         until_state(addr, &id, "paid").await;
@@ -543,17 +587,17 @@ async fn a_top_up_for_a_card_fits_its_free_slots() -> anyhow::Result<()> {
     let (addr, registry) = (f.addr, f.registry.clone());
     with_actor(actor, async move {
         registry.free.store(2, Ordering::SeqCst);
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "0011aabb"}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!(s, 200, "{v}");
         let amount = v["amount_msat"].as_u64().unwrap();
         assert!(amount.count_ones() <= 2, "{amount} needs more than 2 notes");
         assert_eq!(amount, 98_304, "nearest 2-note amount to 100,000 msat");
 
         registry.free.store(0, Ordering::SeqCst);
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "0011aabb"}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
         assert_eq!((s, v["error"].as_str()), (409, Some("card_full")), "{v}");
 
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000, "short_id": "nothex!!"}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 100_000, "short_id": "nothex!!"})).await;
         assert_eq!((s, v["error"].as_str()), (400, Some("bad_request")), "{v}");
     })
     .await;
@@ -569,7 +613,7 @@ async fn waiting_top_ups_are_offered_to_their_card() -> anyhow::Result<()> {
     with_actor(actor, async move {
         let mine = "0011aabb";
         let create = |body: Value| async move {
-            let (s, v) = call(addr, "POST", "/v1/topup", None, Some(body)).await;
+            let (s, v) = create_quote(addr, body).await;
             assert_eq!(s, 200, "{v}");
             v["topup_id"].as_str().unwrap().to_owned()
         };
@@ -640,7 +684,7 @@ async fn expired_and_failed_top_ups_do_not_load() -> anyhow::Result<()> {
     let (f, actor) = start(Setup::OnOps).await?;
     let (addr, ln, topups) = (f.addr, f.ln.clone(), f.topups.clone());
     with_actor(actor, async move {
-        let (_, a) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 21_000}))).await;
+        let (_, a) = create_quote(addr, json!({"amount_msat": 21_000})).await;
         assert_eq!(a["amount_msat"], 20_992, "{a}");
         let a = a["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &a), LnOutcome::Expired);
@@ -648,7 +692,7 @@ async fn expired_and_failed_top_ups_do_not_load() -> anyhow::Result<()> {
         let (s, v) = call(addr, "POST", &format!("/v1/topup/{a}/load"), None, None).await;
         assert_eq!((s, v["error"].as_str()), (410, Some("expired")), "{v}");
 
-        let (_, b) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 50_000}))).await;
+        let (_, b) = create_quote(addr, json!({"amount_msat": 50_000})).await;
         let b = b["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &b), LnOutcome::Failed("gateway gave up".into()));
         let v = until_state(addr, &b, "failed").await;
@@ -671,12 +715,12 @@ async fn bad_requests_are_refused_before_any_invoice() -> anyhow::Result<()> {
     let (addr, ln) = (f.addr, f.ln.clone());
     with_actor(actor, async move {
         for body in [json!({}), json!({"amount_msat": 0}), json!({"amount_msat": 100_000_001})] {
-            let (s, v) = call(addr, "POST", "/v1/topup", None, Some(body.clone())).await;
+            let (s, v) = create_quote(addr, body.clone()).await;
             assert_eq!((s, v["error"].as_str()), (400, Some("bad_amount")), "{body}: {v}");
         }
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 1000, "client_ref": "x".repeat(65)}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 1000, "client_ref": "x".repeat(65)})).await;
         assert_eq!((s, v["error"].as_str()), (400, Some("bad_request")), "{v}");
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 1000, "client_ref": ""}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 1000, "client_ref": ""})).await;
         assert_eq!((s, v["error"].as_str()), (400, Some("bad_request")), "{v}");
         assert_eq!(ln.invoices.load(Ordering::SeqCst), 0);
     })
@@ -689,7 +733,7 @@ async fn a_till_off_ops_or_without_lightning_takes_no_top_ups() -> anyhow::Resul
     let (f, actor) = start(Setup::Local).await?;
     let addr = f.addr;
     with_actor(actor, async move {
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         assert_eq!((s, v["error"].as_str()), (503, Some("ops_not_connected")), "{v}");
     })
     .await;
@@ -697,7 +741,7 @@ async fn a_till_off_ops_or_without_lightning_takes_no_top_ups() -> anyhow::Resul
     let (f, actor) = start(Setup::NoLightning).await?;
     let addr = f.addr;
     with_actor(actor, async move {
-        let (s, v) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (s, v) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{v}");
         let (s, v) = call(addr, "GET", "/v1/topup/abc", None, None).await;
         assert_eq!((s, v["error"].as_str()), (503, Some("lightning_unavailable")), "{v}");
@@ -720,12 +764,15 @@ async fn a_restarted_till_watches_its_unpaid_invoices() -> anyhow::Result<()> {
             client_ref: None,
             requested_msat: 100_000,
             amount_msat: 100_352,
+            quote: None,
             invoice: "lnbcrt100352fake".into(),
             operation_id: op.clone(),
             created_at_ms: 1,
             expires_at_ms: u64::MAX,
             state: fedimint_card_sidecar::topup::TopupState::Waiting,
             load_txid: None,
+            load_operation_id: None,
+            realized_costs: None,
             short_id: None,
             detail: None,
             for_card: None,
@@ -757,7 +804,7 @@ async fn a_load_cut_short_after_it_was_sent_is_finished_not_repeated() -> anyhow
     let (f, actor) = start(Setup::OnOps).await?;
     let (addr, ln, topups, registry, card) = (f.addr, f.ln.clone(), f.topups.clone(), f.registry.clone(), f.card.clone());
     with_actor(actor, async move {
-        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (_, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
         until_state(addr, &id, "paid").await;
@@ -850,7 +897,7 @@ async fn a_top_up_load_keys_a_split_cards_slots_at_the_tap() -> anyhow::Result<(
         *registry.unkeyed.lock().unwrap() = (8..32).collect();
         assert_eq!(card_key(&card, 8), None, "slot 8 is empty on the card");
 
-        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (_, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
         until_state(addr, &id, "paid").await;
@@ -874,7 +921,7 @@ async fn a_top_up_load_keys_a_split_cards_slots_at_the_tap() -> anyhow::Result<(
         assert_eq!(slots, vec![1, 8, 9]);
 
         // The next top-up fits the slots keyed ahead: no keying at that tap.
-        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (_, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
         until_state(addr, &id, "paid").await;
@@ -894,7 +941,7 @@ async fn a_top_up_for_a_split_card_counts_its_unkeyed_slots_as_room() -> anyhow:
     let (f, actor) = start(Setup::OnOps).await?;
     let (addr, registry) = (f.addr, f.registry.clone());
     with_actor(actor, async move {
-        let create = |body: Value| async move { call(addr, "POST", "/v1/topup", None, Some(body)).await };
+        let create = |body: Value| async move { create_quote(addr, body).await };
         registry.free.store(0, Ordering::SeqCst);
         *registry.unkeyed.lock().unwrap() = (8..32).collect();
         let (s, v) = create(json!({"amount_msat": 100_000, "short_id": "0011aabb"})).await;
@@ -921,7 +968,7 @@ async fn a_top_up_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
     let (f, actor) = start(Setup::OnOps).await?;
     let (addr, registry) = (f.addr, f.registry.clone());
     with_actor(actor, async move {
-        let create = |body: Value| async move { call(addr, "POST", "/v1/topup", None, Some(body)).await };
+        let create = |body: Value| async move { create_quote(addr, body).await };
         registry.free.store(0, Ordering::SeqCst);
         registry.keyed.lock().unwrap().extend([(24, "k24".to_owned()), (25, "k25".to_owned())]);
         *registry.unkeyed.lock().unwrap() = (26..32).collect();
@@ -937,6 +984,134 @@ async fn a_top_up_counts_no_slot_from_24_up_as_room() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fee_quote_is_created_once_and_an_old_pos_cannot_expose_it() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let addr = f.addr;
+    with_actor(actor, async move {
+        let req = json!({"amount_msat":100_000, "client_ref":"fee-1"});
+        for (path, body) in [
+            ("/v1/topup", req.clone()),
+            ("/v1/topup/fee-inclusive", req.clone()),
+            ("/v1/topup/fee-inclusive", json!({"amount_msat":100_000,"fee_quote_version":2})),
+        ] {
+            let (s, r) = call(addr, "POST", path, None, Some(body)).await;
+            assert_eq!((s, r["error"].as_str()), (409, Some("topup_quote_version")));
+            assert!(r.get("invoice").is_none());
+        }
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 0);
+        let ((s1, first), (s2, second)) = tokio::join!(create_quote(addr, req.clone()), create_quote(addr, req.clone()));
+        assert_eq!((s1, s2), (200, 200));
+        assert_eq!(first, second);
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
+        let (s, hidden) = call(addr, "POST", "/v1/topup", None, Some(req.clone())).await;
+        assert_eq!((s, hidden["error"].as_str()), (409, Some("topup_quote_version")));
+        assert!(hidden.get("invoice").is_none());
+        let id = first["topup_id"].as_str().unwrap();
+        f.ln.settle(&op_of(&f.topups, id), LnOutcome::Paid);
+        until_state(addr, id, "paid").await;
+        let (s, resumed) = call(addr, "POST", "/v1/topup", None, Some(req)).await;
+        assert_eq!((s, resumed["state"].as_str()), (200, Some("paid")));
+        assert_eq!(resumed["amount_msat"], first["amount_msat"]);
+        assert_eq!(resumed["invoice_amount_msat"], first["invoice_amount_msat"]);
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_paid_topup_keeps_its_original_invoice_and_an_accepted_load_cannot_repeat() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    let addr = f.addr;
+    with_actor(actor, async move {
+        let (_, quoted) = create_quote(addr, json!({"amount_msat":100_000,"client_ref":"old"})).await;
+        let id = quoted["topup_id"].as_str().unwrap();
+        f.ln.settle(&op_of(&f.topups, id), LnOutcome::Paid);
+        until_state(addr, id, "paid").await;
+        f.topups
+            .store
+            .lock()
+            .unwrap()
+            .update(id, |t| {
+                t.quote = None;
+                t.invoice = "original-legacy-invoice".into();
+            })
+            .unwrap();
+        let (s, previous) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat":100_000,"client_ref":"old"}))).await;
+        assert_eq!(s, 200);
+        assert_eq!(previous["invoice"], "original-legacy-invoice");
+        assert_eq!(previous["amount_msat"], 100_352);
+        assert!(previous.get("fee_quote_version").is_none());
+        // The process previously got the accepted result into the holder journal, just before
+        // the durable top-up transition. A retry must recover it even with no card in the reader.
+        let receipt = json!({"loads":[],"kept":[{"tag":id,"short_id":f.short_id,"txid":"accepted-before-restart",
+            "accepted":true,"notes":[[1,65536],[2,32768],[3,2048]]}]});
+        std::fs::write(f._dir.path().join(fedimint_card_sidecar::holder::JOURNAL_FILE), serde_json::to_vec(&receipt).unwrap()).unwrap();
+        for _ in 0..2 {
+            let (s, loaded) = call(addr, "POST", &format!("/v1/topup/{id}/load"), None, None).await;
+            assert_eq!((s, loaded["state"].as_str()), (200, Some("loaded")), "{loaded}");
+            assert_eq!(loaded["load_txid"], "accepted-before-restart");
+        }
+        assert!(f.registry.loads.lock().unwrap().is_empty());
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_quote_replay_waits_for_its_original_payment() -> anyhow::Result<()> {
+    let (f, actor) = start(Setup::OnOps).await?;
+    with_actor(actor, async move {
+        let request = json!({"amount_msat": 100_000, "client_ref": "closing-window"});
+        let (_, quote) = create_quote(f.addr, request.clone()).await;
+        let id = quote["topup_id"].as_str().unwrap();
+        f.topups.store.lock().unwrap().update(id, |r| r.expires_at_ms = 1).unwrap();
+        let (code, closed) = create_quote(f.addr, request.clone()).await;
+        assert_eq!((code, closed["error"].as_str()), (409, Some("topup_settlement_pending")));
+        assert!(closed.get("invoice").is_none());
+        let (status, pending) = call(f.addr, "GET", &format!("/v1/topup/{id}"), None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(pending["state"], "waiting");
+        assert_eq!(pending["invoice"], "");
+        f.ln.settle(&op_of(&f.topups, id), LnOutcome::Paid);
+        until_state(f.addr, id, "paid").await;
+        let (_, settled) = create_quote(f.addr, request).await;
+        assert_eq!(settled["topup_id"], id);
+        assert_eq!(settled["state"], "paid");
+        assert_eq!(f.ln.invoices.load(Ordering::SeqCst), 1);
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_receipt_survives_an_earlier_watchers_local_expiry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = TopupStore::path_in(dir.path());
+    std::fs::write(
+        &path,
+        br#"{"version":1,"topups":[{"topup_id":"legacy","requested_msat":100000,"amount_msat":100352,
+        "invoice":"old-invoice","operation_id":"claimed-op","created_at_ms":1,"expires_at_ms":2,"state":"expired"}]}"#,
+    )?;
+    let ln = Arc::new(FakeLn::default());
+    ln.final_receipts.lock().unwrap().insert("claimed-op".into(), true);
+    let topups = Topups::new(TopupStore::open(&path)?, ln.clone());
+    topups.watch_waiting();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while topups.get("legacy").unwrap().state != TopupState::Paid {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let store = TopupStore::open(path)?;
+    assert_eq!(store.get("legacy").unwrap().state, TopupState::Paid);
+    assert_eq!(store.get("legacy").unwrap().invoice, "old-invoice");
+    assert_eq!(ln.invoices.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
 /// The registry does not answer the keys: the load is refused (nothing sent, the top-up stays
 /// paid), and the keys the tap made stay on the card. The next tap finds them with `GET_PUB`,
 /// records those same keys, and loads.
@@ -948,7 +1123,7 @@ async fn keys_a_tap_made_but_never_recorded_are_recorded_by_the_next_tap() -> an
         registry.free.store(0, Ordering::SeqCst);
         *registry.unkeyed.lock().unwrap() = (8..32).collect();
         registry.fail_keys.store(1, Ordering::SeqCst);
-        let (_, created) = call(addr, "POST", "/v1/topup", None, Some(json!({"amount_msat": 100_000}))).await;
+        let (_, created) = create_quote(addr, json!({"amount_msat": 100_000})).await;
         let id = created["topup_id"].as_str().unwrap().to_owned();
         ln.settle(&op_of(&topups, &id), LnOutcome::Paid);
         until_state(addr, &id, "paid").await;
@@ -1066,3 +1241,9 @@ fn slots_to_key_is_the_shortfall_plus_the_margin() {
     assert_eq!(slots_to_key(12, 7, 6), 6);
     assert_eq!(slots_to_key(12, 7, 0), 0);
 }
+
+#[path = "topup/self_funded.rs"]
+mod self_funded;
+
+#[path = "topup/legacy_lightning.rs"]
+mod legacy_lightning;

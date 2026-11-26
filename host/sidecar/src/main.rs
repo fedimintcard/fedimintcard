@@ -473,6 +473,12 @@ async fn main() -> Result<()> {
         Cmd::Ln(LnCmd::Pay { bolt11, max_fee_msat }) => {
             use fedimint_card_sidecar::wallet::LnPayOutcome;
             let w = Wallet::open(&cli.data_dir).await?;
+            fedimint_card_sidecar::payout::funds::protect_fee_inclusive_topups(
+                &w,
+                &cli.data_dir,
+                fedimint_card_sidecar::payout::funds::TopupDebit::Lightning { bolt11, max_fee_msat: *max_fee_msat },
+            )
+            .await?;
             let outcome = w.pay_bolt11(bolt11, *max_fee_msat).await?;
             println!("{}", serde_json::to_string(&outcome)?);
             if !matches!(outcome, LnPayOutcome::Paid { .. } | LnPayOutcome::Pending { .. }) {
@@ -528,6 +534,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Ecash(Ecash::Export { amount_msat, qr: want_qr, round_up, include_invite }) => {
             let w = Wallet::open(&cli.data_dir).await?;
+            let face = amount_msat.checked_next_multiple_of(w.min_denom()).context("eCash amount overflow")?;
+            fedimint_card_sidecar::payout::funds::protect_fee_inclusive_topups(
+                &w,
+                &cli.data_dir,
+                fedimint_card_sidecar::payout::funds::TopupDebit::Mint { amount_msat: face, load_tag: None },
+            )
+            .await?;
             let (notes, face) = w.export_ecash(*amount_msat, *round_up, *include_invite).await?;
             // The log comes before the screen: this string is the only copy of the value.
             StateStore::open(state_path(&cli.data_dir))?.append_cashout_log(&notes.to_string())?;
@@ -633,6 +646,15 @@ async fn main() -> Result<()> {
         }
         Cmd::Card(c) => {
             let mut cw = card_wallet(&cli).await?;
+            if let CardCmd::Topup { amount_msat } = c {
+                let face = amount_msat.iter().try_fold(0_u64, |sum, n| sum.checked_add(*n)).context("card issue amount overflow")?;
+                fedimint_card_sidecar::payout::funds::protect_fee_inclusive_topups(
+                    &cw.wallet,
+                    &cli.data_dir,
+                    fedimint_card_sidecar::payout::funds::TopupDebit::Mint { amount_msat: face, load_tag: None },
+                )
+                .await?;
+            }
             let res = run_card(&mut cw, c).await;
             // Whatever happened, ecash recovered from legacy records must reach the user. It is
             // also in cashouts.log next to the state file.

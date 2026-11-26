@@ -1,7 +1,6 @@
 # Top-up at the POS by Lightning
 
-Status: agreed 2026-11-05 (owner: "yes", amount rule "nearest card amount"), built and in production (verified 2026-11-06). O6 step 3
-in `OPS-PLAN.md`.
+Card 4.0 supports customer-funded top-ups from an empty till.
 
 The holder pays a Lightning invoice from any wallet on their own phone; the till receives eCash
 through the federation's Lightning or Lightning v2 gateway and loads it onto the card with the holder load the Mac loader
@@ -11,9 +10,8 @@ uses (`holder.rs`, the registry's `/cards/:id/load` routes). No PIN: nothing lea
 
 1. The POS reads the card's balance. The balance screen has two buttons: **Charge card** (the
    amount keypad, then the charge) and **Top up card**.
-2. **Top up card**: the holder or merchant types an amount in sats and taps **Create invoice**.
-3. The till rounds it to the nearest card amount (below), makes an invoice for exactly that, and the
-   POS shows it as a QR code with the amount.
+2. **Top up card**: the holder or merchant types an amount in sats and taps **Review top-up**.
+3. The till rounds the requested card credit to a value the card can hold (below). The POS shows **On your card**, **Top-up fee** and **Total to pay** before the customer chooses **Show payment QR** and pays the Lightning invoice.
 4. The holder pays from their wallet. The POS polls; on `paid` it asks for the card.
 5. Tap: the till loads the notes onto the card and records the load in ops. The POS shows
    "Loaded N sats".
@@ -26,8 +24,7 @@ A card holds one note per slot, each a power of two in msat, and has 8 slots (a 
 the largest value at or below it and the smallest value at or above it with at most 3 set bits (a
 tie goes to the lower), each note a denomination the federation issues and at least its smallest
 economical note. Examples: 100 sats → 100.352 sats; 1,000 sats → 1,048.576 sats (983.04 would
-need 4 notes); 21 sats → 20.992 sats. The invoice is for exactly that amount, so the holder pays exactly what lands on the card.
-The gateway's receive fee, if any, is the till's cost (zero on the gateways seen 2026-11-05).
+need 4 notes); 21 sats → 20.992 sats. The fixed top-up fee covers the cost of receiving the payment and issuing the notes. The invoice total is the card credit plus that fee. Any difference between the quoted fee and the final costs stays in the till. A sending wallet may quote a separate routing fee. The till protects this payment for its card load, including while a payout is running. Previously issued top-ups retain their original price.
 
 ## Room on the card
 
@@ -69,16 +66,19 @@ a nearly full card.
 
 | Route | Body → reply |
 |---|---|
-| `POST /v1/topup` | `{amount_msat, client_ref?, short_id?}` → the top-up |
+| `POST /v1/topup/fee-inclusive` | `{fee_quote_version: 1, amount_msat, client_ref?, short_id?}` → the top-up and its fixed quote |
 | `GET /v1/topup/{topup_id}` | → the top-up |
 | `POST /v1/topup/{topup_id}/load` | `{}` with `X-Card-Link` → the top-up, `state: "loaded"` |
 
 Every reply is the top-up: `{ok, topup_id, amount_msat, invoice, expires_at_ms, state,
 load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
 
-- `amount_msat` in the reply is the rounded amount. Requests that round to nothing, or above
+- A new quote includes `fee_quote_version: 1`, the rounded card credit in `amount_msat`, the fixed `topup_fee_msat`, and `invoice_amount_msat`, the total payable on the signed Lightning invoice.
+- For fee-inclusive quotes, `expires_at_ms` is the last payment deadline set by the signed invoice or the incoming Lightning contract, whichever comes first. After the window closes, keep polling the existing receipt. While settlement is pending, its status remains `waiting` and its `invoice` field is empty. Reusing the same creation reference during this window returns `409 topup_settlement_pending`.
+- `fee_accounting` records the gateway deduction, federation claim cost and card-load cost in msat. Once reconciled, `retained_nominal_msat` is the fixed fee less these costs. `retained_spendable_msat` also accounts for any change in mint v1 notes too small to spend. Either amount can be unknown until the wallet can verify both operations. A paid top-up keeps its promised card credit while the wallet completes this accounting.
+- `amount_msat` in the reply is the rounded card amount. Requests that round to nothing, or above
   `MAX_TOPUP_MSAT` (100,000 sats), answer 400 `bad_amount`.
-- `client_ref` (1–64 chars) makes `POST /v1/topup` idempotent: the same ref answers the same
+- `client_ref` (1–64 chars) makes top-up creation idempotent: the same ref answers the same
   top-up; a different amount for a used ref answers 409 `client_ref_conflict`.
 - `state`: `waiting` (invoice unpaid), `paid` (eCash in the till's wallet, not on a card yet),
   `loaded`, `expired` (unpaid at expiry; nothing to do), `failed` (`detail` says why; the eCash, if
@@ -94,7 +94,7 @@ load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
   finished by the next tap (of this top-up or any other) and the top-up marked `loaded`, never sent
   twice.
 - Other errors: 400 `bad_amount`, 400 `bad_request` (body, `client_ref`), 404 `unknown_topup`,
-  502 `invoice_failed` (no gateway answered, or it made no invoice), 503 `lightning_unavailable`
+  409 `topup_quote_version` (update the POS), 503 `topup_quote_unavailable` (the till could not verify a funded quote), 503 `lightning_unavailable`
   (the till's federation has no usable `ln` module), and `busy` as for every card job.
 - Without ops the till refuses top-ups (`ops_not_connected`): a holder load is recorded in ops.
 - Records live in `<data_dir>/topups.json`; after a restart the till goes on watching unpaid
@@ -105,7 +105,7 @@ load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
 A top-up can be paid and not loaded: the card was lifted, the app closed, Cancel after paying, or
 the card was full. The till keeps it `paid`, and the POS offers it again.
 
-- `POST /v1/topup` with `short_id` records that card as the top-up's card (`for_card`).
+- Creating a top-up with `short_id` records that card as the top-up's card (`for_card`).
 - `GET /v1/topups/waiting?short_id=<id>` → `{ok:true, topups:[{topup_id, amount_msat, for_card,
   created_at_ms}]}`: the `paid` top-ups whose `for_card` is that card or none, oldest first.
   Without `short_id`, every `paid` top-up.
@@ -118,9 +118,8 @@ the card was full. The till keeps it `paid`, and the POS offers it again.
 
 - Balance screen: **Charge card** and **Top up card** side by side under the balance; either
   stops the screen's return countdown.
-- Top-up keypad: title "Top up", the amount, **Create invoice**.
-- Invoice screen: "Top up N sats" (the rounded amount), the QR (`lightning:` + invoice, upper
-  case), "Scan with a Lightning wallet", the time left, and Cancel. Polls `GET` every 1.5 s.
+- Top-up keypad: title "Top up", the amount, **Review top-up**.
+- The POS displays and checks the agreed card credit, fee and total before presenting the QR. Once paid, the next step is the card tap. No service restart is needed.
 - Paid: the tap screen ("Hold the card to load N sats"), then the load over the card link, then the
   receipt "Loaded N sats".
 - Expired: "The invoice expired" with **New invoice** and **Done**.

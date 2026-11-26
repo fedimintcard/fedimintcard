@@ -125,10 +125,10 @@ class TillClient(private val baseUrl: () -> String, private val transport: Trans
      * (`card_full`) before any invoice exists.
      */
     fun createTopUp(amountMsat: Long, clientRef: String, shortId: String? = null): TopUpReply<TopUp> {
-        val o = JSONObject().put("amount_msat", amountMsat).put("client_ref", clientRef)
+        val o = JSONObject().put("amount_msat", amountMsat).put("client_ref", clientRef).put("fee_quote_version", 1)
         if (shortId != null) o.put("short_id", shortId)
         val body = o.toString()
-        return when (val r = call("POST", "/v1/topup", body, QUICK_READ_MS + 20_000)) {
+        return when (val r = call("POST", "/v1/topup/fee-inclusive", body, QUICK_READ_MS + 20_000)) {
             is TillResult.Err -> TopUpReply.Failed(r.error)
             is TillResult.Ok -> parseTopUp(r.value.status, r.value.body)
         }
@@ -382,13 +382,40 @@ private fun refused(httpStatus: Int, o: JSONObject, paidLoad: Boolean = false): 
     return TopUpReply.Refused(code, detail, httpStatus)
 }
 
-/** `POST /v1/topup`: `{topup_id, amount_msat, invoice, expires_at_ms, state}`, or `{ok:false,…}`. */
-internal fun parseTopUp(httpStatus: Int, body: String): TopUpReply<TopUp> = try {
-    val o = JSONObject(body)
-    if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o)
-    else TopUpReply.Ok(TopUp(o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("invoice"), o.reqLong("expires_at_ms"), o.optString("state", "waiting")))
-} catch (e: JSONException) {
-    TopUpReply.Failed(TillError.BadResponse(e.message ?: "bad json"))
+/** JSON integers only. The platform getLong can also truncate, coerce strings or saturate. */
+private fun JSONObject.quoteInteger(key: String): Long? = when (val n = opt(key)) {
+    is Int -> n.toLong()
+    is Long -> n
+    else -> null
+}
+
+private fun JSONObject.topUpFace(): Long = quoteInteger("amount_msat")?.takeIf { it > 0 }
+    ?: throw JSONException("invalid top-up amount")
+
+internal fun parseTopUp(httpStatus: Int, body: String): TopUpReply<TopUp> {
+    val invalid = TopUpReply.Refused("invalid_topup_quote", "", httpStatus)
+    if (httpStatus == 404 || httpStatus == 405) return TopUpReply.Refused("topup_quote_version", "", httpStatus)
+    return try {
+        val o = JSONObject(body)
+        if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) return refused(httpStatus, o)
+        val id = o.reqStr("topup_id")
+        val state = o.reqStr("state")
+        val face = o.quoteInteger("amount_msat") ?: return invalid
+        if (id.isEmpty() || face <= 0) return invalid
+        // An idempotent replay may find an older, already-paid invoice. It only needs loading.
+        if (state in setOf("paid", "loaded", "expired", "failed")) {
+            return TopUpReply.Ok(TopUp(id, face, "", 0, state, loadTxid = o.opt("load_txid") as? String))
+        }
+        val fee = o.quoteInteger("topup_fee_msat") ?: return invalid
+        val total = o.quoteInteger("invoice_amount_msat") ?: return invalid
+        val invoice = o.opt("invoice") as? String ?: return invalid
+        val expiry = o.quoteInteger("expires_at_ms") ?: return invalid
+        if (state != "waiting" || o.quoteInteger("fee_quote_version") != 1L || fee < 0 || total < face ||
+            total - face != fee || expiry <= 0 || !verifiedInvoiceTotal(invoice, total)) return invalid
+        TopUpReply.Ok(TopUp(id, face, invoice, expiry, state, TopUpQuote(total, fee)))
+    } catch (e: JSONException) {
+        TopUpReply.Failed(TillError.BadResponse(e.message ?: "bad json"))
+    }
 }
 
 /** `GET /v1/topups/waiting`: `{ok:true, topups:[{topup_id, amount_msat, for_card, created_at_ms}]}`. */
@@ -400,7 +427,7 @@ internal fun parseWaitingTopUps(httpStatus: Int, body: String): List<WaitingTopU
         (0 until a.length()).map { i ->
             val t = a.getJSONObject(i)
             WaitingTopUp(
-                t.reqStr("topup_id"), t.reqLong("amount_msat"),
+                t.reqStr("topup_id"), t.topUpFace(),
                 if (t.isNull("for_card")) null else t.optString("for_card").ifEmpty { null },
                 t.optL("created_at_ms"),
             )
@@ -416,7 +443,7 @@ internal fun parseTopUpStatus(httpStatus: Int, body: String, paidLoad: Boolean =
     if (o.has("ok") && !o.optBoolean("ok", true) || httpStatus >= 400) refused(httpStatus, o, paidLoad)
     else TopUpReply.Ok(
         TopUpStatus(
-            o.reqStr("topup_id"), o.reqLong("amount_msat"), o.reqStr("state"),
+            o.reqStr("topup_id"), o.topUpFace(), o.reqStr("state"),
             if (o.isNull("load_txid")) null else o.optString("load_txid").ifEmpty { null },
             if (o.isNull("detail")) null else o.optString("detail").ifEmpty { null },
         )

@@ -4,7 +4,7 @@ import XCTest
 /// Top-up by Lightning from the balance screen (docs/TOPUP.md).
 final class TopUpFlowTests: XCTestCase {
     private var n = 0
-    private let t = TopUp(topupId: "t1", amountMsat: 100_352, invoice: "lnbc1x", expiresAtMs: 1_000_000, state: "waiting")
+    private let t = TopUp(topupId: "t1", amountMsat: 100_352, invoice: "lnbc1x", expiresAtMs: 1_000_000, state: "waiting", quote: TopUpQuote(invoiceAmountMsat: 103_000, topupFeeMsat: 2_648))
     private func st(_ state: String, txid: String? = nil, detail: String? = nil) -> TopUpReply<TopUpStatus> {
         .ok(TopUpStatus(topupId: "t1", amountMsat: 100_352, state: state, loadTxid: txid, detail: detail))
     }
@@ -77,8 +77,19 @@ final class TopUpFlowTests: XCTestCase {
         XCTAssertEqual(msat, 100_000)
         XCTAssertEqual(f.state, .topUpCreating(createId: cid, requestedMsat: 100_000, clientRef: ref))
         f.dispatch(.topUpCreated(createId: cid, result: .ok(t)))
-        XCTAssertEqual(f.state, .topUpInvoice(t, clientRef: ref))
+        XCTAssertEqual(f.state, .topUpInvoice(t, clientRef: ref, showQR: false))
+        XCTAssertTrue(f.dispatch(.showInvoicePressed).isEmpty)
+        XCTAssertEqual(f.state, .topUpInvoice(t, clientRef: ref, showQR: true))
         XCTAssertEqual(f.pad.sats, 7)
+    }
+
+    func testPaidLegacyRetryGoesStraightToTheCard() {
+        let f = shown()
+        f.dispatch(.topUpPressed); f.topUpPad.press(1)
+        guard case .createTopUp(let id, _, _, _)? = f.dispatch(.createInvoicePressed).first else { return XCTFail() }
+        let paid = TopUp(topupId: "old", amountMsat: 1000, invoice: "", expiresAtMs: 0, state: "paid")
+        guard case .startCardSession(.topUp)? = f.dispatch(.topUpCreated(createId: id, result: .ok(paid))).first else { return XCTFail() }
+        XCTAssertEqual(f.state, .topUpWaitingForCard(paid))
     }
 
     func testChargeCardGoesToTheKeypad() {
@@ -106,7 +117,7 @@ final class TopUpFlowTests: XCTestCase {
 
     func testExpiredOffersANewInvoiceWithANewRef() {
         let f = invoiced()
-        guard case .topUpInvoice(_, let ref) = f.state else { return XCTFail() }
+        guard case .topUpInvoice(_, let ref, _) = f.state else { return XCTFail() }
         f.dispatch(.topUpPolled(topupId: "t1", result: st("expired")))
         guard case .topUpFailed(let e) = f.state else { return XCTFail() }
         XCTAssertEqual(e.problem, .expired)
@@ -288,19 +299,57 @@ final class TopUpClientTests: XCTestCase {
         return (TillClient(pairing: { self.pairing }, transport: t), t)
     }
 
+    // BOLT 11's signed 250,000-sat coffee invoice.
+    private let invoice = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh"
+    private var quoteBody: String {
+        #"{"ok":true,"topup_id":"t1","amount_msat":249900000,"invoice_amount_msat":250000000,"topup_fee_msat":100000,"fee_quote_version":1,"invoice":"\#(invoice)","expires_at_ms":99,"state":"waiting"}"#
+    }
+
     func testCreateTopUpOk() async throws {
-        let (c, t) = client(200, #"{"ok":true,"topup_id":"t1","amount_msat":100352,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"#)
-        let r = await c.createTopUp(amountMsat: 100_000, clientRef: "r1")
-        XCTAssertEqual(r, .ok(TopUp(topupId: "t1", amountMsat: 100_352, invoice: "lnbc1", expiresAtMs: 99, state: "waiting")))
+        let (c, t) = client(200, quoteBody)
+        let r = await c.createTopUp(amountMsat: 249_900_000, clientRef: "r1")
+        XCTAssertEqual(r, .ok(TopUp(topupId: "t1", amountMsat: 249_900_000, invoice: invoice, expiresAtMs: 99, state: "waiting",
+                                    quote: TopUpQuote(invoiceAmountMsat: 250_000_000, topupFeeMsat: 100_000))))
         let req = try XCTUnwrap(t.requests.first)
-        XCTAssertEqual(req.method, "POST"); XCTAssertEqual(req.url.absoluteString, "http://10.0.0.2:9877/v1/topup")
+        XCTAssertEqual(req.method, "POST")
+        XCTAssertEqual(req.url.absoluteString, pairing.baseURL + "/v1/topup/fee-inclusive")
         XCTAssertEqual(req.headers["Authorization"], "Bearer deadbeef")
         let o = try JSONSerialization.jsonObject(with: try XCTUnwrap(req.body)) as! [String: Any]
-        XCTAssertEqual(o["amount_msat"] as? Int, 100_000); XCTAssertEqual(o["client_ref"] as? String, "r1")
+        XCTAssertEqual(o["fee_quote_version"] as? Int, 1)
+        XCTAssertEqual(o["amount_msat"] as? Int, 249_900_000); XCTAssertEqual(o["client_ref"] as? String, "r1")
+    }
+
+    func testUnverifiedQuotesNeverReachThePaymentScreen() {
+        let malformed = [
+            quoteBody.replacingOccurrences(of: #""fee_quote_version":1,"#, with: ""),
+            quoteBody.replacingOccurrences(of: #""fee_quote_version":1"#, with: #""fee_quote_version":2"#),
+            quoteBody.replacingOccurrences(of: "249900000", with: "249899999"),
+            quoteBody.replacingOccurrences(of: "249900000", with: "249900000.5"),
+            quoteBody.replacingOccurrences(of: "249900000", with: "9223372036854775808"),
+            quoteBody.replacingOccurrences(of: "250000000", with: "249999999").replacingOccurrences(of: "249900000", with: "249899999"),
+            quoteBody.replacingOccurrences(of: invoice, with: String(invoice.dropLast()) + "q"),
+        ]
+        for body in malformed {
+            XCTAssertEqual(topUpProblem(TillParse.topUp(status: 200, body: Data(body.utf8))), .unverifiedQuote)
+        }
+        XCTAssertEqual(topUpProblem(TillParse.topUp(status: 405, body: Data())), .unverifiedQuote)
+    }
+
+    func testAlreadyPaidLegacyReplayNeedsNoNewInvoice() {
+        let old = #"{"ok":true,"topup_id":"old","state":"paid","amount_msat":100352}"#
+        XCTAssertEqual(TillParse.topUp(status: 200, body: Data(old.utf8)),
+                       .ok(TopUp(topupId: "old", amountMsat: 100_352, invoice: "", expiresAtMs: 0, state: "paid")))
+    }
+
+    func testZeroFeeQuoteStillVerifiesTheSignedTotal() {
+        let free = quoteBody.replacingOccurrences(of: "249900000", with: "250000000")
+            .replacingOccurrences(of: #""topup_fee_msat":100000"#, with: #""topup_fee_msat":0"#)
+        guard case .ok(let t) = TillParse.topUp(status: 200, body: Data(free.utf8)) else { return XCTFail() }
+        XCTAssertEqual(t.quote, TopUpQuote(invoiceAmountMsat: t.amountMsat, topupFeeMsat: 0))
     }
 
     func testCreateTopUpSendsTheCard() async throws {
-        let ok = #"{"ok":true,"topup_id":"t1","amount_msat":98304,"invoice":"lnbc1","expires_at_ms":99,"state":"waiting"}"#
+        let ok = quoteBody
         let (c, t) = client(200, ok)
         _ = await c.createTopUp(amountMsat: 100_000, clientRef: "r1", shortId: "6f94b19b")
         let o = try JSONSerialization.jsonObject(with: try XCTUnwrap(t.requests.first?.body)) as! [String: Any]

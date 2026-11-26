@@ -71,7 +71,7 @@ struct RootView: View {
         case .waitingForCard, .signing, .balanceWaiting, .balanceReading, .topUpWaitingForCard, .topUpLoading: EmptyView()
         case .topUpEntering: TopUpScreen(creating: false)
         case .topUpCreating: TopUpScreen(creating: true)
-        case .topUpInvoice(let t, _): InvoiceScreen(topUp: t)
+        case .topUpInvoice(let t, _, let showQR): InvoiceScreen(topUp: t, showQR: showQR)
         case .topUpLoaded(let msat, let txid): ReceiptScreen(headline: "Loaded \(formatSats(msat)) sats", txid: txid)
         case .topUpFailed(let f): TopUpErrorScreen(failure: f)
         case .receipt(let r): ReceiptScreen(receipt: r)

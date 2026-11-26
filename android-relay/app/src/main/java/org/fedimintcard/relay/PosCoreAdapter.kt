@@ -4,11 +4,21 @@ import android.util.Log
 import org.fedimintcard.poscore.ApduTransport
 import org.fedimintcard.poscore.ChargeOutcome
 import org.fedimintcard.poscore.PinWaitProgress
+import org.fedimintcard.poscore.invoiceMatchesTotal
 import org.fedimintcard.poscore.PosCore
 import org.fedimintcard.poscore.SlotMsat
 import org.fedimintcard.poscore.TransportException
 import java.io.File
 import java.util.concurrent.Executors
+
+/** Check the signed Lightning invoice. A phone without a compatible core cannot offer this QR. */
+internal fun verifiedInvoiceTotal(invoice: String, total: Long): Boolean = try {
+    invoiceMatchesTotal(invoice, total)
+} catch (_: LinkageError) {
+    false
+} catch (_: Exception) {
+    false
+}
 
 /**
  * The one file that imports the generated bindings (`org.fedimintcard.poscore`, built from

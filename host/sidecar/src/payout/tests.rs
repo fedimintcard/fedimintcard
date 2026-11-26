@@ -46,6 +46,7 @@ enum ExportMode {
 struct Fake {
     guard: Arc<RwLock<()>>,
     balance: Mutex<u64>,
+    unusable_msat: AtomicU64,
     obligations: Mutex<Result<Obligations, String>>,
     pay_mode: Mutex<PayMode>,
     /// `(bolt11, max_fee_msat)` of every payment the wallet was asked to fund.
@@ -75,6 +76,7 @@ impl Fake {
         Self {
             guard: Arc::new(RwLock::new(())),
             balance: Mutex::new(balance_sat * 1000),
+            unusable_msat: AtomicU64::new(0),
             obligations: Mutex::new(Ok(Obligations::default())),
             pay_mode: Mutex::new(PayMode::Paid),
             pays: Mutex::new(vec![]),
@@ -162,11 +164,12 @@ impl Backend for Fake {
         // The claims first, then the balance, as the till's snapshot reads them.
         let o = self.obligations.lock().unwrap().clone().map_err(anyhow::Error::msg);
         let b = *self.balance.lock().unwrap();
+        let debit_balance_msat = b.saturating_sub(self.unusable_msat.load(Ordering::SeqCst));
         let schedules = self.schedules.lock().unwrap().clone();
         Box::pin(async move {
             // A read that takes a moment, as the wallet's does: other spends may run meanwhile.
             tokio::task::yield_now().await;
-            Ok(Snapshot { balance_msat: b, obligations: o?, schedules })
+            Ok(Snapshot { balance_msat: b, debit_balance_msat, obligations: o?, schedules })
         })
     }
 
@@ -475,6 +478,28 @@ async fn holders_value_and_the_reserve_are_never_paid_out_and_unknown_obligation
     assert_eq!(s["blocked"]["error"], "obligations_unknown");
     assert!(s["funds"].is_null());
     assert_eq!(fx.store().file().records.len(), 1, "no record for a refused payout");
+}
+
+#[tokio::test]
+async fn quoted_load_fees_and_unspendable_notes_are_excluded_from_manual_and_automatic_payouts() {
+    let fx = Fx::new(100_000);
+    fx.confirmed(Mode::Both).await;
+    fx.settings(|s| {
+        s.reserve_sat = 0;
+        s.threshold_sat = 1000;
+    });
+    *fx.wallet.obligations.lock().unwrap() = Ok(Obligations { topups_msat: 88_000_000, fees_msat: 1_000_000, pays_msat: 0 });
+    fx.wallet.unusable_msat.store(11_000_000, Ordering::SeqCst);
+    let e = fx.engine();
+    let funds = e.funds(&fx.store()).await.unwrap();
+    assert_eq!(funds.balance_msat, 100_000_000);
+    assert_eq!(funds.spendable_msat, 0);
+    assert!(e.lightning(fx.manual("reserve-ln"), Some(1000), WAIT).await.is_err());
+    assert!(e.ecash("reserve-ecash".into(), 1000, WAIT).await.is_err());
+    fx.store().commit(|f| f.next_auto_at_ms = 0).unwrap();
+    e.sweep(WAIT).await;
+    assert!(fx.store().file().records.is_empty());
+    assert_eq!(fx.wallet.funded(), 0);
 }
 
 #[tokio::test]

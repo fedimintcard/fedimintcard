@@ -44,7 +44,6 @@ class PosUi(
     private val charge: Button = v(R.id.btn_charge)
     private val checkBalance: Button = v(R.id.btn_check_balance)
     private val topUpTitle: View = v(R.id.topup_title)
-    private val invoiceAmount: TextView = v(R.id.invoice_amount)
     private val invoiceQr: android.widget.ImageView = v(R.id.invoice_qr)
     private val invoiceTimeLeft: TextView = v(R.id.invoice_time_left)
     private var qrFor: String? = null
@@ -115,6 +114,7 @@ class PosUi(
         v<View>(R.id.btn_charge_card).setOnClickListener { onEvent(PosEvent.ChargeCardPressed) }
         v<View>(R.id.btn_top_up_card).setOnClickListener { onEvent(PosEvent.TopUpPressed) }
         loadWaiting.setOnClickListener { onEvent(PosEvent.LoadWaitingPressed) }
+        v<View>(R.id.btn_show_invoice).setOnClickListener { onEvent(PosEvent.ShowInvoicePressed) }
         v<View>(R.id.btn_invoice_cancel).setOnClickListener { onEvent(PosEvent.CancelPressed) }
         v<View>(R.id.btn_card_balance_done).setOnClickListener { onEvent(PosEvent.DonePressed) }
         statusAlert.setOnClickListener { showRelay() }
@@ -184,7 +184,7 @@ class PosUi(
         charge.isEnabled = ok
         charge.alpha = if (ok) 1f else 0.4f
         charge.text = when {
-            creating -> "Creating invoice…"
+            creating -> act.getString(R.string.getting_topup_total)
             topUpMode -> act.getString(R.string.create_invoice)
             pad.isChargeable -> "Charge ${pad.display} sats"
             else -> act.getString(R.string.charge)
@@ -198,8 +198,19 @@ class PosUi(
     fun setTimeLeft(text: String) { invoiceTimeLeft.text = "Expires in $text" }
 
     private fun renderInvoice(s: PosState.TopUpInvoice) {
-        invoiceAmount.text = "Top up ${formatSats(s.topUp.amountMsat)} sats"
-        if (qrFor != s.topUp.invoice) {
+        val quote = requireNotNull(s.topUp.quote)
+        fun sats(msat: Long) = act.getString(R.string.amount_in_sats, formatSats(msat))
+        v<TextView>(R.id.invoice_on_your_card).text = sats(s.topUp.amountMsat)
+        v<TextView>(R.id.invoice_topup_fee).text = sats(quote.topupFeeMsat)
+        v<TextView>(R.id.invoice_total_to_pay).text = sats(quote.invoiceAmountMsat)
+        v<View>(R.id.invoice_fee_retention).visibility = if (!s.showQR && quote.topupFeeMsat > 0) View.VISIBLE else View.GONE
+        v<View>(R.id.invoice_wallet_fee).visibility = if (!s.showQR) View.VISIBLE else View.GONE
+        v<View>(R.id.btn_show_invoice).visibility = if (s.showQR) View.GONE else View.VISIBLE
+        v<View>(R.id.invoice_payment).visibility = if (s.showQR) View.VISIBLE else View.GONE
+        if (!s.showQR) {
+            invoiceQr.setImageDrawable(null)
+            qrFor = null
+        } else if (qrFor != s.topUp.invoice) {
             qrFor = s.topUp.invoice
             invoiceQr.setImageBitmap(qrBitmap(invoiceQrText(s.topUp.invoice)))
         }

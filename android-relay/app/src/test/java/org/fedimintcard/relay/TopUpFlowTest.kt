@@ -7,7 +7,7 @@ import org.junit.Test
 class TopUpFlowTest {
     private var refs = 0
     private fun flow(): PosFlow = PosFlow { "ref${++refs}" }
-    private val t = TopUp("t1", 100_352, "lnbc1x", 1_000_000, "waiting")
+    private val t = TopUp("t1", 100_352, "lnbc1x", 1_000_000, "waiting", TopUpQuote(103_000, 2_648))
     private fun st(state: String, txid: String? = null, detail: String? = null) =
         TopUpReply.Ok(TopUpStatus("t1", 100_352, state, txid, detail))
 
@@ -41,7 +41,9 @@ class TopUpFlowTest {
         assertEquals(100_000L, c.amountMsat)
         assertEquals(PosState.TopUpCreating(c.createId, 100_000, c.clientRef), f.state)
         f.dispatch(PosEvent.TopUpCreated(c.createId, TopUpReply.Ok(t)))
-        assertEquals(PosState.TopUpInvoice(t, c.clientRef), f.state)
+        assertEquals(PosState.TopUpInvoice(t, c.clientRef, showQR = false), f.state)
+        assertTrue(f.dispatch(PosEvent.ShowInvoicePressed).isEmpty())
+        assertEquals(PosState.TopUpInvoice(t, c.clientRef, showQR = true), f.state)
         assertEquals(7L, f.pad.sats)
     }
 
@@ -59,6 +61,15 @@ class TopUpFlowTest {
         f.dispatch(PosEvent.TopUpPolled("t1", st("expired")))
         val renewed = f.dispatch(PosEvent.RetryPressed).single() as PosEffect.CreateTopUp
         assertEquals("6f94b19b", renewed.shortId)
+    }
+
+    @Test fun paidLegacyRetryGoesStraightToTheCard() {
+        val f = shown()
+        f.dispatch(PosEvent.TopUpPressed); f.topUpPad.press(1)
+        val create = f.dispatch(PosEvent.CreateInvoicePressed).single() as PosEffect.CreateTopUp
+        val paid = TopUp("old", 1000, "", 0, "paid")
+        f.dispatch(PosEvent.TopUpCreated(create.createId, TopUpReply.Ok(paid)))
+        assertEquals(PosState.TopUpWaitingForCard(paid), f.state)
     }
 
     @Test fun aFullCardIsRefusedBeforeAnyInvoice() {
