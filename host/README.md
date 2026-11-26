@@ -4,7 +4,7 @@ Rust side of the spike: a `Card` transport and federation tests that spend a not
 
 | Crate | What |
 |---|---|
-| `card/` (`fedimint-card-host-card`) | `Card` trait (`gen_key`, `get_pub`, `sign`, and applet 3.0's `set_note`, `get_slot`, `get_state`, `set_change`, `set_limit`, `set_header`, `attest_init`, `set_cert`, `get_cert`, `attest`; `applet_version`); `CardClient<T: Transport>`; backends `SoftCard` (in-process; `SoftCard::new()` is 2.1, `SoftCard::v3()` follows applet 3.0), `BridgeTransport` (HTTP, `ureq`), `PcscTransport` (feature `pcsc`); `v3` (3.0 answers, header work, the registry's certificate) |
+| `card/` (`fedimint-card-host-card`) | `Card` trait (`gen_key`, `get_pub`, `sign`, and the card commands `set_note`, `get_slot`, `get_state`, `set_change`, `set_limit`, `set_header`, `attest_init`, `set_cert`, `get_cert`, `attest`; `applet_version`); `CardClient<T: Transport>`; backends `SoftCard` (in-process; `SoftCard::new()` is 2.1, `SoftCard::v3()` identifies as a legacy 3.0 card, `SoftCard::v4()` exercises the current 4.0 protocol), `BridgeTransport` (HTTP, `ureq`), `PcscTransport` (feature `pcsc`); `v3` (3.0 answers, header work, the registry's certificate) |
 | `fed-tests/` (`fedimint-card-fed-tests`) | 4-guardian in-process federation (`fedimint-testing`), hand-built transactions, steps 3-6 as `cargo test` |
 | `pos-core/` (`fedimint-card-pos-core`) | The offline charge the till and the POS phones share (`docs/POS-OFFLINE.md`): attestation, note checks, the planner, the durable queue, the offline kit and a phone's store; no fedimint client, no async runtime. Feature `ffi`: the apps' UniFFI interface; `scripts/pos-core-mobile.sh android\|ios\|bindings\|check` builds it for the phones |
 | `old-card-pin/` (`fedimint-card-old-card-pin`) | The P1 00 PIN of cards older than 4.0, for tests only. No till, POS phone or command line sends a P1 00 PIN (a card older than 4.0 gets the old-card refusal first), and `tests/not_in_the_product.rs` fails if `sidecar` or `pos-core` lists this crate as a dependency or names it |
@@ -100,21 +100,21 @@ adb reverse tcp:9877 tcp:9877   # phone -> till service on the laptop
 * One charge or balance call at a time; a second gets `409 busy`.
 * `sales.json` in the data dir (mode 0600) is a convenience ledger for the app and for
   `client_ref` replays. The money truth is the federation and `card_state.json`.
-* No authentication: keep it on loopback (a warning is printed otherwise).
+* Pair phones with a POS token. For a reverse proxy, use `--require-pos-token` so requests forwarded through loopback also require that token. [POS pairing and authentication](../docs/POS-LINK.md)
 * Applet 4.0 cards and offline charges (`docs/TILL-API.md`, `docs/OFFLINE-PROTOCOL.md` § 4):
   `--esplora-url` (`TILL_ESPLORA_URL`, default `https://mempool.space/api`, empty to turn off)
   is where block headers for the cards' clocks come from (every 10 minutes, kept in
   `block-header.json`); `--offline-cap-msat` (default 100,000,000) and `--offline-cap-count`
   (default 200) cap what the till holds unsettled from offline charges; `--spare-target`
   (`TILL_SPARE_TARGET`, default 12) and `--spare-keys-per-tap` (`TILL_SPARE_KEYS_PER_TAP`,
-  default 2) set the spare reserve online taps keep a 3.0 card at, so it can take change offline;
+  default 2) set the spare reserve online taps keep a compatible 4.x card at, so it can take change offline;
   `--offline-fee-base-msat` (`TILL_OFFLINE_FEE_BASE_MSAT`, default 100) and
   `--offline-fee-headroom-ppm` (`TILL_OFFLINE_FEE_HEADROOM_PPM`, default 0) set the fee schedule an
   offline charge keeps a fee margin for, on a federation at core consensus 2.1 or later (0 and 0:
   none; `docs/TILL-API.md`, "Fee margin"). Charges taken offline
   wait in `offline_queue.json` (0600) and are sent every 30 s while the till is on ops; the
   registry's certificate key is kept as `cert_key` in `till-ops.json`. Back up both with the
-  wallet: the queue is the merchant's money until it is sent. At an online tap of a 3.0 card the
+  wallet: the queue is the merchant's money until it is sent. At an online tap of a 4.x card the
   till first sends the registry's releases (§ 6) for charges the federation rejected or the
   registry refused as double spends, logging any the card does not take, and, at a
   `POST /v1/charge`, finishes, drops or sets aside the charges a pulled card left `signing`.

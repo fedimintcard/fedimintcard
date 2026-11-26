@@ -2,27 +2,31 @@
 
 An experiment in NFC cards for [Fedimint](https://github.com/fedimint/fedimint) ecash.
 
-The card holds the spend keys of Fedimint notes and signs spends with them; the phone or
-till does the rest. Because Fedimint notes are spent with a Schnorr signature from each
-note's own key, this needs no change to the Fedimint protocol and works with existing
-federations.
-
-Status: running in production for the Island Bitcoin Community federation, with 32-slot cards
-(applet 2.1) since 2026-11-06: a registry, a till on StartOS, a Setup app for operators and a POS
-app for merchants. Results on silicon and end to end: [docs/CAP-BUILD.md](docs/CAP-BUILD.md).
-
-This is experimental software. Put on a card only what you can afford to lose.
+The card holds the spend keys for its Fedimint notes. When the holder pays, the card signs the spend and the till settles it with the federation.
 
 ## Card 4.0 merchant till
 
-The merchant till accepts Card 4.x and works with Bitcoin mint v1 and mint v2 federations. It requires a Card 4.0 registry with support for the selected mint. Merchants with older cards still need a compatible till to spend or withdraw their balance. Use the web page to set up a till, pair a POS phone, review sales and withdraw proceeds.
+The till holds the merchant's wallet. Use Till admin to join a federation, pair a POS phone, review sales and pay out the proceeds. POS can also load a customer's card from one Lightning payment, even when the till starts with an empty wallet. The customer reviews the card credit, fixed top-up fee and total before choosing **Show payment QR**. [Top-up guide](docs/TOPUP.md) · [Sales overview](docs/images/till/overview.png) · [Payouts](docs/images/till/payouts.png)
 
-[Docker installation and backup](docs/TILL-DOCKER.md) · [Merchant overview](docs/images/till/overview.png) · [Payouts](docs/images/till/payouts.png)
+**Compatibility.** Use a Card 4.x card and a Card 4.0 registry that supports your federation's Bitcoin mint (v1 or v2). In Fedimint Card Setup, choose the federation the till joined and sign in to the registry that will approve its claim. Keep a compatible till for older cards. Spend or withdraw their balance and settle outstanding holds before resetting them. [Registry pairing](docs/TILL-CLAIM.md)
+
+### Install the till and POS
+
+| Platform | Release 0.1.0 |
+|---|---|
+| Docker | Use the [tagged Compose file](https://github.com/fedimintcard/fedimintcard/blob/till-v0.1.0/compose.yaml) for Linux amd64 or arm64. [Installation and backup](docs/TILL-DOCKER.md) |
+| StartOS | Back up an existing Card 4.0 till. Sideload revision `0.1.0:12` for [x86_64](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/fedimintcard-till-0.1.0-12-x86_64.s9pk) or [aarch64](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/fedimintcard-till-0.1.0-12-aarch64.s9pk). [Package checksums](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/SHA256SUMS) · [Setup and pairing](https://github.com/bobodread876/fedimintcard-till-startos/blob/7ddd06d51ab1297c90edb48e94b685b29d16d2b0/instructions.md) |
+| Umbrel | Follow the [official store submission](https://github.com/getumbrel/umbrel-apps/pull/6423) for availability. |
+| Android POS | For a fresh install or an update signed by the same distributor, download [Fedimint Card POS 1.1.0 (8)](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk). The APK supports arm64-v8a and x86_64. For an existing Play installation, keep its data and update through Play when a compatible version is available. [APK checksum](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk.sha256) |
+| Setup app | The operator uses a Card 4.0 Setup build to provision cards and approve tills. Check the build with your distributor. This release includes the [Setup source and operator guide](apps/provisioner/README.md). |
+| iOS POS | The merchant needs a build with Card 4.0 and fee-inclusive top-ups. Ask your distributor to confirm its build. The tagged release includes the [iOS source](https://github.com/fedimintcard/fedimintcard/tree/till-v0.1.0/ios-pos). |
+
+Fedimint Card is experimental software. Put on a card only what you can afford to lose. [Till release notes](https://github.com/fedimintcard/fedimintcard/releases/tag/till-v0.1.0)
 
 ## Layout
 
 ```
-applet/         JavaCard applet: 32 slots, GEN_KEY, GET_PUB, SIGN, PIN, STATE_KEY; jCardSim tests
+applet/         Card 4.0 JavaCard applet, 32 key slots, sealed PIN and jCardSim tests
 bridge/         HTTP bridge that serves the simulated applet on 127.0.0.1
 host/           Rust workspace: card transport, the till (card-sidecar) and federation tests (host/README.md)
 registry/       Cloudflare Worker: cards, notes, tills and operators; nightly encrypted backup
@@ -34,7 +38,7 @@ scripts/        release builds
 docs/           plans, protocols and results (below)
 ```
 
-[docs/RELEASING.md](docs/RELEASING.md) says how the POS and Setup apps are built for TestFlight and Play.
+See the release guide for the GitHub APK, TestFlight and Google Play builds. [Mobile releases](docs/RELEASING.md)
 
 ## Docs
 
@@ -42,7 +46,7 @@ docs/           plans, protocols and results (below)
 |---|---|
 | [DESIGN-NOTE.md](docs/DESIGN-NOTE.md) | the design: how a card holds Fedimint notes, and what it trusts |
 | [SPIKE.md](docs/SPIKE.md), [SPIKE-PLAN.md](docs/SPIKE-PLAN.md) | the first spike: one card, one federation |
-| [CAP-BUILD.md](docs/CAP-BUILD.md) | building and installing the applet; 32 slots on silicon; the end-to-end run and the production rollout |
+| [CAP-BUILD.md](docs/CAP-BUILD.md) | building and installing the applet; 32 slots on silicon; the historical end-to-end run and rollout |
 | [HARDWARE_TEST_REPORT_2026-11-19.j3r452.md](docs/HARDWARE_TEST_REPORT_2026-11-19.j3r452.md) | hardware test report: the Setup app and a staging till on a J3R452 and a J3R180, 2026-11-15 to 2026-11-19 |
 | [OPS-PLAN.md](docs/OPS-PLAN.md) | the registry ("ops") and how tills, holders and operators use it |
 | [PROVISIONER-PLAN.md](docs/PROVISIONER-PLAN.md), [PROVISIONER-HANDOFF.md](docs/PROVISIONER-HANDOFF.md) | the Setup app and cardkit |
@@ -51,7 +55,7 @@ docs/           plans, protocols and results (below)
 | [OFFLINE-PAYMENTS.md](docs/OFFLINE-PAYMENTS.md) | research: card payments with no internet for days |
 | [OFFLINE-PLAN.md](docs/OFFLINE-PLAN.md) | plan: offline card payments, as built and drilled |
 | [OFFLINE-PROTOCOL.md](docs/OFFLINE-PROTOCOL.md) | the contract between card, registry, till and apps |
-| [ROLLOUT-OFFLINE.md](docs/ROLLOUT-OFFLINE.md) | checklist: offline payments to production |
+| [ROLLOUT-OFFLINE.md](docs/ROLLOUT-OFFLINE.md) | dated rollout checklist and deployment history |
 | [DEMO.md](docs/DEMO.md) | the first demo script (2026-10-27, laptop till) |
 
 ## Build
@@ -69,28 +73,9 @@ The bridge listens on 127.0.0.1 only. `POST /apdu` takes `{"apdu":"<hex>"}` and 
 from `SecureRandom` per card; `--fixed-keys` turns that off (jCardSim then makes the same first
 key every time).
 
-## APDUs
+## Card protocol
 
-CLA `B0`. Applet AID `F0464D4341524401`. Key slots: 32 (P1 = 0..31). P2 = 0 on every command, except GEN_KEY which also takes P2 = 1.
-
-| Command | INS | Data | Response |
-|---|---|---|---|
-| GEN_KEY | `10` | none | 32-byte x-only pubkey; P2 = 0: `6985` if the slot is used; P2 = 1 (overwrite): wipes the slot and generates a new key, used or not |
-| GET_PUB | `11` | none | 32-byte x-only pubkey; `6985` if empty |
-| SIGN | `12` | 32-byte message | 64-byte BIP340 signature; `6985` if empty; needs a `VERIFY_PIN` in the same session |
-| VERIFY_PIN | `40` | 4..8-byte PIN | `9000` and this session may SIGN; `63CX` wrong, X tries left; `6A98` a wait is owed, send it again; `6984` no PIN set |
-| SET_PIN | `41` | 4..8-byte PIN | `9000` the first time; `6985` if a PIN is already set; does not open a session |
-| CHANGE_PIN | `42` | old PIN then new PIN, 8..16 bytes, equal lengths | `9000`; P1 = old PIN length (0 = equal halves); the old PIN is checked as in `VERIFY_PIN` and ends the session |
-
-`SELECT` answers `04009000`: the applet's version 4.0 in two data bytes, then the status word.
-
-The applet is meant for contactless (T=1 style) use. GEN_KEY and GET_PUB call
-`setIncomingAndReceive` on commands with no data, which may stall on T=0 contact transports;
-step 7 must re-check this on the real card.
-
-Status words: `9000` ok, `6700` wrong length, `6A94` PIN required, `6A98` a PIN wait is owed (send the same command again),
-`6A96` clock not anchored, `6982` bad note signature, `6984` no PIN set, `6B00` bad P1/P2, `6985` state refused, `6D00`
-unknown INS, `6E00` wrong CLA, `6F00` crypto failure.
+The Card 4.0 contactless applet uses AID `F0464D4341524401`, command class `B0`, and 32 key slots. A successful `SELECT` returns version bytes `04 00` followed by status `90 00`. The host verifies the card and seals PIN commands to its authenticated key using a fresh nonce. See the protocol for the commands, status words and PIN handling. [Card protocol](docs/OFFLINE-PROTOCOL.md) · [Sealed PIN](docs/OFFLINE-PROTOCOL.md#9-the-sealed-pin-fedimint-card-40) · [Applet command reference](applet/src/main/java/io/github/bobodread876/fedimintcard/applet/FedimintCardApplet.java)
 
 ## License
 

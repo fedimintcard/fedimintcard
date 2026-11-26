@@ -1,11 +1,10 @@
 # Fedimint Provisioner
 
-The phone-side operator app for programming blank J3R180 JavaCards into Fedimint
+The phone-side operator app for programming supported blank JavaCards into Fedimint
 cards, one tap at a time, in batches. It installs the Fedimint card applet over
 NFC, locks its card manager to the card's own keys from ops, lets the card
 generate its keys, sets its offline limit, gets the registry's certificate over the
-card's attestation key written onto it, and sets the card's PIN (applet 3.0, all in
-the one install tap; docs/OFFLINE-PROTOCOL.md § 5). Value comes from the holder's wallet
+card's attestation key written onto it, and sets a sealed PIN on the Card 4.0 applet in the install tap. See the [card protocol](../../docs/OFFLINE-PROTOCOL.md). Value comes from the holder's wallet
 (docs/OPS-PLAN.md § 6).
 
 Read `docs/PROVISIONER-PLAN.md` § 5 for what the app is and § 8.6 for the
@@ -31,15 +30,11 @@ certificate's attestation key, then one sealed `SET_PIN` (P1 01, a 90-byte envel
 PIN command is sealed, and none is sealed to a card that fails a check:
 the tap stops at `setPin` with "the card did not prove it is a genuine card of this
 registry". The reset of a 4.0 card seals the holder's `VERIFY_PIN` the same way, with the
-certificate key fetched before the tap; without it the reset stops before the PIN. Only
-the reset of an applet before 4.0 sends that applet's form (`oldCardResetPinApdu`, P1 00),
-and the PIN screen warns the operator; nothing else in the app does, and the till and the
-POS phones send no PIN to such a card at all. A tap lifted
+certificate key fetched before the tap; without it the reset stops before the PIN. For an older card, spend or withdraw the balance on a compatible till and settle any outstanding holds before requesting a reset. Setup checks the registry's holdings before proceeding and explains the older card's PIN handling on the reset screen. A tap lifted
 anywhere in it is finished by the next tap of the same card: the offline steps are
 idempotent before the PIN (`SET_LIMIT` again, `ATTEST_INIT` again until `SET_CERT`
 took, `SET_REGISTRY_KEY` until byte 58 says it is set), and a card that already holds its certificate keeps its keys, because the
-certificate is over slot 0's key and cannot be replaced. A card that answers SELECT
-below 3.0 is finished the old way, without them. When the registry (not the card)
+certificate is over slot 0's key and cannot be replaced. Setup checks the applet version before finishing a card. An older applet is refused at this step. When the registry (not the card)
 stops the finish, the screen shows the registry's own reason ("The registry refused the
 card's certificate: …"), not the lifted-card text.
 

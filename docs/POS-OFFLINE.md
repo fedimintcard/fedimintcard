@@ -1,7 +1,6 @@
 # The POS phone as an offline till
 
-A POS phone with no network takes a 3.0 card payment, shows "Paid offline" and what waits to sync,
-and the money reaches the till's wallet when the phone next reaches the till. A genuine card
+A paired POS phone with a current offline kit can take a compatible Card 4.x payment without a network connection. The phone shows **Paid offline** and the number of sales waiting to sync. When it reconnects, it sends those sales to the till for settlement. A genuine card
 cannot pay twice with the same note. A cloned card, or a lost or rooted phone, costs the merchant
 at most the phone's caps, never the proceeds already queued; a lost or wiped phone also strands,
 on the holders' cards, the inputs of the sales it had not synced, and the caps do not bound that
@@ -18,14 +17,10 @@ iOS, and ENG-844, Android) and how it was drilled on production (ENG-845, § Dri
 ## Architecture
 
 **One Rust core, used by the till and both apps.** `host/pos-core` (`fedimint-card-pos-core`) is
-the till's offline charge, cut out of the sidecar: the card driver (`host/card`, the 3.0
-commands), the attestation check (`GET_CERT`, `ATTEST`), the note check (`Note::verify` under the
-federation's key for the tier), the planner (`plan.rs`: inputs, change, fee headroom, now with
+the till's offline charge, cut out of the sidecar: the Card 4.x driver (`host/card`), the attestation check (`GET_CERT`, `ATTEST`), the mint-specific signature check under the federation's key for the note's denomination, the planner (`plan.rs`: inputs, change, fee headroom, now with
 the tiers the till's outputs may use), `SET_CHANGE` and `SIGN` per slot, and the durable queue
 with the till's write order: `signing` saved, with every secret, before the card is told
-anything; `queued`, with the signed bytes, before the caller is answered. It depends on
-fedimint-core, fedimint-mint-common, tbs and the card crate only: no fedimint client, no API
-client, no rocksdb, no registry client (`host/scripts/pos-core-mobile.sh check` proves it in CI).
+anything; `queued`, with the signed bytes, before the caller is answered. It uses the common types for mint v1 and mint v2 and the card driver. It runs without a federation client, RocksDB or a registry connection (`host/scripts/pos-core-mobile.sh check` proves it in CI).
 It is synchronous and runs no async runtime. The till's `offline::charge` runs it in one
 `on_card`, with the till's own outputs; a phone runs it with an offline kit in place of the
 wallet. It builds for aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios,
@@ -37,22 +32,15 @@ routes for paired phones (`docs/TILL-API.md`): `GET /v1/offline/kit` and
 `POST /v1/offline/charges`. The till puts each charge a phone sends into its own offline queue as
 `queued`; its sender reports it to the registry, writes it into the card's file, lets the
 ordinary recovery send it to the federation and collect its notes, and posts the outcome, as for
-the till's own offline charges. Idempotent by txid. The registry is unchanged.
+the till's own offline charges. Repeated submissions are identified by transaction ID.
 
 **The offline kit.** Fetched while online and on every sync, and good for a week (by default)
 from the fetch that answered it, a kit the till gives again included: the
-federation's id and mint module instance, its note keys per tier, its mint fees (a core built on
-fedimint v0.13.0 refuses a fee schedule that is neither none nor a 100 msat base with at most
-1,000 ppm) and the fee
-headroom, the registry's certificate key the till pins, the phone's caps (count and msat, the
+federation's ID, mint version and module instance, its note keys per tier, the mint fee schedule and fee headroom, the registry's certificate key the till pins, the phone's caps (count and msat, the
 till's `--offline-cap-*`), the validity, the newest block header, and a **pool of till outputs per
 tier**: blinded nonces whose spend keys and blinding keys stay on the till. The phone holds
 nothing that can spend the merchant's proceeds: what it queues is public data and the card's
-signatures. The pool covers every tier from the smallest note the planner gives the till (4 msat
-on fedimint's default fees, 1 msat otherwise; with fees the till's side takes what they leave,
-and a pool from the economical denomination up could pay no price on a card with no room for
-change) to the largest at or below the phone's value cap, 40 entries a tier, fewer when the kit
-would pass 128 KB. A phone holds at most 3 live kits; at that cap the till gives the newest
+signatures. The pool contains the denominations the planner can issue to the till, up to the phone's value cap. Mint v2 merchant outputs must clear their redemption fee. Kits normally contain 40 entries per eligible tier, reduced to fit the 128 KB size limit. A phone holds at most 3 live kits; at that cap the till gives the newest
 again, its tiers topped up once one runs low. The till never reuses an entry, and drops the
 unused entries of a kit past its grace, secrets and all.
 
@@ -82,12 +70,6 @@ acceptance; the card's own daily limit applies as with any till. Double spends a
 tills are found by the registry at report, as today, and counted: the till's count shows in
 Settings on both apps.
 
-**What does not change.** Applet 3.0, the online charge path (but for a sale the till's own
-offline queue holds `signing`, taken the offline way as above, any other charge a card left
-`signing` on the till, settled at the start of a `POST /v1/charge`, and an answer that does not say
-whether the till took the sale, which the apps leave unresolved: ENG-859), the registry API and
-the Setup app.
-
 ## One charge
 
 `charge(card, queue, env, price, client_ref)` runs in this order, so a charge that cannot succeed
@@ -99,7 +81,7 @@ spends no PIN try:
    `conflict` for another price;
 3. a phone's kit expiry (against the latest of the phone's clock, the kit's issue and the latest
    time the store has seen), then the count cap: no APDU;
-4. a 3.0 card (`offline_unsupported_card`), its certificate and attestation (`card_not_genuine`),
+4. the applet version (an older card returns `old_card`), the 4.x card’s certificate and attestation (`card_not_genuine`),
    its clock (`SET_HEADER` when older; the kit's expiry again, by the card's clock), the PIN;
 5. charges this card left `signing` are finished from its stored signatures: a repeat of one is
    that charge (`replayed`), and another card tapped for one is `undecided`. One that can never be
@@ -203,9 +185,7 @@ was sent leave the sale unresolved ("Outcome unknown": Try again with the same `
 Check sales, Abandon sale, no Back; ENG-859). A 401 or 403 never falls back: the pairing is dead.
 An unresolved sale whose retry cannot reach the till stays on the unreachable screen with the lost
 reply's copy. Otherwise the unreachable screen says which: no kit yet, the kit expired, or the
-caps reached. Balance reads and top-ups never fall back. The till's own answers with the codes of
-its offline path (`offline_cap_reached`, `offline_not_ready`, `offline_note_invalid`) read as
-before, in the till's words: the phone's copy for them is about the phone's kit and queue.
+caps reached. Balance reads and top-ups never fall back. When a card's notes cannot be verified offline, POS asks the merchant to connect to the till to check its federation and mint. For a payment still held on this phone, follow the held-payment instructions first.
 
 **Local only.** A sale in `signing_refs()`, or whose last local charge answered `undecided` or
 threw, is retried with `PosCore.charge` only, with the same `client_ref`, whatever the till's
@@ -273,10 +253,10 @@ does not say whether the till took the sale.
 | `offline_not_ready` | no kit yet, or one this phone cannot use | "Till service unreachable": no kit yet |
 | `offline_kit_expired` | the kit is past its expiry (phone's clock or card's) | kit expired: reach the till |
 | `offline_cap_reached` | the phone's caps on what waits to sync | caps reached: reach the till |
-| `old_card` | a card older than applet 4.0 (`detail` is the message to show) | "This card has an older applet. Reset it and set it up again." |
+| `old_card` | a card older than applet 4.0 (`detail` is the message to show) | “Old card.” Before resetting, spend or withdraw its balance and settle outstanding holds on a compatible till. |
 | `offline_unsupported_card` | a card the offline path does not take | this card pays online only |
 | `card_not_genuine` | not a card the registry certified (a clone) | decline |
-| `offline_note_invalid` | notes that do not check, and the rest do not pay | a card the kit cannot verify |
+| `offline_note_invalid` | notes that do not check, and the rest do not pay | “Couldn’t verify card notes” and a prompt to connect to the till |
 | `offline_no_change_room` | needs change, and the card has no fresh KEYED slot from 24 to 31 for it | "No room for change offline", then "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_pool_exhausted` | the kit has run out of a tier the price needs | "Try N sats", then a new kit |
 | `wrong_pin` | the card refused the PIN (`63 CX`): `wrong_tries` is X, the wrong tries in a row; `wait_s` is about how long the next try waits | ask again; the card holds the next try for `wait_s` |
@@ -543,7 +523,7 @@ run in step 7's staging pass (`ROLLOUT-OFFLINE.md` § Afterwards).
   online sale that needs them fails (step 6). No release exists for a charge the registry never
   saw.
 
-## Risks
+## Risks recorded during the drill
 
 1. A phone gives change to a KEYED slot whose key the till knows carried a note before (a dead
    change key); the registry refuses that change at report (409) and the sale is refused, its notes

@@ -28,7 +28,7 @@ and the Android script do not check, so `git status --short` must print nothing 
 
 ## Versions
 
-Bump the versions on `main` before building. The bump is the last change merged before the builds,
+For store builds, bump the versions on `main` before building. The bump is the last change merged before the builds,
 and nothing merges between it and them, so every build comes from the bump's commit.
 
 - POS, iOS: `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in `ios-pos/project.yml`, then
@@ -147,6 +147,21 @@ As with the POS app, the upload leaves no export folder. xcodebuild gets
 App Store Connect processes an upload before TestFlight offers it. Each app's `Info.plist` answers
 export compliance. What to Test and the external testing groups are set in App Store Connect; the
 first build of a version added to an external group goes to Beta App Review.
+
+## Android POS on GitHub
+
+The [till 0.1.0 release](https://github.com/fedimintcard/fedimintcard/releases/tag/till-v0.1.0) distributes a signed release APK for `org.fedimintcard.pos`, version **1.1.0 (8)**. Its POS code and native offline core match the release source at `931ce6693767f95fc9a494b34f5c3b79a51eff52`. The distribution build set Android `versionCode` to 8 at build time. The Gradle file in that tag defaults to 5.
+
+For a subsequent Android POS release, use a version code greater than both the latest GitHub APK and the highest code already uploaded to Play Console. Record the application ID, version name, version code, source revision and APK checksum with the release. Check the manifest version and signer on the signed file before publishing. Google Play signs the APKs it distributes, so Play installations update through Play. A GitHub APK can update an existing installation signed with the same certificate.
+
+To verify the GitHub download, put the [APK](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk) and its [checksum file](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk.sha256) in the same directory. With Android SDK Build Tools on your path, run the following checks.
+
+```sh
+shasum -a 256 -c FedimintCard-POS-1.1.0-8.apk.sha256
+apksigner verify --verbose --print-certs FedimintCard-POS-1.1.0-8.apk
+```
+
+The SHA-256 fingerprint of the APK signing certificate for this release is `7a34e2be4d9117e4b5fa6a7516385a87f6a4679f58f730654bed75bdf958b702`.
 
 ## Android: POS app, Play
 

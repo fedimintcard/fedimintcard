@@ -1,12 +1,12 @@
 # Run a Card 4.0 merchant till
 
-This image accepts **Fedimint Card 4.x cards only** and requires a **Card 4.0 registry**. Check your cards and registry version before upgrading a till that serves older cards. The till opens its existing wallet in place. It supports Bitcoin mint v1 and mint v2 federations. For a mint v2 federation, use a Card 4.0 registry with mint v2 support. Offline phone payments also require a POS app with mint v2 support.
+This image accepts **Fedimint Card 4.x cards only** and requires a **Card 4.0 registry**. Check your cards and registry version before upgrading a till that serves older cards. The till opens its existing wallet in place. It supports Bitcoin mint v1 and mint v2. It also registers Lightning, Lightning v2, metadata and wallet v2 modules when the federation offers them. For a mint v2 federation, use a Card 4.0 registry with mint v2 support. Offline phone payments also require a POS app with mint v2 support.
 
-The till uses `https://registry.fedimintcard.org` when `OPS_URL` is unset. To use another Card 4.0 registry, add a line such as `OPS_URL=https://registry.example.org` to the `.env` file beside `compose.yaml`. Use your registry’s HTTPS origin. Run `docker compose up -d` to apply the setting before connecting the till to the registry.
+Confirm the Card 4.0 registry with your operator before connecting. The till uses `https://registry.fedimintcard.org` when `OPS_URL` is unset. For a different registry, put `OPS_URL=https://registry.example.org` in the `.env` file beside `compose.yaml` and replace the example with the operator's HTTPS origin. Run `docker compose up -d` to apply it. The operator must approve the claim at the same origin. Stock Fedimint Card Setup offers **Test** and **Live** in Settings. A self-hosted registry needs an operator client configured for its own origin. [Registry pairing](TILL-CLAIM.md)
 
-For a build published by source commit, set `TILL_IMAGE=ghcr.io/fedimintcard/till:sha-FULL_COMMIT_SHA` in your Compose environment. For an exact copy, use the published multi-architecture index digest (`ghcr.io/fedimintcard/till@sha256:INDEX_DIGEST`).
+For a build published by source commit, set `TILL_IMAGE=ghcr.io/fedimintcard/till:sha-FULL_COMMIT_SHA` in your Compose environment. For the exact release 0.1.0 image on either architecture, use `TILL_IMAGE=ghcr.io/fedimintcard/till@sha256:6b6af105a2b3822a082c1d92ddc41c3d450b91543fc3b365d6ddbc2e31a519dd`.
 
-Use the Compose file supplied with the till release. The image supports Linux amd64 and arm64. Choose a private admin password of at least 16 visible ASCII characters in your Compose environment. Keep the password in your password manager. The image name is `ghcr.io/fedimintcard/till`. Enter these commands in Bash.
+Download the [release 0.1.0 Compose file](https://raw.githubusercontent.com/fedimintcard/fedimintcard/till-v0.1.0/compose.yaml) as `compose.yaml` in a directory for the till. Run the following commands from that directory. The image supports Linux amd64 and arm64. Choose a private admin password of at least 16 visible ASCII characters in your Compose environment. Keep the password in your password manager. The image name is `ghcr.io/fedimintcard/till`. Enter these commands in Bash.
 
 ```sh
 read -rs -p 'Till admin password: ' TILL_ADMIN_PASSWORD && echo

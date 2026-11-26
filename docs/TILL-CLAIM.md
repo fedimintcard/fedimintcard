@@ -1,17 +1,12 @@
 # Till claim: connecting a till to the registry without a password on the server
 
-Status: agreed 2026-11-05 (owner: "build B"), built and in production (verified 2026-11-06).
+The till requests a token from its registry. An operator signs in to Fedimint Card Setup and approves the till there. The till then uses that token to access the registry.
 
-A till needs a till token (`till_…`) to use the registry. Today an operator makes one with
-`registry/scripts/new-till.sh` on a computer and pastes it into the till. The claim flow lets the
-till ask for its own token and the operator approve it from the provisioner app they are already
-signed in to. No operator password is ever typed on the till's server, and no till token is
-stored in plain text anywhere but the till.
+Before connecting, confirm the registry supports Card 4.0 and the federation's mint. Set the till's registry URL to the operator's HTTPS origin. In Setup, select **Test** or **Live** to match, then sign in to that registry. For a self-hosted registry, use an operator client configured for its origin.
 
 ## Flow
 
-1. The till (StartOS action **Connect to registry**, or `card-sidecar till claim`) starts a claim
-   and shows a QR code and a short code.
+1. Open Till admin and connect to the registry to get a claim QR code and a short code. On StartOS you can also run **Connect to registry**. The command-line equivalent is `card-sidecar till claim`.
 2. The operator, in the provisioner app, opens **Settings → Tills → Add a till**, scans the QR
    (or types the code), sees the till's name, and approves.
 3. The till, polling, receives its till token once and stores it. The claim is gone.

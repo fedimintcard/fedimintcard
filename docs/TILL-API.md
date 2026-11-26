@@ -41,13 +41,12 @@ tap; and every attach writes any live note the card still lacks (a change finish
 till also keeps the newest Bitcoin block header (`--esplora-url`, default
 `https://mempool.space/api`, `TILL_ESPLORA_URL`; every 10 minutes, kept in
 `<data_dir>/block-header.json`; an empty value turns it off) and shows it to the card
-(`SET_HEADER`) when the card's clock is older; this never blocks or fails a job. 2.x cards get
-none of this.
+(`SET_HEADER`) when the card's clock is older; this never blocks or fails a job. An applet older than 4.0 returns `old_card` at the version check.
 
 **Offline.** On ops, a charge first probes the registry (`GET /registry/cert-key`) and the
 federation, 2 s each, the answer kept 10 s. While both answer, charges taken offline are reported
 first and the charge runs online as above. When either does not answer (or the registry goes quiet
-at the attach), a 3.0 card is charged offline: its certificate is checked against the registry's
+at the attach), a compatible 4.x card can be charged offline: its certificate is checked against the registry's
 certificate key the till keeps (`cert_key` in `till-ops.json`, refreshed by every probe while
 online), the card attests to a fresh challenge, each note's federation signature is checked
 against the federation's keys from the client config, notes this till already took offline are
@@ -98,7 +97,7 @@ the card's stored signatures.
 **Stranded slots.** A charge that reaches no till (a POS phone's offline sales, lost with the
 phone before it synced) leaves its card SPENT slots whose notes the registry still calls live, and
 CHANGE slots it calls free. The card signs a note once, and a CHANGE slot takes only the change
-it is owed, so every charge, balance or issue tap of a 3.0 card on ops, after the releases and
+it is owed, so every charge, balance or issue tap of a 4.x card on ops, after the releases and
 before anything is planned, holds such slots back for that tap: a SPENT slot whose note is live
 and is no input of an open charge, and a CHANGE slot whose key never carried a note, unless the
 transaction the slot signed or waits on is one this till or the registry has (an open charge, a
@@ -127,7 +126,7 @@ all the same.
 
 **Spare slots for offline change.** Offline, change goes only to a KEYED slot from 24 to 31 whose
 key never carried a note, and no till can key one without the registry; a freshly loaded card has only a
-few (the F6 drill's card ran out after two charges with change). So every online tap of a 3.0
+few (the F6 drill's card ran out after two charges with change). So every online tap of a 4.x
 card on ops (a charge, a balance, a load), after the releases and the notes it writes and before
 anything is planned, tops up a spare reserve: when the card has fewer than `--spare-target`
 (`TILL_SPARE_TARGET`, default 12; 0 turns it off) fresh keyed slots, the till keys more, at most
@@ -139,7 +138,7 @@ first, queued to the registry as every renewal is (`PUT /cards/:id/slots/:n`); r
 holder's PIN, so only a charge renews. Then never-keyed slots (`unkeyed_slots`) are keyed and
 recorded with `POST /cards/:id/slot-keys`. A failure is logged and the tap goes on; only a PIN the
 card refuses ends it (`wrong_pin`, as the charge would when it signs, so the holder spends one try,
-not two). 2.x cards are left as they are. Renewals and new keys alike take slots 24 to 31 first, and while fewer than
+not two). Renewals and new keys alike take slots 24 to 31 first, and while fewer than
 2 of them are keyed and free it keys up to 2 of them whatever the budget, so a card's first online
 tap keys 24 and 25 (`OFFLINE-PROTOCOL.md` § 8). Once the card takes the holder's PIN, a slot from 24
 to 31 whose notes are all dead is released and re-keyed in the same tap.
@@ -187,7 +186,7 @@ Notes the till's checks refuse (no denomination of the federation's, or a federa
 that does not verify) are skipped; when the rest do not pay, the charge is
 `offline_note_invalid` (403), not `insufficient`.
 
-**POS phones offline.** A paired POS phone with no network takes a 3.0 card itself, with the
+**POS phones offline.** A paired POS phone with no network takes a compatible 4.x card itself, with the
 same charge as the till's (`host/pos-core`, docs/POS-OFFLINE.md), and syncs what it took when it
 next reaches the till: it fetches an offline kit while online (`GET /v1/offline/kit`, below) and
 sends its charges with `POST /v1/offline/charges`, which puts each into this till's offline queue
@@ -341,20 +340,20 @@ the ops codes (`card_changed`, `unknown_card`, `ops_*`) prove nothing about an e
 | `pin_required` | 400 | a till on ops was sent a charge without `pin`; the card was not touched and no try was spent | ask the holder for the PIN and send it |
 | `wrong_pin` | 403 | the card refused the holder's PIN (`63 CX`); the body adds `wrong_tries` (integer, X: the wrong tries in a row, 1 to 15) and `wait_s` (integer, whole seconds: about how long the card makes the next try wait, 2^(X-1) askings of 0.75 s, rounded up); nothing moved | ask the holder again; the next try takes about `wait_s` |
 | `pin_wait` | 423 | the card is serving its PIN wait and was taken away before it ended (`6A98`); the body adds `wait_s` (integer, whole seconds, rounded up: about what is left, 0 when the till does not know) and no `wrong_tries`; nothing moved | hold the card again until the wait is over, same `client_ref` |
-| `old_card` | 409 | the card's applet is older than 4.0; `detail` is the message to show; no PIN command was sent and nothing moved | show `detail`: the card must be reset and set up again |
+| `old_card` | 409 | the card's applet is older than 4.0; `detail` is the message to show; no PIN command was sent and nothing moved | use a compatible till to spend or withdraw the balance and settle outstanding holds before resetting an older card |
 | `sign_check_failed` | 409 | the card's signature failed the card's own check (`6F00` from SIGN); nothing was spent | tap again, same `client_ref` |
 | `card_changed` | 409 | on ops: the card's state changed under this till (another till, a stale version), or the registry refused the charge's intent (409) | retry the tap |
 | `unknown_card` | 404 | on ops: the registry has no such card for this till's operator | card not provisioned for this operator |
 | `ops_unreachable` | 502 | on ops: the registry could not be reached; nothing was sent | retry; check the network |
 | `ops_refused` | 502 | on ops: the registry refused the till (bad or revoked token) | check the till token |
 | `ops_not_connected` | 503 | the till belongs on ops but has no token yet (no claim, a claim waiting for approval, or an expired one); nothing ran | connect the till (Connect to registry), approve it in the provisioner app |
-| `card_limit` | 402 | a 3.0 card's daily limit (`6A95`) does not take this charge; checked before anything is signed or recorded | decline; the card pays again once a later block header starts its next day |
+| `card_limit` | 402 | a 4.x card's daily limit (`6A95`) does not take this charge; checked before anything is signed or recorded | decline; the card pays again once a later block header starts its next day |
 | `offline_unsupported_card` | 409 | the registry or the federation is unreachable and the card is one this till takes only online; nothing moved | decline, or retry once the till is online |
 | `offline_not_ready` | 503 | offline, and the till has no certificate key from the registry yet (it fetches one while online); online or offline, a 4.0 card's sealed PIN when the till holds no certificate key and cannot fetch one: no PIN was sent | retry once the till is online |
 | `card_not_genuine` | 403 | offline, or before an online sealed PIN to a 4.0 card: the card's certificate does not check against the registry's key, is for another card, or the card's attestation does not verify (a clone); nothing moved | decline |
 | `offline_no_change_room` | 409 | offline: the price needs change and the card has no fresh keyed slot from 24 to 31 (or too few) for it; an online till keys more. The body adds `suggested_msat`, `suggest_below_msat` and `suggest_above_msat`, prices in whole sats the card pays exactly now (each may be null); nothing moved | show "This card can't take change while offline. Try N sats" (`suggested_msat`), else "Try another amount" |
 | `offline_cap_reached` | 503 | offline: this till's unsettled offline total or count would pass its cap; nothing moved | decline, or retry once the till is online and has sent its queue |
-| `offline_note_invalid` | 403 | offline: some of the card's notes do not check against the federation's keys (no denomination of its, or a signature that does not verify) and the rest do not pay the price; nothing was signed | decline: the card cannot be checked offline; it pays online |
+| `offline_note_invalid` | 403 | offline: some of the card's notes do not check against the federation's keys (no denomination of its, or a signature that does not verify) and the rest do not pay the price; nothing was signed | connect to the till to check the card's federation and mint |
 | `offline_kit_expired` | 403 | a POS phone's offline charge only: its offline kit is past its expiry, by the phone's clock or the card's; nothing was asked of the card | take the card online, or fetch a new kit from the till |
 | `offline_pool_exhausted` | 409 | a POS phone's offline charge only: the price needs a till note of a tier the phone's offline kit has run out of; the answer has the prices the kit still pays (`suggested_msat`, `below_msat`, `above_msat`, as `offline_no_change_room`); nothing moved | show "Try N sats", and fetch a new kit when online |
 | `internal` | 500 | anything else. The till may have taken the sale: an error after the federation accepted it, or the till service stopped before answering | treat as `undecided`: keep the `client_ref`, send it again, look in `/v1/sales`; never start a new sale for the card |
@@ -382,12 +381,7 @@ the money truth is the federation and `card_state.json`.
 
 A Bitcoin mint v1 federation uses version 1 of the kit. A Bitcoin mint v2 federation uses version 2 with `mint_version: "v2"` and requires a POS app that understands this version.
 
-The kit carries the federation's note keys per tier and its mint fees, the till's fee headroom,
-the registry's certificate key, the phone's caps (the till's `--offline-cap-*`), its validity
-(`--offline-kit-ttl-hours`), the newest block header, and a pool of the till's outputs: per tier
-from the smallest note the planner gives the till (4 msat on fedimint's default fees) to the
-largest at or below `cap_msat`, 40 blinded nonces each (fewer when the kit would pass 128 KB; the
-till logs it). Their spend keys and blinding keys stay on the till, in `offline_pool.json` (0600),
+The kit carries the federation's note keys and fees, the till's fee headroom, the registry's certificate key, the phone's caps (`--offline-cap-*`), the validity period (`--offline-kit-ttl-hours`) and the newest block header. Its pool of till outputs covers eligible denominations up to `cap_msat`. Mint v2 excludes outputs at or below their redemption fee. The pool holds up to 40 blinded nonces per tier, fewer if needed to fit the 128 KB limit. Their spend keys and blinding keys stay on the till, in `offline_pool.json` (0600),
 written before the kit is answered. Asked again within an hour, while every tier has 4 entries
 left, the phone gets the same kit (its entries still unused); else a new one, but never more than
 3 kits that have not expired: at the cap, the newest again, its tiers topped up to 40 under the
@@ -465,11 +459,13 @@ Lightning module is unavailable.
 rounds `N` to the nearest card amount (at most 3 notes) and answers the top-up. With `short_id`
 (from `/v1/card/balance`) the till reads that card's free slots from ops (keyed and unkeyed, slots 0 to 23 only), rounds
 to fit them, and refuses a card with none (`409 card_full`) before any invoice exists; the card is recorded as the
-top-up's `for_card`.
+top-up's `for_card`. A card from another federation or mint returns `409 wrong_federation` before an invoice is created.
 
 `200 {"ok":true,"topup_id":"<16 hex>","fee_quote_version":1,"amount_msat":N,"topup_fee_msat":F,"invoice_amount_msat":T,"invoice":"lnbc…","expires_at_ms":E,"state":"waiting","fee_accounting":{…}}`
 
-The invoice amount is the card credit plus the fixed top-up fee (`T = N + F`). An updated POS verifies that the signed Lightning invoice has this total and shows all three amounts before revealing the QR. An invoice expires after 10 minutes. A matching `client_ref`, amount and card return the original top-up. Reusing the reference for a different purchase returns `409 client_ref_conflict`. Previously issued top-ups keep their original terms.
+The invoice amount is the card credit plus the fixed top-up fee (`T = N + F`). An updated POS verifies that the signed Lightning invoice has this total and shows all three amounts before revealing the QR. Use `expires_at_ms` as the payment deadline. It is the earlier of the signed invoice expiry and the incoming contract expiry when available. Previously issued top-ups keep their original terms.
+
+Reusing the same `client_ref`, requested amount and card returns the original receipt while the payment window is open or after the outcome is known. If the window has closed and settlement is still pending, creation returns `409 topup_settlement_pending`. Poll `GET /v1/topup/{topup_id}` for the original receipt. While its state is `waiting` after the deadline, the `invoice` field is empty. Reusing the reference for a different amount or card returns `409 client_ref_conflict`.
 
 For a new invoice the legacy `POST /v1/topup` route and unsupported quote versions return `409 topup_quote_version`. Unverified funding or gateway terms return `503 topup_quote_unavailable`. A missing, zero or excessive requested amount (over 100,000 sats) returns `400 bad_amount`.
 

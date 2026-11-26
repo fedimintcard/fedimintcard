@@ -2,6 +2,10 @@
 
 Two things in one app: a point-of-sale UI ("Fedimint Card POS", below) and the NFC relay it is built on.
 
+## Install Fedimint Card POS
+
+For a fresh installation or an update signed with the same certificate, download [Android POS 1.1.0 (8)](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk). For a Play installation, keep the app and its data and update through Play when a compatible build is available. After installing, open **Settings → Pair with till** and scan the POS pairing QR from Till admin. [APK checksum](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk.sha256) · [Till installation](../README.md#install-the-till-and-pos)
+
 ## Relay
 
 Turns an NFC phone into the card reader for the fedimint-card demo. It runs the same HTTP API as
@@ -90,7 +94,7 @@ back to the USB path above.
 To try the UI without the Rust service: `MOCK_SCENARIO=success python3 tools/mock_till.py`
 (also `change`, `undecided` which records the sale after 8 s, or any error code such as `insufficient`), then `adb reverse` as above.
 
-Paired, the phone takes a 3.0 card itself when the till cannot be reached ("Paid offline") and
+Once paired and equipped with a current offline kit, the phone can take a compatible 4.x card payment when the till cannot be reached ("Paid offline") and
 syncs it when the till answers again; Settings shows the offline kit, what waits on the phone and
 any charge the till refused (docs/POS-OFFLINE.md § Android).
 
