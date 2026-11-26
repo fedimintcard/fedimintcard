@@ -155,13 +155,17 @@ pub struct TopupRec {
 }
 
 impl TopupRec {
+    pub(crate) fn payment_window_closed(&self) -> bool {
+        self.quote.is_some() && self.state == TopupState::Waiting && now_ms() >= self.expires_at_ms
+    }
+
     /// The API's view: no operation id, nothing secret.
     pub fn to_json(&self) -> Value {
         let mut v = json!({
             "ok": true,
             "topup_id": self.topup_id,
             "amount_msat": self.amount_msat,
-            "invoice": self.invoice,
+            "invoice": if self.payment_window_closed() { "" } else { &self.invoice },
             "expires_at_ms": self.expires_at_ms,
             "state": self.state.name(),
         });

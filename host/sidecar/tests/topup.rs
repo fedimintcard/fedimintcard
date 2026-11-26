@@ -1071,7 +1071,10 @@ async fn closed_quote_replay_waits_for_its_original_payment() -> anyhow::Result<
         let (code, closed) = create_quote(f.addr, request.clone()).await;
         assert_eq!((code, closed["error"].as_str()), (409, Some("topup_settlement_pending")));
         assert!(closed.get("invoice").is_none());
-        assert_eq!(f.topups.get(id).unwrap().state, TopupState::Waiting);
+        let (status, pending) = call(f.addr, "GET", &format!("/v1/topup/{id}"), None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(pending["state"], "waiting");
+        assert_eq!(pending["invoice"], "");
         f.ln.settle(&op_of(&f.topups, id), LnOutcome::Paid);
         until_state(f.addr, id, "paid").await;
         let (_, settled) = create_quote(f.addr, request).await;

@@ -74,6 +74,7 @@ Every reply is the top-up: `{ok, topup_id, amount_msat, invoice, expires_at_ms, 
 load_txid?, detail?}` (`load_txid` once loaded; `detail` when failed).
 
 - A new quote includes `fee_quote_version: 1`, the rounded card credit in `amount_msat`, the fixed `topup_fee_msat`, and `invoice_amount_msat`, the total payable on the signed Lightning invoice.
+- For fee-inclusive quotes, `expires_at_ms` is the last payment deadline set by the signed invoice or the incoming Lightning contract, whichever comes first. After the window closes, keep polling the existing receipt. While settlement is pending, its status remains `waiting` and its `invoice` field is empty. Reusing the same creation reference during this window returns `409 topup_settlement_pending`.
 - `fee_accounting` records the gateway deduction, federation claim cost and card-load cost in msat. Once reconciled, `retained_nominal_msat` is the fixed fee less these costs. `retained_spendable_msat` also accounts for any change in mint v1 notes too small to spend. Either amount can be unknown until the wallet can verify both operations. A paid top-up keeps its promised card credit while the wallet completes this accounting.
 - `amount_msat` in the reply is the rounded card amount. Requests that round to nothing, or above
   `MAX_TOPUP_MSAT` (100,000 sats), answer 400 `bad_amount`.

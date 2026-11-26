@@ -2132,6 +2132,14 @@ async fn topup_fee_inclusive(State(h): State<TillHandle>, body: Bytes) -> Reply 
     topup_create(&h, body, true).await
 }
 
+fn quote_reply(rec: &TopupRec) -> Reply {
+    if rec.payment_window_closed() {
+        // Payment may already be in flight. Keep watching the original receipt and its hold.
+        return Reply::fail(409, "topup_settlement_pending", "The payment window has closed. Check this top-up again for its outcome.");
+    }
+    Reply::ok(rec.to_json())
+}
+
 fn topup_quote_version() -> Reply {
     Reply::fail(409, "topup_quote_version", "Update POS to see the top-up fee and invoice total before payment.")
 }
@@ -2169,20 +2177,10 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
         if had.for_card != for_card {
             return Reply::fail(409, "client_ref_conflict", "this top-up reference was used for a different card");
         }
-        if had.state == TopupState::Waiting && had.quote.is_some() {
-            if !supports_quote {
-                return topup_quote_version();
-            }
-            if crate::topup::now_ms() >= had.expires_at_ms {
-                // Payment may already be in flight. Keep watching this receipt and its hold.
-                return Reply::fail(
-                    409,
-                    "topup_settlement_pending",
-                    "The payment window has closed. Check this top-up again for its outcome.",
-                );
-            }
+        if had.state == TopupState::Waiting && had.quote.is_some() && !supports_quote {
+            return topup_quote_version();
         }
-        return Reply::ok(had.to_json());
+        return quote_reply(&had);
     }
     if !supports_quote {
         return topup_quote_version();
@@ -2261,7 +2259,7 @@ async fn topup_create(h: &TillHandle, body: Bytes, fee_endpoint: bool) -> Reply 
     }
     drop(admission);
     t.watch(&rec);
-    Reply::ok(rec.to_json())
+    quote_reply(&rec)
 }
 
 async fn topup_get(State(h): State<TillHandle>, UrlPath(id): UrlPath<String>) -> Reply {
