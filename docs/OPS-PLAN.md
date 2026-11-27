@@ -330,6 +330,8 @@ Done means every box is ticked and the acceptance run at the end passes on relea
   bytes. Needs an applet change (a new load on every card) and the POS app.
 
 **Ops**
+See [Atoll Recovery](ATOLL-RECOVERY.md) for independent Nextcloud copies and the offline restore drill.
+
 - [ ] **Restore.** A tested way to load a snapshot into a fresh registry object, drilled on staging
   from a real backup; operators recover with an `OPERATOR_SETUP` recover, tills get new tokens.
 - [ ] **Backup monitoring.** Something outside Cloudflare reads `/registry/backup-status` daily and
