@@ -23,7 +23,7 @@ export const SNAPSHOT_VERSION = 1;
 /** A backup older than this reads as stale; the alarm runs every 24 hours. */
 export const STALE_AFTER_MS = 26 * 60 * 60 * 1000;
 
-const TABLES = [
+export const SNAPSHOT_TABLES = [
   'operators', 'batches', 'cards', 'card_slots', 'card_versions', 'notes', 'card_txs',
   'tills', 'federations', 'federation_keys', 'holder_loads', 'manager_keys', 'card_resets',
   'offline_reports', 'releases',
@@ -43,7 +43,7 @@ export function snapshot(storage: DurableObjectStorage, now: number): Snapshot {
   const sql = storage.sql;
   return storage.transactionSync(() => {
     const tables: Record<string, Record<string, unknown>[]> = {};
-    for (const t of TABLES) {
+    for (const t of SNAPSHOT_TABLES) {
       tables[t] = sql
         .exec(`SELECT * FROM ${t}`)
         .toArray()

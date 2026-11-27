@@ -123,9 +123,11 @@ import {
 } from './offline';
 import {isChip, issueManagerKeys} from './managerKeys';
 import {completeReset, resetCheck, resetOwner} from './reset';
+import {recovery} from './recovery';
 import {closedReason, closeSuperseded, parseSupersedes, pinIsSet, resumeCheck} from './resume';
 
 export interface Env {
+  readonly ATOLL_RECOVERY_GRANT?: string;
   readonly REGISTRY: DurableObjectNamespace;
   /**
    * The operator setup command, a secret, as JSON:
@@ -238,6 +240,8 @@ export class Registry {
     const path = url.pathname;
     const method = request.method;
     const now = Date.now();
+
+    if (path.startsWith('/recovery/')) return recovery(request, this.env, storage);
 
     if (path === '/auth/operator/session') {
       if (method !== 'POST') return fail(405, 'use POST');

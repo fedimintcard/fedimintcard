@@ -13,6 +13,7 @@ export default defineConfig({
         // The bootstrap command a deployment sets as a secret: the tests sign
         // in as this operator.
         bindings: {
+          ATOLL_RECOVERY_GRANT: JSON.stringify({issuer_id: "425a3910-cc01-412a-81f5-c13dc792afae", code_hash: "2c1a175d38789ac7d9eaedfdfc23a05f50b374294ad6cb59047d45f947fc4592", expires_at: Date.now() + 3600000}),
           OPERATOR_SETUP: JSON.stringify({
             action: 'bootstrap',
             nonce: 'test-bootstrap-nonce-0001',

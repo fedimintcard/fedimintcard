@@ -2725,3 +2725,109 @@ describe('note signatures (DESIGN § 6)', () => {
     }
   });
 });
+
+describe('Atoll Recovery reader', () => {
+  it('pairs once, lists and streams the same encrypted bytes and keeps registry credentials separate', async () => {
+    const pairing = 'P'.repeat(43);
+    const secret = 'S'.repeat(43);
+    const claim = (s: string) => post('/recovery/claim', null, {code: pairing, secret: s});
+    const first = await claim(secret);
+    expect(first.status).toBe(200);
+    expect(await (await claim(secret)).json()).toEqual(await first.json());
+    expect((await claim('X'.repeat(43))).status).toBe(403);
+    const token = await signIn();
+    const till = await newTill(token);
+    for (const unsuitable of [null, token, till.token, 'recovery-v1.' + 'T'.repeat(43)]) {
+      expect((await get('/recovery/exports', unsuitable)).status).toBe(403);
+    }
+    const reader = 'recovery-v1.' + secret;
+    expect((await get('/registry/cards?batch_id=1', reader)).status).toBe(401);
+    expect((await post('/internal/backup', reader, {})).status).toBe(404);
+    const {key} = (await (
+      await stub().fetch('https://registry.internal/internal/backup', {method: 'POST'})
+    ).json()) as {key: string};
+    const object = await env.BACKUPS!.get(key);
+    const page = (await (await get('/recovery/exports', reader)).json()) as {
+      objects: {Name: string; Size: number}[];
+    };
+    const name = key
+      .slice('backups/'.length)
+      .replace(/T(\d\d)-(\d\d)-(\d\d)-(\d{3})Z/, 'T$1:$2:$3.$4Z')
+      .replace('.json.age', '.age');
+    expect(page.objects).toContainEqual({Name: name, Size: object!.size, IsDir: false});
+    const downloaded = await get('/recovery/exports/' + encodeURIComponent(name), reader);
+    expect(downloaded.status).toBe(200);
+    expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(new Uint8Array(await object!.arrayBuffer()));
+    expect((await get('/recovery/exports/not-a-backup.age', reader)).status).toBe(404);
+  });
+});
+
+describe('offline snapshot restore', () => {
+  it('restores on a fresh migrated object, locks old credentials and rolls back an incomplete row', async () => {
+    const {restoreSnapshot} = await import('../scripts/restore-snapshot');
+    const token = await signIn();
+    await cardWithNote(token);
+    const till = await newTill(token);
+    const r = await stub().fetch('https://registry.internal/internal/backup', {method: 'POST'});
+    const {key} = (await r.json()) as {key: string};
+    const snap = await decrypt(await (await env.BACKUPS!.get(key))!.text(), BACKUP_IDENTITY);
+    const fresh = env.REGISTRY.get(env.REGISTRY.newUniqueId());
+    await runInDurableObject(fresh, (_, st) => {
+      // The fixture bootstraps even fresh test objects; a restore target has no operator setup.
+      st.storage.sql.exec('DELETE FROM operators');
+      st.storage.sql.exec('DELETE FROM operator_setup_commands');
+      const bad = structuredClone(snap);
+      delete bad.tables.notes![0]!.slot;
+      expect(() => restoreSnapshot(st.storage, bad)).toThrow();
+      expect(st.storage.sql.exec('SELECT * FROM operators').toArray()).toHaveLength(0);
+      restoreSnapshot(st.storage, snap);
+      expect(st.storage.sql.exec('SELECT short_id, status FROM notes').one()).toMatchObject({
+        short_id: '9c2f0a1b',
+        status: 'live',
+      });
+      expect(st.storage.sql.exec('SELECT revoked_at FROM tills').one().revoked_at).toBeTypeOf('number');
+      expect(() => restoreSnapshot(st.storage, snap)).toThrow('empty');
+    });
+    for (const old of [token, till.token]) {
+      expect(
+        (
+          await fresh.fetch('https://registry.internal/registry/batches', {
+            headers: {Authorization: 'Bearer ' + old},
+          })
+        ).status,
+      ).toBe(401);
+    }
+  });
+});
+
+it('expires unclaimed grants, supports lost replies and revokes a reader on rotation or removal', async () => {
+  const {recovery} = await import('../src/recovery');
+  await runInDurableObject(stub(), async (_, st) => {
+    const code = 'C'.repeat(43),
+      secret = 'D'.repeat(43);
+    const g = {
+      issuer_id: '7eac9704-e6e1-486e-af67-a0ae6783833f',
+      code_hash: await sha256Hex(code),
+      expires_at: Date.now() - 1,
+    };
+    const call = (path: string, body?: unknown, raw: string | undefined = JSON.stringify(g)) =>
+      recovery(
+        new Request('https://local.test/recovery/' + path, {
+          method: body ? 'POST' : 'GET',
+          headers: {Authorization: 'Bearer recovery-v1.' + secret},
+          body: body ? JSON.stringify(body) : undefined,
+        }),
+        {...env, REGISTRY: env.REGISTRY, BACKUPS: env.BACKUPS, ATOLL_RECOVERY_GRANT: raw},
+        st.storage,
+      );
+    expect((await call('claim', {code, secret})).status).toBe(403);
+    g.expires_at = Date.now() + 300000;
+    expect((await call('claim', {code, secret})).status).toBe(200);
+    g.expires_at = Date.now() - 1;
+    expect((await call('claim', {code, secret})).status).toBe(200);
+    expect((await call('exports')).status).toBe(200);
+    expect((await call('exports', undefined, '')).status).toBe(404);
+    g.code_hash = await sha256Hex('E'.repeat(43));
+    expect((await call('exports')).status).toBe(403);
+  });
+});
