@@ -17,11 +17,15 @@ The till holds the merchant's wallet. Use Till admin to join a federation, pair 
 | Docker | Use the [tagged Compose file](https://github.com/fedimintcard/fedimintcard/blob/till-v0.1.0/compose.yaml) for Linux amd64 or arm64. [Installation and backup](docs/TILL-DOCKER.md) |
 | StartOS | Back up an existing Card 4.0 till. Sideload revision `0.1.0:12` for [x86_64](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/fedimintcard-till-0.1.0-12-x86_64.s9pk) or [aarch64](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/fedimintcard-till-0.1.0-12-aarch64.s9pk). [Package checksums](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/SHA256SUMS) · [Setup and pairing](https://github.com/bobodread876/fedimintcard-till-startos/blob/7ddd06d51ab1297c90edb48e94b685b29d16d2b0/instructions.md) |
 | Umbrel | Follow the [official store submission](https://github.com/getumbrel/umbrel-apps/pull/6423) for availability. |
-| Android POS | For a fresh install or an update signed by the same distributor, download [Fedimint Card POS 1.1.0 (8)](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk). The APK supports arm64-v8a and x86_64. For an existing Play installation, keep its data and update through Play when a compatible version is available. [APK checksum](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk.sha256) |
-| Setup app | The operator uses a Card 4.0 Setup build to provision cards and approve tills. Check the build with your distributor. This release includes the [Setup source and operator guide](apps/provisioner/README.md). |
+| Android POS | Install [Fedimint Card POS on Google Play](https://play.google.com/store/apps/details?id=org.fedimintcard.pos). The separately signed [build 8 APK](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk) supports arm64-v8a and x86_64. Update through the channel you originally installed from. [APK checksum](https://github.com/fedimintcard/fedimintcard/releases/download/till-v0.1.0/FedimintCard-POS-1.1.0-8.apk.sha256) |
+| Setup app | Install [Fedimint Card Setup on Google Play](https://play.google.com/store/apps/details?id=org.fedimintcard.provisioner) to provision cards and approve tills. For iPhone access, see the [Setup downloads](https://fedimintcard.org/downloads). [Operator guide](apps/provisioner/README.md) |
 | iOS POS | The merchant needs a build with Card 4.0 and fee-inclusive top-ups. Ask your distributor to confirm its build. The tagged release includes the [iOS source](https://github.com/fedimintcard/fedimintcard/tree/till-v0.1.0/ios-pos). |
 
 Fedimint Card is experimental software. Put on a card only what you can afford to lose. [Till release notes](https://github.com/fedimintcard/fedimintcard/releases/tag/till-v0.1.0)
+
+## Developer libraries
+
+Use the [Card 4.x developer guide](sdks/README.md) for TypeScript, React Native NFC, Rust and Dart/Flutter. It includes a first card read and a paired wallet payment example.
 
 ## Layout
 
