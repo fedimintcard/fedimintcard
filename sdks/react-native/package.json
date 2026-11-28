@@ -1,0 +1,39 @@
+{
+  "name": "fedimintcard-react-native",
+  "version": "0.1.0",
+  "description": "Read a Fedimint Card 4.0 over NFC on iOS and Android.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fedimintcard/fedimintcard.git",
+    "directory": "sdks/react-native"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.cjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "fedimintcard": "file:../typescript",
+    "react-native-nfc-manager": "3.17.2",
+    "react-native": "0.77.1",
+    "@types/react": "18.3.18",
+    "react": "18.3.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "fedimintcard": "^0.1.0",
+    "react-native-nfc-manager": "^3.17.2",
+    "react-native": ">=0.77 <1"
+  }
+}

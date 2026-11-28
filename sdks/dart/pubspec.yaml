@@ -1,0 +1,11 @@
+name: fedimintcard
+description: Read Fedimint Card 4.x over ISO 7816, verify registry certificates, and connect to a paired merchant till for balances, payments and top-ups.
+version: 0.1.0
+homepage: https://fedimintcard.org
+repository: https://github.com/fedimintcard/fedimintcard
+environment:
+  sdk: '>=3.11.0 <4.0.0'
+dependencies:
+  pointycastle: ^4.0.0
+dev_dependencies:
+  test: ^1.31.0

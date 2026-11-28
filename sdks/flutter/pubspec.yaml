@@ -1,0 +1,16 @@
+name: fedimintcard_flutter
+description: Connect Flutter Android and iOS apps to Fedimint Card 4.x with scoped native NFC sessions and the Fedimint Card reader.
+version: 0.1.0
+homepage: https://fedimintcard.org
+repository: https://github.com/fedimintcard/fedimintcard
+environment:
+  sdk: '>=3.11.0 <4.0.0'
+  flutter: '>=3.47.0'
+dependencies:
+  fedimintcard: ^0.1.0
+  flutter:
+    sdk: flutter
+  flutter_nfc_kit: ^3.7.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

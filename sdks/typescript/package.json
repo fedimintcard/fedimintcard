@@ -1,0 +1,33 @@
+{
+  "name": "fedimintcard",
+  "version": "0.1.0",
+  "description": "Read a Fedimint Card 4.0 applet over ISO 7816.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fedimintcard/fedimintcard.git",
+    "directory": "sdks/typescript"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.cjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0"
+  }
+}

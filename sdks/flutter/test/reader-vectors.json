@@ -1,0 +1,73 @@
+{
+  "source": "Fedimint Card 4.0 public host/card and applet; synthetic offline fixtures",
+  "select": {
+    "command": "00a4040008f0464d434152440100",
+    "response": "04009000",
+    "major": 4,
+    "minor": 0
+  },
+  "futureMinor": {
+    "response": "04019000",
+    "major": 4,
+    "minor": 1
+  },
+  "legacy": {
+    "response": "03009000"
+  },
+  "absent": {
+    "response": "6a82"
+  },
+  "malformedSelect": {
+    "response": "049000"
+  },
+  "state": {
+    "command": "b016000000",
+    "response": "0102040300000000000000000000000000000000000000000000000000000000671db480671db09800200000000000a50000000000001b590000000102002101039000",
+    "slots": [
+      1,
+      2,
+      4,
+      3,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "now": 1730000000,
+    "window": 1729999000,
+    "limitMsat": "9007199254741157",
+    "spentMsat": "7001",
+    "wrongTries": 2,
+    "owed": 33
+  },
+  "identity": {
+    "command": "b011000000",
+    "response": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817989000",
+    "xOnly": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+  },
+  "malformedResponse": "90"
+}
