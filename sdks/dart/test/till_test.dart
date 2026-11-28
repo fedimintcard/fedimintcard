@@ -202,6 +202,7 @@ void main() {
       final found = (await client.findSale(reference))!;
       expect(found.receivedMsat, 0);
       expect(found.offline && found.doubleSpent, true);
+      expect(found.rejected, isNull);
       expect(await client.findSale(reference), isNull);
       await expectLater(
         client.findSale(reference),
@@ -324,11 +325,6 @@ void main() {
         reply({...paid, 'client_ref': 'wrong'}),
       ]);
       final client = script.client(pay);
-      final expired = script.client(
-        pay,
-        (invoice) => (amountMsat: 1, paymentHash: hash, expiresAtMs: 1),
-      );
-      await expectLater(payBolt(expired), fails('expired_invoice'));
       await expectLater(
         payBolt(script.client(pay, null)),
         fails('invoice_verifier_required'),
@@ -365,6 +361,106 @@ void main() {
         client.payStatus(9, reference),
         fails('invalid_till_response'),
       );
+    },
+  );
+  test(
+    'accepted charge retains its transaction identity on ledger failure; exact-reference replay distinguishes rejection',
+    () async {
+      final row = {
+        ...sale,
+        'sale_id': 0,
+        'warnings': ['sale not recorded'],
+      };
+      final script = Script([
+        reply(row),
+        reply({...sale, 'offline': true, 'rejected': true}),
+        reply({...sale, 'offline': true}),
+      ]);
+      final client = script.client();
+      final accepted = await charge(client);
+      expect(accepted.saleId, 0);
+      expect(accepted.txid, txid);
+      expect(accepted.rejected, false);
+      expect((await charge(client)).rejected, true);
+      expect((await charge(client)).rejected, false);
+    },
+  );
+
+  test(
+    'recognizes revision 11 federation refusals only for their exact operation and diagnostic',
+    () async {
+      const mint = 'the registry mint version differs from this wallet';
+      final fed1 = '1' * 64, fed2 = '2' * 64;
+      final detail =
+          'card abcd1234 belongs to federation $fed1, and this wallet is in $fed2';
+      Reply internal(String text, [int status = 500]) =>
+          reply({'ok': false, 'error': 'internal', 'detail': text}, status);
+      final script = Script([
+        internal(mint),
+        internal(detail),
+        internal(detail.replaceAll(fed2, fed1)),
+        internal('$detail.'),
+        internal(mint, 409),
+        internal(mint),
+        internal(detail),
+        reply({
+          'ok': false,
+          'error': 'ops_refused',
+          'detail':
+              'ops refused (409): the card belongs to a different federation or mint',
+        }, 409),
+        reply({
+          'ok': false,
+          'error': 'ops_refused',
+          'detail': 'other reason',
+        }, 409),
+        reply({...quote, 'state': 'paid'}),
+      ]);
+      final client = script.client();
+      for (var i = 0; i < 2; i++) {
+        await expectLater(
+          client.loadTopUp(id, link),
+          fails('wrong_federation'),
+        );
+      }
+      for (var i = 0; i < 3; i++) {
+        await expectLater(client.loadTopUp(id, link), fails('internal'));
+      }
+      await expectLater(client.topUp(id), fails('internal'));
+      await expectLater(charge(client), fails('internal'));
+      await expectLater(client.balance(link), fails('wrong_federation'));
+      await expectLater(client.balance(link), fails('ops_refused'));
+      expect((await client.topUp(id)).state, 'paid');
+      expect(
+        script.requests.where((r) => r.uri.path == '/v1/topup/fee-inclusive'),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'explicit same-reference wallet replay can prove a pre-expiry payment; a new expired invoice returns the till refusal',
+    () async {
+      final script = Script([
+        reply(paid),
+        reply({'ok': false, 'error': 'invoice_expired'}, 400),
+      ]);
+      final client = script.client(
+        pay,
+        (text) => (amountMsat: 2105000, paymentHash: hash, expiresAtMs: 1),
+      );
+      expect((await payBolt(client)).preimage, proof);
+      await expectLater(
+        client.payInvoice(
+          invoice: bolt,
+          maxFeeMsat: 3000,
+          clientRef: 'other',
+          pin: '0011',
+          cardLink: link,
+        ),
+        fails('invoice_expired'),
+      );
+      expect(script.requests.length, 2);
     },
   );
 }

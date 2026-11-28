@@ -22,7 +22,7 @@ typedef SaleReceipt = ({
   int receivedMsat,
   bool collectionPending,
   bool offline,
-  bool rejected,
+  bool? rejected,
   bool doubleSpent,
 });
 typedef PaymentReceipt = ({
@@ -146,16 +146,36 @@ Future<({int status, String body})> _nativeRequest(
   }
 }
 
-SaleReceipt _receipt(_Json row, Object? id) => (
-  saleId: _positive(id),
-  txid: _responseHex(row['txid'], 64),
-  priceMsat: _uint(row['price_msat']),
-  receivedMsat: _uint(row['received_msat']),
-  collectionPending: _bool(row['collection_pending']),
-  offline: _bool(row['offline'] ?? false),
-  rejected: _bool(row['rejected'] ?? false),
-  doubleSpent: _bool(row['double_spent'] ?? false),
-);
+// A completed charge can return id 0 if the ledger write failed after money
+// moved. The txid remains the transaction identity in that response.
+SaleReceipt _receipt(_Json row, Object? id, {bool fromLedger = false}) {
+  final offline = _bool(row['offline'] ?? false);
+  final rejected = row.containsKey('rejected')
+      ? _bool(row['rejected'])
+      : fromLedger && offline
+      ? null
+      : false;
+  return (
+    saleId: _uint(id),
+    txid: _responseHex(row['txid'], 64),
+    priceMsat: _uint(row['price_msat']),
+    receivedMsat: _uint(row['received_msat']),
+    collectionPending: _bool(row['collection_pending']),
+    offline: offline,
+    rejected: rejected,
+    doubleSpent: _bool(row['double_spent'] ?? false),
+  );
+}
+
+bool _legacyPaidLoadMismatch(Object? detail) {
+  if (detail == 'the registry mint version differs from this wallet')
+    return true;
+  if (detail is! String) return false;
+  final match = RegExp(
+    r'card [0-9a-f]{8} belongs to federation ([0-9a-f]{64}), and this wallet is in ([0-9a-f]{64})',
+  ).matchAsPrefix(detail);
+  return match != null && match.end == detail.length && match[1] != match[2];
+}
 
 /// HTTPS client for a paired POS or pay-only wallet. Card operations use the
 /// link from the active foreground card session. No operation is retried here.
@@ -210,6 +230,7 @@ class TillClient {
     String path, {
     _Json? body,
     String? cardLink,
+    bool paidLoad = false,
   }) async {
     final headers = {
       'Authorization': 'Bearer $_token',
@@ -240,10 +261,20 @@ class TillClient {
     }
     if (response.status != 200 || row['ok'] == false) {
       final error = row['error'], id = row['pay_id'], state = row['state'];
-      final code =
+      var code =
           error is String && _matches(error, RegExp('[a-z][a-z0-9_]{0,63}'))
           ? error
           : 'unexpected_till_status';
+      if (code == 'ops_refused' &&
+          row['detail'] ==
+              'ops refused (409): the card belongs to a different federation or mint') {
+        code = 'wrong_federation';
+      } else if (paidLoad &&
+          response.status == 500 &&
+          code == 'internal' &&
+          _legacyPaidLoadMismatch(row['detail'])) {
+        code = 'wrong_federation';
+      }
       throw TillException(
         code,
         httpStatus: response.status,
@@ -308,7 +339,9 @@ class TillClient {
     return sale;
   }
 
-  /// A missing entry can mean settlement is still in progress.
+  /// A missing entry can mean settlement is still in progress. The ledger
+  /// omits the rejection flag for an offline sale. Its [SaleReceipt] then
+  /// carries a null rejection flag until a definitive answer is available.
   Future<SaleReceipt?> findSale(String clientRef) async {
     _require(TillScope.pos);
     _reference(clientRef, 128);
@@ -319,7 +352,7 @@ class TillClient {
       final row = _object(raw);
       if (row['client_ref'] != clientRef) continue;
       if (result != null) return _invalid();
-      result = _receipt(row, row['id']);
+      result = _receipt(row, row['id'], fromLedger: true);
     }
     return result;
   }
@@ -429,6 +462,7 @@ class TillClient {
         'POST',
         '/v1/topup/${_checkedId(id, 16)}/load',
         cardLink: cardLink,
+        paidLoad: true,
       ),
       id,
     );
@@ -451,8 +485,8 @@ class TillClient {
       'pin': _pin(pin),
     };
     final signed = await _signed(invoice);
-    if (signed.expiresAtMs <= DateTime.now().millisecondsSinceEpoch)
-      throw const TillException('expired_invoice');
+    // The till checks expiry before any new spend. An explicitly repeated
+    // reference may still retrieve proof of a payment made before expiry.
     final row = await _request(
       'POST',
       '/v1/pay',
