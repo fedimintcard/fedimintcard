@@ -67,14 +67,17 @@ function amount(value: number, min: number, max: number): number {
 
 export interface SaleReceipt {
   saleId: number; txid: string; priceMsat: number; receivedMsat: number;
-  collectionPending: boolean; offline: boolean; rejected: boolean; doubleSpent: boolean;
+  collectionPending: boolean; offline: boolean; doubleSpent: boolean;
+  /** An offline sales ledger on a 4.0 till can omit the outcome of a rejected transaction. */
+  rejected: boolean | undefined;
 }
-function receipt(row: Json, id: unknown): SaleReceipt {
+function receipt(row: Json, id: unknown, fromLedger = false): SaleReceipt {
   if (!hex(row.txid, 64)) return invalid();
+  const offline = row.offline === undefined ? false : bool(row.offline);
+  const rejected = row.rejected === undefined ? (fromLedger && offline ? undefined : false) : bool(row.rejected);
   return { saleId: uint(id), txid: row.txid, priceMsat: uint(row.price_msat),
     receivedMsat: uint(row.received_msat), collectionPending: bool(row.collection_pending),
-    offline: row.offline === undefined ? false : bool(row.offline),
-    rejected: row.rejected === undefined ? false : bool(row.rejected),
+    offline, rejected,
     doubleSpent: row.double_spent === undefined ? false : bool(row.double_spent) };
 }
 
@@ -143,6 +146,13 @@ export class TillClient {
         if (code === 'ops_refused' && data.detail === 'ops refused (409): the card belongs to a different federation or mint') {
           code = 'wrong_federation';
         }
+        if (code === 'internal' && response.status === 500 && method === 'POST' &&
+            /^\/v1\/topup\/[0-9a-f]{16}\/load$/.test(path) && typeof data.detail === 'string') {
+          const mismatch = /^card [0-9a-f]{8} belongs to federation ([0-9a-f]{64}), and this wallet is in ([0-9a-f]{64})$/.exec(data.detail);
+          if (data.detail === 'the registry mint version differs from this wallet' || (mismatch && mismatch[1] !== mismatch[2])) {
+            code = 'wrong_federation';
+          }
+        }
         const knownState = payStates.find(state => state === data.state);
         const payId = typeof data.pay_id === 'number' && Number.isSafeInteger(data.pay_id) && data.pay_id > 0 ? data.pay_id : undefined;
         throw new TillError(code, response.status, payId, knownState);
@@ -185,7 +195,7 @@ export class TillClient {
     if (!Array.isArray(r.sales)) return invalid();
     const matches = r.sales.map(record).filter(row => row.client_ref === clientRef);
     if (matches.length > 1) return invalid();
-    return matches.length ? receipt(matches[0], matches[0].id) : undefined;
+    return matches.length ? receipt(matches[0], matches[0].id, true) : undefined;
   }
   async #topUp(r: Json, expectedId?: string): Promise<TopUp> {
     if (!hex(r.topup_id, 16) || (expectedId !== undefined && expectedId !== r.topup_id)) return invalid();

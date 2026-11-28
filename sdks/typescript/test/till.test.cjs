@@ -129,3 +129,22 @@ test('wallet fails closed without signed-invoice validation or valid local input
   await assert.rejects(client.charge({...saleArgs,pin:'123'}),TypeError);
   assert.equal(requests.length,0);
 });
+
+test('offline ledger can omit the federation outcome even after collection stopped', async () => {
+  const offlineRow = { ...sale, id: 1, offline: true, client_ref: 'order-7', double_spent: false };
+  const {client} = harness(pos,[{json:{sales:[offlineRow]}},{json:{...sale,sale_id:0}}]);
+  assert.equal((await client.findSale('order-7')).rejected, undefined);
+  assert.equal((await client.charge(saleArgs)).saleId,0);
+});
+test('earlier paid load recognizes only the precise mint mismatch or two differing federation IDs', async () => {
+  const first = 'a'.repeat(64), second='b'.repeat(64);
+  const detail = (a,b) => 'card 0123abcd belongs to federation '+a+', and this wallet is in '+b;
+  const refusal = text => ({status:500,json:{ok:false,error:'internal',detail:text}});
+  const {client} = harness(pos,[refusal('the registry mint version differs from this wallet'),refusal(detail(first,second)),
+    refusal(detail(first,first)),refusal('prefix '+detail(first,second)),refusal(detail(first,second))]);
+  await assert.rejects(client.loadTopUp(id,link),errorCode('wrong_federation'));
+  await assert.rejects(client.loadTopUp(id,link),errorCode('wrong_federation'));
+  await assert.rejects(client.loadTopUp(id,link),errorCode('internal'));
+  await assert.rejects(client.loadTopUp(id,link),errorCode('internal'));
+  await assert.rejects(client.balance(link),errorCode('internal'));
+});
