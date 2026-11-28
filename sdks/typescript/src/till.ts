@@ -245,7 +245,11 @@ export class TillClient {
     if (r.state !== 'paid' || r.client_ref !== args.clientRef || r.payment_hash !== signed.paymentHash ||
         r.invoice_msat !== signed.amountMsat || !hex(r.preimage, 64) ||
         bytesToHex(sha256(hexToBytes(r.preimage))) !== signed.paymentHash) return invalid();
-    return { payId: uint(r.pay_id), priceMsat: uint(r.price_msat), receivedMsat: uint(r.received_msat), preimage: r.preimage };
+    const priceMsat = uint(r.price_msat);
+    const receivedAmountKnown = Object.prototype.hasOwnProperty.call(r, 'received_msat');
+    // Earlier paid journal entries retain the price but may omit the amount taken from the card.
+    const receivedMsat = receivedAmountKnown ? uint(r.received_msat) : priceMsat;
+    return { payId: uint(r.pay_id), priceMsat, receivedMsat, receivedAmountKnown, preimage: r.preimage };
   }
   async payStatus(id: number, clientRef: string) {
     this.#require('pay');

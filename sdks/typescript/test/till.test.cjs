@@ -148,3 +148,18 @@ test('earlier paid load recognizes only the precise mint mismatch or two differi
   await assert.rejects(client.loadTopUp(id,link),errorCode('internal'));
   await assert.rejects(client.balance(link),errorCode('internal'));
 });
+
+test('verified legacy Lightning receipts fall back to price only when received_msat is absent', async () => {
+  const {received_msat, ...legacy} = paid;
+  const {client} = harness(pay, [
+    {json:legacy}, {json:{...paid, received_msat:0}}, {json:{...legacy, state:'paying'}},
+    {json:{...legacy, preimage:txid}}, ...[null, -1, '1', 1.5].map(value => ({json:{...paid, received_msat:value}})),
+  ]);
+  const old = await client.payInvoice(payArgs);
+  assert.equal(old.receivedAmountKnown, false);
+  assert.equal(old.receivedMsat, paid.price_msat);
+  const current = await client.payInvoice(payArgs);
+  assert.equal(current.receivedAmountKnown, true);
+  assert.equal(current.receivedMsat, 0);
+  for (let i = 0; i < 6; i++) await assert.rejects(client.payInvoice(payArgs), errorCode('invalid_till_response'));
+});

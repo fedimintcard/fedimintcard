@@ -35,3 +35,5 @@ To check an issuer signature, call `verifiesCertificate(certificate, observedSlo
 `CardStatusError.statusWord` carries the card's ISO status. `UnsupportedCardError` reports an unsupported applet version. `CardProtocolError` reports a malformed reply. Transport failures propagate to the caller.
 
 `TillClient.fromPairing(pairingText, options)` accepts a merchant's scanned HTTPS till pairing. Payment operations require an active card link. Use an invoice signature verifier for flows that display or pay a Lightning invoice. Mobile apps should follow the [paired transport requirements](../react-native/README.md#pairing-a-till).
+
+On a proof-verified Lightning payment, `receivedAmountKnown` tells you whether the till recorded the amount taken from the card. Older paid receipts may provide only the price. In that case `receivedMsat` uses the recorded price and `receivedAmountKnown` is false.
