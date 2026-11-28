@@ -22,7 +22,7 @@ export async function readCard(signal: AbortSignal) {
 
 The result contains `notesMsat` and `pendingChangeMsat` as separate `bigint` values. See the [reader methods](../typescript/README.md) for state, slots and certificates.
 
-Give the library exclusive access to the NFC manager during a tap. It opens one ISO-DEP session, runs the callback, and releases the session on return, cancellation or error. Abort the signal when leaving the scan screen. Await each command inside the callback. Android uses NFC-A reader mode and skips NDEF dispatch while scanning. For a custom foreground card operation, `withNfcTransport(async transceive => ..., options)` exposes that same scoped connection.
+Give the library exclusive access to the NFC manager during a tap. It opens one ISO-DEP session, runs the callback, and releases the session on return, cancellation or error. Abort the signal when leaving the scan screen. Await each command inside the callback. Android uses NFC-A and NFC-B reader modes and skips NDEF dispatch while scanning. For a custom foreground card operation, `withNfcTransport(async transceive => ..., options)` exposes that same scoped connection.
 
 ## Native configuration
 

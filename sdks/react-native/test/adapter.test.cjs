@@ -19,7 +19,7 @@ function loadNative(platform) {
     [require.resolve('react-native'), {Platform:{OS:platform}}],
     [require.resolve('react-native-nfc-manager'), {
       __esModule:true, default:native, NfcTech:{IsoDep:'IsoDep'},
-      NfcAdapter:{FLAG_READER_NFC_A:1,FLAG_READER_SKIP_NDEF_CHECK:128},
+      NfcAdapter:{FLAG_READER_NFC_A:1,FLAG_READER_NFC_B:2,FLAG_READER_SKIP_NDEF_CHECK:128},
     }]
   ]);
   for (const [path, exports] of deps) require.cache[path] = {id:path,filename:path,loaded:true,exports};
@@ -35,7 +35,7 @@ for (const platform of ['ios', 'android']) {
     const android = platform === 'android';
     const cmd = [...Buffer.from('00a4040008f0464d434152440100','hex')];
     assert.deepEqual(calls, [
-      'start', ...(android ? [['register',{isReaderModeEnabled:true,readerModeFlags:129}]] : []),
+      'start', ...(android ? [['register',{isReaderModeEnabled:true,readerModeFlags:131}]] : []),
       ['tech','IsoDep',{alertMessage:'Hold card'}], ...(android ? [['timeout',5000]] : []),
       ['send',cmd], ...(android ? ['unregister'] : []), 'cancel',
     ]);

@@ -21,7 +21,7 @@ export const withNfcTransport = makeSession({
       // Own foreground dispatch before requestTechnology starts waiting for a tap.
       await NfcManager.registerTagEvent({
         isReaderModeEnabled: true,
-        readerModeFlags: NfcAdapter.FLAG_READER_NFC_A | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+        readerModeFlags: NfcAdapter.FLAG_READER_NFC_A | NfcAdapter.FLAG_READER_NFC_B | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
       });
     }
   },
