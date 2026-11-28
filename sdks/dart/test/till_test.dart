@@ -338,7 +338,9 @@ void main() {
         fails('invoice_verifier_required'),
       );
       expect(script.requests, isEmpty);
-      expect((await payBolt(client)).preimage, proof);
+      final standard = await payBolt(client);
+      expect(standard.preimage, proof);
+      expect(standard.receivedAmountKnown, true);
       for (var i = 0; i < 4; i++) {
         await expectLater(payBolt(client), fails('invalid_till_response'));
       }
@@ -461,6 +463,24 @@ void main() {
         fails('invoice_expired'),
       );
       expect(script.requests.length, 2);
+    },
+  );
+  test(
+    'replayed paid records from before received_msat was stored preserve the verified proof',
+    () async {
+      final legacy = {...paid}..remove('received_msat');
+      final script = Script([
+        reply(legacy),
+        reply({...legacy, 'received_msat': 'bad'}),
+        reply({...legacy, 'preimage': txid}),
+      ]);
+      final client = script.client(pay);
+      final receipt = await payBolt(client);
+      expect(receipt.receivedMsat, receipt.priceMsat);
+      expect(receipt.receivedAmountKnown, false);
+      expect(receipt.preimage, proof);
+      await expectLater(payBolt(client), fails('invalid_till_response'));
+      await expectLater(payBolt(client), fails('invalid_till_response'));
     },
   );
 }

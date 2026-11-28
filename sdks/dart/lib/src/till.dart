@@ -30,6 +30,7 @@ typedef PaymentReceipt = ({
   String preimage,
   int priceMsat,
   int receivedMsat,
+  bool receivedAmountKnown,
 });
 typedef PaymentStatus = ({
   int payId,
@@ -508,10 +509,16 @@ class TillClient {
         _uint(row['invoice_msat']) != signed.amountMsat ||
         hash != signed.paymentHash)
       return _invalid();
+    final price = _uint(row['price_msat']);
+    // Before the till recorded overpayment separately it counted the price.
+    final received = row.containsKey('received_msat')
+        ? _uint(row['received_msat'])
+        : price;
     return (
       payId: _positive(row['pay_id']),
-      priceMsat: _uint(row['price_msat']),
-      receivedMsat: _uint(row['received_msat']),
+      priceMsat: price,
+      receivedMsat: received,
+      receivedAmountKnown: row.containsKey('received_msat'),
       preimage: preimage,
     );
   }
