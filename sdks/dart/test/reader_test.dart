@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:fedimintcard/nfc.dart';
-import 'package:flutter/services.dart';
-import 'package:flutter_test/flutter_test.dart';
+import 'package:fedimintcard/fedimintcard.dart';
+import 'dart:typed_data';
+import 'package:test/test.dart';
 
 Uint8List hex(String value) => Uint8List.fromList([
   for (var i = 0; i < value.length; i += 2)
@@ -37,7 +37,6 @@ String responseForSlot(int state, String amountHex) {
 }
 
 void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
   test('reads only the public output reference for owed change', () async {
     final reply = hex(responseForSlot(3, '0000000000000007'));
     reply.fillRange(121, 153, 0x11);
@@ -177,83 +176,6 @@ void main() {
       await expectLater(first, throwsStateError);
       await expectLater(reader.state(), throwsStateError);
       expect(calls, 2);
-    },
-  );
-  test(
-    'native adapter polls a single tag, sends binary APDUs and closes the reader',
-    () async {
-      const channel = MethodChannel('flutter_nfc_kit/method');
-      final binary =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      final calls = <String>[];
-      binary.setMockMethodCallHandler(channel, (call) async {
-        calls.add(call.method);
-        switch (call.method) {
-          case 'poll':
-            expect(call.arguments['technologies'], 0x83);
-            return jsonEncode({
-              'id': '00',
-              'type': 'iso7816',
-              'standard': 'ISO 14443-4',
-            });
-          case 'transceive':
-            final data = call.arguments['data'] as Uint8List;
-            if (calls.length == 2) {
-              expect(data, hex(vectors['select']['command']));
-              return hex(vectors['select']['response']);
-            }
-            expect(data, hex(vectors['identity']['command']));
-            return hex(vectors['identity']['response']);
-          case 'finish':
-            return null;
-        }
-        fail('unexpected channel method');
-      });
-      addTearDown(() => binary.setMockMethodCallHandler(channel, null));
-      late FedimintCardReader escaped;
-      final key = await withFedimintCard((card) async {
-        escaped = card;
-        await expectLater(withFedimintCard((r) => r.state()), throwsStateError);
-        return card.publicKey();
-      });
-      expect(key, hex(cert['observedSlot0']));
-      expect(calls, ['poll', 'transceive', 'transceive', 'finish']);
-      await expectLater(escaped.state(), throwsStateError);
-    },
-  );
-  test(
-    'failed selection closes NFC even when the platform reports a cleanup error',
-    () async {
-      const channel = MethodChannel('flutter_nfc_kit/method');
-      final binary =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      final calls = <String>[];
-      binary.setMockMethodCallHandler(channel, (call) async {
-        calls.add(call.method);
-        if (call.method == 'poll')
-          return jsonEncode({
-            'id': '00',
-            'type': 'iso7816',
-            'standard': 'ISO 14443-4',
-          });
-        if (call.method == 'transceive') return hex('03009000');
-        throw PlatformException(code: 'gone');
-      });
-      addTearDown(() => binary.setMockMethodCallHandler(channel, null));
-      for (var i = 0; i < 2; i++) {
-        await expectLater(
-          withFedimintCard((r) => r.state()),
-          throwsA(isA<UnsupportedApplet>()),
-        );
-      }
-      expect(calls, [
-        'poll',
-        'transceive',
-        'finish',
-        'poll',
-        'transceive',
-        'finish',
-      ]);
     },
   );
 }

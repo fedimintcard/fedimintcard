@@ -2,9 +2,10 @@
 library;
 
 import 'dart:typed_data';
+
 import 'package:flutter_nfc_kit/flutter_nfc_kit.dart';
-import 'fedimintcard.dart';
-export 'fedimintcard.dart';
+import 'package:fedimintcard/fedimintcard.dart';
+export 'package:fedimintcard/fedimintcard.dart';
 
 bool _scanActive = false;
 

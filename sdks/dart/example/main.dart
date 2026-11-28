@@ -1,46 +1,15 @@
-import 'package:fedimintcard/nfc.dart';
-import 'package:flutter/material.dart';
+import 'package:fedimintcard/fedimintcard.dart';
 
-void main() => runApp(const MaterialApp(home: ReaderExample()));
-
-class ReaderExample extends StatefulWidget {
-  const ReaderExample({super.key});
-  @override
-  State<ReaderExample> createState() => _ReaderExampleState();
+/// Pass a transport connected to a single card. Each reply includes SW1 and SW2.
+Future<CardBalance> readBalance(Transceive transceive) async {
+  final reader = await FedimintCardReader.select(transceive);
+  try {
+    return await reader.balance();
+  } finally {
+    reader.close();
+  }
 }
 
-class _ReaderExampleState extends State<ReaderExample> {
-  String result = '';
-  bool scanning = false;
-  Future<void> scan() async {
-    setState(() => scanning = true);
-    try {
-      final amount = await withFedimintCard((reader) => reader.balance());
-      if (mounted)
-        setState(
-          () => result =
-              'Stored ${amount.storedMsat} msat, owed ${amount.owedMsat} msat',
-        );
-    } catch (error) {
-      if (mounted) setState(() => result = error.toString());
-    } finally {
-      if (mounted) setState(() => scanning = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    body: Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(result),
-          ElevatedButton(
-            onPressed: scanning ? null : scan,
-            child: const Text('Read card'),
-          ),
-        ],
-      ),
-    ),
-  );
+void main() {
+  print('Connect a card transport, then call readBalance(transceive).');
 }

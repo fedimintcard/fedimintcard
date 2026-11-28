@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:fedimintcard/src/till.dart';
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 
 const pos = 'fedimintcard-till:https://shop.example:9443/?t=abc123';
 const pay = 'fedimintcard-till-pay:https://shop.example:9443?t=abc456';
